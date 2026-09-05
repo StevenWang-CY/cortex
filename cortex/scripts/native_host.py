@@ -160,6 +160,18 @@ def is_daemon_running(port: int = WEBSOCKET_PORT) -> bool:
 
 
 CORTEX_APP_PATH = "/Applications/Cortex.app"
+#: ``CFBundleIdentifier`` of Cortex.app (see ``cortex/scripts/cortex.spec``).
+#: ``open -b`` resolves the bundle through LaunchServices wherever the
+#: user actually put it, which is the only sane fallback for a packaged
+#: host when the app is not at the canonical ``/Applications`` path.
+CORTEX_BUNDLE_ID = "com.cortex.daemon"
+#: How long a freshly opened Cortex.app gets to bring its in-process
+#: daemon up (the desktop shell starts it lazily).
+_APP_READY_TIMEOUT_S = 20.0
+_NOT_INSTALLED_MESSAGE = (
+    "Cortex.app is not installed in /Applications. Move Cortex.app into "
+    "/Applications (or reinstall from the DMG) and try again."
+)
 
 
 def _is_installed_app() -> bool:
@@ -167,16 +179,62 @@ def _is_installed_app() -> bool:
     return os.path.isdir(CORTEX_APP_PATH)
 
 
+def _is_frozen() -> bool:
+    """True inside the PyInstaller-built ``CortexNativeHost`` binary."""
+    return bool(getattr(sys, "frozen", False))
+
+
+def _wait_for_daemon_ready(timeout_s: float) -> dict:
+    """Poll the WS port until the daemon listens or ``timeout_s`` elapses."""
+    polls = max(1, int(timeout_s / 0.5))
+    for i in range(polls):
+        time.sleep(0.5)
+        if is_daemon_running():
+            log(f"Daemon ready after {(i + 1) * 0.5}s")
+            return {"status": "launched"}
+    log(f"Daemon did not become ready in {timeout_s:.0f}s")
+    return {
+        "status": "timeout",
+        "error": f"Daemon started but port {WEBSOCKET_PORT} not yet ready",
+    }
+
+
+def _open_app(argv: list[str], *, label: str) -> dict | None:
+    """Run an ``open`` command; return an error envelope or ``None`` on success."""
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception as e:
+        log(f"{label} failed: {e}")
+        return {"status": "error", "error": str(e)}
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        log(f"{label} failed rc={result.returncode} stderr={stderr}")
+        return {"status": "error", "error": stderr or f"Failed to launch via {label}"}
+    log(f"Launched daemon via {label}")
+    return None
+
+
 def launch_daemon() -> dict:
     """Launch the Cortex daemon as a detached background process.
 
-    Two launch modes:
+    Three launch modes:
 
     * **DMG mode** — Cortex.app is installed in /Applications. Use
-      ``open -a Cortex`` so the bundled Python and in-process daemon
-      start with the app's own TCC camera identity. This is the path
-      end users hit after installing the DMG.
-    * **Dev mode** — No installed .app. Fall back to running
+      ``open /Applications/Cortex.app`` so the bundled Python and
+      in-process daemon start with the app's own TCC camera identity.
+      This is the path end users hit after installing the DMG.
+    * **Packaged host, app elsewhere** — the frozen ``CortexNativeHost``
+      never takes the dev path (that would open Terminal running
+      ``CortexNativeHost -m cortex.scripts.run_dev``, which cannot work).
+      It asks LaunchServices for the bundle by id (``open -b``) and
+      otherwise returns a structured error telling the user to install
+      the app into /Applications.
+    * **Dev mode** — source checkout, no installed .app. Run
       ``python -m cortex.scripts.run_dev`` via Terminal.app so the
       dev-checkout daemon inherits Terminal's camera permission.
     """
@@ -185,36 +243,20 @@ def launch_daemon() -> dict:
 
     # --- DMG path: open the installed .app ---------------------------------
     if _is_installed_app():
-        try:
-            result = subprocess.run(
-                ["open", CORTEX_APP_PATH],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if result.returncode != 0:
-                stderr = (result.stderr or "").strip()
-                log(f"open failed rc={result.returncode} stderr={stderr}")
-                return {
-                    "status": "error",
-                    "error": stderr or "Failed to launch Cortex.app",
-                }
-            log("Launched daemon via open -a Cortex.app")
-        except Exception as e:
-            log(f"open -a failed: {e}")
-            return {"status": "error", "error": str(e)}
+        failure = _open_app(["open", CORTEX_APP_PATH], label="open Cortex.app")
+        if failure is not None:
+            return failure
+        return _wait_for_daemon_ready(_APP_READY_TIMEOUT_S)
 
-        # The desktop shell starts its daemon lazily — allow up to 20s.
-        for i in range(40):
-            time.sleep(0.5)
-            if is_daemon_running():
-                log(f"Daemon ready after {(i + 1) * 0.5}s")
-                return {"status": "launched"}
-        log("Daemon did not become ready in 20s")
-        return {
-            "status": "timeout",
-            "error": f"Daemon started but port {WEBSOCKET_PORT} not yet ready",
-        }
+    # --- Packaged host without /Applications/Cortex.app --------------------
+    if _is_frozen():
+        failure = _open_app(
+            ["open", "-b", CORTEX_BUNDLE_ID],
+            label=f"open -b {CORTEX_BUNDLE_ID}",
+        )
+        if failure is not None:
+            return {"status": "error", "error": _NOT_INSTALLED_MESSAGE}
+        return _wait_for_daemon_ready(_APP_READY_TIMEOUT_S)
 
     # --- Dev path: python -m cortex.scripts.run_dev via Terminal.app -------
     # Find the project root (this script is at cortex/scripts/native_host.py)
@@ -257,116 +299,40 @@ def launch_daemon() -> dict:
 
     # Wait for the daemon to start listening (up to 12 seconds —
     # camera warmup alone takes ~2s on Mac builtin camera)
-    for i in range(24):
-        time.sleep(0.5)
-        if is_daemon_running():
-            log(f"Daemon ready after {(i + 1) * 0.5}s")
-            return {"status": "launched"}
-
-    log("Daemon did not become ready in 12s")
-    return {"status": "timeout", "error": "Daemon started but port 9473 not yet ready"}
+    return _wait_for_daemon_ready(12.0)
 
 
 def _find_all_daemon_pids() -> set[int]:
-    """Find ALL Cortex daemon PIDs — by port AND by process name.
+    """Find every PID that is provably the Cortex daemon (D1).
 
-    The daemon can lose its port binding while the process (and camera)
-    keeps running, so we must also search by command name.
+    Delegates to :func:`cortex.scripts.launcher_agent.find_daemon_pids`
+    — the single dependency-free implementation shared by both
+    launchers: listening socket owners only (``lsof -sTCP:LISTEN``),
+    anchored ``pgrep`` patterns that can never match this host's own
+    ``.../MacOS/CortexNativeHost`` argv, the daemon-written pidfile, and
+    never our own PID or Chrome (our parent).
     """
-    pids: set[int] = set()
+    from cortex.scripts import launcher_agent
 
-    # Method 1: lsof on known ports
-    for port in (WEBSOCKET_PORT, HTTP_API_PORT):
-        try:
-            result = subprocess.run(
-                ["lsof", "-ti", f"tcp:{port}"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            for line in result.stdout.strip().split("\n"):
-                line = line.strip()
-                if line.isdigit():
-                    pids.add(int(line))
-        except Exception:
-            pass
-
-    # Method 2: pgrep by command — catches orphaned processes that lost
-    # their port binding but still hold the camera open
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", "cortex.scripts.run_dev"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        for line in result.stdout.strip().split("\n"):
-            line = line.strip()
-            if line.isdigit():
-                pids.add(int(line))
-    except Exception:
-        pass
-    # Bundled app executable path for DMG installs.
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", f"{CORTEX_APP_PATH}/Contents/MacOS/Cortex"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        for line in result.stdout.strip().split("\n"):
-            line = line.strip()
-            if line.isdigit():
-                pids.add(int(line))
-    except Exception:
-        pass
-
-    return pids
+    return launcher_agent.find_daemon_pids()
 
 
 def stop_daemon() -> dict:
-    """Stop the Cortex daemon — guaranteed kill."""
-    import signal as _signal
+    """Stop the Cortex daemon: graceful first, escalate only when needed (D2).
 
-    # Step 1: Try HTTP shutdown (cleanest — triggers graceful stop chain)
-    try:
-        import urllib.request
+    Delegates to :func:`cortex.scripts.launcher_agent.stop_daemon`:
+    ``POST /shutdown`` with ``X-Cortex-Auth-Token``, poll ``/health`` for
+    connection-refused for up to 20 s, then SIGTERM, then (5 s later)
+    SIGKILL. The native ``StopResponse`` schema is closed
+    (``extra="forbid"``), so the launcher's ``method`` diagnostic is
+    logged rather than returned.
+    """
+    from cortex.scripts import launcher_agent
 
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{HTTP_API_PORT}/shutdown",
-            method="POST",
-            data=b"",
-        )
-        urllib.request.urlopen(req, timeout=2)
-    except Exception:
-        pass
-
-    # Step 2: Find ALL daemon PIDs and send SIGTERM
-    pids = _find_all_daemon_pids()
-    for pid in pids:
-        try:
-            os.kill(pid, _signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-    if pids:
-        log(f"Sent SIGTERM to pids: {pids}")
-
-    # Step 3: Wait for graceful shutdown
-    for _ in range(6):
-        time.sleep(0.5)
-        remaining = _find_all_daemon_pids()
-        if not remaining:
-            return {"status": "stopped"}
-
-    # Step 4: SIGKILL anything still alive
-    remaining = _find_all_daemon_pids()
-    for pid in remaining:
-        try:
-            os.kill(pid, _signal.SIGKILL)
-            log(f"SIGKILL sent to {pid}")
-        except ProcessLookupError:
-            pass
-
+    result = launcher_agent.stop_daemon(log=log)
+    log(f"stop chain finished: {result}")
+    # A daemon that was never running is "stopped" from the extension's
+    # point of view; only an exception maps to ``error`` (see ``main``).
     return {"status": "stopped"}
 
 
@@ -394,18 +360,22 @@ def _get_auth_token_response() -> dict[str, object]:
 
 
 def _read_auth_token() -> str:
-    """Best-effort load of the capability token for HTTP header use.
+    """Best-effort *pure* read of the capability token for HTTP header use.
 
     Used by the ``raise_dashboard`` branch to authenticate against
     ``POST /dashboard/raise`` (Phase 4b). Returns an empty string on
     failure — the daemon route will then return 401, which surfaces to
     the extension as ``{ok: false, error: "..."}``. We never propagate
     a stack trace into the response body.
+
+    Never mints a token: if the file is absent the daemon has not started
+    (it provisions the token on boot), so there is nothing to talk to
+    anyway, and a host-minted token would race the daemon's own.
     """
     try:
-        from cortex.libs.auth import load_or_create_token
+        from cortex.libs.auth.local_token import load_token_or_none
 
-        return load_or_create_token()
+        return load_token_or_none() or ""
     except Exception:
         return ""
 

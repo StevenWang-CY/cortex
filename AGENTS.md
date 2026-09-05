@@ -19,7 +19,7 @@ Cortex is a real-time biofeedback engine (webcam + input devices) that detects c
 - `cortex/apps/desktop_shell/dashboard.py` — Two-tab dashboard (consumer biometrics + advanced debug)
 - `cortex/apps/desktop_shell/connections.py` — One-click browser/editor extension setup
 - `cortex/apps/desktop_shell/tokens.py` — Design tokens (warm palette, typography, spacing)
-- `cortex/apps/desktop_shell/onboarding.py` — 4-step first-run wizard (camera, accessibility, BYOK, extensions)
+- `cortex/apps/desktop_shell/onboarding.py` — 6-step first-run wizard (camera, accessibility, BYOK, calibration, extensions, macOS notifications)
 - `cortex/apps/browser_extension/background.ts` — Extension service worker (launch/stop/connect)
 - `cortex/apps/browser_extension/popup.tsx` — Extension popup UI
 - `.cortex_launcher.c` — C source for CortexDaemon.app (TCC camera wrapper, legacy)
@@ -60,15 +60,15 @@ Cortex is a real-time biofeedback engine (webcam + input devices) that detects c
 
 ### Daemon Stop Flow
 
-13. **Stopping the daemon requires multiple kill mechanisms.** A single approach is never enough. The proven kill chain:
+13. **Stopping the daemon is a bounded chain that must never signal a client.** The proven order:
     1. WebSocket `SHUTDOWN` message (with 300ms flush delay before disconnect)
-    2. HTTP `POST /shutdown`
-    3. Wait 1 second
-    4. Native messaging `stop` command (finds PIDs via `lsof` + `pgrep`)
-    5. `SIGTERM` all found PIDs
-    6. Wait 3 seconds, then `SIGKILL` any survivors
+    2. HTTP `POST /shutdown` **with the capability token** (`X-Cortex-Auth-Token` read from `<config_dir>/auth.token`; without it the route answers 401 and the graceful step is dead code)
+    3. Wait for the daemon's own graceful shutdown (recap, receipts, database close): poll `/health` until connection refused, at least 20 s
+    4. Native messaging `stop` command, which identifies the daemon by its pidfile or its **listening** socket (rule 14)
+    5. `SIGTERM` that process only
+    6. Wait, then `SIGKILL` any survivor
 
-14. **Find daemon PIDs by BOTH port AND process name.** `lsof -ti tcp:9473` misses orphaned processes that lost their port binding but still hold the camera open. Always also use `pgrep -f "cortex.scripts.run_dev"`.
+14. **Identify the daemon by pidfile, listening socket, or an anchored process pattern, never by "anything on the port".** `lsof -ti tcp:9473` lists **both ends** of every socket (empirically verified): it returns Chrome's network service, the VS Code extension host, and the WebSocket desktop shell, and the v0.3.15 kill chain SIGKILLed them. Use `lsof -ti tcp:9473 -sTCP:LISTEN`, prefer the daemon-written `<config_dir>/daemon.pid`, anchor `pgrep` to the GUI executable (`^/Applications/Cortex.app/Contents/MacOS/Cortex( |$)`) so it can never match `CortexNativeHost`, and exclude the caller's own PID and parent PID. A daemon that lost its port but holds the camera is found through the pidfile or the anchored pattern, not through a port sweep.
 
 15. **`webcam.stop()` must ALWAYS call `cap.release()`.** Never early-return from `stop()` based on a `_running` flag without releasing the camera. An inconsistent flag state will leak the camera handle.
 
@@ -113,6 +113,14 @@ Cortex is a real-time biofeedback engine (webcam + input devices) that detects c
 32. **App Translocation breaks native messaging paths.** Downloaded ad-hoc-signed apps are secretly copied to `/private/var/folders/.../AppTranslocation/...` on first launch. Always use `canonical_app_path()` (hardcoded `/Applications/Cortex.app`) for native messaging manifest paths, never `sys.executable`. Proper code signing + notarization eliminates translocation entirely.
 
 33. **GUI apps don't inherit shell `$PATH`.** When launched from Finder/Dock, the app gets only `/usr/bin:/bin:/usr/sbin:/sbin`. Use absolute paths to find `code`, `cursor`, `codium` binaries (e.g., `/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code`). `shutil.which()` is a last-resort fallback only.
+
+34. **PyInstaller `COLLECT` inherits `console` from the LAST `EXE`, and the macOS bundler turns `console=True` into `LSBackgroundOnly=1`.** The two-executable bundle (GUI + `CortexNativeHost`) shipped v0.3.15 as a background-only app: no Dock icon, no Cmd-Tab, and no window could become key, so the keyboard was dead. Always set `"LSBackgroundOnly": False` in the `BUNDLE` `info_plist`, and keep the release verifier's plist check that rejects any truthy `LSBackgroundOnly`/`LSUIElement`.
+
+35. **Qt parses 8-digit hex as `#AARRGGBB`; CSS uses `#RRGGBBAA`.** Design tokens are authored in CSS order in `tokens.yaml`; the emitter (`sync_design_tokens.py`) must reorder the channels for the Python/Qt output. Emitting CSS order into Qt made every hairline a 24 % olive line and the UNKNOWN/HYPO state dots nearly invisible. The contrast contract test pins the emitted order.
+
+36. **Tests must never touch the real user profile.** `cortex/tests/conftest.py` installs a session `HOME` sandbox (with `XDG_*` variables) before any Cortex import; before it existed, the suite overwrote the real goals file, cost ledger, onboarding marker, and native-host log under `~/Library/Application Support/Cortex`. Do not add fixtures that bypass it; opt out only with `CORTEX_TEST_REAL_HOME=1` for a deliberate local experiment.
+
+37. **Current Claude models reject sampling parameters and forced tool choice.** `temperature`/`top_p`/`top_k` return HTTP 400 on Opus 4.7+ and Sonnet 5, and forced `tool_choice` is refused on the newest models. The planner uses structured outputs (`output_config.format`) with no sampling parameters, treats 400/404/422 and `stop_reason` `refusal`/`max_tokens` as terminal, and keeps one circuit breaker per model tier so a broken tier cannot silence the others.
 
 ---
 

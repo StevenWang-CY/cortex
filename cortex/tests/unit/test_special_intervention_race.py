@@ -9,12 +9,16 @@ the sentinel was set *after* the LLM await. The fix sets
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from cortex.application.clock import SYSTEM_CLOCK
+from cortex.libs.config.settings import InterventionConfig, LLMConfig, StateConfig
 from cortex.services.runtime_daemon import CortexDaemon
+from cortex.services.state_engine.trigger_policy import TriggerPolicy
 
 
 class _RecordingClient:
@@ -52,7 +56,7 @@ class _RecordingClient:
 
 
 @pytest.fixture
-def daemon(monkeypatch: pytest.MonkeyPatch) -> CortexDaemon:
+def daemon(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> CortexDaemon:
     d = CortexDaemon.__new__(CortexDaemon)
     d._active_intervention_id = None
     d._last_policy_decision_id = None
@@ -60,10 +64,33 @@ def daemon(monkeypatch: pytest.MonkeyPatch) -> CortexDaemon:
     d._last_policy_propensity = None
     d._llm_client = _RecordingClient()
 
+    # Audit D5: special proposals pass the shared interruption gate before
+    # the sentinel/LLM path, so the minimal harness carries the gate's
+    # inputs (an open policy, interventions enabled, stubbed receptivity).
+    intervention_config = InterventionConfig(
+        receptivity_enforced=False,
+        cooldown_seconds=0,
+        max_interventions_per_hour=0,
+    )
+    d.config = SimpleNamespace(intervention=intervention_config, llm=LLMConfig())  # type: ignore[assignment]
+    d._trigger_policy = TriggerPolicy(
+        config=intervention_config,
+        state_config=StateConfig(),
+        dismissal_model_path=tmp_path / "dismissal_model.json",
+        quiet_mode_history_path=tmp_path / "quiet_mode_history.json",
+    )
+    d._interventions_enabled = True
+    d._break_active = False
+    d._clock = SYSTEM_CLOCK
+    d._last_mic_active_at = 0.0
+    d._current_telemetry = lambda: None  # type: ignore[method-assign]
+
     # Patch enrich_plan_with_context inside runtime_daemon's namespace.
     import cortex.services.runtime_daemon as rd
 
     monkeypatch.setattr(rd, "enrich_plan_with_context", lambda plan, ctx: plan)
+    monkeypatch.setattr(rd.receptivity, "is_microphone_in_use", lambda: False)
+    monkeypatch.setattr(rd.receptivity, "is_app_fullscreen", lambda: False)
 
     d._recorder = SimpleNamespace(append=lambda *a, **k: None)
 

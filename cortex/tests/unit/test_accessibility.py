@@ -119,12 +119,12 @@ def test_label_tertiary_meets_wcag_aa_against_control_bg() -> None:
     """``_LABEL_TERTIARY`` is used for placeholders and captions on the
     dashboard's ``_CONTROL_BG`` (#FFFFFF). WCAG AA for normal-weight
     text requires >= 4.5:1."""
-    from cortex.apps.desktop_shell import dashboard
+    from cortex.apps.desktop_shell import tokens
 
-    ratio = _contrast_ratio(dashboard._LABEL_TERTIARY, dashboard._CONTROL_BG)
+    ratio = _contrast_ratio(tokens.CX_TEXT_TERTIARY, tokens.CX_SURFACE)
     assert ratio >= 4.5, (
-        f"_LABEL_TERTIARY {dashboard._LABEL_TERTIARY} on "
-        f"{dashboard._CONTROL_BG} is {ratio:.2f}:1 — fails WCAG AA "
+        f"CX_TEXT_TERTIARY {tokens.CX_TEXT_TERTIARY} on "
+        f"{tokens.CX_SURFACE} is {ratio:.2f}:1 — fails WCAG AA "
         "(>= 4.5:1)"
     )
 
@@ -136,11 +136,12 @@ def test_consumer_tab_interactive_widgets_have_accessible_names(
 
     win = DashboardWindow()
     consumer = win._consumer  # type: ignore[attr-defined]
+    consumer.set_connected(True)
 
     expected = {
         "_goal_input": "Goal",
         "_connect_btn": "Open Connections panel",
-        "_stop_btn": "Stop Cortex",
+        "_stop_btn": "End session",
     }
     for attr, name in expected.items():
         widget = getattr(consumer, attr)
@@ -196,10 +197,8 @@ def test_overlay_dismiss_and_toggle_have_accessible_names(
     from cortex.apps.desktop_shell.overlay import OverlayWindow
 
     win = OverlayWindow()
-    assert win._dismiss_btn.accessibleName() == "Dismiss intervention"
-    assert win._causal_toggle.accessibleName() == (
-        "Show full causal explanation"
-    )
+    assert win._dismiss_btn.accessibleName() == "Dismiss suggestion"
+    assert win._causal_toggle.accessibleName() == "Why Cortex suggested this"
 
 
 def test_overlay_hud_palette_meets_high_alpha_contract() -> None:

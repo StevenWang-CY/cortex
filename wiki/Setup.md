@@ -4,7 +4,7 @@
 
 1. Choose the arm64 or x86_64 DMG for your Mac from the GitHub release.
 2. Verify its matching `SHA256SUMS-<arch>` line and GitHub attestation; optionally run `stapler`
-   and `spctl` as shown in the [release guide](docs/release/README.md).
+   and `spctl` as shown in the [release guide](https://github.com/StevenWang-CY/cortex/blob/main/docs/release/README.md).
 3. Mount the DMG and drag Cortex to `/Applications`.
 4. Launch the installed copy and complete onboarding. A properly notarized
    release should not require removing quarantine attributes.
@@ -63,7 +63,7 @@ uv run --project cortex --locked python -m cortex.scripts.install_native_host
 
 ## Configuration
 
-The generated [configuration reference](cortex/docs/configuration-reference.md)
+The generated [configuration reference](https://github.com/StevenWang-CY/cortex/blob/main/cortex/docs/configuration-reference.md)
 lists every runtime setting, type, default, and environment name. Edit only the
 overrides you need. Important safe defaults are:
 
@@ -104,4 +104,4 @@ cd ../vscode_extension && npm run compile && npm test
 
 The Python gate isolates the Qt desktop test process because loading PySide6
 after other native scientific/macOS libraries can crash the interpreter during
-collection. See [Troubleshooting](Troubleshooting.md) for lifecycle issues.
+collection. See [Troubleshooting](Troubleshooting) for lifecycle issues.

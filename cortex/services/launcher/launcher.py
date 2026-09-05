@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import signal
 import sys
 from collections.abc import Sequence
@@ -23,6 +24,24 @@ from cortex.libs.utils.shell_allowlist import validate_command
 from cortex.services.launcher.project_config import ProjectConfig
 
 logger = logging.getLogger(__name__)
+
+# D8: ``hide_apps`` entries come from user-editable project YAML and used
+# to be interpolated straight into an AppleScript string literal, so a
+# name containing ``"`` broke out into arbitrary AppleScript (``do shell
+# script`` included). Only plain application names are accepted — the
+# brief's ``^[A-Za-z0-9 ._+-]{1,64}$`` tightened so the first character
+# is alphanumeric, which also guarantees the name can never be mistaken
+# for an ``osascript`` option when it is passed as an argv parameter.
+HIDE_APP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._+-]{0,63}$")
+
+# The name is bound at run time through ``argv`` (``item 1 of argv``) and
+# is never part of the script text, so even a name that slipped past the
+# allowlist could only ever be data to ``System Events``.
+_HIDE_APP_SCRIPT = (
+    "on run argv\n"
+    '    tell application "System Events" to set visible of process (item 1 of argv) to false\n'
+    "end run"
+)
 
 
 def _terminate_process(
@@ -328,14 +347,25 @@ class ProjectLauncher:
         """Hide an application using macOS osascript.
 
         B14 (Phase 4.1): shield + terminate-on-cancel.
+
+        D8: the name is validated against :data:`HIDE_APP_NAME_RE` and
+        then handed to ``osascript`` as an ``argv`` parameter of a fixed
+        script (:data:`_HIDE_APP_SCRIPT`) — it is never interpolated into
+        AppleScript source, so a quote in a project YAML cannot become
+        code. Rejected names are logged and reported as a failed step.
         """
         if not self._is_macos:
             return False
-        script = f'tell application "System Events" to set visible of process "{app_name}" to false'
+        if HIDE_APP_NAME_RE.fullmatch(app_name) is None:
+            logger.warning(
+                "Rejected hide_apps entry %r: not a plain application name",
+                app_name,
+            )
+            return False
         proc: asyncio.subprocess.Process | None = None
         try:
             proc = await asyncio.create_subprocess_exec(
-                "osascript", "-e", script,
+                "osascript", "-e", _HIDE_APP_SCRIPT, app_name,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )

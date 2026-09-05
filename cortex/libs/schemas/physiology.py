@@ -81,13 +81,22 @@ class SignalAlgorithmIdentity(BaseModel):
 
 
 class EstimateUncertainty(BaseModel):
-    """Bounded interval around a numeric estimate."""
+    """Bounded interval around a numeric estimate.
+
+    ``interval_kind`` states what the bound *is*: a ``statistical`` interval
+    carries a real coverage probability in ``confidence_level``; a
+    ``heuristic`` bound (spectral resolution, window quality, channel
+    disagreement) carries no coverage claim and therefore no
+    ``confidence_level``. Labelling a heuristic bound with a level such as
+    0.95 is rejected at construction.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     lower: float
     upper: float
-    confidence_level: float = Field(..., gt=0.0, lt=1.0)
+    confidence_level: float | None = Field(None, gt=0.0, lt=1.0)
+    interval_kind: Literal["statistical", "heuristic"] = "statistical"
     method: str = Field(..., min_length=1)
 
     @model_validator(mode="after")
@@ -96,6 +105,11 @@ class EstimateUncertainty(BaseModel):
             raise ValueError("uncertainty bounds must be finite")
         if self.lower > self.upper:
             raise ValueError("uncertainty lower bound must not exceed upper bound")
+        if self.interval_kind == "heuristic":
+            if self.confidence_level is not None:
+                raise ValueError("heuristic bounds carry no confidence_level")
+        elif self.confidence_level is None:
+            raise ValueError("statistical intervals require a confidence_level")
         return self
 
 

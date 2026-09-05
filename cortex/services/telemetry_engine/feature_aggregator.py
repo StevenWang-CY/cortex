@@ -13,7 +13,9 @@ Derived features:
 - keyboard_burst_score: typing intensity spikes (0-1)
 - keystroke_interval_variance: typing rhythm regularity (ms^2)
 - backspace_density: deletion-to-keystroke ratio (0-1)
-- inactivity_seconds: time since last input event
+- inactivity_seconds: time since last input event (from the hooks'
+  last-input marker, bounded by observed exposure — never by the
+  15 s aggregation window)
 - window_switch_rate: app/window switches per minute
 - tab_count: browser tabs (from external source, optional)
 - scroll_reversal_score: scroll direction changes (0-1)
@@ -121,6 +123,17 @@ class FeatureAggregator:
         )
         if self._observation_started_at is None:
             self._observation_started_at = now
+        # Exposure = how long input has actually been observed. The hooks
+        # may have been listening before the first aggregation; use the
+        # earlier of the two starts so silence observed by the listeners
+        # is not discarded, while a fresh process still starts at zero.
+        exposure_started_at = self._observation_started_at
+        listening_since = getattr(self._hooks, "listening_since", None)
+        if isinstance(listening_since, (int, float)) and not isinstance(
+            listening_since, bool
+        ):
+            exposure_started_at = min(exposure_started_at, float(listening_since))
+        exposure_seconds = max(0.0, now - exposure_started_at)
 
         # Gather events
         events = self._hooks.get_events_in_window(window, now)
@@ -161,15 +174,25 @@ class FeatureAggregator:
         ks_variance = self._compute_keystroke_interval_variance(key_events)
         bs_density = self._compute_backspace_density(key_events)
         correction_rate = self._compute_correction_rate_per_100_keys(key_events)
+        # Audit D1: the window-pruned event lists can never show more than
+        # ``window`` seconds of silence, which made every >15 s inactivity
+        # rule (under-engaged floor at 30 s, zombie reading, flow's
+        # activity gate) unreachable. Inactivity is measured from the hooks'
+        # last-input marker and bounded only by observed exposure.
+        last_input = getattr(self._hooks, "last_input_timestamp", None)
         inactivity = self._compute_inactivity(
             mouse_moves,
             mouse_clicks,
             mouse_scrolls,
             key_events,
             now,
-            no_event_fallback_seconds=min(
-                window, max(0.0, now - self._observation_started_at)
+            no_event_fallback_seconds=exposure_seconds,
+            last_input_timestamp=(
+                float(last_input)
+                if isinstance(last_input, (int, float)) and not isinstance(last_input, bool)
+                else None
             ),
+            max_inactivity_seconds=exposure_seconds,
         )
         switch_rate = self._compute_window_switch_rate(window_events, window)
         scroll_rev = self._compute_scroll_reversal_score(mouse_scrolls)
@@ -441,9 +464,17 @@ class FeatureAggregator:
         keys: list[KeyEvent],
         current_time: float,
         no_event_fallback_seconds: float | None = None,
+        *,
+        last_input_timestamp: float | None = None,
+        max_inactivity_seconds: float | None = None,
     ) -> float:
         """
         Compute seconds since last input event.
+
+        ``last_input_timestamp`` (the hooks' last-input marker) takes
+        precedence over the window-pruned event lists, which by
+        construction cannot witness silence longer than the window.
+        ``max_inactivity_seconds`` bounds the result by observed exposure.
 
         Returns:
             Seconds of inactivity.
@@ -458,18 +489,23 @@ class FeatureAggregator:
             latest = max(latest, scrolls[-1].timestamp)
         if keys:
             latest = max(latest, keys[-1].timestamp)
+        if last_input_timestamp is not None:
+            latest = max(latest, last_input_timestamp)
 
         if latest == 0.0:
             # ``current_time`` is commonly a machine-uptime monotonic value.
             # Production supplies elapsed collector exposure so a fresh
             # process cannot fabricate hours of inactivity.
-            return (
+            inactivity = (
                 max(0.0, no_event_fallback_seconds)
                 if no_event_fallback_seconds is not None
                 else current_time
             )
-
-        return max(0.0, current_time - latest)
+        else:
+            inactivity = max(0.0, current_time - latest)
+        if max_inactivity_seconds is not None:
+            inactivity = min(inactivity, max(0.0, max_inactivity_seconds))
+        return inactivity
 
     @staticmethod
     def _compute_window_switch_rate(
@@ -485,8 +521,12 @@ class FeatureAggregator:
         if not window_events or window_seconds < 1e-6:
             return 0.0
 
-        # Each event is a switch (except possibly the first which may be initial state)
-        n_switches = max(0, len(window_events) - 1)
+        # Every focus event inside the sliding window is a real transition
+        # (the tracker already de-duplicates same-window refreshes). The
+        # old ``len - 1`` treated the first event in *every* window as an
+        # initial-state marker and under-counted each window by one
+        # switch (audit D13).
+        n_switches = len(window_events)
         minutes = window_seconds / 60.0
         return n_switches / minutes if minutes > 0 else 0.0
 

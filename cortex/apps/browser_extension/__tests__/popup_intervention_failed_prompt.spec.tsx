@@ -115,17 +115,20 @@ describe("popup INTERVENTION_FAILED / INTERVENTION_PROMPT consumers", () => {
             await act(async () => {
                 await new Promise((r) => setTimeout(r, 0));
             });
-            const cta = container.querySelector(
+            // Nothing can run, so there is no primary control to disable;
+            // the situation is stated as status text instead.
+            expect(container.querySelector(
                 '[data-testid="intervention-primary-action"]',
-            ) as HTMLButtonElement | null;
-            expect(cta).not.toBeNull();
-            expect(cta!.textContent).toBe("Manual review only");
-            expect(cta!.disabled).toBe(true);
+            )).toBeNull();
             expect(container.querySelector(
                 '[data-testid="manual-action-review-note"]',
             )?.textContent).toContain("no workspace change will run");
+            const note = container.querySelector(
+                '[data-testid="intervention-status-note"]',
+            );
+            expect(note?.getAttribute("role")).toBe("status");
+            expect(note?.textContent).toContain("Manual review only");
 
-            cta!.click();
             const sentExecution = globalThis.__cortexChrome.runtime.sendMessage
                 .mock.calls.some(([message]) =>
                     (message as { type?: unknown } | undefined)?.type
@@ -167,15 +170,20 @@ describe("popup INTERVENTION_FAILED / INTERVENTION_PROMPT consumers", () => {
             expect(banner).not.toBeNull();
             expect(banner!.textContent).toContain("Extension lacks tab permission");
 
-            // The primary apply CTA must be disabled.
+            // A failure never reads as "Done": no control claims success
+            // and nothing offers Undo for a change that did not happen.
             const buttons = Array.from(
                 container.querySelectorAll("button"),
             ) as HTMLButtonElement[];
-            const cta = buttons.find((b) =>
-                /Couldn't apply/i.test(b.textContent || ""),
-            );
-            expect(cta).toBeDefined();
-            expect(cta!.disabled).toBe(true);
+            expect(buttons.some((b) => /^Done$/.test(b.textContent || ""))).toBe(false);
+            expect(container.querySelector('[data-testid="intervention-undo"]')).toBeNull();
+            const cta = container.querySelector(
+                '[data-testid="intervention-primary-action"]',
+            ) as HTMLButtonElement | null;
+            if (cta) {
+                expect(cta.disabled).toBe(true);
+                expect(cta.textContent).toMatch(/^Nothing changed/);
+            }
         } finally {
             await cleanup();
         }

@@ -1,23 +1,20 @@
-"""Audit F11 — Bedrock token must not leak into the process env permanently.
+"""Audit F11 / D2 — the Bedrock token never touches the process env.
 
-Previously, ``AnthropicPlanner.__init__`` for ``provider="bedrock"``
-sourced the bearer token from Keychain and wrote it to
-``os.environ["AWS_BEARER_TOKEN_BEDROCK"]``. Child processes spawned
-afterwards (capture workers, native host re-launches, terminals from
-the project launcher) inherited the token. A debugger or crash-dump
-attached to any descendant could read it.
-
-After the F11 fix the env mutation is scoped to the SDK constructor
-call only; once the planner is built, the env is restored to its prior
-state. Subsequent ``os.fork``/``subprocess.spawn`` cannot inherit the
-token via environment.
+Previously ``AnthropicPlanner.__init__`` for ``provider="bedrock"`` sourced
+the bearer token from Keychain and wrote it to
+``os.environ["AWS_BEARER_TOKEN_BEDROCK"]`` (first permanently, later inside
+a scoped window) so the SDK could read it back. Child processes spawned
+during that window inherited the token, and the window itself was a
+race. The token is now passed explicitly to
+``build_anthropic_sdk_client(bedrock_bearer_token=...)`` and on to
+``AsyncAnthropicBedrockMantle(api_key=...)``; ``os.environ`` is never
+mutated by any LLM module.
 """
 
 from __future__ import annotations
 
 import os
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 
@@ -38,59 +35,44 @@ def _bedrock_config() -> LLMConfig:
     )
 
 
-def test_planner_does_not_leave_token_in_env_after_construction(
-    clean_bedrock_env,
-) -> None:
-    """The whole point of F11: after the planner is built, the env must
-    not contain the Bedrock bearer."""
-    assert "AWS_BEARER_TOKEN_BEDROCK" not in os.environ
+def test_llm_modules_never_mutate_the_process_environment() -> None:
+    """Static guard: no LLM module assigns to or pops ``os.environ``."""
+    import inspect
 
-    with patch.object(
-        anthropic_planner,
-        "_keychain_get_bedrock_token",
-        return_value="bedrock-keychain-token-12345",
-    ):
-        # Build with a stub SDK so we don't make real network calls;
-        # the env-mutation logic runs regardless because the keychain
-        # path was the leak source.
-        config = _bedrock_config()
-        keychain_token = anthropic_planner._keychain_get_bedrock_token(config)
-        assert keychain_token == "bedrock-keychain-token-12345"
+    from cortex.libs.llm import anthropic_client
+    from cortex.services.llm_engine import context_broker
 
-        # Manually exercise the F11 path: emulate the constructor's
-        # env-scoping by calling the same fragment. (We can't easily
-        # construct the full planner without provider plumbing; what
-        # matters is that the env is clean afterwards.)
-        prior = os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
-        try:
-            os.environ["AWS_BEARER_TOKEN_BEDROCK"] = keychain_token
-            # ... SDK construction would happen here ...
-            pass
-        finally:
-            if prior is None:
-                os.environ.pop("AWS_BEARER_TOKEN_BEDROCK", None)
-            else:
-                os.environ["AWS_BEARER_TOKEN_BEDROCK"] = prior
-
-    # The contract: after the scoped block, the env is clean.
-    assert "AWS_BEARER_TOKEN_BEDROCK" not in os.environ
+    for module in (anthropic_planner, anthropic_client, context_broker):
+        source = inspect.getsource(module)
+        assert "os.environ[" not in source.replace("os.environ.get(", ""), module.__name__
+        assert "os.environ.pop(" not in source, module.__name__
+        assert "os.putenv(" not in source, module.__name__
 
 
-def test_real_planner_construction_scopes_env_mutation(
+def test_real_planner_construction_passes_token_explicitly(
     clean_bedrock_env,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Construct a real AnthropicPlanner with a stubbed SDK and assert
-    the env contains the keychain token DURING construction (so the
-    SDK can read it) but NOT after the constructor returns."""
+    """Construct a real AnthropicPlanner with a stubbed transport factory
+    and assert the keychain token reaches it as an explicit argument while
+    ``os.environ`` stays untouched throughout (audit D2)."""
 
-    captured_token: dict[str, str | None] = {}
+    captured: dict[str, str | None] = {}
 
     class _StubSDK:
-        def __init__(self) -> None:
-            captured_token["seen"] = os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
+        pass
 
-    def _fake_build(*, provider: str, bedrock_region: str, **_: Any) -> Any:
+    def _fake_build(
+        *,
+        provider: str,
+        bedrock_region: str,
+        bedrock_bearer_token: str | None = None,
+        **_: Any,
+    ) -> Any:
+        captured["provider"] = provider
+        captured["region"] = bedrock_region
+        captured["token"] = bedrock_bearer_token
+        captured["env_during_build"] = os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
         return _StubSDK()
 
     monkeypatch.setattr(anthropic_planner, "build_anthropic_sdk_client", _fake_build)
@@ -102,12 +84,12 @@ def test_real_planner_construction_scopes_env_mutation(
 
     planner = anthropic_planner.AnthropicPlanner(_bedrock_config())
 
-    # The SDK construction saw the token (so its own constructor could
-    # read it).
-    assert captured_token["seen"] == "scoped-secret-from-keychain"
-    # After construction returned, the env is restored to clean.
+    assert captured["token"] == "scoped-secret-from-keychain"
+    assert captured["provider"] == "bedrock"
+    assert captured["region"] == "us-east-2"
+    # Never in the environment — not even transiently during construction.
+    assert captured["env_during_build"] is None
     assert "AWS_BEARER_TOKEN_BEDROCK" not in os.environ
-    # And the planner has the SDK reference it expected.
     assert isinstance(planner._sdk, _StubSDK)
 
 
@@ -119,10 +101,19 @@ def test_existing_env_value_is_preserved(
     before the daemon started, the planner must not clobber it on exit."""
     monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "user-supplied-env-token")
 
+    captured: dict[str, str | None] = {}
+
     class _StubSDK:
         pass
 
-    def _fake_build(*, provider: str, bedrock_region: str, **_: Any) -> Any:
+    def _fake_build(
+        *,
+        provider: str,
+        bedrock_region: str,
+        bedrock_bearer_token: str | None = None,
+        **_: Any,
+    ) -> Any:
+        captured["token"] = bedrock_bearer_token
         return _StubSDK()
 
     monkeypatch.setattr(anthropic_planner, "build_anthropic_sdk_client", _fake_build)
@@ -134,6 +125,7 @@ def test_existing_env_value_is_preserved(
 
     anthropic_planner.AnthropicPlanner(_bedrock_config())
 
-    # The user-supplied env survives. (Keychain is only consulted when
-    # the env is empty.)
+    # The user-supplied env survives and is what the SDK receives.
+    # (Keychain is only consulted when the env is empty.)
     assert os.environ.get("AWS_BEARER_TOKEN_BEDROCK") == "user-supplied-env-token"
+    assert captured["token"] == "user-supplied-env-token"

@@ -64,8 +64,11 @@ class _StorageMaintenanceStub:
             mono_ns=5_000,
             _boot_id=UUID("00000000-0000-0000-0000-000000000808"),
         )
+        # D4: ``/health`` must never run the live probe; count invocations.
+        self.health_calls = 0
 
     async def health(self) -> StorageHealthReport:
+        self.health_calls += 1
         return StorageHealthReport(
             healthy=True,
             degraded=False,
@@ -318,16 +321,24 @@ class TestHealthEndpoint:
         self,
         client: TestClient,
     ) -> None:
-        registry.register("storage_maintenance", _StorageMaintenanceStub())
+        stub = _StorageMaintenanceStub()
+        registry.register("storage_maintenance", stub)
 
+        # D4: the unauthenticated ``/health`` is DB-free — it never runs
+        # the live integrity probe (the previous expectation that it
+        # returned a fresh ``storage`` report encoded the defect). The
+        # stub exposes no cached report, so ``storage`` is ``None``.
         health = client.get("/health")
         assert health.status_code == 200
-        assert health.json()["storage"]["journal_mode"] == "delete"
+        assert health.json()["storage"] is None
+        assert stub.health_calls == 0
 
         status = client.get("/storage/status")
         assert status.status_code == 200
+        assert stub.health_calls == 1
         assert status.json()["retention_days"]["sessions"] == 7
         assert status.json()["storage"]["database_filename"] == "cortex.sqlite3"
+        assert status.json()["storage"]["journal_mode"] == "delete"
 
         exported = client.post(
             "/storage/export",

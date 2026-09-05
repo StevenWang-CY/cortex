@@ -9,11 +9,11 @@ all mutations for later restoration.
 from __future__ import annotations
 
 import logging
-import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
+from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 from cortex.libs.adapters.registry import AdapterRegistry
 from cortex.libs.observability.metrics import INTERVENTIONS_APPLIED_TOTAL
 from cortex.libs.schemas.intervention import AdapterCommand, InterventionPlan
@@ -146,7 +146,10 @@ class InterventionExecutor:
         execution_mode: Literal[
             "suggest_only", "authorized", "research_autonomous"
         ] = "suggest_only",
+        clock: Clock | None = None,
     ) -> None:
+        # Audit D16: mutation timestamps come from the injected clock.
+        self._clock = clock or SYSTEM_CLOCK
         self._adapters: dict[str, WorkspaceAdapter] = {}
         self._registry: AdapterRegistry | None = adapter_registry
         self._active_mutations: dict[str, list[Mutation]] = {}
@@ -310,7 +313,7 @@ class InterventionExecutor:
         Returns:
             List of mutations that were applied (both successful and failed).
         """
-        now = timestamp if timestamp is not None else time.monotonic()
+        now = timestamp if timestamp is not None else monotonic_seconds(self._clock)
         mutations: list[Mutation] = []
 
         # Phase-4b TASK M: map planner action_type → consent level int.
@@ -610,7 +613,7 @@ class InterventionExecutor:
                     Mutation(
                         adapter=m.adapter,
                         action=m.action,
-                        timestamp=time.monotonic(),
+                        timestamp=monotonic_seconds(self._clock),
                         success=False,
                         reason="reverse_action_unavailable",
                     )
@@ -637,7 +640,7 @@ class InterventionExecutor:
                 reversals.append(Mutation(
                     adapter=m.adapter,
                     action=m.reverse_action,  # type: ignore[arg-type]  # is_reversible guard above ensures non-None
-                    timestamp=time.monotonic(),
+                    timestamp=monotonic_seconds(self._clock),
                     success=False,
                     reason="reverse_adapter_missing",
                 ))
@@ -651,7 +654,7 @@ class InterventionExecutor:
                 # ensures it is non-None here. mypy cannot follow the
                 # property-based narrowing across the attribute access.
                 action=m.reverse_action,  # type: ignore[arg-type]
-                timestamp=time.monotonic(),
+                timestamp=monotonic_seconds(self._clock),
             )
 
             try:

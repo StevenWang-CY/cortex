@@ -1,4 +1,4 @@
-# Intervention Engine - Trigger, execute, restore
+# Intervention Engine - plan validation, execute, restore
 
 from cortex.services.intervention_engine.executor import (
     InterventionExecutor,
@@ -18,19 +18,17 @@ from cortex.services.intervention_engine.restore import (
     RestoreManager,
 )
 from cortex.services.intervention_engine.snapshot import capture_snapshot
-from cortex.services.intervention_engine.trigger import (
-    InterventionTrigger,
-    TriggerDecision,
-)
+
+# ``InterventionTrigger`` / ``TriggerDecision`` (the deprecated pre-v2
+# trigger) were removed (audit D17); the production trigger lives in
+# ``cortex.services.state_engine.trigger_policy``.
 
 __all__ = [
     "ActiveIntervention",
     "AdapterCommand",
     "InterventionExecutor",
-    "InterventionTrigger",
     "Mutation",
     "RestoreManager",
-    "TriggerDecision",
     "ValidationResult",
     "WorkspaceAdapter",
     "capture_snapshot",

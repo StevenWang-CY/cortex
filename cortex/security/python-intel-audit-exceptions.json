@@ -9,9 +9,9 @@
       "path_prefixes": [
         "protobuf"
       ],
-      "expires_on": "2026-09-22",
-      "reason": "MediaPipe 0.10.21 is the final macOS Intel wheel and requires protobuf<5; the advisory affects json_format.ParseDict on attacker-controlled nested Any dictionaries, an API absent from Cortex and the installed MediaPipe Python sources.",
-      "mitigation": "Intel CI initializes the real bundled FaceLandmarker model, scans Cortex and MediaPipe Python sources for the vulnerable JSON parser boundary, preserves local-only model inputs, and re-runs this expiring audit for every candidate. Replace MediaPipe or remove Intel release support before expiry if no compatible patched wheel exists."
+      "expires_on": "2026-10-15",
+      "reason": "Re-reviewed 2026-09-04: MediaPipe 0.10.21 remains the final macOS Intel wheel and requires protobuf<5; the advisory affects json_format.ParseDict on attacker-controlled nested Any dictionaries, an API absent from Cortex and the installed MediaPipe Python sources (enforced by verify_repository_contracts).",
+      "mitigation": "Intel CI initializes the real bundled FaceLandmarker model, scans Cortex and MediaPipe Python sources for the vulnerable JSON parser boundary, preserves local-only model inputs, and re-runs this expiring audit for every candidate. Decision due before expiry: adopt a patched Intel-compatible backend or retire the Intel artifact to CI-only/unsupported status; do not extend silently."
     }
   ]
 }

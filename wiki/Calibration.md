@@ -39,5 +39,5 @@ If calibration falls back to simulation, reports insufficient valid exposure,
 or loses the face/camera, resolve the visible cause and retry. Cortex should
 degrade to telemetry-only/unknown rather than save fabricated evidence.
 
-Implementation details: [calibration documentation](cortex/docs/calibration.md)
-and [limitations](docs/limitations.md).
+Implementation details: [calibration documentation](https://github.com/StevenWang-CY/cortex/blob/main/cortex/docs/calibration.md)
+and [limitations](https://github.com/StevenWang-CY/cortex/blob/main/docs/limitations.md).

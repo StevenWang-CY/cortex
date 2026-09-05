@@ -1,21 +1,26 @@
-"""Unit tests for F30: cost accounting on shielded-call cancellation.
+"""Cancellation accounting for shielded SDK calls (audit F30 / D4).
 
-The shielded ``self._sdk.messages.create`` call kept billing tokens even
-after the caller (state-engine teardown, daemon SIGTERM) cancelled the
-coroutine. Without F30's try/except, that spend disappeared from
-telemetry while still landing on the cloud invoice. These tests assert:
+The SDK call runs as its own task behind ``asyncio.shield``. When the
+caller (state-engine teardown, daemon SIGTERM, the daemon's outer
+``wait_for``) is cancelled mid-flight the task keeps running; the old
+code recorded a request-side *estimate* at cancel time, lost the real
+usage, never surfaced the orphan's failure, and leaked its semaphore
+slot. These tests assert the done-callback design:
 
-1. Cancellation after the response arrived: the real ``usage`` numbers
-   are billed and the cost entry carries ``cancelled=True``.
-2. Cancellation before the response arrived: a best-estimate input-token
-   count is billed with ``output_tokens=0``.
-3. ``CancelledError`` still propagates to the caller after recording.
-4. The shared ``CostTracker`` reflects the new entry.
+1. Cancel, then let the orphaned task complete → its real ``usage`` is
+   billed (tagged ``cancelled=True``) and the semaphore slot is released.
+2. Cancel, then the orphan fails → nothing billed, slot released.
+3. Cancel, then the orphan itself is cancelled (event-loop teardown) →
+   the request-side estimate is billed with ``output_tokens=0``.
+4. ``CancelledError`` still propagates to the caller.
+5. The ``_record_cost_on_cancellation`` helper bills real numbers when a
+   response exists and the estimate otherwise.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -67,11 +72,11 @@ def _make_state() -> StateEstimate:
     )
 
 
-_VALID_PLAN_DICT: dict[str, Any] = {
-    "level": "overlay_only",
-    "headline": "Fix the NameError on line 10",
+_VALID_DRAFT: dict[str, Any] = {
     "situation_summary": "1 error in main.py",
     "primary_focus": "main.py:10",
+    "headline": "Fix the NameError on line 10",
+    "causal_explanation": "1 active error pulled focus off the function.",
     "micro_steps": ["Read the NameError", "Define x before use"],
     "hide_targets": ["editor_symbols_except_current_function"],
     "ui_plan": {
@@ -82,28 +87,25 @@ _VALID_PLAN_DICT: dict[str, Any] = {
     },
     "tone": "supportive",
     "suggested_actions": [],
-    "causal_explanation": "1 active error pulled focus off the function.",
+    "error_analysis": None,
+    "tab_recommendations": None,
 }
 
 
-def _stub_response() -> MagicMock:
-    block = SimpleNamespace(
-        type="tool_use",
-        name="emit_intervention_plan",
-        input=_VALID_PLAN_DICT,
+def _stub_response() -> SimpleNamespace:
+    return SimpleNamespace(
+        stop_reason="end_turn",
+        content=[SimpleNamespace(type="text", text=json.dumps(_VALID_DRAFT))],
+        usage=SimpleNamespace(
+            input_tokens=900,
+            output_tokens=120,
+            cache_read_input_tokens=0,
+            cache_creation_input_tokens=0,
+        ),
     )
-    response = MagicMock()
-    response.content = [block]
-    response.usage = SimpleNamespace(
-        input_tokens=900,
-        output_tokens=120,
-        cache_read_input_tokens=0,
-        cache_creation_input_tokens=0,
-    )
-    return response
 
 
-def _make_planner(tracker: CostTracker, sdk: MagicMock) -> AnthropicPlanner:
+def _make_planner(tracker: CostTracker | None, sdk: MagicMock) -> AnthropicPlanner:
     cfg = LLMConfig(
         provider="bedrock",
         bedrock=BedrockConfig(aws_region="us-east-2"),
@@ -119,140 +121,223 @@ def _make_planner(tracker: CostTracker, sdk: MagicMock) -> AnthropicPlanner:
     )
 
 
-# ---------------------------------------------------------------------------
-# Case 1 — cancellation AFTER the response arrived bills real numbers
-# ---------------------------------------------------------------------------
+def _semaphore_slots(planner: AnthropicPlanner) -> int:
+    return planner._semaphore._value  # type: ignore[attr-defined]  # noqa: SLF001
 
 
-@pytest.mark.asyncio
-async def test_cancellation_after_response_bills_real_numbers(
-    tmp_path: Path,
-) -> None:
-    """If the SDK already produced ``usage`` before cancellation, we bill
-    those exact numbers (not the estimate) and tag the entry cancelled."""
-    ledger = tmp_path / "cost_ledger.json"
-    tracker = CostTracker(ledger, warn_usd=5.0, kill_usd=20.0)
-    response = _stub_response()
-    sdk = MagicMock()
-    sdk.messages = MagicMock()
+async def _settle() -> None:
+    """Let the orphaned task and its done-callback run."""
+    for _ in range(6):
+        await asyncio.sleep(0)
 
-    async def fake_create(**_kwargs: Any) -> Any:
-        # Return the response, then immediately have the caller cancel.
-        return response
 
-    sdk.messages.create = AsyncMock(side_effect=fake_create)
-    planner = _make_planner(tracker, sdk)
+async def _cancel_in_flight(
+    planner: AnthropicPlanner,
+    gate: asyncio.Event,
+) -> asyncio.Task[None]:
+    """Start a planner call, wait until the SDK call is in flight, cancel it."""
 
-    # Drive cancellation by cancelling the outer task right after the
-    # shielded call returns. We arrange this with a wrapper coroutine.
     async def runner() -> None:
         await planner.generate_intervention_plan(
             _make_context(), _make_state(), template_name="micro_step_planner",
         )
 
     task = asyncio.create_task(runner())
-    # Yield once so the SDK call resolves and the planner proceeds into
-    # the success path — then we don't cancel. Instead we exercise the
-    # documented cancellation contract by calling
-    # ``_record_cost_on_cancellation`` directly with the real response.
-    await task
-    # Real path also bills cost — wipe and assert the contract under
-    # cancellation explicitly.
-    tracker._days.clear()  # noqa: SLF001 — test seam
-    planner._record_cost_on_cancellation(  # noqa: SLF001
-        "us.anthropic.claude-sonnet-4-6-v1:0",
-        response,
-        estimated_input_tokens=42,
-    )
-    today_total = tracker.today_total_usd()
-    # 900 input + 120 output at Sonnet rates.
-    expected = (900 * 3.0 + 120 * 15.0) / 1_000_000
-    assert today_total == pytest.approx(expected)
+    await gate.wait()  # the fake SDK call has started
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    return task
+
+
+# Sonnet 5 on Bedrock Mantle: $2 / $10 per MTok.
+_SONNET5_IN = 2.0
+_SONNET5_OUT = 10.0
 
 
 # ---------------------------------------------------------------------------
-# Case 2 — cancellation BEFORE response bills the best estimate
+# Case 1 — orphan completes: real usage billed, slot released
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_cancellation_before_response_bills_estimate(
+async def test_orphaned_call_completion_bills_real_usage_and_releases_slot(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """When ``response is None`` we bill the request-side estimate with
-    output_tokens=0; this is the floor on a cancelled-before-response."""
-    ledger = tmp_path / "cost_ledger.json"
-    tracker = CostTracker(ledger, warn_usd=5.0, kill_usd=20.0)
+    tracker = CostTracker(tmp_path / "cost_ledger.json", warn_usd=5.0, kill_usd=20.0)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_create(**_kwargs: Any) -> Any:
+        started.set()
+        await release.wait()
+        return _stub_response()
+
     sdk = MagicMock()
     sdk.messages = MagicMock()
-    sdk.messages.create = AsyncMock(return_value=_stub_response())
+    sdk.messages.create = AsyncMock(side_effect=slow_create)
     planner = _make_planner(tracker, sdk)
 
-    planner._record_cost_on_cancellation(  # noqa: SLF001
-        "us.anthropic.claude-sonnet-4-6-v1:0",
-        response=None,
-        estimated_input_tokens=10_000,
-    )
-    # 10k input tokens at Sonnet input rate, output=0.
-    expected = 10_000 * 3.0 / 1_000_000
+    with caplog.at_level("INFO"):
+        await _cancel_in_flight(planner, started)
+        # The caller is gone but the HTTP transaction is still running:
+        # nothing billed yet, slot still held by the orphan.
+        assert tracker.today_total_usd() == pytest.approx(0.0)
+        assert _semaphore_slots(planner) == 1
+
+        release.set()
+        await _settle()
+
+    expected = (900 * _SONNET5_IN + 120 * _SONNET5_OUT) / 1_000_000
     assert tracker.today_total_usd() == pytest.approx(expected)
+    assert tracker.prompt_tokens_today() == 900
+    assert tracker.completion_tokens_today() == 120
+    assert _semaphore_slots(planner) == 2
+    cost_logs = [r.getMessage() for r in caplog.records if "llm_cost" in r.getMessage()]
+    assert cost_logs and "cancelled=True" in cost_logs[-1]
+    assert any("orphan_completed" in r.getMessage() for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
-# Case 3 — CancelledError propagates after cost is recorded
+# Case 2 — orphan fails: nothing billed, slot released, failure logged
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_cancellation_propagates_and_records(tmp_path: Path) -> None:
-    """The CancelledError must reach the caller; the cost path is a
-    side-effect, not a swallowing of cancellation."""
-    ledger = tmp_path / "cost_ledger.json"
-    tracker = CostTracker(ledger, warn_usd=5.0, kill_usd=20.0)
+async def test_orphaned_call_failure_releases_slot_without_billing(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    tracker = CostTracker(tmp_path / "cost_ledger.json", warn_usd=5.0, kill_usd=20.0)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def failing_create(**_kwargs: Any) -> Any:
+        started.set()
+        await release.wait()
+        raise RuntimeError("connection reset by peer")
+
     sdk = MagicMock()
     sdk.messages = MagicMock()
+    sdk.messages.create = AsyncMock(side_effect=failing_create)
+    planner = _make_planner(tracker, sdk)
 
-    # Configure the SDK call to hang until cancelled, simulating a slow
-    # Bedrock response.
-    create_event = asyncio.Event()
+    with caplog.at_level("WARNING"):
+        await _cancel_in_flight(planner, started)
+        release.set()
+        await _settle()
+
+    assert tracker.today_total_usd() == pytest.approx(0.0)
+    assert _semaphore_slots(planner) == 2
+    assert any("orphan_failed" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Case 3 — orphan itself cancelled (loop teardown): estimate billed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_orphan_cancelled_at_teardown_bills_the_estimate(tmp_path: Path) -> None:
+    tracker = CostTracker(tmp_path / "cost_ledger.json", warn_usd=5.0, kill_usd=20.0)
+    started = asyncio.Event()
+    inner: dict[str, asyncio.Task[Any] | None] = {"task": None}
 
     async def hanging_create(**_kwargs: Any) -> Any:
-        await create_event.wait()
-        # Never reached — we cancel before this fires.
+        inner["task"] = asyncio.current_task()
+        started.set()
+        await asyncio.Event().wait()  # never completes on its own
         return _stub_response()  # pragma: no cover
 
+    sdk = MagicMock()
+    sdk.messages = MagicMock()
     sdk.messages.create = AsyncMock(side_effect=hanging_create)
     planner = _make_planner(tracker, sdk)
 
-    async def runner() -> None:
-        with pytest.raises(asyncio.CancelledError):
-            await planner.generate_intervention_plan(
-                _make_context(),
-                _make_state(),
-                template_name="micro_step_planner",
-            )
+    await _cancel_in_flight(planner, started)
+    assert tracker.today_total_usd() == pytest.approx(0.0)
+    orphan = inner["task"]
+    assert orphan is not None and not orphan.done()
 
-    task = asyncio.create_task(runner())
-    # Yield so the planner enters the shielded call.
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
-    task.cancel()
-    # The shielded create_event is never set; the await on the outer task
-    # is what raises CancelledError on the planner. Allow the cancellation
-    # to propagate; bookkeeping happens in the except branch.
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    # Simulate event-loop teardown cancelling the orphaned task.
+    orphan.cancel()
+    await _settle()
 
-    # Cancellation cost was recorded — the entry uses the input-token
-    # estimate (response was None) so spend is non-zero.
+    # Request-side estimate with output_tokens=0 — non-zero because the
+    # assembled prompt is thousands of characters.
     assert tracker.today_total_usd() > 0.0
+    assert tracker.prompt_tokens_today() > 0
+    assert tracker.completion_tokens_today() == 0
+    assert _semaphore_slots(planner) == 2
 
 
 # ---------------------------------------------------------------------------
-# Case 4 — CostTracker shows the entry with cancelled=True
+# Case 4 — CancelledError propagates; no accounting happens at cancel time
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancellation_propagates_to_the_caller(tmp_path: Path) -> None:
+    tracker = CostTracker(tmp_path / "cost_ledger.json", warn_usd=5.0, kill_usd=20.0)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_create(**_kwargs: Any) -> Any:
+        started.set()
+        await release.wait()
+        return _stub_response()
+
+    sdk = MagicMock()
+    sdk.messages = MagicMock()
+    sdk.messages.create = AsyncMock(side_effect=slow_create)
+    planner = _make_planner(tracker, sdk)
+
+    task = await _cancel_in_flight(planner, started)
+    assert task.cancelled()
+    release.set()
+    await _settle()
+
+
+# ---------------------------------------------------------------------------
+# Case 5 — the accounting helper
+# ---------------------------------------------------------------------------
+
+
+def test_record_cost_on_cancellation_bills_real_numbers_when_response_exists(
+    tmp_path: Path,
+) -> None:
+    tracker = CostTracker(tmp_path / "cost_ledger.json", warn_usd=5.0, kill_usd=20.0)
+    sdk = MagicMock()
+    sdk.messages = MagicMock()
+    planner = _make_planner(tracker, sdk)
+    planner._record_cost_on_cancellation(  # noqa: SLF001
+        "us.anthropic.claude-sonnet-4-6-v1:0",  # legacy id still normalises
+        _stub_response(),
+        estimated_input_tokens=42,
+    )
+    # 900 input + 120 output at Sonnet 4.6 rates ($3 / $15 per MTok).
+    expected = (900 * 3.0 + 120 * 15.0) / 1_000_000
+    assert tracker.today_total_usd() == pytest.approx(expected)
+    assert tracker.prompt_tokens_today() == 900
+
+
+def test_record_cost_on_cancellation_bills_estimate_without_response(
+    tmp_path: Path,
+) -> None:
+    tracker = CostTracker(tmp_path / "cost_ledger.json", warn_usd=5.0, kill_usd=20.0)
+    sdk = MagicMock()
+    sdk.messages = MagicMock()
+    planner = _make_planner(tracker, sdk)
+    planner._record_cost_on_cancellation(  # noqa: SLF001
+        "anthropic.claude-sonnet-5",
+        response=None,
+        estimated_input_tokens=10_000,
+    )
+    expected = 10_000 * _SONNET5_IN / 1_000_000
+    assert tracker.today_total_usd() == pytest.approx(expected)
+    assert tracker.prompt_tokens_today() == 10_000
+    assert tracker.completion_tokens_today() == 0
 
 
 def test_cancellation_entry_carries_cancelled_flag(
@@ -262,23 +347,19 @@ def test_cancellation_entry_carries_cancelled_flag(
     """The structured LLM_COST log line emitted by the tracker on a
     cancellation must carry ``cancelled=True`` so an aggregator can
     distinguish cancellation cost from successful spend."""
-    ledger = tmp_path / "cost_ledger.json"
-    tracker = CostTracker(ledger, warn_usd=5.0, kill_usd=20.0)
+    tracker = CostTracker(tmp_path / "cost_ledger.json", warn_usd=5.0, kill_usd=20.0)
     now = datetime(2026, 5, 19, 14, 0, 0)
     with caplog.at_level("INFO"):
         tracker.record(
             "cid_cancel",
-            "claude-sonnet-4-6",
+            "claude-sonnet-5",
             0.42,
             cancelled=True,
             now=now,
         )
-    cost_logs = [
-        r for r in caplog.records if "llm_cost" in r.getMessage()
-    ]
+    cost_logs = [r for r in caplog.records if "llm_cost" in r.getMessage()]
     assert cost_logs, "Expected an LLM_COST log line"
     assert "cancelled=True" in cost_logs[-1].getMessage()
-    # The per-cid bucket is populated.
     sub = tracker.per_cid_today("cid_cancel", now=now)
     assert sub["calls"] == 1
     assert sub["total_usd"] == pytest.approx(0.42)

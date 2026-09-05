@@ -93,6 +93,21 @@ def test_probe_token_totals_rejects_bool() -> None:
     assert probe_token_totals(_Bad()) == (None, 7)
 
 
+def test_probe_token_totals_reads_real_cost_tracker(tmp_path: Path) -> None:
+    """Audit D15: the production tracker keeps per-day token counters, so the
+    probe returns real numbers instead of ``(None, None)``."""
+    tracker = CostTracker(tmp_path / "ledger.json", warn_usd=5.0, kill_usd=20.0)
+    assert probe_token_totals(tracker) == (0, 0)
+    tracker.record("cid", "claude-sonnet-5", 0.01, prompt_tokens=1200, completion_tokens=340)
+    tracker.record(
+        "cid", "claude-sonnet-5", 0.01, prompt_tokens=100, completion_tokens=10, cancelled=True
+    )
+    assert probe_token_totals(tracker) == (1300, 350)
+    # Counters survive a restart through the on-disk ledger.
+    reloaded = CostTracker(tmp_path / "ledger.json", warn_usd=5.0, kill_usd=20.0)
+    assert probe_token_totals(reloaded) == (1300, 350)
+
+
 def test_probe_active_model_attr_then_config() -> None:
     class _Cfg:
         model = "claude-from-config"

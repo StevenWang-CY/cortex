@@ -59,6 +59,8 @@ semantic:
     grouped_bg:       { hex: "#F2F2F7" }   # ~NSColor.systemGroupedBackground
     sidebar_bg:       { hex: "#E5E5EA" }
     label_primary:    { hex: "#1A1A1A" }   # ~NSColor.labelColor
+    # Eight-digit values are CSS ``#RRGGBBAA``. The Python emitter rewrites
+    # them to Qt's ``#AARRGGBB`` so QSS/QColor read the intended alpha.
     label_secondary:  { hex: "#3C3C434C" } # 30% alpha black (NSColor.secondaryLabelColor)
     label_tertiary:   { hex: "#3C3C432E" } # 18%
     label_quaternary: { hex: "#3C3C4318" } # 9%
@@ -67,6 +69,15 @@ semantic:
     success:          { hex: "#30B257" }   # systemGreen
     warning:          { hex: "#D9A100" }   # systemYellow
     info:             { hex: "#0A84FF" }   # systemBlue
+    # Foreground on a filled label_primary control (dark ink surface).
+    label_inverse:    { hex: "#FFFFFF" }
+    # Contrast-safe *text* variants of the semantic status colors. The fills
+    # above stay as-is for dots, bars, and badges; small copy must use these
+    # (systemGreen/systemYellow are 2.0-2.8:1 on white and fail WCAG AA).
+    success_text:     { hex: "#1B6B3C" }
+    warning_text:     { hex: "#7A5600" }
+    info_text:        { hex: "#005BBD" }   # 4.9:1 on its own 10% tint over window_bg
+    danger_text:      { hex: "#B3000F" }   # 5.3:1 on its own 10% tint over grouped_bg
   dark:
     window_bg:        { hex: "#1E1E1E" }
     control_bg:       { hex: "#2C2C2E" }
@@ -84,6 +95,11 @@ semantic:
     success:          { hex: "#32D74B" }
     warning:          { hex: "#FFD60A" }
     info:             { hex: "#0A84FF" }
+    label_inverse:    { hex: "#1A1A1A" }
+    success_text:     { hex: "#5FD37E" }
+    warning_text:     { hex: "#E8B84A" }
+    info_text:        { hex: "#5CA8FF" }
+    danger_text:      { hex: "#FF6961" }
 
 # Cortex-specific state palette — derived from brand accent + system semantic
 # colors. Used on the state badge (capsule), tray icon tint, panel-provider
@@ -110,6 +126,12 @@ typography:
   # invisible default). On the desktop app the token emitter additionally
   # produces a QFont via cortex/apps/desktop_shell/mac_native.system_font().
   system_stack: "-apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"SF Pro Display\", system-ui, sans-serif"
+  # Qt cannot resolve the web aliases above (-apple-system, system-ui, and the
+  # SF Pro marketing names are not installed families) and warns "Replace uses
+  # of missing font family", which the release smoke probe treats as fatal.
+  # The Python/Qt output therefore uses the family Qt maps to the macOS system
+  # font; browser and VS Code outputs keep the web stack.
+  qt_system_stack: "\".AppleSystemUIFont\", \"Helvetica Neue\", sans-serif"
   display_stack: "\"Cormorant Garamond\", ui-serif, Georgia, serif"
   # Menlo is present on every supported macOS release. SF Mono is an optional
   # developer-tool font and cannot be assumed on a clean user machine.

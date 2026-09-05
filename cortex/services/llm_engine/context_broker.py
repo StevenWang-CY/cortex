@@ -13,11 +13,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import re
 import secrets
 import unicodedata
 from collections import Counter, OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import PureWindowsPath
 from typing import Any, Final, Protocol
@@ -51,16 +53,38 @@ from cortex.libs.schemas.privacy import (
     ContextSourceSelection,
     ProviderRetentionDisclosure,
 )
-from cortex.libs.schemas.state import StateEstimate
+from cortex.libs.schemas.state import (
+    EstimateStatus,
+    SignalQuality,
+    StateEstimate,
+    StateScores,
+    SupportState,
+    UserState,
+)
 from cortex.services.llm_engine.prompts import (
     PROMPT_TEMPLATES,
     build_user_prompt,
     select_prompt_template,
 )
 
+logger = logging.getLogger(__name__)
+
+# Reasons the external transport is unavailable, as surfaced by
+# ``PrivacyAwarePlanner.transport_state`` / preview errors / fallback plans.
+TRANSPORT_DISABLED: Final[str] = "external_context_disabled"
+TRANSPORT_CREDENTIALS_MISSING: Final[str] = "credentials_missing"
+TRANSPORT_READY: Final[str] = "ready"
+
 
 class ExternalContextDisabledError(RuntimeError):
-    """Raised when configuration has not enabled the external boundary."""
+    """Raised when configuration has not enabled the external boundary.
+
+    The message starts with ``external_context_disabled`` (disclosure not
+    acknowledged / mode not external) or ``credentials_missing`` (external
+    mode is configured but no provider credential could be loaded — the
+    BYOK step fixes this without a restart) so callers can tell the two
+    apart.
+    """
 
 
 class PreviewAuthorizationError(RuntimeError):
@@ -157,8 +181,13 @@ CONTEXT_FIELD_CATALOG: Final[dict[str, ContextFieldPolicy]] = {
 
 
 _BIDI_AND_ZERO_WIDTH = re.compile("[\u061c\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]")
+# Any absolute POSIX path with at least two segments (``/Applications/...``,
+# ``/etc/...``, ``/usr/local/...``, ``/srv``, ``/mnt``, ``/root``,
+# ``/workspace``, ...), not just the home-style roots. The look-behind keeps
+# URL paths intact: in ``https://host/path`` the slash is preceded by a
+# word character, and the ``//`` after the scheme by ``:`` / ``/``.
 _POSIX_ABSOLUTE_PATH = re.compile(
-    r"(?<![\w:/])/(?:Users|home|private|Volumes|opt|var|tmp)/[^\s:'\"<>|]+"
+    r"(?<![\w:/.])/(?:[^\s:'\"<>|/]+/)+[^\s:'\"<>|/]+"
 )
 _WINDOWS_ABSOLUTE_PATH = re.compile(r"(?i)(?<![\w])(?:[a-z]:\\|\\\\)[^\s:'\"<>|]+")
 _URI_CREDENTIALS = re.compile(
@@ -392,18 +421,39 @@ def _request_digest(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _projected_state(state: StateEstimate) -> StateEstimate:
+    """Forward only the three values the prompt interpolates.
+
+    ``build_user_prompt`` reads ``state`` / ``confidence`` /
+    ``dwell_seconds`` and nothing else, so the outbound estimate is rebuilt
+    from those three with neutral defaults everywhere else — component
+    scores, reasons, signal quality, timestamps, and the estimate id never
+    reach the transport or the plan cache (audit D14).
+    """
+
+    return StateEstimate(
+        state=state.state,
+        confidence=state.confidence,
+        dwell_seconds=state.dwell_seconds,
+        scores=StateScores(),
+        signal_quality=SignalQuality(),
+        timestamp=0.0,
+    )
+
+
 def _neutral_state(state: StateEstimate) -> StateEstimate:
     """Keep wire shape valid while withholding all support-estimate values."""
 
-    return state.model_copy(
-        deep=True,
-        update={
-            "state": "UNKNOWN",
-            "support_state": "unknown",
-            "status": "insufficient_evidence",
-            "confidence": 0.0,
-            "dwell_seconds": 0.0,
-        },
+    del state
+    return StateEstimate(
+        state=UserState.UNKNOWN,
+        support_state=SupportState.UNKNOWN,
+        status=EstimateStatus.INSUFFICIENT_EVIDENCE,
+        confidence=0.0,
+        dwell_seconds=0.0,
+        scores=StateScores(),
+        signal_quality=SignalQuality(),
+        timestamp=0.0,
     )
 
 
@@ -579,7 +629,7 @@ class ContextBroker:
                 record("learned_relevance", host, domain.redactions)
 
         if selection.support_estimate:
-            outbound_state = state.model_copy(deep=True)
+            outbound_state = _projected_state(state)
             record("state.state", str(state.state))
             record("state.confidence", round(state.confidence, 3))
             record("state.dwell_seconds", round(state.dwell_seconds, 1))
@@ -747,7 +797,14 @@ class NoContentPlanner:
 
 
 class PrivacyAwarePlanner:
-    """One-time preview gate around the raw external transport primitive."""
+    """One-time preview gate around the raw external transport primitive.
+
+    ``inner`` may be ``None`` when external mode is configured but the
+    provider credential was not available at daemon start (first-run
+    BYOK). ``transport_factory`` then lets :meth:`reload_credentials`
+    construct the transport lazily once the token has been saved, without
+    a restart; the composition root (``create_llm_client``) supplies it.
+    """
 
     def __init__(
         self,
@@ -756,9 +813,11 @@ class PrivacyAwarePlanner:
         *,
         clock: Clock | None = None,
         broker: ContextBroker | None = None,
+        transport_factory: Callable[[], _ExternalPlanner] | None = None,
     ) -> None:
         self._config = config
         self._inner = inner
+        self._transport_factory = transport_factory
         self._clock = clock or SYSTEM_CLOCK
         self._broker = broker or ContextBroker()
         self._pending: OrderedDict[str, _PreparedPreview] = OrderedDict()
@@ -771,6 +830,42 @@ class PrivacyAwarePlanner:
     @property
     def _cost_tracker(self) -> Any | None:
         return getattr(self._inner, "_cost_tracker", None)
+
+    @property
+    def transport_state(self) -> str:
+        """``ready`` / ``credentials_missing`` / ``external_context_disabled``."""
+
+        if not self._config.privacy.external_transport_enabled:
+            return TRANSPORT_DISABLED
+        if self._inner is None:
+            return TRANSPORT_CREDENTIALS_MISSING
+        return TRANSPORT_READY
+
+    @property
+    def worst_case_seconds(self) -> float:
+        """Upper bound on one confirmed external request (delegates inward)."""
+
+        inner_bound = getattr(self._inner, "worst_case_seconds", None)
+        if isinstance(inner_bound, (int, float)) and not isinstance(inner_bound, bool):
+            return float(inner_bound)
+        return self._config.planner_worst_case_seconds
+
+    def _require_transport(self) -> _ExternalPlanner:
+        """Return the transport or raise with a reason callers can distinguish."""
+
+        state = self.transport_state
+        if state == TRANSPORT_DISABLED or self._inner is None:
+            if state == TRANSPORT_CREDENTIALS_MISSING:
+                raise ExternalContextDisabledError(
+                    f"{TRANSPORT_CREDENTIALS_MISSING}: external planning is configured "
+                    "but no provider credential is available; complete the BYOK step "
+                    "(the planner reloads without a restart)"
+                )
+            raise ExternalContextDisabledError(
+                f"{TRANSPORT_DISABLED}: external planning is disabled until the "
+                "current context disclosure is acknowledged"
+            )
+        return self._inner
 
     @property
     def pending_preview_count(self) -> int:
@@ -807,16 +902,14 @@ class PrivacyAwarePlanner:
             pending_previews=self.pending_preview_count,
             provider=self._config.provider,
             retention=provider_retention_disclosure(self._config),
+            transport_state=self.transport_state,
         )
 
     async def preview_external_request(
         self,
         request: ContextPreviewRequest,
     ) -> ContextPreviewResponse:
-        if not self._config.privacy.external_transport_enabled or self._inner is None:
-            raise ExternalContextDisabledError(
-                "external planning is disabled until the current context disclosure is acknowledged"
-            )
+        self._require_transport()
 
         bundle = self._broker.sanitize(
             request.task_context,
@@ -904,8 +997,9 @@ class PrivacyAwarePlanner:
     ) -> InterventionPlan:
         # No caller may smuggle a self-authored manifest past the broker.
         del disclosure_manifest
-        if not self._config.privacy.external_transport_enabled or self._inner is None:
-            return build_no_content_plan(reason="external_context_disabled")
+        transport_state = self.transport_state
+        if transport_state != TRANSPORT_READY or self._inner is None:
+            return build_no_content_plan(reason=transport_state)
         if not privacy_preview_id:
             return build_no_content_plan(reason="context_preview_required")
         try:
@@ -981,10 +1075,9 @@ class PrivacyAwarePlanner:
         Neither path grants any workspace capability.
         """
 
-        if not self._config.privacy.external_transport_enabled or self._inner is None:
-            raise ExternalContextDisabledError("external planning is disabled")
+        inner = self._require_transport()
         prepared = await self._consume_prepared_preview(preview_id, confirmation)
-        return await self._inner.generate_intervention_plan(
+        return await inner.generate_intervention_plan(
             prepared.context,
             prepared.state,
             prepared.constraints,
@@ -1011,6 +1104,31 @@ class PrivacyAwarePlanner:
         return True
 
     def reload_credentials(self) -> bool:
+        """Hot-reload provider credentials, building the transport if needed.
+
+        First-run BYOK: the daemon started in external mode with no token,
+        so ``inner`` is ``None``. Once the token is saved this constructs
+        the transport through ``transport_factory`` instead of returning
+        ``False`` and demanding a restart (audit D10). Returns ``True`` iff
+        a working transport exists afterwards.
+        """
+
+        if self._inner is None:
+            if not self._config.privacy.external_transport_enabled:
+                return False
+            if self._transport_factory is None:
+                logger.warning("reload_credentials: no transport factory configured")
+                return False
+            try:
+                self._inner = self._transport_factory()
+            except RuntimeError as exc:
+                logger.warning("reload_credentials: transport unavailable (%s)", exc)
+                return False
+            except Exception:
+                logger.exception("reload_credentials: transport construction failed")
+                return False
+            logger.info("External planner transport constructed after credential reload")
+            return True
         reload_method = getattr(self._inner, "reload_credentials", None)
         if not callable(reload_method):
             return False

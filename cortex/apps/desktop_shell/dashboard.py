@@ -1,9 +1,16 @@
 """Desktop Shell — Dashboard Window (macOS-native refactor).
 
-Two-tab layout:
-    Tab 1 "Dashboard" — Consumer biometrics view (Cormorant numerics, terracotta
-                        accent, native typography & spacing)
-    Tab 2 "Advanced"  — Developer debug view: HR trace, signal quality, scores
+Three-segment layout:
+    "Dashboard" — Consumer biometrics view (hero numerals in the display
+                  serif, terracotta accent, native typography & spacing)
+    "History"   — Past sessions and trends
+    "Advanced"  — Developer debug view: HR trace, signal quality, scores
+
+Session lifecycle (see ``_ConsumerTab._enter_phase``): the footer control is
+"End session" while sensing runs, "Ending…" while the daemon stops, then
+"Start session" once it has stopped. Quitting is a separate, explicit
+"Quit Cortex" control (footer after a session ends, the recap sheet, the
+tray) — ending a session never exits the app.
 
 The visual layer is now driven by:
 
@@ -221,6 +228,8 @@ except ImportError:  # pragma: no cover
     pass
 
 from cortex.apps.desktop_shell import mac_native
+from cortex.apps.desktop_shell.components import SegmentedControl, status_dot_qss
+from cortex.apps.desktop_shell.palette_runtime import active_state_color
 from cortex.apps.desktop_shell.tokens import (
     BIO_BLINK,
     BIO_HR,
@@ -228,26 +237,45 @@ from cortex.apps.desktop_shell.tokens import (
     BRAND_ACCENT_DARK,
     BRAND_ACCENT_TEXT,
     BRAND_DISPLAY_FONT,
+    BTN_DESTRUCTIVE_QSS,
+    BTN_FOCUS_RING,
+    BTN_GHOST_QSS,
+    BTN_LINK_QSS,
+    CARD_QSS,
+    CX_BG,
+    CX_BG_SECONDARY,
+    CX_BORDER_DEFAULT,
+    CX_DANGER,
+    CX_SUCCESS,
+    CX_SURFACE,
+    CX_TEXT,
     CX_TEXT_SECONDARY,
     CX_TEXT_TERTIARY,
     DASHBOARD_MAX_HEIGHT,
     DASHBOARD_WIDTH,
     FONT_MONO,
+    FONT_SYSTEM,
     FS_CAPTION,
     FS_FOOTNOTE,
-    FS_HERO_NUMERIC,
     FS_TITLE,
+    FW_MEDIUM,
     FW_REGULAR,
     FW_SEMIBOLD,
+    GOAL_INPUT_HEIGHT,
+    HERO_NUMERAL_QSS,
+    INPUT_QSS,
+    PILL_BUTTON_QSS,
+    PILL_QSS,
     RADIUS_CARD,
     RADIUS_PILL,
+    SECTION_HEADING_QSS,
     SEMANTIC_LIGHT,
+    SP1,
     SP2,
     SP3,
     SP4,
     SP5,
     SP6,
-    STATE_COLORS,
     STATE_TEXT_COLORS,
 )
 from cortex.apps.desktop_shell.view_models import (
@@ -361,24 +389,37 @@ _STOP_SAFETY_TIMEOUT_MS = 10_000
 # the dashboard finalises the stop anyway so the Qt app can exit.
 _RECAP_WATCHDOG_MS = 6_000
 
-# Resolved semantic colors. These hex strings are dev-mode fallbacks; on
-# macOS, the window chrome (background tint + titlebar) re-adapts to the
-# user's light/dark setting at runtime via the appearance observer wired
-# at app startup (see :func:`mac_native.install_appearance_observer`,
-# invoked from ``CortexApp.run`` / ``CortexAppController``). These Qt
-# stylesheet token values stay fixed; the native NSWindow background
-# colour follows the system appearance.
-_WINDOW_BG = SEMANTIC_LIGHT["window_bg"]
-_CONTROL_BG = SEMANTIC_LIGHT["control_bg"]
-_GROUPED_BG = SEMANTIC_LIGHT["grouped_bg"]
-_LABEL = SEMANTIC_LIGHT["label_primary"]
-# F55 + audit-w2: the warm-greyscale label tints now live in the token
-# registry. Tertiary is the AA-passing "#6B6661" (~5.4:1 on #FFFFFF) — was
-# previously a sub-AA value (3.98:1). Source-of-truth: tokens.py.
-_LABEL_SECONDARY = CX_TEXT_SECONDARY
-_LABEL_TERTIARY = CX_TEXT_TERTIARY
-_SEPARATOR = SEMANTIC_LIGHT["separator"]
-_DANGER = SEMANTIC_LIGHT["danger"]
+# Session lifecycle phases for the footer control + state pill. Every
+# label the user sees for the session comes from ``_enter_phase`` so the
+# button, the pill, and the accessible descriptions can never disagree.
+_PHASE_STARTING = "starting"
+_PHASE_LIVE = "live"
+_PHASE_STOPPING = "stopping"
+_PHASE_ENDED = "ended"
+_PHASE_DISCONNECTED = "disconnected"
+
+# Connectivity is reported with the info colour, never a state colour, so
+# "Connected" cannot be confused with the "Steady activity" estimate.
+_CONNECTED_DOT = SEMANTIC_LIGHT["info"]
+
+# Accent-tinted pill button (focus-protection / break / recalibrate chips).
+# Same geometry as ``tokens.PILL_BUTTON_QSS`` so a chip can swap tint
+# without moving.
+_ACCENT_PILL_BUTTON_QSS = (
+    "QPushButton {"
+    f"  font-family: {FONT_SYSTEM};"
+    f"  font-size: {FS_CAPTION}px;"
+    f"  font-weight: {FW_MEDIUM};"
+    f"  color: {BRAND_ACCENT_TEXT};"
+    "  background: rgba(217, 119, 87, 0.14);"
+    f"  border-radius: {RADIUS_PILL}px;"
+    "  padding: 3px 10px;"
+    "  border: 2px solid transparent;"
+    "}"
+    "QPushButton:hover { background: rgba(217, 119, 87, 0.22); }"
+    "QPushButton:pressed { background: rgba(217, 119, 87, 0.32); }"
+    f"QPushButton:focus {{ border: {BTN_FOCUS_RING}; }}"
+)
 
 
 def _set_accessible_name(widget: object, name: str) -> None:
@@ -411,16 +452,6 @@ def _set_tab_order(first: object, second: object) -> None:
             fn(first, second)
         except Exception:
             pass
-
-
-def _system(point_size: float, weight: str = "regular") -> str:
-    """Return a Qt stylesheet font-family value resolving to the system font.
-
-    Used inside QSS strings where a literal stack is required. The companion
-    helper :func:`mac_native.system_font` returns an actual ``QFont`` for use
-    with ``setFont()`` calls.
-    """
-    return '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif'
 
 
 def _make_history_icon(color_hex: str, size: int = 13) -> object:
@@ -457,15 +488,18 @@ def _make_history_icon(color_hex: str, size: int = 13) -> object:
 
 _GLOBAL_QSS = f"""
 QWidget#CortexDashboard {{
+    /* The NSWindow behind Qt's content view is tinted and pinned to the
+       light Aqua appearance by mac_native.apply_vibrancy; off-mac the
+       QApplication palette supplies the same light window colour. */
     background-color: transparent;
 }}
 QLineEdit {{
     selection-background-color: {BRAND_ACCENT};
 }}
 QToolTip {{
-    background-color: {_CONTROL_BG};
-    color: {_LABEL};
-    border: 1px solid {_SEPARATOR};
+    background-color: {CX_SURFACE};
+    color: {CX_TEXT};
+    border: 1px solid {CX_BORDER_DEFAULT};
     padding: 4px 8px;
     border-radius: 6px;
 }}
@@ -476,9 +510,9 @@ QToolTip {{
    the popup (observed: recent-goals menu over the Biometrics card).
    Defining it globally hardens every present and future menu. */
 QMenu {{
-    background-color: {_CONTROL_BG};
-    color: {_LABEL};
-    border: 1px solid {_SEPARATOR};
+    background-color: {CX_SURFACE};
+    color: {CX_TEXT};
+    border: 1px solid {CX_BORDER_DEFAULT};
     border-radius: 8px;
     padding: 4px;
 }}
@@ -488,116 +522,23 @@ QMenu::item {{
 }}
 QMenu::item:selected {{
     background-color: {BRAND_ACCENT};
-    color: {_LABEL};
+    color: {CX_TEXT};
 }}
 QMenu::separator {{
     height: 1px;
-    background-color: {_SEPARATOR};
+    background-color: {CX_BORDER_DEFAULT};
     margin: 4px 8px;
 }}
 """
 
 
 # ---------------------------------------------------------------------------
-# Native-style segmented control (capsule pill, two segments)
+# Segmented control — the shared capsule component (dashboard + history)
 # ---------------------------------------------------------------------------
 
-class _MacSegmentedControl(QWidget):
-    """Two-segment capsule pill matching ``NSSegmentedControl.capsule`` look.
-
-    Emits ``selection_changed(int)`` when the user clicks a segment. Used in
-    place of the previous ``QTabWidget`` underline-accent bar (which is a
-    Chrome/Material pattern, not a Mac one).
-    """
-
-    selection_changed = Signal(int)
-
-    def __init__(self, labels: list[str], parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._buttons: list[QPushButton] = []
-        self._group = QButtonGroup(self)
-        self._group.setExclusive(True)
-        outer = QHBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-
-        track = QFrame()
-        track.setObjectName("_seg_track")
-        track.setStyleSheet(
-            f"#_seg_track {{ background: {_GROUPED_BG};"
-            f" border: 0.5px solid {_SEPARATOR};"
-            f" border-radius: 8px; }}"
-        )
-        track_layout = QHBoxLayout(track)
-        track_layout.setContentsMargins(3, 3, 3, 3)
-        track_layout.setSpacing(2)
-        for index, label in enumerate(labels):
-            btn = QPushButton(label)
-            btn.setCheckable(True)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
-            # Phase J-5 a11y sweep: segmented-control buttons need
-            # explicit accessible names (the visible label is the
-            # text but VoiceOver also needs the role context to
-            # announce "tab — Dashboard, selected"), and StrongFocus
-            # so the keyboard tab cycle reaches them rather than the
-            # default WheelFocus which excludes them from tabbing.
-            _set_accessible_name(btn, f"{label} tab")
-            _set_accessible_description(btn, f"Switch to the {label} view.")
-            try:
-                btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-            except Exception:
-                pass
-            btn.setStyleSheet(
-                "QPushButton {"
-                "  padding: 4px 14px;"
-                "  border-radius: 6px;"
-                "  background: transparent;"
-                f"  color: {_LABEL_SECONDARY};"
-                "  border: none;"
-                "}"
-                f"QPushButton:hover {{ color: {_LABEL}; }}"
-                "QPushButton:checked {"
-                f"  background: {_CONTROL_BG};"
-                f"  color: {_LABEL};"
-                f"  font-weight: {FW_SEMIBOLD};"
-                "}"
-            )
-            btn.clicked.connect(lambda _checked=False, i=index: self._on_clicked(i))
-            self._group.addButton(btn, index)
-            self._buttons.append(btn)
-            track_layout.addWidget(btn, stretch=1)
-        outer.addWidget(track, stretch=1)
-        if self._buttons:
-            self._buttons[0].setChecked(True)
-
-    def _on_clicked(self, index: int) -> None:
-        for i, b in enumerate(self._buttons):
-            b.setChecked(i == index)
-        self.selection_changed.emit(index)
-
-    def set_selected(self, index: int) -> None:
-        """Programmatically activate a segment and emit
-        ``selection_changed`` so subscribers (e.g. the QStackedWidget)
-        re-sync.
-
-        Phase 4.B fix (#22): provides a public API for the dashboard's
-        ``_on_recap_view_full`` so it no longer has to reach into the
-        private ``_buttons`` list. Out-of-range indices are clamped
-        defensively; a negative or oversized index becomes a no-op
-        rather than raising. The emitted ``selection_changed`` signal
-        is the same one the user click path emits — listeners cannot
-        tell the difference.
-        """
-        if not self._buttons:
-            return
-        if index < 0 or index >= len(self._buttons):
-            logger.debug(
-                "_MacSegmentedControl.set_selected: index %d out of range",
-                index,
-            )
-            return
-        self._on_clicked(index)
+# Historical name kept for call sites and tests; the implementation is the
+# shared :class:`cortex.apps.desktop_shell.components.SegmentedControl`.
+_MacSegmentedControl = SegmentedControl
 
 
 # ---------------------------------------------------------------------------
@@ -654,10 +595,16 @@ class _ConsumerTab(QWidget):
     # path back to Cortex Settings instead of relying on discovery of the
     # menu-bar item.
     open_settings_requested = Signal()
+    # "Start session" after a session ended (in-process hosts restart the
+    # daemon; WS hosts hide the control via ``set_session_restart_available``).
+    session_start_requested = Signal()
+    # The "Recalibrate" chip is a real control: hosts route it to the same
+    # calibration runner Settings uses.
+    recalibrate_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setStyleSheet(f"background: transparent; color: {_LABEL};")
+        self.setStyleSheet(f"background: transparent; color: {CX_TEXT};")
         # P0 §3.7: cached BREAK_RECOMMENDATION payload so the click
         # handler can carry it up to the controller. ``apply_break_recommendation``
         # populates this; ``_clear_break_pill`` clears it.
@@ -673,10 +620,16 @@ class _ConsumerTab(QWidget):
         self._undo_toast: QWidget | None = None
         self._undo_toast_timer: QTimer | None = None
 
-        # F34: state machine for the Stop button. ``_stopping`` flips to True
-        # on first click and back to False on ``notify_daemon_stopped`` (or
-        # the safety-timer expiry). Coalesces double-clicks at the slot level.
+        # F34: ``_stopping`` flips to True on End session and back to False
+        # when the daemon acknowledges (or the safety timer expires).
+        # Coalesces double-clicks at the slot level.
         self._stopping: bool = False
+        # Session lifecycle — see ``_enter_phase``.
+        self._session_phase: str = _PHASE_DISCONNECTED
+        self._quit_after_stop: bool = False
+        self._restart_available: bool = True
+        self._ended_by_user: bool = False
+        self._last_state: str = "UNKNOWN"
         # P0 §3.11: cached quiet-mode state envelope. Mirrors the
         # daemon's QUIET_MODE_STATE broadcast so the capsule re-renders
         # without round-trips.
@@ -688,11 +641,10 @@ class _ConsumerTab(QWidget):
         self._render_cache: dict[int, dict[str, str]] = {}
         # Phase J-3: empty-state flag. Flips False on the first ``update_state``
         # call so the placeholder paragraph in the biometrics card vanishes
-        # and the live BPM / HRV / BLK numerics take over. The flag is sticky
-        # — once Cortex has rendered live data, subsequent reconnects keep
-        # the live UI (the dashboard reuses cached values rather than
-        # collapsing back to "no data yet").
+        # and the live numerics take over. Sticky across reconnects.
         self._has_received_state: bool = False
+        # The "This session" stats reveal only once a real estimate exists.
+        self._has_estimate: bool = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(SP6, SP5, SP6, SP6)
@@ -701,21 +653,22 @@ class _ConsumerTab(QWidget):
         # ── Header ────────────────────────────────────────────────────
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, SP5)
+        header.setSpacing(SP2)
 
-        # Brand wordmark (preserved — Cormorant italic, terracotta is the
-        # signature contrast). HIG section-heading conventions don't apply to
-        # the wordmark; it's the app identity.
+        # Brand wordmark — the one place (with hero numerals) the display
+        # serif is used.
         brand = QLabel("Cortex")
         brand.setStyleSheet(
             f"font-family: {BRAND_DISPLAY_FONT}, ui-serif, Georgia, serif;"
             f"font-style: italic; font-size: {FS_TITLE}px;"
             f"font-weight: {FW_REGULAR};"
-            f"color: {_LABEL}; background: transparent;"
+            f"color: {CX_TEXT}; background: transparent;"
         )
+        _set_accessible_name(brand, "Cortex")
         header.addWidget(brand)
         header.addStretch()
 
-        # State pill — capsule with dot + label, sits on the grouped background.
+        # Status pill — capsule with dot + label, sits on the grouped background.
         self._state_badge = QWidget()
         badge_layout = QHBoxLayout(self._state_badge)
         badge_layout.setContentsMargins(10, 3, 12, 3)
@@ -723,79 +676,53 @@ class _ConsumerTab(QWidget):
 
         self._state_dot = QLabel()
         self._state_dot.setFixedSize(7, 7)
-        self._state_dot.setStyleSheet(
-            f"background: {_LABEL_TERTIARY}; border-radius: 3px;"
-        )
+        self._state_dot.setStyleSheet(status_dot_qss(CX_TEXT_TERTIARY, size=7))
         badge_layout.addWidget(self._state_dot, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         self._state_label = QLabel("Disconnected")
-        self._state_label.setFont(mac_native.system_font(FS_FOOTNOTE - 1, "medium"))
+        self._state_label.setFont(mac_native.system_font(FS_CAPTION, "medium"))
         self._state_label.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
-        # P0 §3.17: glossary tooltips on every quantitative chrome
-        # element. Help text taken verbatim from _CONCEPTS_GLOSSARY
-        # below so a single edit point keeps the in-app tooltip + the
-        # Concepts dialog in lockstep.
+        # P0 §3.17: glossary tooltips on every quantitative chrome element.
         try:
             self._state_label.setToolTip(_CONCEPTS_GLOSSARY["state"])
         except Exception:
             pass
+        _set_accessible_name(self._state_label, "Cortex status")
         badge_layout.addWidget(self._state_label, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         self._state_badge.setStyleSheet(
-            f"background: {_GROUPED_BG}; border-radius: {RADIUS_PILL}px;"
+            f"background: {CX_BG_SECONDARY}; border-radius: {RADIUS_PILL}px;"
         )
         header.addWidget(self._state_badge, alignment=Qt.AlignmentFlag.AlignVCenter)
 
-        # P0 §3.11: Pause/Quiet capsule — one-click access to the three
-        # quiet modes (Snooze 15, Quiet for session, Pause) plus an
-        # Off entry to clear any active mode. Lives next to the state
-        # badge so the user can disarm in a single gesture. The
-        # capsule's label mirrors the active mode (e.g. "Quiet · 28m")
-        # so the user always sees what's on.
+        # P0 §3.11: Pause/Quiet capsule — one-click access to the quiet
+        # modes. The label mirrors the active mode (e.g. "Quiet · 28m").
         self._quiet_capsule = QPushButton("Pause")
         try:
             self._quiet_capsule.setCursor(Qt.CursorShape.PointingHandCursor)
         except Exception:
             pass
-        self._quiet_capsule.setFont(
-            mac_native.system_font(FS_FOOTNOTE - 1, "medium")
-        )
+        self._quiet_capsule.setFont(mac_native.system_font(FS_CAPTION, "medium"))
         try:
             self._quiet_capsule.setFlat(True)
+            self._quiet_capsule.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         except Exception:
             pass
-        self._quiet_capsule.setStyleSheet(
-            "QPushButton {"
-            f"  background: {_GROUPED_BG};"
-            f"  color: {_LABEL_SECONDARY};"
-            f"  border-radius: {RADIUS_PILL}px;"
-            "  padding: 3px 12px;"
-            "  margin-left: 8px;"
-            "  border: none;"
-            "}"
-            f"QPushButton:hover {{ background: rgba(0,0,0,0.05); color: {_LABEL}; }}"
+        self._quiet_capsule.setStyleSheet(PILL_BUTTON_QSS)
+        _set_accessible_name(self._quiet_capsule, "Pause or quiet Cortex")
+        _set_accessible_description(
+            self._quiet_capsule,
+            "Opens a menu to snooze, quiet, or pause Cortex. "
+            "Shortcut: Command + Shift + Slash.",
         )
-        try:
-            _set_accessible_name(
-                self._quiet_capsule, "Pause or quiet Cortex",
-            )
-            _set_accessible_description(
-                self._quiet_capsule,
-                "Opens a menu to snooze, quiet, or pause Cortex. "
-                "Shortcut: Command + Shift + Slash.",
-            )
-        except Exception:
-            pass
         self._quiet_capsule.clicked.connect(self._on_quiet_capsule_clicked)
         header.addWidget(
             self._quiet_capsule, alignment=Qt.AlignmentFlag.AlignVCenter,
         )
 
-        # P0 §3.11: ⌘⇧/ keyboard shortcut. The shortcut opens the same
-        # menu the capsule does so muscle-memory power users can
-        # disarm without leaving their keyboard.
+        # P0 §3.11: ⌘⇧/ opens the same menu the capsule does.
         try:
             self._quiet_shortcut = QShortcut(
                 QKeySequence("Ctrl+Shift+/"), self,
@@ -816,8 +743,6 @@ class _ConsumerTab(QWidget):
         #   Cmd+Shift+P → toggle quiet capsule (pause/resume)
         #   Cmd+Shift+R → request a manual session recap
         #   Cmd+Shift+D → dismiss the active intervention overlay
-        # All three are application-scoped so the user can fire them
-        # while focused in another app (popup, settings dialog, etc.).
         def _install_shortcut(seq: str, slot: object) -> None:
             try:
                 sc = QShortcut(QKeySequence(seq), self)
@@ -847,69 +772,39 @@ class _ConsumerTab(QWidget):
             and self.dismiss_overlay_requested.emit(),
         )
 
-        # P0 §3.10: auto-armed focus protection toast. Hidden by
-        # default; revealed via :meth:`apply_quiet_mode_state` when
-        # the daemon emits START_FOCUS_AUTO (or QUIET_MODE_STATE with
-        # an auto-armed kind). Click → emits
-        # ``auto_focus_disarm_requested``.
+        # ── Ambient chips (footer meta strip) ─────────────────────────
+        # Each chip is hidden until its render slot has real data; every
+        # pressable chip is a real button with hover/pressed/focus.
+
+        # P0 §3.10: auto-armed focus protection. Click → disarm.
         self._focus_protection_pill = QPushButton("")
         try:
-            self._focus_protection_pill.setCursor(
-                Qt.CursorShape.PointingHandCursor,
-            )
+            self._focus_protection_pill.setCursor(Qt.CursorShape.PointingHandCursor)
         except Exception:
             pass
-        self._focus_protection_pill.setFont(
-            mac_native.system_font(FS_CAPTION, "medium")
-        )
-        self._focus_protection_pill.setStyleSheet(
-            "QPushButton {"
-            f"  background: {BRAND_ACCENT}1A;"
-            f"  color: {BRAND_ACCENT_TEXT};"
-            f"  border-radius: {RADIUS_PILL}px;"
-            "  padding: 3px 10px;"
-            "  margin-left: 8px;"
-            "  border: none;"
-            "}"
-            "QPushButton:hover { background: rgba(217,119,87,0.20); }"
-        )
+        self._focus_protection_pill.setFont(mac_native.system_font(FS_CAPTION, "medium"))
+        self._focus_protection_pill.setStyleSheet(_ACCENT_PILL_BUTTON_QSS)
         self._focus_protection_pill.setVisible(False)
+        _set_accessible_name(self._focus_protection_pill, "Turn off focus protection")
         self._focus_protection_pill.clicked.connect(
             self.auto_focus_disarm_requested.emit,
         )
-        # UI redesign: the ambient chips (focus-protection, cost, break,
-        # baseline) move OUT of the top bar into a footer meta strip (built
-        # near the Stop button below) so the header reads as brand + state +
-        # quiet only. The widgets keep their attribute names so every render
-        # slot (apply_auto_focus_state / cost update / apply_break_recommendation
-        # / refresh_baseline_freshness) updates them unchanged.
 
-        # P0 §3.15: LLM cost meter pill. Subdued unless near budget. The
-        # daemon publishes the running daily total via a COST_RESPONSE
-        # WS message (Phase 4b owns the plumbing); the desktop polls
-        # COST_REQUEST every ~60 s and re-renders. Until Phase 4b lands
-        # the message handler, the pill falls back to "$—".
-        self._cost_pill = QLabel("$—")
-        self._cost_pill.setFont(
-            mac_native.system_font(FS_CAPTION, "medium"),
-        )
+        # P0 §3.15: LLM cost meter. Hidden until the daemon reports a cost
+        # (``apply_cost_update``) — a permanent "$—" would be a placeholder
+        # pretending to be data.
+        self._cost_pill = QLabel("")
+        self._cost_pill.setFont(mac_native.system_font(FS_CAPTION, "medium"))
         self._cost_pill.setObjectName("CortexCostPill")
-        self._cost_pill.setStyleSheet(
-            "QLabel#CortexCostPill {"
-            f"  color: {_LABEL_TERTIARY};"
-            f"  background: {_GROUPED_BG};"
-            f"  border-radius: {RADIUS_PILL}px;"
-            "  padding: 3px 10px;"
-            "  margin-left: 8px;"
-            "}"
-        )
+        self._cost_pill.setStyleSheet(f"QLabel#CortexCostPill {{ {PILL_QSS} }}")
         try:
             self._cost_pill.setToolTip(
-                "LLM spend today — click Settings → Budget to set a daily cap."
+                "LLM spend today — Settings → Budget sets a daily cap."
             )
         except Exception:
             pass
-        # (added to the footer meta strip below, not the header)
+        self._cost_pill.setVisible(False)
+        _set_accessible_name(self._cost_pill, "LLM spend today")
         # Cache the last applied cost so we don't restyle on every poll.
         self._cost_last_value: float = -1.0
         self._cost_budget_warned: bool = False
@@ -922,67 +817,73 @@ class _ConsumerTab(QWidget):
             self._break_pill.setCursor(Qt.CursorShape.PointingHandCursor)
         except Exception:
             pass
-        self._break_pill.setFont(
-            mac_native.system_font(FS_CAPTION, "medium"),
-        )
-        self._break_pill.setStyleSheet(
-            "QPushButton {"
-            f"  background: rgba(217, 119, 87, 0.18);"
-            f"  color: {BRAND_ACCENT_TEXT};"
-            f"  border-radius: {RADIUS_PILL}px;"
-            "  padding: 3px 10px;"
-            "  margin-left: 8px;"
-            "  border: none;"
-            "}"
-            "QPushButton:hover { background: rgba(217,119,87,0.30); }"
-        )
+        self._break_pill.setFont(mac_native.system_font(FS_CAPTION, "medium"))
+        self._break_pill.setStyleSheet(_ACCENT_PILL_BUTTON_QSS)
         self._break_pill.setVisible(False)
+        _set_accessible_name(self._break_pill, "Take a break")
         try:
             self._break_pill.clicked.connect(self._on_break_pill_clicked)
         except Exception:
             logger.debug("break pill connect failed", exc_info=True)
-        # (added to the footer meta strip below, not the header)
 
-        # P0 §3.4 — baseline freshness pill. Hidden when the baseline
-        # file doesn't exist (so we don't shame the user mid-onboarding)
-        # and quiet when fresh. >30 days old it surfaces a subtle
-        # "Recalibrate?" link.
-        self._baseline_pill = QLabel("")
-        self._baseline_pill.setFont(
-            mac_native.system_font(FS_CAPTION, "medium")
-        )
+        # P0 §3.4 — measured-profile freshness. A real control: clicking it
+        # starts recalibration. Hidden when no profile exists or it is fresh.
+        self._baseline_pill = QPushButton("")
+        try:
+            self._baseline_pill.setCursor(Qt.CursorShape.PointingHandCursor)
+        except Exception:
+            pass
+        self._baseline_pill.setFont(mac_native.system_font(FS_CAPTION, "medium"))
+        self._baseline_pill.setStyleSheet(_ACCENT_PILL_BUTTON_QSS)
         self._baseline_pill.setVisible(False)
-        self._baseline_pill.setStyleSheet(
-            f"color: {_LABEL_TERTIARY}; background: {_GROUPED_BG};"
-            f" border-radius: {RADIUS_PILL}px; padding: 3px 10px;"
+        _set_accessible_name(self._baseline_pill, "Recalibrate measured profile")
+        _set_accessible_description(
+            self._baseline_pill,
+            "Your measured profile is more than 30 days old. Starts the guided "
+            "recalibration; nothing is saved until you review it.",
         )
-        # (added to the footer meta strip below, not the header)
+        try:
+            self._baseline_pill.clicked.connect(self.recalibrate_requested.emit)
+        except Exception:
+            logger.debug("baseline pill connect failed", exc_info=True)
 
-        # UI redesign: footer meta strip — the four ambient chips
-        # (focus-protection, break, baseline, cost) right-aligned in a
-        # single subtle row. Each is hidden until its render slot reveals
-        # it; cost shows "$—" quietly. This declutters the top bar while
-        # keeping every signal reachable. Widget objects + attribute names
-        # are unchanged, so all render slots keep working.
+        # P0 §3.16: "Restore previous state" — undoes the most recent
+        # verified reversible workspace change. Lives in the strip (hidden
+        # until a receipt arrives) instead of being conjured as a parentless
+        # window.
+        self._restore_pill: QPushButton | None = QPushButton("Restore previous state")
+        try:
+            self._restore_pill.setCursor(Qt.CursorShape.PointingHandCursor)
+        except Exception:
+            pass
+        self._restore_pill.setFont(mac_native.system_font(FS_CAPTION, "medium"))
+        self._restore_pill.setStyleSheet(PILL_BUTTON_QSS)
+        self._restore_pill.setVisible(False)
+        _set_accessible_name(self._restore_pill, "Restore previous workspace state")
+        _set_accessible_description(
+            self._restore_pill,
+            "Undoes the most recent workspace change Cortex applied.",
+        )
+        try:
+            self._restore_pill.clicked.connect(self._on_restore_pill_clicked)
+        except Exception:
+            logger.debug("restore pill connect failed", exc_info=True)
+
         self._meta_strip = QHBoxLayout()
         self._meta_strip.setContentsMargins(0, 0, 0, SP3)
         self._meta_strip.setSpacing(SP2)
         self._meta_strip.addStretch()
-        self._meta_strip.addWidget(
-            self._focus_protection_pill, alignment=Qt.AlignmentFlag.AlignVCenter
-        )
-        self._meta_strip.addWidget(
-            self._break_pill, alignment=Qt.AlignmentFlag.AlignVCenter
-        )
-        self._meta_strip.addWidget(
-            self._baseline_pill, alignment=Qt.AlignmentFlag.AlignVCenter
-        )
-        self._meta_strip.addWidget(
-            self._cost_pill, alignment=Qt.AlignmentFlag.AlignVCenter
-        )
+        for chip in (
+            self._restore_pill,
+            self._focus_protection_pill,
+            self._break_pill,
+            self._baseline_pill,
+            self._cost_pill,
+        ):
+            self._meta_strip.addWidget(chip, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         root.addLayout(header)
-        # Run an initial freshness check so the pill is correct on first
+        # Run an initial freshness check so the chip is correct on first
         # paint. The controller / main app also calls refresh on a
         # completed calibration.
         try:
@@ -992,23 +893,18 @@ class _ConsumerTab(QWidget):
 
         # F16 (Phase-4 audit): envelope-level health warning strip,
         # mirrored from the daemon's ``payload["capture"]["stale"]`` and
-        # ``payload["store"]["degraded"]`` flags. Hidden by default;
-        # ``update_state`` flips visibility on receipt of a STATE_UPDATE
-        # carrying either flag. Uses the existing danger token (no new
-        # palette).
+        # ``payload["store"]["degraded"]`` flags. Hidden by default.
         self._health_banner = QLabel("")
         self._health_banner.setObjectName("CortexHealthBanner")
         self._health_banner.setWordWrap(True)
-        self._health_banner.setFont(
-            mac_native.system_font(FS_CAPTION, "regular")
-        )
+        self._health_banner.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         self._health_banner.setStyleSheet(
             "QLabel#CortexHealthBanner {"
-            f"  color: {_DANGER};"
-            f"  background: rgba(215, 0, 21, 0.10);"
-            f"  border: 1px solid {_DANGER};"
-            f"  border-radius: 6px;"
-            f"  padding: 6px 10px;"
+            f"  color: {CX_DANGER};"
+            "  background: rgba(215, 0, 21, 0.08);"
+            f"  border: 1px solid {CX_DANGER};"
+            f"  border-radius: {RADIUS_CARD}px;"
+            "  padding: 6px 10px;"
             "}"
         )
         self._health_banner.setOpenExternalLinks(False)
@@ -1027,63 +923,36 @@ class _ConsumerTab(QWidget):
         _set_accessible_name(self._health_banner, "Health warning")
         root.addWidget(self._health_banner)
 
-        # ── Goal input — minimum width, flexible (HIG: avoid fixed sizes) ──
+        # ── Goal input ────────────────────────────────────────────────
         self._goal_input = QLineEdit()
         self._goal_input.setPlaceholderText("What are you working on?")
-        self._goal_input.setMinimumHeight(36)
-        # Mirror the browser-extension popup (popup.tsx) and the backend
-        # ``GoalSet`` schema upper bound so the desktop input can never
-        # accumulate more characters than the daemon will accept.
+        self._goal_input.setMinimumHeight(GOAL_INPUT_HEIGHT)
+        # Mirror the browser-extension popup and the backend ``GoalSet``
+        # schema upper bound.
         self._goal_input.setMaxLength(500)
-        # F55: accessible name + description for VoiceOver / screen
-        # readers. Wrapped because the legacy MockQLineEdit stub in
-        # test_desktop_shell.py does not expose these QWidget methods.
         _set_accessible_name(self._goal_input, "Goal")
         _set_accessible_description(
             self._goal_input,
             "Tell Cortex what you're working on so suggestions match your intent.",
         )
         self._goal_input.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
-        self._goal_input.setStyleSheet(
-            "QLineEdit {"
-            f"  padding: 0 {SP4}px;"
-            f"  border: 0.5px solid {_SEPARATOR};"
-            f"  border-radius: 6px;"
-            f"  color: {_LABEL};"
-            f"  background: {_CONTROL_BG};"
-            "}"
-            f"QLineEdit:focus {{ border: 1.5px solid {BRAND_ACCENT}; }}"
-        )
-        # F19 (Phase-4 audit/UI 4.6): drive placeholder color via
-        # QPalette.PlaceholderText instead of the
-        # ``QLineEdit::placeholder`` QSS selector. The QSS form silently
-        # no-ops on some Qt 6.x builds (the parser accepts
-        # ``::placeholder`` but never wires it to the actual paint
-        # path), while the palette role is the documented Qt API and
-        # works on every backend.
+        # Constant 1px border: focus changes colour only, so the text never
+        # shifts by a pixel when the field takes focus.
+        self._goal_input.setStyleSheet(INPUT_QSS)
+        # F19: placeholder colour via QPalette (the QSS selector silently
+        # no-ops on some Qt 6.x builds).
         try:
             from PySide6.QtGui import QColor, QPalette
 
             placeholder_palette = self._goal_input.palette()
             placeholder_palette.setColor(
                 QPalette.ColorRole.PlaceholderText,
-                QColor(_LABEL_TERTIARY),
+                QColor(CX_TEXT_TERTIARY),
             )
             self._goal_input.setPalette(placeholder_palette)
         except Exception:
-            # Headless test envs may not have a real platform plugin —
-            # the placeholder colour is non-functional in that case,
-            # which is harmless for unit tests.
             pass
-        # E.1: emit goal_set when the user hits return.
-        # F33: debounce the goal-set emission. A held-down Return key fires
-        # ``returnPressed`` repeatedly (Qt key auto-repeat); without a
-        # coalescer the daemon receives N rapid-fire goals, the LLM kicks
-        # off N planner calls, and the user pays the latency + cost of
-        # the bursts. Schedule a single 150 ms singleShot per burst and
-        # ignore subsequent presses while one is pending — the emit reads
-        # the latest input text at fire time, so the user still gets the
-        # value they typed last.
+        # F33: debounce the goal-set emission (held Return auto-repeats).
         self._goal_debounce_pending = False
 
         def _schedule_goal_emit() -> None:
@@ -1096,10 +965,7 @@ class _ConsumerTab(QWidget):
             self._goal_debounce_pending = False
             text = self._goal_input.text().strip()
             self.goal_set.emit(text)
-            # P0 §3.13: persist the goal to the on-disk recent-goals
-            # store so the dropdown picks it up on next open. Failures
-            # are non-fatal — we never want a write error to swallow
-            # the daemon-bound goal_set emission.
+            # P0 §3.13: persist the goal to the on-disk recent-goals store.
             if text:
                 try:
                     from cortex.libs.store.goal_store import add_goal
@@ -1109,25 +975,17 @@ class _ConsumerTab(QWidget):
                     logger.debug("goal_store add_goal failed", exc_info=True)
 
         self._goal_input.returnPressed.connect(_schedule_goal_emit)
-        # Expose the scheduler for tests so they can drive the coalescer
-        # deterministically (the QTimer.singleShot path needs an event
-        # loop tick which the offscreen test harness provides via
-        # ``QApplication.processEvents``).
+        # Exposed for tests so they can drive the coalescer deterministically.
         self._schedule_goal_emit = _schedule_goal_emit
         self._fire_goal_emit = _fire_goal_emit
 
-        # P0 §3.13 / UI redesign: recent goals live behind a trailing
-        # pull-down glyph INSIDE the goal field — the macOS "field with a
-        # built-in menu" pattern (Safari address bar / NSComboButton),
-        # replacing the stock QComboBox that read as dated. One clean
-        # control; the menu renders with native vibrancy. The affordance
-        # is hidden until the on-disk store has at least one goal so a
-        # first-run user still sees a blank field.
+        # P0 §3.13: recent goals behind a trailing pull-down glyph inside
+        # the goal field. Hidden until the store has at least one goal.
         self._goal_history_action = None
         try:
             from PySide6.QtGui import QAction  # noqa: F401  (presence check)
 
-            icon = _make_history_icon(_LABEL_SECONDARY)
+            icon = _make_history_icon(CX_TEXT_SECONDARY)
             action = self._goal_input.addAction(
                 icon, QLineEdit.ActionPosition.TrailingPosition
             )
@@ -1138,62 +996,40 @@ class _ConsumerTab(QWidget):
         except Exception:
             logger.debug("recent-goals affordance init failed", exc_info=True)
         root.addWidget(self._goal_input)
-        # Populate from disk on first paint (silently).
         try:
             self._refresh_recent_goals_dropdown()
         except Exception:
             logger.debug("initial recent goals refresh failed", exc_info=True)
         root.addSpacing(SP5)
 
-        # ── Biometrics inset section (no shadow, hairline border) ──
-        # NB: Qt's stylesheet selector ``QFrame`` matches QFrame *and every
-        # subclass* (incl. QLabel, QLCDNumber, QStackedWidget). Without the
-        # objectName scope, the card's white-background / hairline-border /
-        # 8px-radius leak into every QLabel descendant, which scrambles
-        # text rendering (see the Connections panel regression). All six
-        # card stylesheets in desktop_shell are scoped this way.
+        # ── Biometrics card ───────────────────────────────────────────
+        # NB: Qt's ``QFrame`` selector matches every subclass (QLabel etc.),
+        # so every card stylesheet is scoped by objectName.
         bio_card = QFrame()
         bio_card.setObjectName("CortexBioCard")
-        bio_card.setStyleSheet(
-            "QFrame#CortexBioCard {"
-            f"  background: {_CONTROL_BG};"
-            f"  border: 0.5px solid {_SEPARATOR};"
-            f"  border-radius: {RADIUS_CARD}px;"
-            "}"
-        )
+        bio_card.setStyleSheet(f"QFrame#CortexBioCard {{ {CARD_QSS} }}")
         bio_inner = QVBoxLayout(bio_card)
         bio_inner.setContentsMargins(SP5, SP4, SP5, SP4)
         bio_inner.setSpacing(SP3)
 
-        # Sentence-case section heading (HIG) — no letter-spacing, secondary color.
         bio_heading = QLabel("Biometrics")
         bio_heading.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
-        bio_heading.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
-        )
+        bio_heading.setStyleSheet(SECTION_HEADING_QSS)
         bio_inner.addWidget(bio_heading)
 
-        # Phase J-3: empty-state placeholder. Pre-first-frame the BPM /
-        # pulse / blink numerics carry placeholder "--" glyphs but that
-        # reads as "stuck at zero" rather than "we haven't started yet".
-        # The placeholder paragraph below sets the expectation: nothing
-        # is broken; the daemon simply hasn't captured a frame. Hidden
-        # the moment ``update_state`` arrives.
-        self._bio_empty_state = QLabel(
-            "Start a session to see your biometrics."
-        )
+        # Phase J-3: empty state before the first capture frame. The copy
+        # says what is actually happening — the camera has not delivered a
+        # frame yet — rather than instructing the user to do something.
+        self._bio_empty_state = QLabel("Waiting for the camera… Live biometrics appear as soon as frames arrive.")
         self._bio_empty_state.setObjectName("CortexBioEmptyState")
         self._bio_empty_state.setWordWrap(True)
         self._bio_empty_state.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._bio_empty_state.setFont(
-            mac_native.system_font(FS_CAPTION, "regular")
-        )
+        self._bio_empty_state.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         self._bio_empty_state.setStyleSheet(
             "QLabel#CortexBioEmptyState {"
-            f"  color: {_LABEL_TERTIARY};"
+            f"  color: {CX_TEXT_TERTIARY};"
             "  background: transparent;"
             "  padding: 2px 0 6px 0;"
-            "  font-style: italic;"
             "}"
         )
         _set_accessible_name(self._bio_empty_state, "Biometrics empty state")
@@ -1204,11 +1040,10 @@ class _ConsumerTab(QWidget):
         bio_row.setContentsMargins(0, 0, 0, 0)
 
         self._bpm_label = QLabel("--")
-        self._hrv_label = QLabel("--")
         self._blk_label = QLabel("--")
 
-        # P0 §3.17: tooltip key per biometric channel so the dialog +
-        # the inline tooltips share a single source of truth.
+        # Channel tints stay as 6 px dots (data identity); the caption itself
+        # uses the secondary text token so it clears AA at 11 px.
         bio_specs = [
             (self._bpm_label, "BPM", BIO_HR, "hr"),
             (self._blk_label, "BLK", BIO_BLINK, "blink"),
@@ -1219,46 +1054,41 @@ class _ConsumerTab(QWidget):
             col.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
             val_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            # Brand identity — Cormorant numerics, terracotta channel
-            # accents — preserved across the macOS refactor.
-            val_widget.setStyleSheet(
-                f"font-family: {BRAND_DISPLAY_FONT}, ui-serif, Georgia, serif;"
-                f"font-size: {FS_HERO_NUMERIC}px;"
-                f"font-weight: {FW_REGULAR};"
-                f"color: {_LABEL};"
-                f"background: transparent; border: none;"
-            )
-            try:
-                tip = _CONCEPTS_GLOSSARY.get(glossary_key)
-                if tip:
+            # Hero numeral — the display serif's one non-wordmark use.
+            val_widget.setStyleSheet(HERO_NUMERAL_QSS)
+            _set_accessible_name(val_widget, f"{title} value")
+            tip = _CONCEPTS_GLOSSARY.get(glossary_key)
+            if tip:
+                try:
                     val_widget.setToolTip(tip)
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
+            heading_row = QHBoxLayout()
+            heading_row.setContentsMargins(0, 0, 0, 0)
+            heading_row.setSpacing(SP1)
+            heading_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            dot = QLabel()
+            dot.setFixedSize(6, 6)
+            dot.setStyleSheet(status_dot_qss(color, size=6))
             heading = QLabel(title)
-            heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
             heading.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
             heading.setStyleSheet(
-                f"color: {color}; background: transparent; border: none;"
+                f"color: {CX_TEXT_SECONDARY}; background: transparent; border: none;"
             )
-            try:
-                tip = _CONCEPTS_GLOSSARY.get(glossary_key)
-                if tip:
+            if tip:
+                try:
                     heading.setToolTip(tip)
-            except Exception:
-                pass
+                except Exception:
+                    pass
+            heading_row.addWidget(dot, alignment=Qt.AlignmentFlag.AlignVCenter)
+            heading_row.addWidget(heading, alignment=Qt.AlignmentFlag.AlignVCenter)
             col.addWidget(val_widget)
-            col.addWidget(heading)
+            col.addLayout(heading_row)
             bio_row.addLayout(col, stretch=1)
 
-        # Wrap the numerics row in a container so we can swap it for a
-        # status banner ("Reading your pulse…" / "Camera offline" / …)
-        # while the rPPG window fills. Both the numerics container and
-        # the status banner share an explicit fixed height so the card
-        # doesn't reflow when the first reading lands. The value (96 px)
-        # matches the natural height of the populated numerics row at
-        # default Mac font sizes (FS_NUMERIC value + FS_CAPTION heading
-        # + bio_row padding).
+        # Numerics and the status banner share a fixed height so the card
+        # never reflows when the first reading lands.
         _BIO_SWAP_HEIGHT = 96
         self._bio_numerics = QWidget()
         self._bio_numerics.setStyleSheet("background: transparent;")
@@ -1266,29 +1096,18 @@ class _ConsumerTab(QWidget):
         self._bio_numerics.setFixedHeight(_BIO_SWAP_HEIGHT)
         bio_inner.addWidget(self._bio_numerics)
 
-        # Contextual status banner. Shown only when ``heart_rate`` is
-        # ``None`` post-first-STATE_UPDATE; the message is driven by
-        # ``payload["capture"]`` (camera frames flowing, face detected).
-        # Three states:
-        #   • camera offline (no frames)        → "Camera offline …"
-        #   • frames flowing, no face yet       → "Looking for your face…"
-        #   • frames flowing, face, no rPPG yet → "Reading your pulse…"
+        # Contextual status banner ("Camera offline …" / "Looking for your
+        # face…" / "Reading your pulse…") shown while ``heart_rate`` is None.
         self._bio_status_label = QLabel("")
         self._bio_status_label.setObjectName("CortexBioStatus")
         self._bio_status_label.setWordWrap(True)
         self._bio_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._bio_status_label.setFont(
-            mac_native.system_font(FS_CAPTION, "regular")
-        )
-        # No vertical padding here — height is pinned via ``setFixedHeight``
-        # below to match ``_bio_numerics`` exactly, with the label's own
-        # ``AlignCenter`` keeping the message vertically centred.
+        self._bio_status_label.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         self._bio_status_label.setStyleSheet(
             "QLabel#CortexBioStatus {"
-            f"  color: {_LABEL_SECONDARY};"
+            f"  color: {CX_TEXT_SECONDARY};"
             "  background: transparent;"
             "  padding: 0 8px;"
-            "  font-style: italic;"
             "}"
         )
         self._bio_status_label.setFixedHeight(_BIO_SWAP_HEIGHT)
@@ -1298,52 +1117,40 @@ class _ConsumerTab(QWidget):
         root.addWidget(bio_card)
         root.addSpacing(SP4)
 
-        # ── Connections row ───────────────────────────────────────────
+        # ── Connections row — dot + "Chrome · Off" text, never colour alone ──
         conn_row = QHBoxLayout()
         conn_row.setContentsMargins(SP2, 0, SP2, 0)
-        conn_row.setSpacing(SP4)
+        conn_row.setSpacing(SP3)
 
         self._conn_dots: dict[str, QLabel] = {}
+        self._conn_labels: dict[str, QLabel] = {}
         for name in ("Chrome", "Edge", "Editor"):
             dot = QLabel()
             dot.setFixedSize(6, 6)
-            dot.setStyleSheet(
-                f"background: {_LABEL_TERTIARY}; border-radius: 3px;"
-            )
-            lbl = QLabel(name)
+            dot.setStyleSheet(status_dot_qss(CX_TEXT_TERTIARY, size=6))
+            lbl = QLabel(f"{name} · Off")
             lbl.setFont(mac_native.system_font(FS_CAPTION, "regular"))
-            lbl.setStyleSheet(
-                f"color: {_LABEL_TERTIARY}; background: transparent;"
-            )
+            lbl.setStyleSheet(f"color: {CX_TEXT_SECONDARY}; background: transparent;")
+            _set_accessible_name(lbl, f"{name} extension: off")
             conn_row.addWidget(dot, alignment=Qt.AlignmentFlag.AlignVCenter)
             conn_row.addWidget(lbl, alignment=Qt.AlignmentFlag.AlignVCenter)
             self._conn_dots[name] = dot
+            self._conn_labels[name] = lbl
 
         conn_row.addStretch()
 
-        self._connect_btn = QPushButton("Connect")
+        self._connect_btn = QPushButton("Connect…")
         self._connect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        # F55: accessible name for VoiceOver.
         _set_accessible_name(self._connect_btn, "Open Connections panel")
-        # Phase J-5: QPushButton defaults to TabFocus on most platforms
-        # but macOS Qt builds occasionally inherit WheelFocus, which
-        # silently excludes the button from the keyboard tab cycle.
-        # StrongFocus is the union of Tab + Click + Wheel and is the
-        # safe default for any user-driven control.
+        _set_accessible_description(
+            self._connect_btn, "Opens the window that links your browser and editor.",
+        )
         try:
             self._connect_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         except Exception:
             pass
-        self._connect_btn.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
-        self._connect_btn.setStyleSheet(
-            "QPushButton {"
-            f"  color: {BRAND_ACCENT_TEXT};"
-            f"  background: transparent;"
-            f"  border: none;"
-            f"  padding: 4px 0;"
-            "}"
-            f"QPushButton:hover {{ color: {_LABEL}; }}"
-        )
+        self._connect_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
+        self._connect_btn.setStyleSheet(BTN_LINK_QSS)
         conn_row.addWidget(self._connect_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
         root.addLayout(conn_row)
         root.addSpacing(SP5)
@@ -1351,108 +1158,115 @@ class _ConsumerTab(QWidget):
         # ── Divider (hairline, system separator) ───────────────────────
         divider = QFrame()
         divider.setFixedHeight(1)
-        divider.setStyleSheet(f"background: {_SEPARATOR};")
+        divider.setStyleSheet(f"background: {CX_BORDER_DEFAULT};")
         root.addWidget(divider)
         root.addSpacing(SP5)
 
-        # ── Today stats — sentence-case, no letter-spacing ────────────
-        today_label = QLabel("Today")
+        # ── This session — hidden until a real estimate exists ────────
+        # The three numbers are exactly what the dashboard measures from the
+        # STATE_UPDATE stream since this session started: steady-activity
+        # time, the longest contiguous steady run, and how many nudges were
+        # shown. Nothing here is a placeholder or a guess.
+        self._session_stats = QWidget()
+        self._session_stats.setStyleSheet("background: transparent;")
+        stats_col = QVBoxLayout(self._session_stats)
+        stats_col.setContentsMargins(0, 0, 0, 0)
+        stats_col.setSpacing(SP3)
+        today_label = QLabel("This session")
         today_label.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
-        today_label.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
-        )
-        root.addWidget(today_label)
-        root.addSpacing(SP3)
+        today_label.setStyleSheet(SECTION_HEADING_QSS)
+        stats_col.addWidget(today_label)
 
         today_row = QHBoxLayout()
         today_row.setSpacing(0)
 
-        self._today_focus = QLabel("--")
-        self._today_sessions = QLabel("--")
-        self._today_best = QLabel("--")
-        self._today_blocked = QLabel("--")
+        self._today_focus = QLabel("0m")
+        self._today_best = QLabel("0s")
+        self._today_blocked = QLabel("0")
 
         for val_widget, title in [
             (self._today_focus, "Steady"),
-            (self._today_sessions, "Sessions"),
-            (self._today_best, "Best"),
-            (self._today_blocked, "Blocked"),
+            (self._today_best, "Longest steady"),
+            (self._today_blocked, "Nudges shown"),
         ]:
             col = QVBoxLayout()
             col.setSpacing(2)
             col.setAlignment(Qt.AlignmentFlag.AlignCenter)
             val_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            val_widget.setStyleSheet(
-                f"font-family: {BRAND_DISPLAY_FONT}, ui-serif, Georgia, serif;"
-                f"font-size: {FS_TITLE}px;"
-                f"color: {_LABEL};"
-                f"background: transparent;"
-            )
+            val_widget.setFont(mac_native.system_font(FS_TITLE, "semibold"))
+            val_widget.setStyleSheet(f"color: {CX_TEXT}; background: transparent;")
+            _set_accessible_name(val_widget, title)
             heading = QLabel(title)
             heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
             heading.setFont(mac_native.system_font(FS_CAPTION, "regular"))
-            heading.setStyleSheet(
-                f"color: {_LABEL_TERTIARY}; background: transparent;"
-            )
+            heading.setStyleSheet(f"color: {CX_TEXT_SECONDARY}; background: transparent;")
             col.addWidget(val_widget)
             col.addWidget(heading)
             today_row.addLayout(col, stretch=1)
 
-        root.addLayout(today_row)
+        stats_col.addLayout(today_row)
+        self._session_stats.setVisible(False)
+        root.addWidget(self._session_stats)
         root.addStretch()
 
-        # UI redesign: footer meta strip (ambient chips: focus-protection,
-        # break, baseline, cost) sits just above the Stop button, pushed to
-        # the bottom by the stretch above so the top bar stays uncluttered.
+        # Footer meta strip (ambient chips) just above the session control.
         root.addLayout(self._meta_strip)
 
-        # ── Stop button (HIG destructive role) ─────────────────────────
+        # ── Session control ─────────────────────────────────────────────
+        # "End session" stops sensing and shows the recap; Cortex stays
+        # open. "Quit Cortex" appears only once the session has ended and
+        # names its consequence. Cmd+Q belongs to Quit alone (app menu /
+        # tray), never to this button.
         root.addSpacing(SP4)
-        self._stop_btn = QPushButton("Stop Cortex")
+        footer = QHBoxLayout()
+        footer.setContentsMargins(0, 0, 0, 0)
+        footer.setSpacing(SP2)
+
+        self._quit_btn = QPushButton("Quit Cortex")
+        self._quit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._quit_btn.setMinimumHeight(36)
+        self._quit_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
+        self._quit_btn.setStyleSheet(BTN_DESTRUCTIVE_QSS)
+        try:
+            self._quit_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        except Exception:
+            pass
+        _set_accessible_name(self._quit_btn, "Quit Cortex")
+        _set_accessible_description(
+            self._quit_btn,
+            "Quits Cortex. Sensing is already off; the menu-bar icon closes "
+            "until you relaunch.",
+        )
+        try:
+            self._quit_btn.setToolTip("Quits Cortex and closes the menu-bar icon")
+        except Exception:
+            pass
+        self._quit_btn.setVisible(False)
+        self._quit_btn.clicked.connect(self._on_quit_clicked)
+        footer.addWidget(self._quit_btn)
+
+        self._stop_btn = QPushButton("End session")
         self._stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._stop_btn.setMinimumHeight(36)  # HIG tap target ≥ 44 once font padding factored
+        self._stop_btn.setMinimumHeight(36)
         self._stop_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
-        self._stop_btn.setShortcut("Ctrl+Q")  # VoiceOver picks this up
-        _set_accessible_name(self._stop_btn, "Stop Cortex")
-        # Phase J-5: ensure the destructive Stop button is keyboard
-        # reachable on every Qt build. The shortcut alone doesn't put
-        # the button into the tab cycle.
+        self._stop_btn.setStyleSheet(BTN_GHOST_QSS)
         try:
             self._stop_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         except Exception:
             pass
-        self._stop_btn.setStyleSheet(
-            "QPushButton {"
-            f"  border: 0.5px solid {_SEPARATOR};"
-            f"  background: {_CONTROL_BG};"
-            f"  color: {_DANGER};"
-            f"  border-radius: 8px;"
-            f"  padding: 6px 14px;"
-            "}"
-            f"QPushButton:hover {{ background: rgba(215, 0, 21, 0.06); }}"
-            f"QPushButton:pressed {{ background: rgba(215, 0, 21, 0.12); }}"
-        )
-        # E.1: emit stop_requested so the parent dashboard re-emits and the
-        # app-level handler calls _shutdown_daemon.
-        # F34: clicking the button transitions to the "stopping" state.
-        # The button disables itself, displays "Stopping…", and arms a safety
-        # timer that re-enables after `_STOP_SAFETY_TIMEOUT_MS` even if the
-        # daemon never reports `daemon_stopped`. Double-click coalesces to a
-        # single emission because the second click hits a disabled button.
         self._stop_safety_timer = QTimer(self)
         self._stop_safety_timer.setSingleShot(True)
         self._stop_safety_timer.setInterval(_STOP_SAFETY_TIMEOUT_MS)
         self._stop_safety_timer.timeout.connect(self._stop_safety_expired)
-        self._stop_btn.clicked.connect(self._handle_stop_clicked)
-        root.addWidget(self._stop_btn)
+        self._stop_btn.clicked.connect(self._on_primary_clicked)
+        footer.addWidget(self._stop_btn, stretch=1)
+        root.addLayout(footer)
+        self._enter_phase(_PHASE_DISCONNECTED)
 
-        # F55: explicit tab-order chain. Without setTabOrder, Qt falls
-        # back to widget-creation order which is usually right but is not
-        # contractual — a single re-ordering of constructor lines can
-        # silently scramble VoiceOver / keyboard navigation. The chain
-        # below is the canonical reading order: Goal → Connect → Stop.
+        # F55: explicit tab-order chain: Goal → Connect → Quit → session control.
         _set_tab_order(self._goal_input, self._connect_btn)
-        _set_tab_order(self._connect_btn, self._stop_btn)
+        _set_tab_order(self._connect_btn, self._quit_btn)
+        _set_tab_order(self._quit_btn, self._stop_btn)
 
     # -- Public update methods (preserved byte-identical) ----------------
 
@@ -1477,12 +1291,11 @@ class _ConsumerTab(QWidget):
         return True
 
     def refresh_baseline_freshness(self) -> None:
-        """P0 §3.4 — refresh the freshness pill next to the state badge.
+        """P0 §3.4 — refresh the measured-profile chip in the meta strip.
 
-        Hidden when the baseline file does not exist (don't shame users
-        during onboarding). When >30 days old we surface a quiet
-        "Recalibrate?" prompt; otherwise the pill stays hidden so the
-        dashboard chrome remains uncluttered."""
+        Hidden when no profile exists (don't shame users during onboarding)
+        or it is fresh. Past 30 days the chip becomes a real control:
+        "Profile is N days old · Recalibrate" starts recalibration."""
         pill = getattr(self, "_baseline_pill", None)
         if pill is None:
             return
@@ -1490,19 +1303,19 @@ class _ConsumerTab(QWidget):
             age = _baseline_age_days()
         except Exception:
             return
-        if age is None:
+        if age is None or age <= 30.0:
             pill.setVisible(False)
             return
-        if age > 30.0:
-            pill.setText("Measured profile is old · Recalibrate?")
-            pill.setStyleSheet(
-                f"color: {BRAND_ACCENT_TEXT}; background: {_GROUPED_BG};"
-                f" border-radius: {RADIUS_PILL}px; padding: 3px 10px;"
-                " margin-left: 8px;"
+        days = int(age)
+        pill.setText(f"Profile is {days} days old · Recalibrate")
+        try:
+            pill.setToolTip(
+                "Measured baselines drift over time. Starts the guided "
+                "recalibration; nothing is saved until you review it."
             )
-            pill.setVisible(True)
-        else:
-            pill.setVisible(False)
+        except Exception:
+            pass
+        pill.setVisible(True)
 
     # ── P0 §3.15: LLM cost meter ────────────────────────────────────
 
@@ -1540,21 +1353,12 @@ class _ConsumerTab(QWidget):
         self._cost_last_value = cost
         try:
             self._cost_pill.setText(text)
-            if ratio >= 0.80:
-                color = BRAND_ACCENT_TEXT
-            elif ratio >= 0.50:
-                color = _LABEL_SECONDARY
-            else:
-                color = _LABEL_TERTIARY
+            color = BRAND_ACCENT_TEXT if ratio >= 0.80 else CX_TEXT_SECONDARY
             self._cost_pill.setStyleSheet(
-                "QLabel#CortexCostPill {"
-                f"  color: {color};"
-                f"  background: {_GROUPED_BG};"
-                f"  border-radius: {RADIUS_PILL}px;"
-                "  padding: 3px 10px;"
-                "  margin-left: 8px;"
-                "}"
+                f"QLabel#CortexCostPill {{ {PILL_QSS} color: {color}; }}"
             )
+            # The chip exists only once the daemon has reported real spend.
+            self._cost_pill.setVisible(True)
         except Exception:
             logger.debug("cost pill update failed", exc_info=True)
         # One-shot 80% threshold toast.
@@ -1629,14 +1433,14 @@ class _ConsumerTab(QWidget):
                 pass
             menu.setStyleSheet(
                 f"QMenu#RecentGoalsMenu {{"
-                f" background-color: {_CONTROL_BG};"
-                f" color: {_LABEL};"
-                f" border: 1px solid {_SEPARATOR};"
+                f" background-color: {CX_SURFACE};"
+                f" color: {CX_TEXT};"
+                f" border: 1px solid {CX_BORDER_DEFAULT};"
                 f" border-radius: 8px; padding: 4px; }}"
                 f"QMenu#RecentGoalsMenu::item {{"
                 f" padding: 6px 12px; border-radius: 5px; }}"
                 f"QMenu#RecentGoalsMenu::item:selected {{"
-                f" background-color: {BRAND_ACCENT}; color: {_LABEL}; }}"
+                f" background-color: {BRAND_ACCENT}; color: {CX_TEXT}; }}"
             )
             menu.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
             for g in goals:
@@ -1750,36 +1554,12 @@ class _ConsumerTab(QWidget):
             self._quiet_capsule.setText(label)
         except Exception:
             logger.debug("quiet capsule label update failed", exc_info=True)
-        if kind != "off":
-            try:
-                self._quiet_capsule.setStyleSheet(
-                    "QPushButton {"
-                    f"  background: {BRAND_ACCENT}22;"
-                    f"  color: {BRAND_ACCENT_TEXT};"
-                    f"  border-radius: {RADIUS_PILL}px;"
-                    "  padding: 3px 12px;"
-                    "  margin-left: 8px;"
-                    "  border: none;"
-                    "}"
-                    "QPushButton:hover { background: rgba(217,119,87,0.28); }"
-                )
-            except Exception:
-                pass
-        else:
-            try:
-                self._quiet_capsule.setStyleSheet(
-                    "QPushButton {"
-                    f"  background: {_GROUPED_BG};"
-                    f"  color: {_LABEL_SECONDARY};"
-                    f"  border-radius: {RADIUS_PILL}px;"
-                    "  padding: 3px 12px;"
-                    "  margin-left: 8px;"
-                    "  border: none;"
-                    "}"
-                    f"QPushButton:hover {{ background: rgba(0,0,0,0.05); color: {_LABEL}; }}"
-                )
-            except Exception:
-                pass
+        try:
+            self._quiet_capsule.setStyleSheet(
+                _ACCENT_PILL_BUTTON_QSS if kind != "off" else PILL_BUTTON_QSS
+            )
+        except Exception:
+            pass
 
     def apply_auto_focus_state(self, armed: bool, preset: str = "") -> None:
         """P0 §3.10: show / hide the focus-protection toast pill."""
@@ -2051,11 +1831,8 @@ class _ConsumerTab(QWidget):
         self._undo_toast = toast
 
     def _refresh_restore_pill(self) -> None:
-        """Show / hide the "Restore previous state" pill based on the
+        """Show / hide the "Restore previous state" chip based on the
         sliding-window membership of recently reversible actions."""
-        # The pill itself is created lazily so the dashboard's header
-        # doesn't grow another permanent widget when no reversible
-        # action has happened yet.
         import time as _time
         now = _time.monotonic()
         cutoff = now - self._reversible_window_seconds
@@ -2063,41 +1840,11 @@ class _ConsumerTab(QWidget):
             entry for entry in self._reversible_actions
             if entry[0] >= cutoff
         ]
-        # Lazily build the pill.
-        if not hasattr(self, "_restore_pill") or self._restore_pill is None:
-            pill = QPushButton("Restore previous state")
-            try:
-                pill.setCursor(Qt.CursorShape.PointingHandCursor)
-            except Exception:
-                pass
-            pill.setFont(mac_native.system_font(FS_CAPTION, "medium"))
-            pill.setStyleSheet(
-                "QPushButton {"
-                f"  background: {_GROUPED_BG};"
-                f"  color: {_LABEL_SECONDARY};"
-                f"  border-radius: {RADIUS_PILL}px;"
-                "  padding: 3px 10px;"
-                "  border: none;"
-                "}"
-                f"QPushButton:hover {{ background: rgba(0,0,0,0.05); color: {_LABEL}; }}"
-            )
-            try:
-                pill.clicked.connect(self._on_restore_pill_clicked)
-            except Exception:
-                pass
-            try:
-                # Add to header row if available.
-                self._header_layout.addWidget(  # type: ignore[attr-defined]
-                    pill, alignment=Qt.AlignmentFlag.AlignVCenter,
-                )
-            except Exception:
-                # No header reference — keep the pill detached; the
-                # consumer can show()/hide() it programmatically without
-                # blowing up.
-                pass
-            self._restore_pill: QPushButton | None = pill
+        pill = getattr(self, "_restore_pill", None)
+        if pill is None:
+            return
         try:
-            self._restore_pill.setVisible(bool(self._reversible_actions))
+            pill.setVisible(bool(self._reversible_actions))
         except Exception:
             pass
 
@@ -2142,7 +1889,7 @@ class _ConsumerTab(QWidget):
                 if health_text.startswith("Camera offline"):
                     health_text = (
                         f"{health_text} · "
-                        f'<a style="color: {_DANGER};" '
+                        f'<a style="color: {CX_DANGER};" '
                         'href="cortex-settings">Open Settings</a>'
                     )
                 self._set_text_if_changed(self._health_banner, health_text)
@@ -2154,19 +1901,16 @@ class _ConsumerTab(QWidget):
             # setText; the visibility flag isn't load-bearing.
             pass
 
+        # A state frame means the daemon is live, whatever the connection
+        # signal said last.
+        if self._session_phase in (_PHASE_STARTING, _PHASE_DISCONNECTED):
+            self._enter_phase(_PHASE_LIVE)
+
         state = view.state
-        dot_color = STATE_COLORS.get(state, _LABEL_TERTIARY)
-        text_color = STATE_TEXT_COLORS.get(state, _LABEL_TERTIARY)
-        self._set_style_if_changed(
-            self._state_dot, f"background: {dot_color}; border-radius: 3px;"
-        )
-        self._set_text_if_changed(self._state_label, view.label)
-        self._set_style_if_changed(
-            self._state_label, f"color: {text_color}; background: transparent;"
-        )
+        self._last_state = state
+        self._render_state_badge(state, view.label)
 
         hr = view.heart_rate
-        hrv = view.hrv_rmssd
         blink = view.blink_rate
 
         # When no heart-rate has landed yet, swap the BPM/HRV/BLK row for
@@ -2193,20 +1937,17 @@ class _ConsumerTab(QWidget):
                 pass
             self._set_text_if_changed(self._bpm_label, f"{hr:.0f}")
             self._set_text_if_changed(
-                self._hrv_label, f"{hrv:.0f}" if hrv is not None else "--"
-            )
-            self._set_text_if_changed(
                 self._blk_label, f"{blink:.1f}" if blink is not None else "--"
             )
 
-        # Audit-2 fix: drive the Today panel from accumulated session
-        # stats instead of leaving the placeholder "--" labels. We
-        # accumulate steady-activity seconds, count interventions seen, and
-        # track the longest contiguous steady streak. Approximation is
-        # acceptable here — these are at-a-glance numerics, not
-        # research data — and is better than dead UI.
+        # "This session" stats accumulate steady-activity seconds, the
+        # longest contiguous steady run, and nudges shown. The section is
+        # revealed only once a real estimate has arrived.
         try:
             self._accumulate_today_stats(state)
+            if state != "UNKNOWN" and not self._has_estimate:
+                self._has_estimate = True
+                self._session_stats.setVisible(True)
         except Exception:
             # Don't let a stats bug crash state rendering.
             pass
@@ -2252,7 +1993,6 @@ class _ConsumerTab(QWidget):
         self._today_session_started_at = self._today_last_tick
         try:
             self._set_text_if_changed(self._today_focus, "0m")
-            self._set_text_if_changed(self._today_sessions, "1")
             self._set_text_if_changed(self._today_best, "0s")
             self._set_text_if_changed(self._today_blocked, "0")
         except Exception:
@@ -2300,15 +2040,14 @@ class _ConsumerTab(QWidget):
             else (f"{best_m}m" if best_m else f"{int(self._today_best_streak)}s")
         )
         self._set_text_if_changed(self._today_focus, focus_text)
-        self._set_text_if_changed(self._today_sessions, "1")
         self._set_text_if_changed(self._today_best, best_text)
         self._set_text_if_changed(
             self._today_blocked, str(self._today_intervention_count)
         )
 
     def record_intervention_seen(self) -> None:
-        """Audit-2 fix: invoked by the parent dashboard when an
-        intervention is broadcast so the Today/Blocked counter advances.
+        """Invoked by the parent dashboard when an intervention is
+        broadcast so the "Nudges shown" counter advances.
         """
         if not hasattr(self, "_today_intervention_count"):
             self._today_intervention_count = 0
@@ -2321,59 +2060,205 @@ class _ConsumerTab(QWidget):
             pass
 
     def set_extension_connected(self, name: str, connected: bool) -> None:
-        """Audit-2 fix: update the Chrome / Edge / Editor connection dots.
+        """Update a Chrome / Edge / Editor connection row: dot colour, the
+        "· On / Off" text, and the accessible name together.
+
+        The visible word is short because three rows plus the Connect control
+        share one 380 px line; "Connected" overflowed it on the v0.4.0 local
+        build. The accessible name keeps the full word.
 
         ``name`` is matched case-insensitively against the constructed
         keys ("Chrome", "Edge", "Editor"). Unknown names are ignored.
         """
-        dot = None
-        for key, widget in self._conn_dots.items():
+        key_match = None
+        for key in self._conn_dots:
             if key.lower() == (name or "").lower():
-                dot = widget
+                key_match = key
                 break
-        if dot is None:
+        if key_match is None:
             return
-        color = BRAND_ACCENT if connected else _LABEL_TERTIARY
+        dot = self._conn_dots[key_match]
+        label = self._conn_labels.get(key_match)
+        color = CX_SUCCESS if connected else CX_TEXT_TERTIARY
+        status = "On" if connected else "Off"
         try:
-            self._set_style_if_changed(
-                dot, f"background: {color}; border-radius: 3px;"
-            )
+            self._set_style_if_changed(dot, status_dot_qss(color, size=6))
         except Exception:
             pass
+        if label is not None:
+            self._set_text_if_changed(label, f"{key_match} · {status}")
+            self._set_style_if_changed(
+                label,
+                f"color: {CX_TEXT if connected else CX_TEXT_SECONDARY};"
+                " background: transparent;",
+            )
+            _set_accessible_name(
+                label,
+                f"{key_match} extension: {'connected' if connected else 'off'}",
+            )
 
     def set_connected(self, connected: bool) -> None:
         # G3 (audit-prod): when the daemon connection drops, gray every
-        # extension dot too — they can't possibly be alive without the
+        # extension row too — they can't possibly be alive without the
         # daemon. This keeps the dashboard's connection story coherent.
-        if not connected:
-            for name in list(self._conn_dots.keys()):
-                self.set_extension_connected(name, False)
         if connected:
-            self._set_text_if_changed(self._state_label, "Connected")
-            self._set_style_if_changed(
-                self._state_dot,
-                f"background: {BRAND_ACCENT}; border-radius: 3px;",
-            )
+            self._ended_by_user = False
+            self._enter_phase(_PHASE_LIVE)
+            return
+        for name in list(self._conn_dots.keys()):
+            self.set_extension_connected(name, False)
+        if self._session_phase == _PHASE_STOPPING:
+            # The daemon went away while we were ending the session: that
+            # is the acknowledgement, whichever host mode we run in.
+            self.notify_daemon_stopped()
+        elif self._session_phase == _PHASE_ENDED:
+            return
         else:
-            self._set_text_if_changed(self._state_label, "Disconnected")
-            self._set_style_if_changed(
-                self._state_dot,
-                f"background: {_LABEL_TERTIARY}; border-radius: 3px;",
-            )
+            self._enter_phase(_PHASE_DISCONNECTED)
 
     def set_starting(self) -> None:
         """Render a truthful pre-readiness state during daemon startup."""
-
         for name in list(self._conn_dots.keys()):
             self.set_extension_connected(name, False)
-        self._set_text_if_changed(self._state_label, "Starting…")
+        self._enter_phase(_PHASE_STARTING)
+
+    def set_session_restart_available(self, available: bool) -> None:
+        """Whether this host can start a new session after one ends.
+
+        The in-process app restarts its daemon; the WebSocket dev shell
+        cannot start a daemon, so its ended state offers Quit only.
+        """
+        self._restart_available = bool(available)
+        self._enter_phase(self._session_phase)
+
+    def apply_palette_change(self) -> None:
+        """Re-render state colours after the accessibility palette changed."""
+        if self._session_phase == _PHASE_LIVE and self._has_received_state:
+            label = self._render_cache.get(id(self._state_label), {}).get("text", "")
+            self._render_state_badge(self._last_state, label or "")
+
+    def _render_state_badge(self, state: str, label: str) -> None:
+        """Dot + label for a live state estimate (palette-aware)."""
+        if state == "UNKNOWN":
+            dot_color = CX_TEXT_TERTIARY
+            text_color = CX_TEXT_SECONDARY
+        else:
+            dot_color = active_state_color(state)
+            text_color = STATE_TEXT_COLORS.get(state, CX_TEXT_SECONDARY)
+        self._set_style_if_changed(self._state_dot, status_dot_qss(dot_color, size=7))
+        self._set_text_if_changed(self._state_label, label)
         self._set_style_if_changed(
-            self._state_dot,
-            f"background: {_LABEL_TERTIARY}; border-radius: 3px;",
+            self._state_label, f"color: {text_color}; background: transparent;"
         )
 
     # ------------------------------------------------------------------
-    # F34 — Stop button state machine
+    # Session lifecycle — one place decides every label
+    # ------------------------------------------------------------------
+
+    def _enter_phase(self, phase: str) -> None:
+        previous = self._session_phase
+        self._session_phase = phase
+        btn = self._stop_btn
+        quit_btn = getattr(self, "_quit_btn", None)
+        restart = self._restart_available
+
+        def _pill(text: str, color: str = CX_TEXT_TERTIARY) -> None:
+            self._set_text_if_changed(self._state_label, text)
+            self._set_style_if_changed(self._state_dot, status_dot_qss(color, size=7))
+            self._set_style_if_changed(
+                self._state_label,
+                f"color: {CX_TEXT_SECONDARY}; background: transparent;",
+            )
+
+        show_quit = False
+        if phase == _PHASE_STARTING:
+            btn.setText("Starting…")
+            btn.setEnabled(False)
+            _set_accessible_name(btn, "Starting session")
+            _set_accessible_description(btn, "Cortex is starting its sensors.")
+            _pill("Starting…")
+        elif phase == _PHASE_LIVE:
+            btn.setText("End session")
+            btn.setEnabled(True)
+            _set_accessible_name(btn, "End session")
+            _set_accessible_description(
+                btn,
+                "Stops sensing and shows a summary of this session. "
+                "Cortex stays open.",
+            )
+            if previous != _PHASE_LIVE:
+                _pill("Connected", _CONNECTED_DOT)
+        elif phase == _PHASE_STOPPING:
+            btn.setText("Ending…")
+            btn.setEnabled(False)
+            _set_accessible_name(btn, "Ending session")
+            _set_accessible_description(btn, "Cortex is stopping its sensors.")
+            _pill("Ending session…")
+        elif phase == _PHASE_ENDED:
+            show_quit = True
+            if restart:
+                btn.setText("Start session")
+                btn.setEnabled(True)
+                _set_accessible_name(btn, "Start session")
+                _set_accessible_description(
+                    btn, "Starts the camera and input sensing again.",
+                )
+            else:
+                btn.setText("Session ended")
+                btn.setEnabled(False)
+                _set_accessible_name(btn, "Session ended")
+                _set_accessible_description(
+                    btn, "Sensing is off. Relaunch the daemon to start again.",
+                )
+            _pill("Session ended")
+        else:  # disconnected
+            show_quit = True
+            if restart:
+                btn.setText("Start session")
+                btn.setEnabled(True)
+                _set_accessible_name(btn, "Start session")
+                _set_accessible_description(
+                    btn, "Starts the camera and input sensing.",
+                )
+            else:
+                btn.setText("Disconnected")
+                btn.setEnabled(False)
+                _set_accessible_name(btn, "Disconnected")
+                _set_accessible_description(
+                    btn, "Cortex is not connected to its daemon.",
+                )
+            _pill("Disconnected")
+        if quit_btn is not None:
+            try:
+                quit_btn.setVisible(show_quit)
+            except Exception:
+                pass
+
+    def _on_primary_clicked(self) -> None:
+        """Footer control: End session while live, Start session after."""
+        if self._session_phase == _PHASE_LIVE:
+            self._arm_stop()
+        elif self._session_phase in (_PHASE_ENDED, _PHASE_DISCONNECTED):
+            self._request_session_start()
+
+    def _request_session_start(self) -> None:
+        if not self._restart_available:
+            return
+        self._enter_phase(_PHASE_STARTING)
+        try:
+            self.session_start_requested.emit()
+        except Exception:
+            logger.debug("session_start_requested.emit raised", exc_info=True)
+
+    def _on_quit_clicked(self) -> None:
+        """Explicit quit after the session has ended — no recap pending."""
+        try:
+            self.gui_quit_requested.emit()
+        except Exception:
+            logger.debug("gui_quit_requested.emit raised", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # F34 — End-session state machine
     # ------------------------------------------------------------------
 
     def _handle_stop_clicked(self) -> None:
@@ -2382,34 +2267,33 @@ class _ConsumerTab(QWidget):
         §3.3) is the single source of truth."""
         self._arm_stop()
 
-    def _arm_stop(self) -> None:
-        """P0 §3.3 phase 1 — fire the daemon-stop request, disarm the
-        Stop affordance, and *wait* for the SESSION_RECAP broadcast
-        before quitting Qt.
+    def _arm_stop(self, *, quit_after: bool = False) -> None:
+        """P0 §3.3 phase 1 — ask the daemon to stop and wait for the
+        SESSION_RECAP broadcast.
 
-        Phase 4.B fix (#1): the previous implementation did NOT emit
-        any signal here. The daemon therefore never received a stop
-        request, the SESSION_RECAP pipeline never ran, and the recap
-        sheet was unreachable — every click ended in the 6 s watchdog
-        firing followed by a hard quit. The new contract:
+        ``quit_after`` records the route the user chose: False for "End
+        session" (Cortex stays open once the recap is consumed), True for
+        a user-initiated quit (tray, Cmd+Q). Whichever it is, the recap
+        sheet's "View full report" keeps Cortex open and its "Quit
+        Cortex" quits — the user can always change their mind on the
+        sheet.
 
-        * ``daemon_stop_requested`` fires IMMEDIATELY. The controller
-          schedules ``daemon.stop()`` on its asyncio loop; this kicks
-          off the SESSION_RECAP broadcast pipeline (or short-session
-          synthetic empty-payload broadcast).
-        * The safety + recap watchdogs arm so the GUI doesn't wedge
-          if either the recap or the daemon never report back.
-        * ``gui_quit_requested`` is deferred to :meth:`_finalize_stop`,
-          which fires when the recap is dismissed / the watchdog
-          expires / the safety timer expires.
+        * ``daemon_stop_requested`` fires IMMEDIATELY so the controller
+          can schedule ``daemon.stop()`` and the SESSION_RECAP pipeline
+          runs.
+        * The safety + recap watchdogs arm so the GUI doesn't wedge if
+          either the recap or the daemon never report back.
+        * The route completes in :meth:`_finalize_stop` (recap dismissed
+          / watchdog / safety / daemon ack without recap).
 
         Double clicks are coalesced via ``self._stopping``.
         """
         if getattr(self, "_stopping", False):
             return
         self._stopping = True
-        self._stop_btn.setEnabled(False)
-        self._stop_btn.setText("Stopping…")
+        self._quit_after_stop = bool(quit_after)
+        self._ended_by_user = True
+        self._enter_phase(_PHASE_STOPPING)
         self._stop_safety_timer.start()
         # Recap-watchdog: if no SESSION_RECAP arrives in
         # ``_RECAP_WATCHDOG_MS`` ms, proceed with quit anyway. Matches
@@ -2448,16 +2332,15 @@ class _ConsumerTab(QWidget):
         logger.info("Recap watchdog expired; finalising stop without recap sheet")
         self._finalize_stop()
 
-    def _finalize_stop(self) -> None:
-        """P0 §3.3 phase 2 — quit the Qt app now that the recap has been
-        consumed (or its watchdog expired). Idempotent; safe to call
-        from the recap-sheet dismiss handler, the recap-watchdog, the
-        safety timer, or the controller's own shutdown path.
+    def _finalize_stop(self, *, quit: bool | None = None) -> None:
+        """P0 §3.3 phase 2 — complete the route the user chose now that
+        the recap has been consumed (or its watchdog expired).
 
-        Phase 4.B fix (#1): emits ``gui_quit_requested`` rather than
-        the legacy ``stop_requested``. The daemon-stop signal was
-        already fired from :meth:`_arm_stop`; this signal is solely
-        about quitting the GUI now that the user has seen the recap.
+        ``quit`` overrides the route recorded by :meth:`_arm_stop`: the
+        recap sheet passes False for "View full report" (stay open) and
+        True for "Quit Cortex". Idempotent; safe to call from the
+        recap-sheet handlers, the watchdog, the safety timer, or the
+        daemon-ack path.
         """
         if getattr(self, "_recap_finalised", False):
             return
@@ -2467,40 +2350,47 @@ class _ConsumerTab(QWidget):
                 self._recap_watchdog.stop()
             except Exception:
                 pass
-        try:
-            self.gui_quit_requested.emit()
-        except Exception:
-            logger.debug("gui_quit_requested.emit raised", exc_info=True)
+        should_quit = self._quit_after_stop if quit is None else bool(quit)
+        self._quit_after_stop = should_quit
+        if should_quit:
+            try:
+                self.gui_quit_requested.emit()
+            except Exception:
+                logger.debug("gui_quit_requested.emit raised", exc_info=True)
+        elif not self._stopping:
+            # The daemon already acknowledged; the session is over and
+            # Cortex stays open.
+            self._enter_phase(_PHASE_ENDED)
 
     def _stop_safety_expired(self) -> None:
-        """F34 safety net: if the daemon never reports stopped, re-enable
-        the button so the user can try again rather than be wedged.
-
-        Also force-finalises the recap flow so a missed SESSION_RECAP
-        cannot wedge the user inside ``_arm_stop`` indefinitely.
+        """F34 safety net: if the daemon never reports stopped, finish the
+        route and re-enable the footer control so the user is not wedged.
         """
         logger.warning(
-            "Stop button safety timeout fired; re-enabling without daemon ack"
+            "End-session safety timeout fired; finalising without daemon ack"
         )
-        # Finalise before re-enabling so the daemon does receive the
-        # stop request even on the slow path.
         self._finalize_stop()
         self.notify_daemon_stopped()
 
     def notify_daemon_stopped(self) -> None:
-        """Called when the daemon confirms shutdown (controller wires this).
-        Idempotent — safe to call from both the daemon-ack path and the
-        safety-timer path."""
+        """Called when the daemon confirms shutdown (controller wires this;
+        the connection-dropped path calls it too). Idempotent.
+
+        If the recap watchdog is still armed no recap can arrive any more,
+        so the route is completed here instead of waiting out the 6 s.
+        """
         self._stop_safety_timer.stop()
-        if getattr(self, "_recap_watchdog", None) is not None:
-            try:
-                self._recap_watchdog.stop()
-            except Exception:
-                pass
         self._stopping = False
-        self._recap_finalised = True  # No more emits expected.
-        self._stop_btn.setEnabled(True)
-        self._stop_btn.setText("Stop Cortex")
+        watchdog = getattr(self, "_recap_watchdog", None)
+        if watchdog is not None:
+            try:
+                pending = bool(watchdog.isActive())
+            except Exception:
+                pending = False
+            if pending:
+                self._finalize_stop()
+        if not self._quit_after_stop or not getattr(self, "_recap_finalised", False):
+            self._enter_phase(_PHASE_ENDED)
 
 
 # ---------------------------------------------------------------------------
@@ -2528,17 +2418,17 @@ class HRTracePlot(QWidget):
         pad = 8
 
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(_CONTROL_BG))
+        painter.setBrush(QColor(CX_SURFACE))
         path = QPainterPath()
         path.addRoundedRect(QRectF(0, 0, w, h), RADIUS_CARD, RADIUS_CARD)
         painter.drawPath(path)
 
-        painter.setPen(QPen(QColor(0, 0, 0, 24), 1))  # ~ system separator 15%
+        painter.setPen(QPen(QColor(CX_BORDER_DEFAULT), 1))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPath(path)
 
         if len(self._values) < 2:
-            painter.setPen(QColor(_LABEL_TERTIARY))
+            painter.setPen(QColor(CX_TEXT_TERTIARY))
             painter.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Waiting for HR data...")
             painter.end()
@@ -2566,7 +2456,7 @@ class HRTracePlot(QWidget):
             y2 = pad + (h - 2 * pad) - int((vals[i] - min_hr) / hr_range * (h - 2 * pad))
             painter.drawLine(x1, y1, x2, y2)
 
-        painter.setPen(QColor(_LABEL))
+        painter.setPen(QColor(CX_TEXT))
         f = mac_native.system_font(FS_FOOTNOTE, "semibold")
         if isinstance(f, QFont):
             painter.setFont(f)
@@ -2588,7 +2478,7 @@ class _SignalQualityBar(QWidget):
         self._label.setFixedWidth(76)
         self._label.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
         self._label.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
         layout.addWidget(self._label)
         self._bar = QProgressBar()
@@ -2597,7 +2487,7 @@ class _SignalQualityBar(QWidget):
         self._bar.setTextVisible(False)
         self._bar.setFixedHeight(5)
         self._bar.setStyleSheet(
-            f"QProgressBar {{ background: {_GROUPED_BG};"
+            f"QProgressBar {{ background: {CX_BG_SECONDARY};"
             f" border: none; border-radius: 2px; }}"
             f"QProgressBar::chunk {{ background: {BRAND_ACCENT};"
             f" border-radius: 2px; }}"
@@ -2609,7 +2499,7 @@ class _SignalQualityBar(QWidget):
         self._val_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._val_label.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         self._val_label.setStyleSheet(
-            f"color: {_LABEL_TERTIARY}; background: transparent;"
+            f"color: {CX_TEXT_TERTIARY}; background: transparent;"
         )
         layout.addWidget(self._val_label)
 
@@ -2618,13 +2508,13 @@ class _SignalQualityBar(QWidget):
         self._bar.setValue(pct)
         self._val_label.setText(f"{pct}%")
         if quality >= 0.7:
-            color = SEMANTIC_LIGHT["success"]
+            color = CX_SUCCESS
         elif quality >= 0.4:
-            color = BIO_BLINK
+            color = SEMANTIC_LIGHT["warning"]
         else:
-            color = _DANGER
+            color = CX_DANGER
         self._bar.setStyleSheet(
-            f"QProgressBar {{ background: {_GROUPED_BG};"
+            f"QProgressBar {{ background: {CX_BG_SECONDARY};"
             f" border: none; border-radius: 2px; }}"
             f"QProgressBar::chunk {{ background: {color};"
             f" border-radius: 2px; }}"
@@ -2681,7 +2571,7 @@ class _AdvancedTab(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setStyleSheet(f"background: transparent; color: {_LABEL};")
+        self.setStyleSheet(f"background: transparent; color: {CX_TEXT};")
         self._timeline_events: list[dict] = []
         self._session_start = time.monotonic()
         # F31: render-cache per widget; only setText / setValue when the
@@ -2703,8 +2593,8 @@ class _AdvancedTab(QWidget):
         # so the developer (and curious user) doesn't read the zero bars
         # as "Cortex is broken". Hidden once update_state arrives.
         self._empty_state = QLabel(
-            "Start a session to populate signal quality, heart-rate "
-            "trace, and support scores."
+            "Waiting for the camera — signal quality, heart-rate trace, and "
+            "support scores appear once frames arrive."
         )
         self._empty_state.setObjectName("CortexAdvancedEmptyState")
         self._empty_state.setWordWrap(True)
@@ -2712,11 +2602,10 @@ class _AdvancedTab(QWidget):
         self._empty_state.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         self._empty_state.setStyleSheet(
             "QLabel#CortexAdvancedEmptyState {"
-            f"  color: {_LABEL_TERTIARY};"
-            f"  background: {_GROUPED_BG};"
+            f"  color: {CX_TEXT_SECONDARY};"
+            f"  background: {CX_BG_SECONDARY};"
             f"  border-radius: {RADIUS_CARD}px;"
             "  padding: 10px 14px;"
-            "  font-style: italic;"
             "}"
         )
         _set_accessible_name(self._empty_state, "Advanced tab empty state")
@@ -2731,10 +2620,10 @@ class _AdvancedTab(QWidget):
         # Warm terracotta hint without recoloring the whole tab.
         self._degraded_badge.setStyleSheet(
             "QLabel#CortexDegradedBadge {"
-            "  color: #B25430;"  # deep terracotta, WCAG-AA on grouped bg
+            f"  color: {BRAND_ACCENT_TEXT};"
             "  background-color: rgba(217, 119, 87, 0.10);"
-            "  border: 0.5px solid rgba(217, 119, 87, 0.35);"
-            "  border-radius: 6px;"
+            "  border: 1px solid rgba(217, 119, 87, 0.35);"
+            f"  border-radius: {RADIUS_CARD}px;"
             "  padding: 4px 10px;"
             "}"
         )
@@ -2743,9 +2632,7 @@ class _AdvancedTab(QWidget):
 
         sq_label = QLabel("Signal quality")
         sq_label.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
-        sq_label.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
-        )
+        sq_label.setStyleSheet(SECTION_HEADING_QSS)
         layout.addWidget(sq_label)
 
         self._physio_q = _SignalQualityBar("Physio")
@@ -2758,35 +2645,34 @@ class _AdvancedTab(QWidget):
 
         hr_label = QLabel("Heart rate")
         hr_label.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
-        hr_label.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
-        )
+        hr_label.setStyleSheet(SECTION_HEADING_QSS)
         layout.addWidget(hr_label)
         self._hr_plot = HRTracePlot()
         layout.addWidget(self._hr_plot)
 
         scores_label = QLabel("Support scores")
         scores_label.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
-        scores_label.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
-        )
+        scores_label.setStyleSheet(SECTION_HEADING_QSS)
         layout.addWidget(scores_label)
 
         scores_grid = QGridLayout()
         scores_grid.setVerticalSpacing(6)
         self._score_bars: dict[str, QProgressBar] = {}
         self._score_labels: dict[str, QLabel] = {}
-        for i, (name, display_name, color) in enumerate([
-            ("flow", "Steady", STATE_COLORS["FLOW"]),
-            ("hyper", "Support", STATE_COLORS["HYPER"]),
-            ("hypo", "Quiet", STATE_COLORS["HYPO"]),
-            ("recovery", "Settling", STATE_COLORS["RECOVERY"]),
+        self._score_states: dict[str, str] = {}
+        for i, (name, display_name, state_key) in enumerate([
+            ("flow", "Steady", "FLOW"),
+            ("hyper", "Support", "HYPER"),
+            ("hypo", "Quiet", "HYPO"),
+            ("recovery", "Settling", "RECOVERY"),
         ]):
+            color = active_state_color(state_key)
+            self._score_states[name] = state_key
             lbl = QLabel(display_name)
             lbl.setFixedWidth(72)
             lbl.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
             lbl.setStyleSheet(
-                f"color: {_LABEL_SECONDARY}; background: transparent;"
+                f"color: {CX_TEXT_SECONDARY}; background: transparent;"
             )
             scores_grid.addWidget(lbl, i, 0)
             bar = QProgressBar()
@@ -2795,7 +2681,7 @@ class _AdvancedTab(QWidget):
             bar.setFixedHeight(5)
             bar.setTextVisible(False)
             bar.setStyleSheet(
-                f"QProgressBar {{ background: {_GROUPED_BG}; border: none;"
+                f"QProgressBar {{ background: {CX_BG_SECONDARY}; border: none;"
                 f" border-radius: 2px; }}"
                 f"QProgressBar::chunk {{ background: {color};"
                 f" border-radius: 2px; }}"
@@ -2806,7 +2692,7 @@ class _AdvancedTab(QWidget):
             val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             val_lbl.setFont(mac_native.system_font(FS_CAPTION, "regular"))
             val_lbl.setStyleSheet(
-                f"color: {_LABEL_TERTIARY}; background: transparent;"
+                f"color: {CX_TEXT_TERTIARY}; background: transparent;"
             )
             scores_grid.addWidget(val_lbl, i, 2)
             self._score_bars[name] = bar
@@ -2817,12 +2703,12 @@ class _AdvancedTab(QWidget):
         self._confidence_lbl = QLabel("Evidence strength: --")
         self._confidence_lbl.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
         self._confidence_lbl.setStyleSheet(
-            f"color: {_LABEL_TERTIARY}; background: transparent;"
+            f"color: {CX_TEXT_TERTIARY}; background: transparent;"
         )
         self._dwell_lbl = QLabel("Dwell: --")
         self._dwell_lbl.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
         self._dwell_lbl.setStyleSheet(
-            f"color: {_LABEL_TERTIARY}; background: transparent;"
+            f"color: {CX_TEXT_TERTIARY}; background: transparent;"
         )
         meta_row.addWidget(self._confidence_lbl)
         meta_row.addStretch()
@@ -2831,15 +2717,13 @@ class _AdvancedTab(QWidget):
 
         tl_label = QLabel("Timeline")
         tl_label.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
-        tl_label.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
-        )
+        tl_label.setStyleSheet(SECTION_HEADING_QSS)
         layout.addWidget(tl_label)
         self._timeline_text = QLabel("No events yet")
         self._timeline_text.setWordWrap(True)
         self._timeline_text.setStyleSheet(
             f"font-family: {FONT_MONO};"
-            f"font-size: {FS_CAPTION}px; color: {_LABEL_SECONDARY};"
+            f"font-size: {FS_CAPTION}px; color: {CX_TEXT_SECONDARY};"
             f"background: transparent; line-height: 1.6;"
         )
         self._timeline_text.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -2861,6 +2745,20 @@ class _AdvancedTab(QWidget):
         slot["value"] = value
         widget.setValue(value)
         return True
+
+    def apply_palette_change(self) -> None:
+        """Restyle the support-score bars after the palette changed."""
+        for name, bar in self._score_bars.items():
+            color = active_state_color(self._score_states.get(name, ""))
+            try:
+                bar.setStyleSheet(
+                    f"QProgressBar {{ background: {CX_BG_SECONDARY}; border: none;"
+                    f" border-radius: 2px; }}"
+                    f"QProgressBar::chunk {{ background: {color};"
+                    f" border-radius: 2px; }}"
+                )
+            except Exception:
+                logger.debug("score bar restyle failed", exc_info=True)
 
     def update_state(self, payload: dict) -> None:
         # Phase J-3: first frame retires the empty-state panel.
@@ -2965,7 +2863,7 @@ class ConceptsDialog(QDialog):
         except Exception:
             pass
         try:
-            self.setStyleSheet(f"background: {_WINDOW_BG};")
+            self.setStyleSheet(f"background: {CX_BG};")
         except Exception:
             pass
         layout = QVBoxLayout(self)
@@ -2977,7 +2875,7 @@ class ConceptsDialog(QDialog):
         try:
             title = QLabel("Concepts")
             title.setFont(mac_native.system_font(FS_TITLE, "semibold"))
-            title.setStyleSheet(f"color: {_LABEL}; background: transparent;")
+            title.setStyleSheet(f"color: {CX_TEXT}; background: transparent;")
             layout.addWidget(title)
         except Exception:
             pass
@@ -2993,15 +2891,18 @@ class ConceptsDialog(QDialog):
                 desc.setWordWrap(True)
                 desc.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
                 desc.setStyleSheet(
-                    f"color: {_LABEL_SECONDARY}; background: transparent;"
+                    f"color: {CX_TEXT_SECONDARY}; background: transparent;"
                 )
                 layout.addWidget(desc)
             except Exception:
                 continue
         try:
             close_btn = QPushButton("Close")
+            close_btn.setStyleSheet(BTN_GHOST_QSS)
+            close_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            _set_accessible_name(close_btn, "Close concepts")
             close_btn.clicked.connect(self.accept)
-            layout.addWidget(close_btn)
+            layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignRight)
         except Exception:
             pass
 
@@ -3060,10 +2961,14 @@ class DashboardWindow(QWidget):
     force_recap_requested = Signal()
     dismiss_overlay_requested = Signal()
     open_settings_requested = Signal()
+    # Session lifecycle re-emits (see ``_ConsumerTab``).
+    session_start_requested = Signal()
+    recalibrate_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._connected = False
+        self._last_recap_payload: dict = {}
         self.setObjectName("CortexDashboard")
         self.setWindowTitle("Cortex")
         # HIG: minimum width, flexible. Macs at 1024×768 still fit comfortably.
@@ -3095,24 +3000,20 @@ class DashboardWindow(QWidget):
         except Exception:
             _history_segment_available = False
         if _history_segment_available:
-            self._seg = _MacSegmentedControl(["Dashboard", "History", "Advanced"])
+            self._seg = SegmentedControl(["Dashboard", "History", "Advanced"])
         else:
-            self._seg = _MacSegmentedControl(["Dashboard", "Advanced"])
+            self._seg = SegmentedControl(["Dashboard", "Advanced"])
         seg_container.addWidget(self._seg, stretch=1)
         layout.addLayout(seg_container)
 
-        # Phase J-2: error toast lives under the segmented control so it
-        # is visible from either tab. Hidden until ``show_error`` is
-        # called. Lazy-import the Toast helper at construction time so a
-        # legacy mock harness that swaps out PySide6 doesn't crash on
-        # module import — the toast is itself test-stub-tolerant.
+        # Phase J-2: the status toast FLOATS over the content (a plain
+        # child widget positioned by ``_place_toast``), so surfacing an
+        # error never reflows the page. Hidden until ``show_error`` /
+        # ``show_info_toast``. Construction is guarded so the legacy mock
+        # harness that swaps out PySide6 keeps the dashboard importable.
         try:
             from cortex.apps.desktop_shell.components import Toast
-            toast_container = QHBoxLayout()
-            toast_container.setContentsMargins(SP6, 0, SP6, SP3)
             self._toast: Toast | None = Toast(self)
-            toast_container.addWidget(self._toast, stretch=1)
-            layout.addLayout(toast_container)
         except Exception:  # pragma: no cover - mock harness without Toast
             logger.debug("Toast widget unavailable; skipping", exc_info=True)
             self._toast = None
@@ -3177,6 +3078,14 @@ class DashboardWindow(QWidget):
             self._consumer.open_settings_requested.connect(
                 self.open_settings_requested.emit,
             )
+        if hasattr(self._consumer, "session_start_requested"):
+            self._consumer.session_start_requested.connect(
+                self.session_start_requested.emit,
+            )
+        if hasattr(self._consumer, "recalibrate_requested"):
+            self._consumer.recalibrate_requested.connect(
+                self.recalibrate_requested.emit,
+            )
 
         # P0 §3.1 + §3.2: forward history-tab outgoing signals so the
         # controller can route them to the daemon via WS or direct call.
@@ -3212,9 +3121,26 @@ class DashboardWindow(QWidget):
         # show is cheap and idempotent.
         try:
             mac_native.apply_unified_titlebar(self)
-            mac_native.apply_vibrancy(self, material="window_background")
+            mac_native.apply_vibrancy(self)
         except Exception:
             logger.debug("native chrome application failed", exc_info=True)
+        self._place_toast()
+
+    def resizeEvent(self, event: object) -> None:  # noqa: D401 - Qt override
+        super().resizeEvent(event)
+        self._place_toast()
+
+    def _place_toast(self) -> None:
+        """Float the toast just below the segmented control."""
+        toast = getattr(self, "_toast", None)
+        if toast is None:
+            return
+        try:
+            top = self._seg.geometry().bottom() + SP2
+            toast.set_top_offset(max(SP3, top))
+            toast.reposition()
+        except Exception:
+            logger.debug("toast placement failed", exc_info=True)
 
     # -- Public update methods (signature-stable) ------------------------
 
@@ -3240,6 +3166,22 @@ class DashboardWindow(QWidget):
     def set_starting(self) -> None:
         self._connected = False
         self._consumer.set_starting()
+
+    def set_session_restart_available(self, available: bool) -> None:
+        """Forward the host's restart capability to the session control."""
+        if self._consumer is not None and hasattr(
+            self._consumer, "set_session_restart_available"
+        ):
+            self._consumer.set_session_restart_available(available)
+
+    def apply_palette_change(self) -> None:
+        """Re-render state colours on every tab after a palette swap."""
+        for tab in (self._consumer, self._advanced):
+            if tab is not None and hasattr(tab, "apply_palette_change"):
+                try:
+                    tab.apply_palette_change()
+                except Exception:
+                    logger.debug("palette re-render failed", exc_info=True)
 
     def set_extension_connected(self, name: str, connected: bool) -> None:
         """Audit-2 fix: update the Chrome / Edge / Editor connection
@@ -3366,6 +3308,7 @@ class DashboardWindow(QWidget):
                         "recap watchdog stop on recap arrival failed",
                         exc_info=True,
                     )
+        self._last_recap_payload = dict(payload)
         if self._recap_sheet is None:
             try:
                 from cortex.apps.desktop_shell.recap_sheet import RecapSheet
@@ -3374,6 +3317,9 @@ class DashboardWindow(QWidget):
                 self._recap_sheet.view_full_report.connect(
                     self._on_recap_view_full,
                 )
+                quit_signal = getattr(self._recap_sheet, "quit_requested", None)
+                if quit_signal is not None:
+                    quit_signal.connect(self._on_recap_quit)
             except Exception:
                 logger.debug("Failed to construct RecapSheet", exc_info=True)
                 self._recap_sheet = None
@@ -3385,8 +3331,15 @@ class DashboardWindow(QWidget):
                     except Exception:
                         logger.debug("fallback finalize_stop failed", exc_info=True)
                 return
+        quit_pending = bool(getattr(self._consumer, "_quit_after_stop", False))
         try:
-            self._recap_sheet.show_report(payload)
+            self._recap_sheet.show_report(payload, quit_pending=quit_pending)
+        except TypeError:
+            # Older / stub sheets without the keyword.
+            try:
+                self._recap_sheet.show_report(payload)
+            except Exception:
+                logger.debug("show_report failed", exc_info=True)
         except Exception:
             logger.debug("show_report failed", exc_info=True)
             if self._consumer is not None:
@@ -3533,52 +3486,54 @@ class DashboardWindow(QWidget):
                 logger.debug("finalize_stop on dismiss failed", exc_info=True)
 
     def _on_recap_view_full(self, session_id: str) -> None:
-        """User clicked ``View full report →``. Switch to the History
-        tab, request the detail, then continue with the shutdown like
-        a normal dismiss.
-
-        Phase 4.B fix (#22): uses the public
-        ``_MacSegmentedControl.set_selected`` API rather than reaching
-        into the private ``_buttons`` list. The set_selected call
-        emits ``selection_changed`` itself, which drives the
-        ``QStackedWidget``'s ``setCurrentIndex`` via the existing
-        connection — so we no longer need a separate manual switch.
+        """User chose ``View full report``: keep Cortex open, switch to
+        the History tab, and show the report from the recap payload
+        already in hand — the daemon has stopped, so nothing is requested
+        from it. Viewing cancels any pending quit.
         """
-        # Compute the History tab index defensively because the
-        # ``HistoryTab`` may be absent in degraded mock harnesses.
+        if self._consumer is not None:
+            try:
+                self._consumer._finalize_stop(quit=False)
+            except Exception:
+                logger.debug("finalize_stop on view_full failed", exc_info=True)
         history_index = 1 if self._history_tab is not None else -1
-        if history_index >= 0:
-            # Prefer the public set_selected API; fall back to the
-            # private stack-index path if the segmented control is a
-            # mock stub without set_selected.
-            if hasattr(self._seg, "set_selected"):
-                try:
-                    self._seg.set_selected(history_index)
-                except Exception:
-                    logger.debug(
-                        "_MacSegmentedControl.set_selected failed",
-                        exc_info=True,
-                    )
-            else:
-                try:
-                    self._stack.setCurrentIndex(history_index)
-                except Exception:
-                    logger.debug("switch to History tab failed", exc_info=True)
+        if history_index < 0:
+            return
+        if hasattr(self._seg, "set_selected"):
+            try:
+                self._seg.set_selected(history_index)
+            except Exception:
+                logger.debug("SegmentedControl.set_selected failed", exc_info=True)
+        else:
+            try:
+                self._stack.setCurrentIndex(history_index)
+            except Exception:
+                logger.debug("switch to History tab failed", exc_info=True)
+        report = self._last_recap_payload
+        if str(report.get("session_id") or "") != str(session_id or ""):
+            report = {}
+        try:
+            self._history_tab.open_detail(session_id, report=report or None)
+        except TypeError:
             try:
                 self._history_tab.open_detail(session_id)
             except Exception:
                 logger.debug("HistoryTab.open_detail failed", exc_info=True)
-        # Continue with the shutdown — user already consumed the recap.
+        except Exception:
+            logger.debug("HistoryTab.open_detail failed", exc_info=True)
+
+    def _on_recap_quit(self) -> None:
+        """User chose ``Quit Cortex`` on the recap sheet."""
         if self._consumer is not None:
             try:
-                self._consumer._finalize_stop()
+                self._consumer._finalize_stop(quit=True)
             except Exception:
-                logger.debug("finalize_stop on view_full failed", exc_info=True)
+                logger.debug("finalize_stop on recap quit failed", exc_info=True)
 
     # Phase J-2 ----------------------------------------------------------
 
     def show_error(self, title: str, body: str, cid: str = "") -> None:
-        """Surface a daemon error in the top-bar toast.
+        """Surface a daemon error in the floating toast.
 
         ``cid`` is the F19 correlation id quoted back to the user so a
         support engineer can grep the daemon log for the matching entry.
@@ -3592,6 +3547,7 @@ class DashboardWindow(QWidget):
                 title, body, cid,
             )
             return
+        self._place_toast()
         self._toast.show_error(title, body, cid)
 
     def show_info_toast(self, title: str, body: str = "") -> None:
@@ -3602,6 +3558,7 @@ class DashboardWindow(QWidget):
             logger.info("Toast unavailable; info toast skipped: %s", title)
             return
         try:
+            self._place_toast()
             self._toast.show_info(title, body)
         except Exception:
             logger.debug("show_info_toast failed", exc_info=True)

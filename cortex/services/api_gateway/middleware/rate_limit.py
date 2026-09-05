@@ -38,8 +38,10 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp
 
+from cortex.libs.auth import verify_token
 from cortex.libs.logging.correlation import get_correlation_id
 from cortex.libs.logging.structured import EventType
+from cortex.services.api_gateway.auth import extract_token
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +86,19 @@ def _normalise_route(path: str, *, limits: dict[str, int]) -> str | None:
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Per-IP, per-route sliding-window rate limiter."""
+    """Per-IP, per-route sliding-window rate limiter.
+
+    D3: with ``authenticated_only`` (the default) a request only consumes
+    bucket budget after its capability token validates. The middleware
+    wraps the whole app while auth is a route dependency, and every
+    local client shares the ``127.0.0.1`` bucket — so without this an
+    unauthenticated localhost page could exhaust ``/shutdown``,
+    ``/consent/reset`` or ``/api/launch`` and starve the real clients.
+    Unauthenticated requests pass straight through to the route, whose
+    ``require_capability_token`` dependency answers 401 without any
+    budget having been spent. Isolated harnesses that mount the limiter
+    without the auth dependency pass ``authenticated_only=False``.
+    """
 
     def __init__(
         self,
@@ -93,11 +107,13 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         limits: dict[str, int] | None = None,
         window_seconds: float = WINDOW_SECONDS,
         time_func: Callable[[], float] = time.monotonic,
+        authenticated_only: bool = True,
     ) -> None:
         super().__init__(app)
         self._limits: dict[str, int] = dict(limits) if limits is not None else dict(DEFAULT_LIMITS)
         self._window: float = float(window_seconds)
         self._now = time_func
+        self._authenticated_only = bool(authenticated_only)
         # ``defaultdict`` over a tuple key keeps the API simple; tests
         # can introspect ``self._buckets`` directly to assert window
         # behaviour without touching private internals.
@@ -109,6 +125,11 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     def limits(self) -> dict[str, int]:
         """Snapshot of the configured per-route caps (read-only view)."""
         return dict(self._limits)
+
+    @property
+    def authenticated_only(self) -> bool:
+        """True when unauthenticated requests never consume budget (D3)."""
+        return self._authenticated_only
 
     def reset(self) -> None:
         """Clear all buckets — exposed for test isolation only."""
@@ -123,12 +144,26 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if route is None:
             return await call_next(request)
 
+        if self._authenticated_only and not self._presents_valid_token(request):
+            # D3: no budget for callers that cannot pass the route's own
+            # token gate; the dependency answers 401 downstream.
+            return await call_next(request)
+
         ip = self._client_ip(request)
         retry_after = self._consume(ip, route)
         if retry_after is None:
             return await call_next(request)
 
         return self._build_429(route=route, ip=ip, retry_after=retry_after)
+
+    @staticmethod
+    def _presents_valid_token(request: Request) -> bool:
+        """Same extraction + constant-time compare as ``require_capability_token``."""
+        token = extract_token(
+            request.headers.get("authorization"),
+            request.headers.get("x-cortex-auth-token"),
+        )
+        return bool(token) and verify_token(token)
 
     # -- Bucket arithmetic ------------------------------------------------
 

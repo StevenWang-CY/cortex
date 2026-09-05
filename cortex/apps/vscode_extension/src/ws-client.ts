@@ -5,6 +5,19 @@
  * Handles STATE_UPDATE and INTERVENTION_TRIGGER messages from daemon,
  * sends IDENTIFY and USER_ACTION messages to daemon.
  * Auto-reconnects on disconnect with exponential backoff.
+ *
+ * Connection contract (audit A1/A4/A5):
+ *   - Only loopback daemon URLs are accepted; anything else is refused
+ *     before a socket is opened because the channel carries the local
+ *     capability token and editor content.
+ *   - ``AUTH`` is the first frame on every socket. The client is only
+ *     reported as *connected* after the daemon answers ``AUTH_OK``;
+ *     ``IDENTIFY`` and the offline outbox are flushed after that.
+ *   - A missing capability token surfaces one warning naming the token
+ *     path; the socket is closed and the backoff cycle re-checks the
+ *     file later instead of tripping the daemon's 1011 auth gate.
+ *   - Daemon close code 1011 and ``PROTOCOL_ERROR`` are surfaced to the
+ *     user instead of being logged to a console nobody reads.
  */
 
 import * as vscode from "vscode";
@@ -14,17 +27,24 @@ import * as os from "os";
 import * as path from "path";
 import { randomUUID } from "crypto";
 import type {
-    InterventionAuthorizationRequest,
     InterventionReceiptBatch,
     WSMessage as WSMessageSchema,
 } from "./generated/cortex_schemas";
 
+/** Result of looking up the daemon-minted capability token. */
+export interface CapabilityTokenLookup {
+    /** The token, or ``null`` when the file is absent/unreadable/too short. */
+    token: string | null;
+    /** Absolute path that was checked (``null`` only if it cannot be resolved). */
+    path: string | null;
+}
+
 /**
- * Audit Debt-2: read the local capability token the daemon mints at
- * ``<config_dir>/auth.token``. The legitimate VS Code extension can
- * read this file because it runs as the same user as the daemon.
+ * Resolve ``<config_dir>/auth.token`` for the current platform. Mirrors the
+ * daemon's config-dir rules so the warning shown when the file is missing
+ * names the exact path the user can inspect.
  */
-function readCapabilityToken(): string | null {
+export function resolveCapabilityTokenPath(): string | null {
     try {
         let configDir: string;
         const platform = process.platform;
@@ -45,15 +65,56 @@ function readCapabilityToken(): string | null {
                 ? path.join(xdg, "cortex")
                 : path.join(os.homedir(), ".config", "cortex");
         }
-        const tokenFile = path.join(configDir, "auth.token");
-        if (!fs.existsSync(tokenFile)) {
-            return null;
-        }
-        const raw = fs.readFileSync(tokenFile, "utf-8").trim();
-        return raw.length >= 32 ? raw : null;
+        return path.join(configDir, "auth.token");
     } catch {
         return null;
     }
+}
+
+/**
+ * Audit Debt-2: read the local capability token the daemon mints at
+ * ``<config_dir>/auth.token``. The legitimate VS Code extension can
+ * read this file because it runs as the same user as the daemon.
+ */
+export function readCapabilityToken(): CapabilityTokenLookup {
+    const tokenFile = resolveCapabilityTokenPath();
+    if (!tokenFile) return { token: null, path: null };
+    try {
+        if (!fs.existsSync(tokenFile)) {
+            return { token: null, path: tokenFile };
+        }
+        const raw = fs.readFileSync(tokenFile, "utf-8").trim();
+        return { token: raw.length >= 32 ? raw : null, path: tokenFile };
+    } catch {
+        return { token: null, path: tokenFile };
+    }
+}
+
+/**
+ * A1: only loopback hosts may receive the auth token + editor content.
+ * Accepts ``ws://127.0.0.1``, ``ws://localhost`` and ``ws://[::1]`` (any
+ * port, ``wss`` allowed for the same hosts). Everything else — other
+ * hosts, other schemes, unparsable strings — is refused.
+ */
+export function isLoopbackDaemonUrl(url: string): boolean {
+    let parsed: URL;
+    try {
+        parsed = new URL(url);
+    } catch {
+        return false;
+    }
+    if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") {
+        return false;
+    }
+    if (parsed.username || parsed.password) {
+        return false;
+    }
+    const host = parsed.hostname.toLowerCase();
+    if (host === "localhost" || host === "[::1]" || host === "::1") {
+        return true;
+    }
+    // 127.0.0.0/8 — the whole IPv4 loopback block.
+    return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
 }
 
 /** Generated wire envelope with metadata optional only before send stamping. */
@@ -100,6 +161,11 @@ type SettingsHandler = (payload: Record<string, unknown>) => void;
 type CopilotThrottleHandler = (payload: Record<string, unknown>) => void;
 type GenericMessageHandler = (msg: { type: string; payload: Record<string, unknown> }) => void;
 
+/** Injectable collaborators (test seam; production uses the defaults). */
+export interface CortexWSClientDeps {
+    readToken?: () => CapabilityTokenLookup;
+}
+
 /**
  * Typed rejection for ``sendWhyDetailRequest`` timeouts.
  *
@@ -141,6 +207,17 @@ export class CortexWSClient {
     private readonly _seenInboundEventIds = new Set<string>();
     private readonly _seenInboundEventOrder: string[] = [];
     private static readonly _MAX_SEEN_EVENT_IDS = 512;
+    private readonly _readToken: () => CapabilityTokenLookup;
+
+    /**
+     * A4: the daemon must answer ``AUTH`` with ``AUTH_OK`` before the
+     * client counts as connected. If nothing arrives within this window
+     * the socket is torn down so the backoff cycle can retry instead of
+     * sitting in a half-open limbo where the heartbeat (frame-level
+     * pongs are answered by the transport, not the daemon) never fires.
+     */
+    private static readonly _AUTH_TIMEOUT_MS = 10_000;
+    private _authTimer: ReturnType<typeof setTimeout> | undefined;
 
     /**
      * F6 (Phase-4 audit): WebSocket frame-level ping/pong heartbeat.
@@ -165,6 +242,15 @@ export class CortexWSClient {
     // should be propagation-aware. ``disconnect()`` aborts this controller
     // so the queued reconnect doesn't fire after teardown.
     private _reconnectAbort: AbortController | undefined;
+
+    // One-shot user-facing notices. Each is reset when the condition it
+    // describes clears so a *new* episode warns again, but a reconnect
+    // storm never stacks toasts.
+    private _hasConnectedOnce = false;
+    private _tokenWarningShown = false;
+    private _urlRefusalShown = false;
+    private _protocolErrorPromptOpen = false;
+    private _lastCloseWarningReason: string | null = null;
 
     // Event handlers
     private _stateUpdateHandlers: StateUpdateHandler[] = [];
@@ -207,11 +293,13 @@ export class CortexWSClient {
     constructor(
         url: string,
         private readonly _clientInstanceId = `vscode_${CLIENT_BOOT_ID}`,
+        deps: CortexWSClientDeps = {},
     ) {
         this._url = url;
+        this._readToken = deps.readToken ?? readCapabilityToken;
     }
 
-    /** Whether the client is currently connected. */
+    /** Whether the client is currently connected (i.e. past ``AUTH_OK``). */
     get connected(): boolean {
         return this._connected;
     }
@@ -228,6 +316,11 @@ export class CortexWSClient {
     /** Per-process identity used to bind editor-origin authorizations. */
     get clientBootId(): string {
         return CLIENT_BOOT_ID;
+    }
+
+    /** The daemon URL this client targets. */
+    get url(): string {
+        return this._url;
     }
 
     /** Register a handler for STATE_UPDATE messages. */
@@ -272,10 +365,37 @@ export class CortexWSClient {
     }
 
     /**
+     * A14: switch the daemon URL at runtime (``cortex.daemonUrl`` changed
+     * in settings). Non-loopback URLs are refused and the previous URL
+     * stays in effect. If a connection or reconnect cycle is active it
+     * is restarted against the new URL.
+     */
+    setUrl(url: string): void {
+        if (url === this._url) return;
+        if (!isLoopbackDaemonUrl(url)) {
+            this._refuseUrl(url);
+            return;
+        }
+        this._url = url;
+        this._urlRefusalShown = false;
+        const active = Boolean(this._ws) || this._connected || Boolean(this._reconnectTimer);
+        if (!active) return;
+        this.disconnect();
+        this.connect();
+    }
+
+    /**
      * Connect to the Cortex daemon WebSocket server.
      */
     connect(): void {
         if (this._connected || this._ws) {
+            return;
+        }
+
+        if (!isLoopbackDaemonUrl(this._url)) {
+            // A1: never open a socket to a non-loopback host. No reconnect
+            // is scheduled — a bad URL cannot fix itself.
+            this._refuseUrl(this._url);
             return;
         }
 
@@ -289,82 +409,7 @@ export class CortexWSClient {
                 this._seenInboundEventIds.clear();
                 this._seenInboundEventOrder.length = 0;
                 this._negotiatedProtocolVersion = PROTOCOL_VERSION;
-                this._connected = true;
-                this._reconnectDelay = 3000; // Reset backoff
-                this._notifyConnection(true);
-                // F6 (Phase-4 audit): start the heartbeat the moment
-                // we transition to "open". A stale connection where
-                // the TCP socket stayed up but the daemon stopped
-                // serving will be detected within ~45s instead of
-                // waiting for the next inbound message that never
-                // arrives.
-                this._startHeartbeat();
-
-                // Audit Debt-2: AUTH first. The daemon refuses every other
-                // type until this frame validates; without it the server
-                // closes the connection with code 1011 ("auth required")
-                // before any STATE_UPDATE reaches us. We send the cached
-                // capability token synchronously inline so an
-                // unauthenticated socket can't be tricked into emitting
-                // any other frame.
-                const token = readCapabilityToken();
-                if (token && this._ws) {
-                    try {
-                        this._ws.send(
-                            JSON.stringify(withWireMetadata({
-                                type: "AUTH",
-                                payload: {
-                                    auth_token: token,
-                                    protocol_version: PROTOCOL_VERSION,
-                                    supported_protocol_versions: [
-                                        ...SUPPORTED_PROTOCOL_VERSIONS,
-                                    ],
-                                },
-                                timestamp: Date.now() / 1000,
-                                sequence: ++this._sequence,
-                            } as WSMessage, this._negotiatedProtocolVersion)),
-                        );
-                    } catch {
-                        // Will be retried on reconnect
-                    }
-                }
-
-                // Identify as VS Code extension
-                this._send({
-                    type: "IDENTIFY",
-                    payload: {
-                        client_type: "vscode",
-                        client_instance_id: this._clientInstanceId,
-                    },
-                    timestamp: Date.now() / 1000,
-                    sequence: ++this._sequence,
-                });
-
-                // P1 (Task A): flush the bounded outbox now that we've
-                // reattached. Drain in FIFO order; do NOT re-queue on
-                // failure — a transient send error during flush is
-                // logged but not retried (the next disconnect/connect
-                // cycle would re-queue infinitely otherwise).
-                const queued = this._outbox;
-                this._outbox = [];
-                this._overflowWarned = false;
-                for (const msg of queued) {
-                    try {
-                        this._ws?.send(JSON.stringify(withWireMetadata(
-                            msg,
-                            this._negotiatedProtocolVersion,
-                        )));
-                    } catch {
-                        // Connection torn down mid-flush; remaining
-                        // messages will be lost. The reconnect handler
-                        // re-enters this path on the next open.
-                    }
-                }
-
-                vscode.window.setStatusBarMessage(
-                    "Cortex: Connected to daemon",
-                    3000,
-                );
+                this._onSocketOpen();
             });
 
             this._ws.on("message", (data: WebSocket.RawData) => {
@@ -379,14 +424,18 @@ export class CortexWSClient {
                 this._lastPongAt = Date.now();
             });
 
-            this._ws.on("close", () => {
-                this._handleDisconnect();
+            this._ws.on("close", (code: number, reason: Buffer | string) => {
+                const reasonText = typeof reason === "string"
+                    ? reason
+                    : (reason ? reason.toString() : "");
+                this._handleDisconnect(code, reasonText);
             });
 
             this._ws.on("error", () => {
                 // onclose will follow; no extra handling needed
             });
         } catch {
+            this._ws = undefined;
             this._scheduleReconnect();
         }
     }
@@ -409,16 +458,237 @@ export class CortexWSClient {
         // F6: stop the heartbeat before tearing down the socket so we
         // don't spuriously trigger reconnect on the in-flight ping.
         this._stopHeartbeat();
+        this._clearAuthTimer();
 
         if (this._ws) {
             this._ws.removeAllListeners("close");
-            this._ws.close();
+            try {
+                this._ws.close();
+            } catch {
+                // Socket may already be dead.
+            }
             this._ws = undefined;
         }
 
         if (this._connected) {
             this._connected = false;
             this._notifyConnection(false);
+        }
+    }
+
+    /**
+     * Socket opened: send AUTH (or, without a token, warn once and back
+     * off). Nothing else is emitted until ``AUTH_OK`` arrives.
+     */
+    private _onSocketOpen(): void {
+        const lookup = this._readToken();
+        if (!lookup.token) {
+            this._warnMissingToken(lookup.path);
+            // Close *our* side so ``_handleDisconnect`` re-arms the
+            // backoff cycle and re-reads the token file later. Sending
+            // any other frame first would make the daemon close with
+            // 1011 and produce the same loop with an extra warning.
+            try {
+                this._ws?.close(1000, "no capability token");
+            } catch {
+                // close event follows regardless
+            }
+            return;
+        }
+        this._tokenWarningShown = false;
+
+        // Audit Debt-2: AUTH first. The daemon refuses every other
+        // type until this frame validates; without it the server
+        // closes the connection with code 1011 ("auth required")
+        // before any STATE_UPDATE reaches us. The frame bypasses the
+        // outbox because we are deliberately not "connected" yet.
+        this._sendRaw({
+            type: "AUTH",
+            payload: {
+                auth_token: lookup.token,
+                protocol_version: PROTOCOL_VERSION,
+                supported_protocol_versions: [
+                    ...SUPPORTED_PROTOCOL_VERSIONS,
+                ],
+            },
+            timestamp: Date.now() / 1000,
+            sequence: ++this._sequence,
+        } as WSMessage);
+
+        this._clearAuthTimer();
+        this._authTimer = setTimeout(() => {
+            this._authTimer = undefined;
+            if (this._connected || !this._ws) return;
+            console.warn("[Cortex] no AUTH_OK within timeout — reconnecting");
+            try {
+                this._ws.terminate();
+            } catch {
+                // close event follows
+            }
+        }, CortexWSClient._AUTH_TIMEOUT_MS);
+    }
+
+    /** ``AUTH_OK`` received: the channel is open for real now. */
+    private _onAuthenticated(selectedProtocol: unknown): void {
+        if (selectedProtocol === "1.0" || selectedProtocol === "2.0") {
+            this._negotiatedProtocolVersion = selectedProtocol;
+        }
+        if (selectedProtocol !== PROTOCOL_VERSION) {
+            console.warn(
+                `[Cortex] daemon selected protocol ${String(selectedProtocol)}; expected ${PROTOCOL_VERSION}`,
+            );
+        }
+        if (this._connected) {
+            // Idempotent replay ACK — nothing else to do.
+            return;
+        }
+        this._clearAuthTimer();
+        this._connected = true;
+        this._reconnectDelay = 3000; // Reset backoff
+        this._lastCloseWarningReason = null;
+        // F6 (Phase-4 audit): start the heartbeat the moment the channel
+        // is live. A stale connection where the TCP socket stayed up but
+        // the daemon stopped serving is detected within ~45s.
+        this._startHeartbeat();
+
+        // Identify as VS Code extension (only after AUTH_OK — A4).
+        this._send({
+            type: "IDENTIFY",
+            payload: {
+                client_type: "vscode",
+                client_instance_id: this._clientInstanceId,
+            },
+            timestamp: Date.now() / 1000,
+            sequence: ++this._sequence,
+        });
+
+        // P1 (Task A): flush the bounded outbox now that we've
+        // reattached. Drain in FIFO order; do NOT re-queue on
+        // failure — a transient send error during flush is
+        // logged but not retried (the next disconnect/connect
+        // cycle would re-queue infinitely otherwise).
+        const queued = this._outbox;
+        this._outbox = [];
+        this._overflowWarned = false;
+        for (const msg of queued) {
+            try {
+                this._ws?.send(JSON.stringify(withWireMetadata(
+                    msg,
+                    this._negotiatedProtocolVersion,
+                )));
+            } catch {
+                // Connection torn down mid-flush; remaining
+                // messages will be lost. The reconnect handler
+                // re-enters this path on the next open.
+            }
+        }
+
+        this._notifyConnection(true);
+
+        // UX: the status-bar item already reflects reconnects; only the
+        // first successful connection of this extension host gets a toast.
+        if (!this._hasConnectedOnce) {
+            this._hasConnectedOnce = true;
+            try {
+                vscode.window.setStatusBarMessage(
+                    "Cortex: Connected to daemon",
+                    3000,
+                );
+            } catch {
+                // Host without a status bar (tests).
+            }
+        }
+    }
+
+    private _warnMissingToken(tokenPath: string | null): void {
+        if (this._tokenWarningShown) return;
+        this._tokenWarningShown = true;
+        const where = tokenPath ?? "the Cortex config directory";
+        const message =
+            "Cortex isn't running or hasn't created its local auth token yet "
+            + `(expected at ${where}). Start the Cortex app, then reconnect.`;
+        try {
+            void Promise.resolve(
+                vscode.window.showWarningMessage(message, "Open Cortex"),
+            ).then((choice) => {
+                if (choice === "Open Cortex") {
+                    void vscode.commands.executeCommand("cortex.showPanel");
+                }
+            }).catch(() => undefined);
+        } catch {
+            console.warn(`[Cortex] ${message}`);
+        }
+    }
+
+    private _refuseUrl(url: string): void {
+        console.error(`[Cortex] refusing non-loopback daemon URL: ${url}`);
+        if (this._urlRefusalShown) return;
+        this._urlRefusalShown = true;
+        try {
+            void vscode.window.showErrorMessage(
+                `Cortex refused to connect to ${url}: only loopback daemon URLs `
+                + "are allowed (ws://127.0.0.1:9473, ws://localhost, ws://[::1]). "
+                + "Check the cortex.daemonUrl setting.",
+            );
+        } catch {
+            // Host without message boxes (tests).
+        }
+    }
+
+    private _showProtocolErrorOnce(payload: Record<string, unknown>): void {
+        if (this._protocolErrorPromptOpen) return;
+        this._protocolErrorPromptOpen = true;
+        const code = typeof payload.code === "string" ? payload.code : "protocol_error";
+        const message =
+            `Cortex daemon rejected the connection (${code}). The daemon and `
+            + "this extension speak different protocol versions — update both "
+            + "to matching releases, then retry.";
+        try {
+            void Promise.resolve(
+                vscode.window.showErrorMessage(message, "Retry"),
+            ).then((choice) => {
+                this._protocolErrorPromptOpen = false;
+                if (choice === "Retry") {
+                    this._forceReconnect();
+                }
+            }).catch(() => {
+                this._protocolErrorPromptOpen = false;
+            });
+        } catch {
+            this._protocolErrorPromptOpen = false;
+        }
+    }
+
+    /** Tear down whatever socket exists and dial again immediately. */
+    private _forceReconnect(): void {
+        this._reconnectAbort?.abort();
+        this._reconnectAbort = undefined;
+        if (this._reconnectTimer) {
+            clearTimeout(this._reconnectTimer);
+            this._reconnectTimer = undefined;
+        }
+        this._stopHeartbeat();
+        this._clearAuthTimer();
+        if (this._ws) {
+            this._ws.removeAllListeners("close");
+            try {
+                this._ws.terminate();
+            } catch {
+                // already dead
+            }
+            this._ws = undefined;
+        }
+        if (this._connected) {
+            this._connected = false;
+            this._notifyConnection(false);
+        }
+        this.connect();
+    }
+
+    private _clearAuthTimer(): void {
+        if (this._authTimer) {
+            clearTimeout(this._authTimer);
+            this._authTimer = undefined;
         }
     }
 
@@ -492,18 +762,6 @@ export class CortexWSClient {
                 intervention_id: interventionId,
                 timestamp: Date.now() / 1000,
             },
-            timestamp: Date.now() / 1000,
-            sequence: ++this._sequence,
-        });
-    }
-
-    /** Send one explicit editor-surface authorization request. */
-    sendInterventionAuthorization(
-        request: InterventionAuthorizationRequest,
-    ): void {
-        this._send({
-            type: "INTERVENTION_AUTHORIZE",
-            payload: request as unknown as Record<string, unknown>,
             timestamp: Date.now() / 1000,
             sequence: ++this._sequence,
         });
@@ -646,49 +904,6 @@ export class CortexWSClient {
     }
 
     /**
-     * P0 §3.7: ask the daemon to dispatch a biology break.
-     *
-     * The action runs entirely on the desktop shell (full-screen Qt
-     * overlay) — the editor has nothing to do locally, so we send the
-     * ACTION_EXECUTE frame with ``request_dispatch=true`` and a fully
-     * populated ``action.metadata`` block mirroring the popup CTA
-     * shape. The daemon's ``_handle_user_action`` matches on
-     * ``action_type == "take_biology_break"`` and routes to the
-     * compatibility action is decoded by the daemon. The supported reminder
-     * path is elapsed-focus/user-requested and never physiology-triggered.
-     */
-    sendBiologyBreakRequest(
-        interventionId: string,
-        metadata: {
-            duration_seconds: number;
-            breathing_pattern: string;
-            audio_cue: boolean;
-            reason: string;
-        },
-    ): void {
-        const actionId = `bk_${Date.now()}`;
-        const mins = Math.max(1, Math.round(metadata.duration_seconds / 60));
-        this._send({
-            type: "ACTION_EXECUTE",
-            payload: {
-                intervention_id: interventionId,
-                action_id: actionId,
-                action_type: "take_biology_break",
-                request_dispatch: true,
-                action: {
-                    action_id: actionId,
-                    action_type: "take_biology_break",
-                    label: `Take ${mins} min`,
-                    target: "",
-                    metadata,
-                },
-            },
-            timestamp: Date.now() / 1000,
-            sequence: ++this._sequence,
-        });
-    }
-
-    /**
      * P0 §3.11 / §3.12: send a SNOOZE_REQUEST for an intervention.
      *
      * VS Code uses this from the OS-notification fallback path when
@@ -710,72 +925,20 @@ export class CortexWSClient {
         });
     }
 
-    /**
-     * P0 §3.11: send a QUIET_MODE_TOGGLE for the kind specified.
-     * Kinds: "snooze_15" | "quiet_session" | "pause" | "off".
-     */
-    sendQuietModeToggle(
-        kind: "snooze_15" | "quiet_session" | "pause" | "off",
-        durationMinutes?: number,
-    ): void {
-        this._send({
-            type: "QUIET_MODE_TOGGLE",
-            payload: {
-                kind,
-                duration_minutes:
-                    typeof durationMinutes === "number"
-                        ? durationMinutes
-                        : null,
-                source: "vscode",
-            },
-            timestamp: Date.now() / 1000,
-            sequence: ++this._sequence,
-        });
-    }
-
-    /**
-     * Notify the daemon that an intervention was applied (or restored).
-     *
-     * B.2: the daemon's in-process executor runs an
-     * ``_OptimisticInterventionAdapter`` that assumes success for every
-     * action; the real workspace effects happen here in the VS Code
-     * extension (folds) and in the browser extension (tabs, overlay).
-     * The ack lets the daemon overwrite ``Mutation.success`` with the
-     * actual client outcome, so ``InterventionOutcome.workspace_restored``
-     * is truthful instead of theatrical.
-     *
-     * ``phase`` values:
-     *   - ``"apply"``   — the UIPlan apply ack (folds, overlay). Resolves
-     *     the daemon's pending ``await_apply_confirmation`` future.
-     *   - ``"restore"`` — the unfold/restore ack.
-     *   - ``"execute_action"`` — a discrete EXECUTE_ACTION catalog item
-     *     (e.g. ``resume_last_active_file``) the editor ran directly. A
-     *     distinct phase so the daemon's ``(intervention_id, phase)`` dedup
-     *     key does NOT collapse this ack into the UIPlan ``"apply"`` ack for
-     *     the same intervention; the resume outcome is recorded on its own.
-     */
-    sendInterventionApplied(
-        interventionId: string,
-        phase: "apply" | "restore" | "execute_action",
-        success: boolean,
-        appliedActions: string[],
-        errors: string[],
-    ): void {
-        this._send({
-            type: "INTERVENTION_APPLIED",
-            payload: {
-                intervention_id: interventionId,
-                phase,
-                success,
-                applied_actions: appliedActions,
-                errors,
-            },
-            timestamp: Date.now() / 1000,
-            sequence: ++this._sequence,
-        });
-    }
-
     // --- Internal ---
+
+    /** Write straight to the socket, bypassing the connected-gate/outbox. */
+    private _sendRaw(msg: WSMessage): void {
+        if (!this._ws) return;
+        try {
+            this._ws.send(JSON.stringify(withWireMetadata(
+                msg,
+                this._negotiatedProtocolVersion,
+            )));
+        } catch {
+            // Will be retried on reconnect
+        }
+    }
 
     private _send(msg: WSMessage): void {
         // P1 (Task A): when disconnected, queue into the bounded outbox
@@ -821,22 +984,17 @@ export class CortexWSClient {
         } catch {
             return;
         }
+        if (!msg || typeof msg !== "object") return;
+        if (!msg.payload || typeof msg.payload !== "object") {
+            msg.payload = {};
+        }
 
         if (!this._acceptIncomingMessage(msg)) return;
 
         switch (msg.type) {
-            case "AUTH_OK": {
-                const selected = msg.payload.selected_protocol_version;
-                if (selected === "1.0" || selected === "2.0") {
-                    this._negotiatedProtocolVersion = selected;
-                }
-                if (selected !== PROTOCOL_VERSION) {
-                    console.warn(
-                        `[Cortex] daemon selected protocol ${String(selected)}; expected ${PROTOCOL_VERSION}`,
-                    );
-                }
+            case "AUTH_OK":
+                this._onAuthenticated(msg.payload.selected_protocol_version);
                 break;
-            }
 
             case "PROTOCOL_ERROR":
                 console.error(
@@ -848,6 +1006,9 @@ export class CortexWSClient {
                 } catch {
                     // Server may already have closed after the error frame.
                 }
+                // A5: a permanent silent disconnect is not acceptable —
+                // tell the user and offer a retry.
+                this._showProtocolErrorOnce(msg.payload);
                 break;
 
             case "STATE_UPDATE":
@@ -1023,10 +1184,18 @@ export class CortexWSClient {
         }
     }
 
-    private _handleDisconnect(): void {
+    private _handleDisconnect(code?: number, reason?: string): void {
         this._ws = undefined;
         // F6: kill the heartbeat — a stopped socket cannot send pings.
         this._stopHeartbeat();
+        this._clearAuthTimer();
+
+        if (code === 1011) {
+            // A4: the daemon actively rejected us (auth required /
+            // invalid token / slow consumer). Say so — once per reason —
+            // instead of flashing "Connected" and silently re-dialling.
+            this._warnDaemonClose(code, reason ?? "");
+        }
 
         if (this._connected) {
             this._connected = false;
@@ -1035,6 +1204,23 @@ export class CortexWSClient {
 
         if (!this._intentionalDisconnect) {
             this._scheduleReconnect();
+        }
+    }
+
+    private _warnDaemonClose(code: number, reason: string): void {
+        const key = `${code}:${reason}`;
+        if (this._lastCloseWarningReason === key) return;
+        this._lastCloseWarningReason = key;
+        const detail = reason.length > 0 ? reason : "auth required";
+        const hint = /auth|token/i.test(detail)
+            ? "Restart the Cortex app so it re-mints the local auth token, then reconnect."
+            : "Cortex will keep retrying in the background.";
+        try {
+            void vscode.window.showWarningMessage(
+                `Cortex daemon closed the connection (${code}: ${detail}). ${hint}`,
+            );
+        } catch {
+            console.warn(`[Cortex] daemon closed the connection (${code}: ${detail})`);
         }
     }
 

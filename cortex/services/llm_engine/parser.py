@@ -8,8 +8,9 @@ Fault-tolerant JSON parsing for LLM output. Handles common malformations:
 - Preamble text before JSON
 - Unescaped quotes (best-effort)
 
-Validates parsed output against Pydantic InterventionPlan schema.
-Falls back to rule-based plan after 2 failed parse attempts.
+Validates parsed output against Pydantic InterventionPlan schema. The
+required narrative fields are never fabricated: a degenerate payload fails
+validation and the planner serves its deterministic fallback instead.
 """
 
 from __future__ import annotations
@@ -172,7 +173,9 @@ def validate_intervention_plan(data: dict[str, Any]) -> InterventionPlan | None:
     Applies lightweight normalization before validation:
     - Ensures ui_plan is a UIPlan object
     - Infers level from ui_plan.intervention_type if missing
-    - Provides defaults for optional fields
+    - Provides defaults for optional fields only; the required narrative
+      fields (situation_summary, headline, primary_focus, micro_steps)
+      must be present, so ``{}`` never validates (audit D9)
 
     Returns:
         InterventionPlan on success, None on validation failure.
@@ -501,21 +504,21 @@ def _normalize_plan_data(data: dict[str, Any]) -> dict[str, Any]:
         else:
             result["level"] = "overlay_only"
 
-    # Ensure required string fields have defaults
-    result.setdefault("situation_summary", "Workspace analysis complete.")
-    result.setdefault("headline", "Focus on the current task")
-    result.setdefault("primary_focus", "Address the most pressing issue")
-    result.setdefault("micro_steps", ["Review the current error or task"])
+    # Optional presentation fields get neutral defaults. The required
+    # narrative fields (situation_summary / headline / primary_focus /
+    # micro_steps) deliberately do NOT: a response that omits them — or an
+    # empty ``{}`` — must fail validation instead of becoming a live plan
+    # built from placeholder text that is then cached as ``source=llm``
+    # (audit D9).
     result.setdefault("hide_targets", [])
     result.setdefault("tone", "direct")
 
-    # Clamp micro_steps to 1-3
-    steps = result.get("micro_steps", [])
+    # Drop blank steps and clamp to the 1-3 the schema allows; an empty
+    # list is left in place for Pydantic to reject.
+    steps = result.get("micro_steps")
     if isinstance(steps, list):
-        if len(steps) == 0:
-            result["micro_steps"] = ["Review the current error or task"]
-        elif len(steps) > 3:
-            result["micro_steps"] = steps[:3]
+        cleaned = [step for step in steps if not (isinstance(step, str) and not step.strip())]
+        result["micro_steps"] = cleaned[:3]
 
     # --- Normalize new actionable fields ---
 

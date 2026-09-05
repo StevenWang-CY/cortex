@@ -100,6 +100,7 @@ async def test_b1_capture_unavailable_reaches_in_process_desktop() -> None:
         "face_detected": False,
         "stale": True,
         "sequence": None,
+        "pulse_unavailable": None,
     }
     assert payload["_seq"] == payload["sequence"] == 1
 

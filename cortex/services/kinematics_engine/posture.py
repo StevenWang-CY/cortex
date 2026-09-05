@@ -16,6 +16,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from cortex.libs.config.settings import PostureSignalConfig
+from cortex.libs.signal.angles import wrapped_angle_delta
 
 
 @dataclass(frozen=True)
@@ -152,7 +153,9 @@ class PostureAnalyzer:
             return state
 
         assert self._neutral_pitch_deg is not None
-        flexion = max(0.0, float(pitch_deg) - self._neutral_pitch_deg)
+        # Pitch is an angle: compare through the wrap so a neutral pose near
+        # +/-180 deg cannot produce a 360 deg flexion.
+        flexion = max(0.0, wrapped_angle_delta(float(pitch_deg), self._neutral_pitch_deg))
         score = float(np.clip(flexion / 45.0, 0.0, 1.0))
         prior_gap = (
             None if self._last_timestamp is None else now - self._last_timestamp

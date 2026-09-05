@@ -4,27 +4,31 @@ Thanks for your interest. Cortex is a personal portfolio project, but
 patches, bug reports, and ideas are welcome.
 
 > Cortex is macOS-only. Linux and Windows are not supported and
-> patches that add support are out of scope for the v0.2.x series.
+> patches that add support are out of scope; the whole stack is tied to
+> AVFoundation, TCC, and macOS-specific frameworks.
 
 ## Prerequisites
 
-| Requirement | Install |
-|-------------|---------|
-| macOS 13+ (Ventura or later) | required |
-| Python 3.11 or 3.12 | `brew install python@3.11` |
-| Node.js 18+ | `brew install node` |
-| pnpm | `npm install -g pnpm` |
-| Anthropic credentials | one of: Bedrock bearer token (Keychain), GCP Vertex ADC, or `ANTHROPIC_API_KEY` — Cortex falls back to deterministic rule-based plans without one |
+Every toolchain version is pinned in the repository and enforced by the
+build and release scripts; matching them exactly avoids lockfile drift.
+
+| Requirement | Pin | Install |
+|-------------|-----|---------|
+| macOS 13+ (Ventura or later) | — | required |
+| uv | `0.10.12` (`cortex/pyproject.toml` `tool.uv.required-version`) | `brew install uv` |
+| Python | `3.11.15` (`.python-version`; CI also validates 3.12.13 on Intel) | `uv python install 3.11.15` |
+| Node.js | `22.23.2` (`.node-version`) | your version manager (`fnm`, `mise`, `nvm`) |
+| pnpm | `9.15.9` (`packageManager` in the extension `package.json`) | `corepack prepare pnpm@9.15.9 --activate` |
+| Claude access (optional) | — | Bedrock bearer token in Keychain, GCP Vertex ADC, or `ANTHROPIC_API_KEY`; the default planner mode makes no network call and the daemon falls back to deterministic plans without credentials |
 
 ## One-time setup
 
 ```bash
 git clone https://github.com/StevenWang-CY/cortex.git
 cd cortex
-make setup            # creates .venv, installs Python + pnpm deps
-pip install pre-commit && pre-commit install
+make setup            # uv sync --locked, pnpm/npm frozen installs, seed storage
+make precommit        # pre-commit hooks (schema-codegen and token drift gates)
 cp cortex/.env.example .env
-python -m cortex.scripts.seed_config --root .
 ```
 
 Common shortcuts (see [Makefile](Makefile)):
@@ -104,8 +108,8 @@ Before submitting:
 
 ## What we won't merge
 
-- Linux or Windows support (out of scope for v0.2.x — Cortex is tied to
-  AVFoundation, TCC, and macOS-specific frameworks)
+- Linux or Windows support (Cortex is tied to AVFoundation, TCC, and
+  macOS-specific frameworks)
 - Any change that puts biometrics into an LLM payload
 - Removal of the consent ladder, undo stack, or capability-token gate
 - Bypassing the schema codegen drift gate

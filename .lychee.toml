@@ -7,12 +7,26 @@ timeout = 20
 accept = [200, 203, 204, 206, 429]
 exclude = [
   "^https://example\\.invalid",
+  # docs.opencv.org answers 403 to every automated client (verified
+  # 2026-09-05, including its own root with a browser user agent). The
+  # reference in IMPLEMENTATION.md stays; only the reachability probe is
+  # excluded, and it is re-checked whenever this list is reviewed.
+  "^https://docs\\.opencv\\.org",
   "^https?://(127\\.0\\.0\\.1|localhost)",
+  # Pages under wiki/ link to each other by bare page name ("](Setup)"),
+  # which is the only form the published GitHub wiki resolves. lychee cannot
+  # apply the ".md" fallback for those file targets, so it is excluded here
+  # and the same links are verified in this job by
+  # ``verify_repository_contracts.check_local_markdown_links``, which does
+  # resolve "wiki/Setup" to "wiki/Setup.md".
+  "^file:.*/wiki/[^/.]+$",
   "^https://github\\.com/StevenWang-CY/cortex/security/advisories/new$"
 ]
 exclude_path = [
   "cortex/apps/browser_extension/node_modules",
   "cortex/apps/browser_extension/.plasmo",
+  "cortex/apps/vscode_extension/node_modules",
+  "cortex/apps/vscode_extension/out",
   "build",
   "dist"
 ]

@@ -4,9 +4,21 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing draft release tag (for example v0.3.0)"
+        description: "Existing draft release tag (for example v0.4.0)"
         required: true
         type: string
+      assurance_tier:
+        description: >-
+          Assurance tier the uploaded manual records declare. self-attested:
+          the maintainer exercised at least one architecture on a clean
+          profile and every core case passed. independently-reviewed: both
+          architectures, every case, and disjoint builder/reviewer identities.
+        required: true
+        type: choice
+        default: self-attested
+        options:
+          - self-attested
+          - independently-reviewed
 
 permissions:
   contents: read
@@ -21,10 +33,11 @@ env:
   NODE_VERSION: "22.23.2"
   PNPM_VERSION: "9.15.9"
   RELEASE_TAG: ${{ github.event.inputs.tag }}
+  ASSURANCE_TIER: ${{ github.event.inputs.assurance_tier }}
 
 jobs:
   validate-and-publish:
-    name: Validate independent evidence and publish draft
+    name: Validate evidence tier and publish draft
     runs-on: ubuntu-latest
     environment: production-publish
     timeout-minutes: 20
@@ -49,18 +62,22 @@ jobs:
           test "$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft)" = "true"
           mkdir -p release-assets
           gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --dir release-assets --clobber
-      - name: Validate tag, two architecture records, hashes, cases, and reviewer independence
+      - name: Validate tag, records, hashes, case catalog, and the declared assurance tier
         run: |
           uv sync --project cortex --locked --extra dev
           uv run --project cortex --locked --extra dev python -m cortex.scripts.sync_versions --check --tag "${RELEASE_TAG}"
           VERSION="$(uv run --project cortex --locked python -m cortex.scripts.sync_versions --print)"
           COMMIT="$(git rev-parse HEAD)"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           uv run --project cortex --locked --extra dev python -m cortex.scripts.validate_release_records \
             --records-dir release-assets \
             --asset-dir release-assets \
             --expected-version "${VERSION}" \
             --expected-commit "${COMMIT}" \
-            --output release-assets/release-promotion-validation.json
+            --tier "${ASSURANCE_TIER}" \
+            --output release-assets/release-promotion-validation.json \
+            --notes-output "${RUNNER_TEMP}/assurance-notes.md" \
+            --workflow-run-url "${RUN_URL}"
       - name: Verify GitHub provenance attestations for all reviewed release assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -81,9 +98,27 @@ jobs:
               --source-ref "refs/tags/${RELEASE_TAG}" \
               --source-digest "${COMMIT}"
           done
+      - name: Append the assurance section to the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NOTES_PATH="${RUNNER_TEMP}/release-notes.md"
+          gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json body --jq .body > "${NOTES_PATH}"
+          # Idempotent: a re-run replaces a previously appended section.
+          python3 - "${NOTES_PATH}" "${RUNNER_TEMP}/assurance-notes.md" <<'PY'
+          import sys
+          from pathlib import Path
+          notes = Path(sys.argv[1]).read_text(encoding="utf-8")
+          section = Path(sys.argv[2]).read_text(encoding="utf-8")
+          marker = "\n## Assurance\n"
+          if marker in notes:
+              notes = notes[: notes.index(marker)]
+          Path(sys.argv[1]).write_text(notes.rstrip("\n") + "\n\n" + section, encoding="utf-8")
+          PY
+          gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --notes-file "${NOTES_PATH}"
       - name: Attach promotion decision and publish the draft
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "${RELEASE_TAG}" release-assets/release-promotion-validation.json --repo "${GITHUB_REPOSITORY}" --clobber
-          gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false --verify-tag
+          gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false --latest --verify-tag

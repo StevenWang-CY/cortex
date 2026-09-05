@@ -1,7 +1,7 @@
 {
   "name": "cortex-browser-extension",
   "displayName": "Cortex — Somatic Workspace Engine",
-  "version": "0.3.15",
+  "version": "0.4.0",
   "packageManager": "pnpm@9.15.9",
   "description": "Real-time biofeedback workspace engine for Chrome.",
   "scripts": {
@@ -38,6 +38,8 @@
   "pnpm": {
     "overrides": {
       "@babel/core@<=7.29.0": "7.29.6",
+      "browserslist@<4.28.7": "4.28.7",
+      "fflate@<0.8.3": "0.8.3",
       "@babel/traverse@<7.23.2": "7.23.2",
       "content-security-policy-parser@<0.6.0": "0.6.0",
       "esbuild@<=0.24.2": "0.25.0",
@@ -54,8 +56,6 @@
       "tabGroups",
       "storage",
       "alarms",
-      "bookmarks",
-      "webNavigation",
       "nativeMessaging",
       "notifications"
     ],

@@ -625,3 +625,191 @@ def test_preview_path_emits_no_raw_context_logs(caplog: pytest.LogCaptureFixture
     assert "super_secret_value_123456" not in logs
     assert "/Users/alice" not in logs
     assert "hunter2" not in logs
+
+
+# ---------------------------------------------------------------------------
+# Audit D7 — every absolute POSIX path (≥2 segments) is minimised
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "basename", "leaked"),
+    [
+        ("/Applications/Cortex.app/Contents/MacOS/Cortex", "Cortex", "Contents"),
+        ("/etc/hosts", "hosts", "/etc/"),
+        ("/usr/local/bin/python3", "python3", "/usr/local"),
+        ("/srv/app/config.yaml", "config.yaml", "/srv/"),
+        ("/mnt/data/private/secret.csv", "secret.csv", "/mnt/"),
+        ("/root/.ssh/id_rsa", "id_rsa", "/root/"),
+        ("/workspace/client-x/main.py", "main.py", "client-x"),
+        ("/opt/homebrew/lib/libfoo.dylib", "libfoo.dylib", "/opt/"),
+        ("/Users/alice/private/notes.md", "notes.md", "alice"),
+    ],
+)
+def test_every_absolute_posix_path_is_reduced_to_a_basename(
+    raw: str, basename: str, leaked: str
+) -> None:
+    result = redact_text(f"Failure in {raw} while building", max_chars=500)
+    assert f"…/{basename}" in result.value
+    assert leaked not in result.value
+    assert raw not in result.value
+
+
+def test_url_paths_are_not_treated_as_posix_paths() -> None:
+    text = "see https://example.com/docs/private/page?q=1 and http://h/a/b"
+    result = redact_text(text, max_chars=500)
+    assert result.value == text
+
+
+def test_relative_paths_and_ratios_are_untouched() -> None:
+    text = "a/b ratio, src/main.py, and 1/2 of the tabs"
+    assert redact_text(text, max_chars=500).value == text
+
+
+def test_single_segment_roots_are_not_paths() -> None:
+    assert redact_text("temp lives in /tmp today", max_chars=500).value == (
+        "temp lives in /tmp today"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Audit D14 — support estimate is projected to the interpolated fields
+# ---------------------------------------------------------------------------
+
+
+def test_support_estimate_forwarding_is_projected_to_three_fields() -> None:
+    state = _state()
+    state.reasons = ["HR 30% above baseline", "6 tab switches in 30s"]
+    bundle = ContextBroker().sanitize(
+        _hostile_context(), state, ContextSourceSelection(support_estimate=True)
+    )
+    outbound = bundle.state
+    assert str(outbound.state) == "HYPER"
+    assert outbound.confidence == pytest.approx(0.91)
+    assert outbound.dwell_seconds == pytest.approx(42.0)
+    assert outbound.reasons == []
+    assert outbound.scores == StateScores()
+    assert outbound.signal_quality.physio == 0.0
+    assert outbound.estimate_id != state.estimate_id
+    serialised = outbound.model_dump_json()
+    assert "0.87" not in serialised
+    assert "tab switches" not in serialised
+
+
+def test_unselected_support_estimate_is_fully_neutral() -> None:
+    bundle = ContextBroker().sanitize(
+        _hostile_context(), _state(), ContextSourceSelection(support_estimate=False)
+    )
+    assert str(bundle.state.state) == "UNKNOWN"
+    assert bundle.state.confidence == 0.0
+    assert bundle.state.dwell_seconds == 0.0
+    assert bundle.state.reasons == []
+    assert bundle.state.scores == StateScores()
+
+
+# ---------------------------------------------------------------------------
+# Audit D10 — first-run BYOK: lazy transport construction, distinct reasons
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_missing_credentials_are_reported_distinctly_and_reload_builds_transport() -> None:
+    external = _FakeExternalPlanner()
+    built: list[int] = []
+
+    def factory() -> _FakeExternalPlanner:
+        built.append(1)
+        return external
+
+    planner = PrivacyAwarePlanner(_external_config(), None, transport_factory=factory)
+    assert planner.transport_state == "credentials_missing"
+    assert planner.privacy_status().network_allowed_by_configuration is False
+    assert planner.privacy_status().transport_state == "credentials_missing"
+    request = ContextPreviewRequest(state_estimate=_state(), task_context=_hostile_context())
+    with pytest.raises(ExternalContextDisabledError, match="^credentials_missing"):
+        await planner.preview_external_request(request)
+    with pytest.raises(ExternalContextDisabledError, match="^credentials_missing"):
+        await planner.confirm_external_request(
+            "ctx_abcdefghijklmnopqrstuvwxyz0123456789", CONTEXT_SEND_CONFIRMATION
+        )
+    plan = await planner.generate_intervention_plan(request.task_context, request.state_estimate)
+    assert plan.metadata["fallback_reason"] == "credentials_missing"
+
+    assert planner.reload_credentials() is True
+    assert built == [1]
+    assert planner.transport_state == "ready"
+    assert planner.privacy_status().network_allowed_by_configuration is True
+    assert planner.privacy_status().transport_state == "ready"
+    preview = await planner.preview_external_request(request)
+    assert preview.model.startswith("fake-model:")
+    sent = await planner.confirm_external_request(preview.preview_id, CONTEXT_SEND_CONFIRMATION)
+    assert sent.metadata["source"] == "llm"
+    assert len(external.calls) == 1
+
+
+def test_reload_credentials_reports_transport_failures_without_raising() -> None:
+    def failing_factory() -> _FakeExternalPlanner:
+        raise RuntimeError("no Bedrock bearer token")
+
+    planner = PrivacyAwarePlanner(_external_config(), None, transport_factory=failing_factory)
+    assert planner.reload_credentials() is False
+    assert planner.transport_state == "credentials_missing"
+    assert PrivacyAwarePlanner(_external_config(), None).reload_credentials() is False
+
+
+@pytest.mark.asyncio
+async def test_disabled_mode_reason_is_distinct_from_missing_credentials() -> None:
+    config = LLMConfig(
+        privacy=LLMPrivacyConfig(
+            planner_mode="external_redacted",
+            external_context_enabled=True,
+            consent_revision="old-revision",
+        )
+    )
+    planner = PrivacyAwarePlanner(config, None, transport_factory=_FakeExternalPlanner)
+    assert planner.transport_state == "external_context_disabled"
+    # Disabled mode never constructs a transport, even on reload.
+    assert planner.reload_credentials() is False
+    request = ContextPreviewRequest(state_estimate=_state(), task_context=_hostile_context())
+    with pytest.raises(ExternalContextDisabledError, match="^external_context_disabled"):
+        await planner.preview_external_request(request)
+    plan = await planner.generate_intervention_plan(request.task_context, request.state_estimate)
+    assert plan.metadata["fallback_reason"] == "external_context_disabled"
+
+
+def test_create_llm_client_without_credentials_is_reloadable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts: list[int] = []
+    external = _FakeExternalPlanner()
+
+    def fake_transport(*_args: Any, **_kwargs: Any) -> _FakeExternalPlanner:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("ANTHROPIC_API_KEY missing")
+        return external
+
+    monkeypatch.setattr("cortex.services.llm_engine.AnthropicPlanner", fake_transport)
+    client = create_llm_client(_external_config())
+    assert isinstance(client, PrivacyAwarePlanner)
+    assert client.transport_state == "credentials_missing"
+    assert client.reload_credentials() is True
+    assert client.transport_state == "ready"
+    assert attempts == [1, 1]
+
+
+def test_privacy_planner_reload_delegates_to_inner_when_present() -> None:
+    class _Inner(_FakeExternalPlanner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reloads = 0
+
+        def reload_credentials(self) -> bool:
+            self.reloads += 1
+            return True
+
+    inner = _Inner()
+    planner = PrivacyAwarePlanner(_external_config(), inner)
+    assert planner.transport_state == "ready"
+    assert planner.reload_credentials() is True
+    assert inner.reloads == 1

@@ -85,6 +85,26 @@ def _rgba_str_to_tuple(rgba_str: str) -> tuple[int, int, int, int]:
     return (r, g, b, a)
 
 
+def _qt_hex(value: str) -> str:
+    """Return a Qt-parsable color literal for a CSS hex token.
+
+    CSS Color Level 4 writes alpha last (``#RRGGBBAA``); Qt's QSS parser and
+    ``QColor`` read a nine-character literal as ``#AARRGGBB``. Emitting the
+    CSS form unchanged made every desktop hairline and low-emphasis label
+    decode as a nearly opaque olive/lavender with 9-24% alpha. Six-digit
+    values pass through untouched.
+    """
+    raw = value.strip()
+    if raw.startswith("#") and len(raw) == 9:
+        rgb, alpha = raw[1:7], raw[7:9]
+        return f"#{alpha}{rgb}".upper()
+    return raw
+
+
+def _py_hex(name: str, value: str) -> str:
+    return _py_const(name, _qt_hex(value))
+
+
 def emit_python(data: dict[str, Any]) -> str:
     out: list[str] = [_PY_HEADER]
 
@@ -103,13 +123,14 @@ def emit_python(data: dict[str, Any]) -> str:
     out.append("\n")
 
     out.append("# --- Semantic palette (light + dark) ---\n")
+    out.append("# Alpha-bearing values are emitted in Qt's #AARRGGBB order.\n")
     out.append("SEMANTIC_LIGHT: Final[dict[str, str]] = {\n")
     for k, v in data["semantic"]["light"].items():
-        out.append(f'    "{k}": "{v["hex"]}",\n')
+        out.append(f'    "{k}": "{_qt_hex(v["hex"])}",\n')
     out.append("}\n\n")
     out.append("SEMANTIC_DARK: Final[dict[str, str]] = {\n")
     for k, v in data["semantic"]["dark"].items():
-        out.append(f'    "{k}": "{v["hex"]}",\n')
+        out.append(f'    "{k}": "{_qt_hex(v["hex"])}",\n')
     out.append("}\n\n")
 
     out.append("# --- State palette mapping (FLOW/HYPER/HYPO/RECOVERY) ---\n")
@@ -128,7 +149,7 @@ def emit_python(data: dict[str, Any]) -> str:
         if role == "brand":
             hex_value = brand["accent"]["hex"]
         elif role in data["semantic"]["light"]:
-            hex_value = data["semantic"]["light"][role]["hex"]
+            hex_value = _qt_hex(data["semantic"]["light"][role]["hex"])
         else:
             hex_value = "#999999"
         out.append(f'    "{k}": "{hex_value}",\n')
@@ -155,7 +176,8 @@ def emit_python(data: dict[str, Any]) -> str:
 
     out.append("# --- Typography ---\n")
     typo = data["typography"]
-    out.append(_py_const("FONT_SYSTEM", typo["system_stack"]))
+    # Qt output: a family list Qt resolves on macOS (see tokens.yaml qt_system_stack).
+    out.append(_py_const("FONT_SYSTEM", typo.get("qt_system_stack", typo["system_stack"])))
     out.append(_py_const("FONT_DISPLAY", typo["display_stack"]))
     out.append(_py_const("FONT_MONO", typo["mono_stack"]))
     out.append("\n# 5-step modular scale (pt)\n")
@@ -230,7 +252,7 @@ def emit_python(data: dict[str, Any]) -> str:
                     if role == "brand":
                         hex_value = brand["accent"]["hex"]
                     elif role in light_sem:
-                        hex_value = light_sem[role]["hex"]
+                        hex_value = _qt_hex(light_sem[role]["hex"])
                     else:
                         hex_value = "#999999"
                 else:
@@ -253,7 +275,12 @@ def emit_python(data: dict[str, Any]) -> str:
     # value instead of carrying private hex copies.
     out.append('CX_TEXT_SECONDARY: Final[str] = "#5C5854"\n')
     out.append('CX_TEXT_TERTIARY: Final[str] = "#6B6661"\n')
-    out.append('CX_TEXT_INVERSE: Final[str] = "#FFFFFF"\n')
+    out.append('CX_TEXT_INVERSE: Final[str] = SEMANTIC_LIGHT["label_inverse"]\n')
+    # Contrast-safe status *text* (the raw semantic fills fail AA as copy).
+    out.append('CX_SUCCESS_TEXT: Final[str] = SEMANTIC_LIGHT["success_text"]\n')
+    out.append('CX_WARNING_TEXT: Final[str] = SEMANTIC_LIGHT["warning_text"]\n')
+    out.append('CX_INFO_TEXT: Final[str] = SEMANTIC_LIGHT["info_text"]\n')
+    out.append('CX_DANGER_TEXT: Final[str] = SEMANTIC_LIGHT["danger_text"]\n')
     out.append("CX_ACCENT: Final[str] = BRAND_ACCENT\n")
     out.append("CX_ACCENT_HOVER: Final[str] = BRAND_ACCENT_HOVER\n")
     out.append("CX_ACCENT_TEXT: Final[str] = BRAND_ACCENT_TEXT\n")
@@ -299,38 +326,44 @@ def emit_python(data: dict[str, Any]) -> str:
     out.append('    f"border-radius: {RADIUS_CARD}px;"\n')
     out.append(")\n\n")
 
+    out.append("# Filled buttons keep a transparent 2px border at rest so the keyboard\n")
+    out.append("# focus ring never shifts layout when it appears.\n")
+    out.append("BTN_FOCUS_RING: Final[str] = f\"2px solid {BRAND_ACCENT}\"\n")
+    out.append("BTN_FOCUS_RING_ON_ACCENT: Final[str] = f\"2px solid {SEMANTIC_LIGHT['label_primary']}\"\n\n")
     out.append("BTN_PRIMARY_QSS: Final[str] = (\n")
     out.append('    "QPushButton {"\n')
-    out.append('    f"  padding: 6px 14px;"\n')
+    out.append('    f"  padding: 4px 12px;"\n')
     out.append('    f"  border-radius: {RADIUS_BUTTON}px;"\n')
     out.append('    f"  background: {SEMANTIC_LIGHT[\'label_primary\']};"\n')
-    out.append('    f"  color: {SEMANTIC_LIGHT[\'control_bg\']};"\n')
+    out.append('    f"  color: {SEMANTIC_LIGHT[\'label_inverse\']};"\n')
     out.append('    f"  font-family: {FONT_SYSTEM};"\n')
     out.append('    f"  font-size: {FS_FOOTNOTE}px;"\n')
     out.append('    f"  font-weight: {FW_SEMIBOLD};"\n')
-    out.append('    "  border: none;"\n')
+    out.append('    "  border: 2px solid transparent;"\n')
     out.append('    "}"\n')
     out.append('    "QPushButton:hover { background: #333; }"\n')
     out.append('    "QPushButton:pressed { background: #555; }"\n')
+    out.append('    f"QPushButton:focus {{ border: {BTN_FOCUS_RING}; }}"\n')
     out.append('    f"QPushButton:disabled {{ background: {SEMANTIC_LIGHT[\'grouped_bg\']}; color: #6B6661; }}"\n')
     out.append(")\n\n")
 
     out.append("BTN_ACCENT_QSS: Final[str] = (\n")
     out.append('    "QPushButton {"\n')
-    out.append('    f"  padding: 6px 14px;"\n')
+    out.append('    f"  padding: 4px 12px;"\n')
     out.append('    f"  border-radius: {RADIUS_BUTTON}px;"\n')
     out.append('    f"  background: {BRAND_ACCENT};"\n')
     out.append('    f"  color: {SEMANTIC_LIGHT[\'label_primary\']};"\n')
     out.append('    f"  font-family: {FONT_SYSTEM};"\n')
     out.append('    f"  font-size: {FS_FOOTNOTE}px;"\n')
     out.append('    f"  font-weight: {FW_SEMIBOLD};"\n')
-    out.append('    "  border: none;"\n')
+    out.append('    "  border: 2px solid transparent;"\n')
     out.append('    "}"\n')
     # Each interaction fill has its own contrast-safe foreground.  The normal
     # terracotta clears AA with the standard dark label, the hover fill needs
     # a slightly darker ink, and the pressed fill clears AA with white.
     out.append('    f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"\n')
     out.append('    f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"\n')
+    out.append('    f"QPushButton:focus {{ border: {BTN_FOCUS_RING_ON_ACCENT}; }}"\n')
     out.append('    f"QPushButton:disabled {{ background: {SEMANTIC_LIGHT[\'grouped_bg\']}; color: #6B6661; }}"\n')
     out.append(")\n\n")
 
@@ -347,7 +380,111 @@ def emit_python(data: dict[str, Any]) -> str:
     out.append('    "}"\n')
     out.append('    "QPushButton:hover { background: rgba(0,0,0,0.03); color: #1A1A1A; }"\n')
     out.append('    "QPushButton:pressed { background: rgba(0,0,0,0.07); color: #1A1A1A; }"\n')
+    out.append('    f"QPushButton:focus {{ border-color: {BRAND_ACCENT}; }}"\n')
     out.append('    "QPushButton:disabled { color: #827D77; border-color: rgba(0,0,0,0.08); }"\n')
+    out.append(")\n\n")
+
+    # Ghost recipe whose foreground names a consequence the user should read
+    # before pressing (quit, discard). Same geometry as BTN_GHOST_QSS so the
+    # two can sit side by side without a baseline shift.
+    out.append("BTN_DESTRUCTIVE_QSS: Final[str] = (\n")
+    out.append('    "QPushButton {"\n')
+    out.append('    f"  padding: 6px 14px;"\n')
+    out.append('    f"  border-radius: {RADIUS_BUTTON}px;"\n')
+    out.append('    "  background: transparent;"\n')
+    out.append('    f"  color: {SEMANTIC_LIGHT[\'danger_text\']};"\n')
+    out.append('    f"  font-family: {FONT_SYSTEM};"\n')
+    out.append('    f"  font-size: {FS_FOOTNOTE}px;"\n')
+    out.append('    f"  font-weight: {FW_MEDIUM};"\n')
+    out.append('    f"  border: 1px solid {SEMANTIC_LIGHT[\'separator\']};"\n')
+    out.append('    "}"\n')
+    out.append('    "QPushButton:hover { background: rgba(215, 0, 21, 0.06); }"\n')
+    out.append('    "QPushButton:pressed { background: rgba(215, 0, 21, 0.12); }"\n')
+    out.append('    f"QPushButton:focus {{ border-color: {SEMANTIC_LIGHT[\'danger\']}; }}"\n')
+    out.append('    "QPushButton:disabled { color: #827D77; border-color: rgba(0,0,0,0.08); }"\n')
+    out.append(")\n\n")
+
+    # Text-only accent action (\"Connect\", \"Recalibrate\"). Keeps the filled
+    # recipes' 2px transparent border so the focus ring never shifts layout.
+    out.append("BTN_LINK_QSS: Final[str] = (\n")
+    out.append('    "QPushButton {"\n')
+    out.append('    f"  padding: 4px 12px;"\n')
+    out.append('    f"  border-radius: {RADIUS_BUTTON}px;"\n')
+    out.append('    "  background: transparent;"\n')
+    out.append('    f"  color: {BRAND_ACCENT_TEXT};"\n')
+    out.append('    f"  font-family: {FONT_SYSTEM};"\n')
+    out.append('    f"  font-size: {FS_FOOTNOTE}px;"\n')
+    out.append('    f"  font-weight: {FW_SEMIBOLD};"\n')
+    out.append('    "  border: 2px solid transparent;"\n')
+    out.append('    "}"\n')
+    out.append('    "QPushButton:hover { background: rgba(217, 119, 87, 0.10); }"\n')
+    out.append('    "QPushButton:pressed { background: rgba(217, 119, 87, 0.20); }"\n')
+    out.append('    f"QPushButton:focus {{ border: {BTN_FOCUS_RING}; }}"\n')
+    out.append('    "QPushButton:disabled { color: #827D77; }"\n')
+    out.append(")\n\n")
+
+    # One segment of the capsule segmented control shared by the dashboard
+    # and the History sub-navigation. Checked = selected segment.
+    out.append("BTN_SEGMENT_QSS: Final[str] = (\n")
+    out.append('    "QPushButton {"\n')
+    out.append('    f"  padding: 4px 12px;"\n')
+    out.append('    f"  border-radius: {RADIUS_BUTTON}px;"\n')
+    out.append('    "  background: transparent;"\n')
+    out.append('    "  color: #5C5854;"\n')
+    out.append('    f"  font-family: {FONT_SYSTEM};"\n')
+    out.append('    f"  font-size: {FS_FOOTNOTE}px;"\n')
+    out.append('    f"  font-weight: {FW_MEDIUM};"\n')
+    out.append('    "  border: 2px solid transparent;"\n')
+    out.append('    "}"\n')
+    out.append('    "QPushButton:hover { color: #1A1A1A; }"\n')
+    out.append('    "QPushButton:pressed { background: rgba(0,0,0,0.05); color: #1A1A1A; }"\n')
+    out.append('    f"QPushButton:checked {{ background: {SEMANTIC_LIGHT[\'control_bg\']}; color: #1A1A1A; font-weight: {FW_SEMIBOLD}; }}"\n')
+    out.append('    f"QPushButton:focus {{ border: {BTN_FOCUS_RING}; }}"\n')
+    out.append(")\n\n")
+
+    # The one pill recipe: ambient status chips (label form) and the
+    # pressable capsule (button form) share geometry so a chip can become
+    # a control without moving.
+    out.append("PILL_QSS: Final[str] = (\n")
+    out.append('    f"font-family: {FONT_SYSTEM};"\n')
+    out.append('    f"font-size: {FS_CAPTION}px;"\n')
+    out.append('    f"font-weight: {FW_MEDIUM};"\n')
+    out.append('    "color: #5C5854;"\n')
+    out.append('    f"background: {SEMANTIC_LIGHT[\'grouped_bg\']};"\n')
+    out.append('    f"border-radius: {RADIUS_PILL}px;"\n')
+    out.append('    "padding: 3px 10px;"\n')
+    out.append('    "border: none;"\n')
+    out.append(")\n\n")
+
+    out.append("PILL_BUTTON_QSS: Final[str] = (\n")
+    out.append('    "QPushButton {"\n')
+    out.append('    f"  font-family: {FONT_SYSTEM};"\n')
+    out.append('    f"  font-size: {FS_CAPTION}px;"\n')
+    out.append('    f"  font-weight: {FW_MEDIUM};"\n')
+    out.append('    "  color: #5C5854;"\n')
+    out.append('    f"  background: {SEMANTIC_LIGHT[\'grouped_bg\']};"\n')
+    out.append('    f"  border-radius: {RADIUS_PILL}px;"\n')
+    out.append('    "  padding: 3px 10px;"\n')
+    out.append('    "  border: 2px solid transparent;"\n')
+    out.append('    "}"\n')
+    out.append('    "QPushButton:hover { background: rgba(0,0,0,0.05); color: #1A1A1A; }"\n')
+    out.append('    "QPushButton:pressed { background: rgba(0,0,0,0.09); color: #1A1A1A; }"\n')
+    out.append('    f"QPushButton:focus {{ border: {BTN_FOCUS_RING}; }}"\n')
+    out.append('    "QPushButton:disabled { color: #827D77; }"\n')
+    out.append(")\n\n")
+
+    # Text inputs keep a constant 1px border; focus changes colour only so
+    # the field contents never shift by a pixel when it takes focus.
+    out.append("INPUT_QSS: Final[str] = (\n")
+    out.append('    "QLineEdit {"\n')
+    out.append('    f"  padding: 0 {SP4}px;"\n')
+    out.append('    f"  border: 1px solid {SEMANTIC_LIGHT[\'separator\']};"\n')
+    out.append('    f"  border-radius: {RADIUS_BUTTON}px;"\n')
+    out.append('    f"  color: {SEMANTIC_LIGHT[\'label_primary\']};"\n')
+    out.append('    f"  background: {SEMANTIC_LIGHT[\'control_bg\']};"\n')
+    out.append('    f"  selection-background-color: {BRAND_ACCENT};"\n')
+    out.append('    "}"\n')
+    out.append('    f"QLineEdit:focus {{ border-color: {BRAND_ACCENT}; }}"\n')
     out.append(")\n\n")
 
     # Sentence-case secondary text (HIG) — replaces the old uppercase
@@ -360,13 +497,24 @@ def emit_python(data: dict[str, Any]) -> str:
     out.append('    "background: transparent;"\n')
     out.append(")\n\n")
 
+    # Page titles use the system face: ``brand.display_font`` is reserved
+    # for the wordmark and hero numerals (tokens.yaml), not window chrome.
     out.append("PAGE_TITLE_QSS: Final[str] = (\n")
-    out.append('    f"font-family: {FONT_DISPLAY};"\n')
+    out.append('    f"font-family: {FONT_SYSTEM};"\n')
     out.append('    f"font-size: {FS_TITLE}px;"\n')
-    out.append('    "font-style: italic;"\n')
+    out.append('    f"font-weight: {FW_SEMIBOLD};"\n')
+    out.append('    "color: #1A1A1A;"\n')
+    out.append('    "background: transparent;"\n')
+    out.append(")\n\n")
+
+    # Hero numerals are the one non-wordmark use of the display serif.
+    out.append("HERO_NUMERAL_QSS: Final[str] = (\n")
+    out.append('    f"font-family: {FONT_DISPLAY};"\n')
+    out.append('    f"font-size: {FS_HERO_NUMERIC}px;"\n')
     out.append('    f"font-weight: {FW_REGULAR};"\n')
     out.append('    "color: #1A1A1A;"\n')
     out.append('    "background: transparent;"\n')
+    out.append('    "border: none;"\n')
     out.append(")\n")
 
     return "".join(out)
@@ -414,13 +562,20 @@ def emit_browser_ts(data: dict[str, Any]) -> str:
     out.append(f'    text: "var(--cx-label-primary, {light["label_primary"]["hex"]})",\n')
     out.append('    textSecondary: "var(--cx-label-secondary, #5C5854)",\n')
     out.append('    textTertiary: "var(--cx-label-tertiary, #6B6661)",\n')
-    out.append('    textInverse: "#FFFFFF",\n')
+    out.append('    textInverse: "var(--cx-label-inverse, #FFFFFF)",\n')
     out.append(f'    accent: "var(--cx-accent, {brand["accent"]["hex"]})",\n')
     out.append(f'    accentHover: "var(--cx-accent-hover, {brand["accent_hover"]["hex"]})",\n')
     out.append(f'    accentText: "var(--cx-accent-text, {brand["accent_text"]["hex"]})",\n')
     out.append(f'    accentDim: "{brand["accent_dim"]["rgba"]}",\n')
     out.append('    danger: "var(--cx-danger, #D70015)",\n')
     out.append('    dangerDim: "rgba(215, 0, 21, 0.10)",\n')
+    out.append(f'    success: "var(--cx-success, {light["success"]["hex"]})",\n')
+    out.append(f'    warning: "var(--cx-warning, {light["warning"]["hex"]})",\n')
+    out.append(f'    info: "var(--cx-info, {light["info"]["hex"]})",\n')
+    out.append("    // Contrast-safe status *text*; the fills above are for dots and bars.\n")
+    out.append(f'    successText: "var(--cx-success-text, {light["success_text"]["hex"]})",\n')
+    out.append(f'    warningText: "var(--cx-warning-text, {light["warning_text"]["hex"]})",\n')
+    out.append(f'    infoText: "var(--cx-info-text, {light["info_text"]["hex"]})",\n')
     out.append(f'    bioHr: "{bio["hr"]["hex"]}",\n')
     out.append(f'    bioHrv: "{bio["hrv"]["hex"]}",\n')
     out.append(f'    bioResp: "{bio["resp"]["hex"]}",\n')
@@ -513,7 +668,7 @@ def emit_browser_ts(data: dict[str, Any]) -> str:
         f'    HYPER: "var(--cx-danger, {light["danger"]["hex"]})",\n'
     )
     out.append('    HYPO: "var(--cx-label-secondary, #5C5854)",\n')
-    out.append('    RECOVERY: "var(--cx-info, #0062CC)",\n')
+    out.append(f'    RECOVERY: "var(--cx-info-text, {light["info_text"]["hex"]})",\n')
     out.append("};\n\n")
 
     out.append("export const STATE_LABELS: Record<string, string> = {\n")

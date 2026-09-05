@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, tzinfo
 from pathlib import Path
 
 from cortex.libs.utils.atomic_write import atomic_write_text
 from cortex.services.eval.policy_repository import PolicyRepository
 
 
-def _day_for_unix_ms(value: int) -> str:
-    return datetime.fromtimestamp(value / 1_000, tz=UTC).date().isoformat()
+def _day_for_unix_ms(value: int, tz: tzinfo = UTC) -> str:
+    return datetime.fromtimestamp(value / 1_000, tz=UTC).astimezone(tz).date().isoformat()
 
 
 def _validated_day(value: str) -> str:
@@ -30,14 +30,24 @@ async def generate_daily_policy_diagnostics(
     storage_root: str | Path,
     *,
     day: str | None = None,
+    tz: tzinfo | None = None,
 ) -> Path:
-    """Write counts/completeness only—never an effect or causal estimate."""
+    """Write counts/completeness only—never an effect or causal estimate.
 
-    target_day = _validated_day(day) if day is not None else datetime.now(tz=UTC).date().isoformat()
+    ``day`` is interpreted in ``tz`` (default UTC). The daemon's nightly run
+    passes the completed *local* day together with the local zone so the
+    report window matches the local-hour schedule that triggers it
+    (audit D12: the old call gated on the local hour but bucketed by UTC day).
+    """
+
+    zone: tzinfo = tz if tz is not None else UTC
+    target_day = (
+        _validated_day(day) if day is not None else datetime.now(tz=zone).date().isoformat()
+    )
     rows = [
         row
         for row in await repository.export_rows()
-        if _day_for_unix_ms(int(row["decision"]["occurred_at_unix_ms"])) == target_day
+        if _day_for_unix_ms(int(row["decision"]["occurred_at_unix_ms"]), zone) == target_day
     ]
     modes = Counter(str(row["decision"].get("policy_mode")) for row in rows)
     arms = Counter(str(row["decision"].get("selected_arm")) for row in rows)

@@ -157,10 +157,39 @@ class InputHooks:
         self._running = False
         self._last_move_time = 0.0
         self._move_interval = 1.0 / self._config.mouse_sample_hz
+        # Monotonic timestamp of the most recent input event of ANY kind.
+        # The sliding event buffers are pruned to the aggregation window
+        # (15 s), so a consumer that only sees window-pruned events can
+        # never observe inactivity longer than the window. Inactivity is
+        # derived from this field instead (audit D1).
+        self._last_input_at: float | None = None
+        # When the listeners began observing. Bounds inactivity so a fresh
+        # process cannot fabricate hours of silence it never observed.
+        self._listening_since: float | None = None
 
     @property
     def is_running(self) -> bool:
         return self._running
+
+    @property
+    def last_input_timestamp(self) -> float | None:
+        """Monotonic timestamp of the latest recorded input, or ``None``."""
+        with self._buffers.lock:
+            return self._last_input_at
+
+    @property
+    def listening_since(self) -> float | None:
+        """Monotonic timestamp when observation started, or ``None``."""
+        return self._listening_since
+
+    def _note_input(self, timestamp: float) -> None:
+        """Advance the last-input marker (caller holds the buffer lock)."""
+        if self._last_input_at is None or timestamp > self._last_input_at:
+            self._last_input_at = timestamp
+        if self._listening_since is None or timestamp < self._listening_since:
+            # A manually recorded event that predates ``start`` still counts
+            # as observed exposure; never let exposure start after an event.
+            self._listening_since = timestamp
 
     @property
     def buffers(self) -> InputEventBuffers:
@@ -192,6 +221,8 @@ class InputHooks:
             self._mouse_listener.start()
             self._keyboard_listener.start()
             self._running = True
+            if self._listening_since is None:
+                self._listening_since = monotonic_seconds(self._clock)
             logger.info("Input hooks started (mouse + keyboard listeners)")
             return True
 
@@ -224,6 +255,7 @@ class InputHooks:
         event = MouseMoveEvent(timestamp=t, x=x, y=y)
         with self._buffers.lock:
             self._buffers.mouse_moves.append(event)
+            self._note_input(t)
 
     def record_mouse_click(
         self, x: int, y: int, button: MouseButton = MouseButton.LEFT,
@@ -234,6 +266,7 @@ class InputHooks:
         event = MouseClickEvent(timestamp=t, x=x, y=y, button=button, pressed=pressed)
         with self._buffers.lock:
             self._buffers.mouse_clicks.append(event)
+            self._note_input(t)
 
     def record_mouse_scroll(
         self, x: int, y: int, dx: int, dy: int,
@@ -247,6 +280,7 @@ class InputHooks:
         )
         with self._buffers.lock:
             self._buffers.mouse_scrolls.append(event)
+            self._note_input(t)
 
     def record_key_event(
         self, key_type: KeyType = KeyType.REGULAR,
@@ -257,6 +291,7 @@ class InputHooks:
         event = KeyEvent(timestamp=t, key_type=key_type, pressed=pressed)
         with self._buffers.lock:
             self._buffers.key_events.append(event)
+            self._note_input(t)
 
     def get_events_in_window(
         self, window_seconds: float | None = None, current_time: float | None = None,
@@ -295,13 +330,17 @@ class InputHooks:
     def _on_mouse_move(self, x: int, y: int) -> None:
         """pynput mouse move callback (rate-limited)."""
         now = monotonic_seconds(self._clock)
-        # Rate limit to sample_hz
+        # Rate limit to sample_hz. Rate-limited samples are still activity:
+        # advance the last-input marker before dropping the sample.
         if now - self._last_move_time < self._move_interval:
+            with self._buffers.lock:
+                self._note_input(now)
             return
         self._last_move_time = now
         event = MouseMoveEvent(timestamp=now, x=x, y=y)
         with self._buffers.lock:
             self._buffers.mouse_moves.append(event)
+            self._note_input(now)
 
     def _on_mouse_click(self, x: int, y: int, button: object, pressed: bool) -> None:
         """pynput mouse click callback."""
@@ -321,6 +360,7 @@ class InputHooks:
         )
         with self._buffers.lock:
             self._buffers.mouse_clicks.append(event)
+            self._note_input(now)
 
     def _on_mouse_scroll(self, x: int, y: int, dx: int, dy: int) -> None:
         """pynput mouse scroll callback."""
@@ -331,6 +371,7 @@ class InputHooks:
         )
         with self._buffers.lock:
             self._buffers.mouse_scrolls.append(event)
+            self._note_input(now)
 
     def _on_key_press(self, key: object) -> None:
         """pynput key press callback."""
@@ -339,6 +380,7 @@ class InputHooks:
         event = KeyEvent(timestamp=now, key_type=key_type, pressed=True)
         with self._buffers.lock:
             self._buffers.key_events.append(event)
+            self._note_input(now)
 
     def _on_key_release(self, key: object) -> None:
         """pynput key release callback."""
@@ -347,6 +389,7 @@ class InputHooks:
         event = KeyEvent(timestamp=now, key_type=key_type, pressed=False)
         with self._buffers.lock:
             self._buffers.key_events.append(event)
+            self._note_input(now)
 
     @staticmethod
     def _classify_key(key: object) -> KeyType:
@@ -374,5 +417,10 @@ class InputHooks:
         return KeyType.REGULAR
 
     def reset(self) -> None:
-        """Clear all event buffers."""
+        """Clear all event buffers and the last-input marker."""
         self._buffers.clear()
+        with self._buffers.lock:
+            self._last_input_at = None
+            self._listening_since = (
+                monotonic_seconds(self._clock) if self._running else None
+            )

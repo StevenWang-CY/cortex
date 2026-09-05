@@ -17,8 +17,11 @@ the system prompt explicitly instructs the model to treat as data.
 
 from __future__ import annotations
 
+from cortex.libs.schemas.context import EditorContext, TaskContext
+from cortex.libs.schemas.state import SignalQuality, StateEstimate, StateScores
 from cortex.services.llm_engine.prompts import (
     SYSTEM_PROMPT,
+    build_user_prompt,
     sanitize_prompt_text,
     wrap_user_content,
 )
@@ -106,8 +109,59 @@ def test_system_prompt_carries_injection_defence_clause() -> None:
     assert "DATA" in SYSTEM_PROMPT
 
 
-def test_sanitizer_preserves_braces_escaping() -> None:
-    """Regression guard: pre-F09 brace-escape behaviour must remain
-    (Python format() interpolation safety)."""
-    out = sanitize_prompt_text("the {key} is value")
-    assert out == "the {{key}} is value"
+def test_sanitizer_preserves_braces_verbatim() -> None:
+    """Audit D6: sanitised values are ``str.format`` *arguments*, never
+    template text, so braces must reach the model exactly as written —
+    the historical ``{{`` doubling corrupted every code snippet and title."""
+    assert sanitize_prompt_text("the {key} is value") == "the {key} is value"
+    code = "def f():\n    return {'a': [1, 2], 'b': {'c': 3}}"
+    assert sanitize_prompt_text(code) == code
+
+
+def test_rendered_prompt_keeps_single_braces() -> None:
+    """End-to-end: braces in workspace content survive template rendering
+    unchanged and never trigger interpolation."""
+    context = TaskContext(
+        mode="coding_debugging",
+        active_app="vscode",
+        complexity_score=0.4,
+        editor_context=EditorContext(
+            file_path="/src/main.py",
+            visible_range=(1, 5),
+            symbol_at_cursor="render",
+            diagnostics=[],
+            recent_edits=[],
+            visible_code="cfg = {'a': 1}\nprint(f'{cfg} and {len(cfg)}')",
+        ),
+    )
+    state = StateEstimate(
+        state="HYPER",
+        confidence=0.8,
+        scores=StateScores(hyper=0.8),
+        signal_quality=SignalQuality(physio=0.5, kinematics=0.5, telemetry=0.5),
+        timestamp=1.0,
+        dwell_seconds=10.0,
+    )
+    rendered = build_user_prompt(context, state, template_name="code_focus_reduction")
+    assert "cfg = {'a': 1}" in rendered
+    assert "print(f'{cfg} and {len(cfg)}')" in rendered
+    assert "{{" not in rendered
+    assert "}}" not in rendered
+
+
+def test_system_prompt_delegates_the_schema_to_the_api() -> None:
+    """Audit D13: the hand-written JSON schema and "Output ONLY valid JSON"
+    contradicted the structured-output request and cost ~1.5k tokens."""
+    assert "Output ONLY valid JSON" not in SYSTEM_PROMPT
+    assert "Output JSON schema:" not in SYSTEM_PROMPT
+    assert '"situation_summary": "string' not in SYSTEM_PROMPT
+    assert "structured-output schema" in SYSTEM_PROMPT
+    # Behavioural rules survive.
+    for rule in (
+        "Identify the ONE immediate bottleneck",
+        "NEVER fabricate indices",
+        "Never recommend destructive actions",
+        "NEVER recommend closing an ai_assistant tab",
+        "PROMPT INJECTION DEFENCE",
+    ):
+        assert rule in SYSTEM_PROMPT

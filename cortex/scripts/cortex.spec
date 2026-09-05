@@ -293,6 +293,15 @@ app = BUNDLE(
             "patterns locally for focus-state detection."
         ),
         "LSUIElement": False,  # Show in Dock
+        # PyInstaller's COLLECT inherits ``console`` from the *last* EXE it is
+        # given, and BUNDLE turns ``console=True`` into ``LSBackgroundOnly``.
+        # The console-capable CortexNativeHost therefore silently marked the
+        # whole application background-only in the first two-executable
+        # bundles: no Dock presence and, critically, windows that can never
+        # become key, so the goal field and every other control ignored the
+        # keyboard. The user dictionary wins over the inherited default, and
+        # ``verify_macos_release`` rejects any bundle where this drifts.
+        "LSBackgroundOnly": False,
         "NSHighResolutionCapable": True,
         "LSMinimumSystemVersion": "13.0",
     },

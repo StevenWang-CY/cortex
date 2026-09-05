@@ -92,7 +92,10 @@ instructions cannot grant a capability.
 Before a field can enter an outbound prompt, Cortex:
 
 1. normalizes Unicode with NFKC and removes bidi/zero-width controls;
-2. replaces absolute POSIX and Windows paths with a basename;
+2. replaces every absolute POSIX path with two or more segments (any root —
+   `/Users`, `/Applications`, `/etc`, `/usr/local`, `/srv`, `/mnt`, `/root`,
+   `/workspace`, …) and every Windows drive or UNC path with its basename;
+   URL paths are left to the URL rule below;
 3. reduces browser URLs to an HTTP(S) origin;
 4. redacts URI credentials, private keys, common provider tokens, JWTs,
    generic secret assignments, and bounded high-entropy token candidates;

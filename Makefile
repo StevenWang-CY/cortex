@@ -114,5 +114,13 @@ clean: ## Remove build artifacts (keeps .venv and node_modules)
 
 # ─── Wiki ─────────────────────────────────────────────────────────────
 
-wiki: ## Push wiki .md files to the wiki remote (origin)
-	git push origin main
+# GitHub renders a wiki from the wiki repository's ``master`` branch only.
+# Publish the ``wiki/`` directory as an orphan history so the wiki never
+# receives (or displays) the full source tree.
+WIKI_REMOTE ?= https://github.com/StevenWang-CY/cortex.wiki.git
+
+wiki: ## Publish wiki/ pages to the GitHub wiki (master branch of the wiki repository)
+	@test -d wiki || (echo "wiki/ directory is missing" >&2; exit 1)
+	git subtree split --prefix=wiki -b wiki-pages >/dev/null
+	git push --force $(WIKI_REMOTE) wiki-pages:master
+	git branch -D wiki-pages >/dev/null

@@ -31,3 +31,21 @@ describe("manifest privacy posture", () => {
         }
     });
 });
+
+describe("manifest permissions", () => {
+    const testDir = path.dirname(fileURLToPath(import.meta.url));
+
+    it("does not request capabilities with no live consumer", () => {
+        const pkg = JSON.parse(fs.readFileSync(path.resolve(testDir, "../package.json"), "utf8")) as {
+            manifest: { permissions: string[] };
+        };
+        expect(pkg.manifest.permissions).not.toContain("bookmarks");
+        expect(pkg.manifest.permissions).not.toContain("webNavigation");
+        expect(pkg.manifest.permissions).toContain("scripting");
+    });
+
+    it("keeps the activity tracker off local dev servers", () => {
+        const source = fs.readFileSync(path.resolve(testDir, "../contents/activity-tracker.ts"), "utf8");
+        expect(source).not.toContain("http://localhost/*");
+    });
+});

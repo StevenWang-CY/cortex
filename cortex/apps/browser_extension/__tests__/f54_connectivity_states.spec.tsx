@@ -123,7 +123,8 @@ describe("F54 popup renders distinct UI per connectivity state", () => {
             });
             const title = container.querySelector('[data-testid="conn-state-not_installed"]');
             expect(title).not.toBeNull();
-            expect(title?.textContent).toContain("Browser bridge unavailable");
+            expect(title?.textContent).toContain("isn't linked to this browser");
+            expect(container.textContent).not.toMatch(/bridge|daemon|native host|handshake/i);
         } finally {
             await cleanup();
         }
@@ -134,7 +135,7 @@ describe("F54 popup renders distinct UI per connectivity state", () => {
         try {
             const title = container.querySelector('[data-testid="conn-state-installed_no_daemon"]');
             expect(title).not.toBeNull();
-            expect(title?.textContent).toContain("Not connected");
+            expect(title?.textContent).toContain("Cortex isn't running");
         } finally {
             await cleanup();
         }
@@ -152,7 +153,12 @@ describe("F54 popup renders distinct UI per connectivity state", () => {
             });
             const title = container.querySelector('[data-testid="conn-state-installed_version_mismatch"]');
             expect(title).not.toBeNull();
-            expect(title?.textContent).toContain("version mismatch");
+            // A minor skew is a dismissible notice over the live session,
+            // never a wall with a dead-end "Restart daemon" button.
+            expect(title?.textContent).toContain("Cortex needs an update");
+            expect(title?.textContent).not.toMatch(/daemon/i);
+            expect(container.querySelector('[data-testid="connection-panel"]')).toBeNull();
+            expect(container.querySelector('[data-testid="version-banner-dismiss"]')).not.toBeNull();
         } finally {
             await cleanup();
         }
@@ -174,9 +180,37 @@ describe("F54 popup renders distinct UI per connectivity state", () => {
             });
             const title = container.querySelector('[data-testid="conn-state-handshake_failed"]');
             expect(title).not.toBeNull();
-            expect(title?.textContent).toContain("Handshake failed");
+            expect(title?.textContent).toContain("Cortex couldn't verify this browser");
+            // The raw code is a diagnostic, never guidance.
+            expect(container.textContent).not.toContain("auth_token_invalid");
         } finally {
             await cleanup();
         }
+    });
+});
+
+describe("version compatibility is major.minor only", () => {
+    it("treats a patch-level skew between the DMG and the extension as ok", () => {
+        expect(
+            classifyConnectivity({
+                connected: true,
+                nativeHostStatus: "present",
+                daemonVersion: "0.3.14",
+                expectedVersion: "0.3.15",
+                handshakeError: null,
+            }),
+        ).toBe("ok");
+    });
+
+    it("still flags a minor skew", () => {
+        expect(
+            classifyConnectivity({
+                connected: true,
+                nativeHostStatus: "present",
+                daemonVersion: "0.4.0",
+                expectedVersion: "0.3.15",
+                handshakeError: null,
+            }),
+        ).toBe("installed_version_mismatch");
     });
 });

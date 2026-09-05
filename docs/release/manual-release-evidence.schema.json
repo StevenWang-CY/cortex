@@ -1,11 +1,21 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Cortex signed release-candidate evidence",
+  "description": "One record per physically exercised architecture. Version 1.1 adds assurance tiers so a solo maintainer can publish a truthfully labelled self-attested release while an independently reviewed release remains a stricter, distinct tier.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "artifact", "host", "cases", "reviewers", "decision"],
+  "required": [
+    "schema_version",
+    "assurance_tier",
+    "artifact",
+    "host",
+    "cases",
+    "reviewers",
+    "decision"
+  ],
   "properties": {
-    "schema_version": { "const": "1.0" },
+    "schema_version": { "const": "1.1" },
+    "assurance_tier": { "enum": ["self-attested", "independently-reviewed"] },
     "artifact": {
       "type": "object",
       "additionalProperties": false,
@@ -56,8 +66,9 @@
               "uninstall.cleanup"
             ]
           },
-          "result": { "enum": ["passed", "failed", "blocked"] },
+          "result": { "enum": ["passed", "failed", "blocked", "not_run"] },
           "observed": { "type": "string", "minLength": 20 },
+          "reason": { "type": "string", "minLength": 20 },
           "evidence_files": {
             "type": "array",
             "uniqueItems": true,
@@ -73,38 +84,27 @@
             "then": {
               "properties": { "evidence_files": { "minItems": 1 } }
             }
+          },
+          {
+            "if": {
+              "required": ["result"],
+              "properties": { "result": { "const": "not_run" } }
+            },
+            "then": { "required": ["reason"] }
           }
         ]
       }
     },
     "reviewers": {
       "type": "array",
-      "minItems": 2,
+      "minItems": 1,
       "uniqueItems": true,
-      "allOf": [
-        {
-          "contains": {
-            "type": "object",
-            "required": ["role"],
-            "properties": { "role": { "const": "builder" } }
-          },
-          "minContains": 1
-        },
-        {
-          "contains": {
-            "type": "object",
-            "required": ["role"],
-            "properties": { "role": { "const": "independent_reviewer" } }
-          },
-          "minContains": 1
-        }
-      ],
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": ["role", "reviewer_id", "signed_at_utc", "attestation"],
         "properties": {
-          "role": { "enum": ["builder", "independent_reviewer"] },
+          "role": { "enum": ["builder", "maintainer", "independent_reviewer"] },
           "reviewer_id": {
             "type": "string",
             "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@-]{2,127}$"
@@ -135,8 +135,57 @@
           "cases": {
             "items": {
               "required": ["result"],
-              "properties": { "result": { "const": "passed" } }
+              "properties": { "result": { "enum": ["passed", "not_run"] } }
             }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["assurance_tier"],
+        "properties": { "assurance_tier": { "const": "independently-reviewed" } }
+      },
+      "then": {
+        "properties": {
+          "reviewers": {
+            "minItems": 2,
+            "allOf": [
+              {
+                "contains": {
+                  "type": "object",
+                  "required": ["role"],
+                  "properties": { "role": { "const": "builder" } }
+                },
+                "minContains": 1
+              },
+              {
+                "contains": {
+                  "type": "object",
+                  "required": ["role"],
+                  "properties": { "role": { "const": "independent_reviewer" } }
+                },
+                "minContains": 1
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["assurance_tier"],
+        "properties": { "assurance_tier": { "const": "self-attested" } }
+      },
+      "then": {
+        "properties": {
+          "reviewers": {
+            "contains": {
+              "type": "object",
+              "required": ["role"],
+              "properties": { "role": { "enum": ["maintainer", "builder"] } }
+            },
+            "minContains": 1
           }
         }
       }

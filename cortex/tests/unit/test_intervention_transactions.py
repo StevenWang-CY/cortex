@@ -1645,7 +1645,14 @@ async def test_restore_failure_remains_retryable_and_idempotent() -> None:
         manifest.intervention_id, reason="user_undo",
     )
     assert retry is not None
-    assert retry.restore_id != restore.restore_id
+    # Audit D9: a retry re-dispatches the *same* exact inverse (receipts
+    # carry an ``attempt`` counter) instead of appending a fresh command to
+    # ``restore_history`` on every retry.
+    assert retry.restore_id == restore.restore_id
+    journal_state = await coordinator.get_transaction(manifest.intervention_id)
+    assert journal_state is not None
+    assert len(journal_state.restore_history) == 1
+    assert journal_state.state == InterventionLifecycleState.RESTORING
     await coordinator.bind_dispatch_targets(
         retry.restore_id,
         {"act_close": "client_browser"},

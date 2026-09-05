@@ -1,10 +1,15 @@
-"""Desktop Shell — Connections Panel (macOS-native refactor).
+"""Desktop Shell — Connections window (macOS-native refactor).
 
-One-click setup for Chrome, Edge, and VS Code / Cursor / VSCodium. Visual
-layer adopts the system semantic palette, SF system fonts, sentence-case
-headings, and the popover-vibrancy material. Subprocess installation
-mechanics, App Translocation detection, and the editor-CLI search are all
-unchanged.
+One-click setup for Chrome, Edge, and VS Code / Cursor / VSCodium.
+
+Every outcome is rendered inline on the card it belongs to — a three-row
+checklist (bridge / extension / Cortex running) plus numbered next steps
+that stay on screen — instead of modal message boxes that vanish the
+moment the user clicks OK. The panel re-probes what it can verify each
+time it is shown, Escape closes it, and it is a window (no "Back").
+
+Subprocess installation mechanics, App Translocation detection, and the
+editor-CLI search are unchanged.
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -22,7 +28,6 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
-    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -34,23 +39,24 @@ from cortex.apps.desktop_shell.a11y import (
     set_accessible_description,
     set_accessible_name,
 )
+from cortex.apps.desktop_shell.components import status_pill_qss, wrap_capped
 from cortex.apps.desktop_shell.tokens import (
-    BRAND_ACCENT,
-    BRAND_ACCENT_HOVER,
-    BRAND_ACCENT_PRESSED,
-    BRAND_ACCENT_TEXT,
-    BRAND_DISPLAY_FONT,
+    BTN_ACCENT_QSS,
+    BTN_GHOST_QSS,
+    CARD_QSS,
+    CX_BG,
+    CX_DANGER_TEXT,
+    CX_SUCCESS_TEXT,
+    CX_TEXT,
     CX_TEXT_SECONDARY,
     CX_TEXT_TERTIARY,
-    FONT_MONO,
+    CX_WARNING_TEXT,
     FS_BODY,
     FS_CAPTION,
     FS_FOOTNOTE,
-    FS_TITLE,
-    FW_REGULAR,
-    RADIUS_BUTTON,
+    PAGE_TITLE_QSS,
     RADIUS_CARD,
-    SEMANTIC_LIGHT,
+    SECTION_HEADING_QSS,
     SP2,
     SP3,
     SP4,
@@ -60,21 +66,8 @@ from cortex.apps.desktop_shell.tokens import (
 
 logger = logging.getLogger(__name__)
 
-_WINDOW_BG = SEMANTIC_LIGHT["window_bg"]
-_CONTROL_BG = SEMANTIC_LIGHT["control_bg"]
-_LABEL = SEMANTIC_LIGHT["label_primary"]
-# Warm-greyscale label tints from the token registry. Tertiary is the
-# WCAG-AA-passing value the dashboard adopted in F55; audit Wave 2
-# promoted it so every surface picks it up.
-_LABEL_SECONDARY = CX_TEXT_SECONDARY
-_LABEL_TERTIARY = CX_TEXT_TERTIARY
-_SEPARATOR = SEMANTIC_LIGHT["separator"]
-_DANGER = SEMANTIC_LIGHT["danger"]
-_DANGER_DIM = "rgba(215, 0, 21, 0.10)"
-_SUCCESS = SEMANTIC_LIGHT["success"]
-_SUCCESS_DIM = "rgba(48, 178, 87, 0.10)"
 _WARNING_BG = "rgba(217, 161, 0, 0.12)"
-_WARNING = SEMANTIC_LIGHT["warning"]
+_DAEMON_PORT = 9473
 
 
 # ---------------------------------------------------------------------------
@@ -230,145 +223,299 @@ def _resolve_browser_bundles() -> list[tuple[str, str, str]]:
 _BROWSERS: list[tuple[str, str, str]] = _resolve_browser_bundles()
 
 
+def _browser_app_name(name: str) -> str:
+    return "Google Chrome" if "chrome" in name.lower() else "Microsoft Edge"
+
+
+def _probe_bridge(app_name: str) -> tuple[bool, bool, str] | None:
+    """Run the real native-host protocol probe for one browser.
+
+    Returns ``(bridge_ok, extension_found, error)`` or ``None`` when the
+    probe itself could not run (missing installer module, crash).
+    """
+    try:
+        from cortex.scripts.install_native_host import verify_browser_installation
+
+        verification = verify_browser_installation(app_name)
+        return (
+            bool(verification.ok),
+            bool(getattr(verification, "extension_ids", ())),
+            str(getattr(verification, "error", "") or ""),
+        )
+    except Exception:
+        logger.debug("bridge probe failed for %s", app_name, exc_info=True)
+        return None
+
+
+def _finish_steps(name: str) -> list[str]:
+    """The browser-required steps after the bridge is registered."""
+    return [
+        f"In {name}, turn on Developer mode (top-right toggle).",
+        "Click “Load unpacked”, press Cmd+Shift+G in the folder picker, "
+        "paste the copied path, press Return, then click Open.",
+        f"Quit {name} fully with Cmd+Q and reopen it — the bridge is only "
+        "picked up on a fresh launch.",
+        "Pin Cortex, open its popup, then click Verify here.",
+    ]
+
+
+_ROW_COPY: dict[str, tuple[str, str, str]] = {
+    # key: (done, not done, not checked yet)
+    "bridge": (
+        "Browser bridge registered",
+        "Browser bridge not registered",
+        "Browser bridge — not checked yet",
+    ),
+    "extension": (
+        "Cortex extension found in the browser",
+        "Cortex extension not found in the browser",
+        "Cortex extension — load it, then Verify",
+    ),
+    "editor": (
+        "Editor found",
+        "No compatible editor found",
+        "Editor — not checked yet",
+    ),
+    "installed": (
+        "Cortex extension installed",
+        "Cortex extension not installed",
+        "Cortex extension — not installed yet",
+    ),
+    "daemon": (
+        "Cortex is running",
+        "Cortex is not running",
+        "Cortex — not checked yet",
+    ),
+}
+
+_TONE_COLOR: dict[str, str] = {
+    "neutral": CX_TEXT_SECONDARY,
+    "success": CX_SUCCESS_TEXT,
+    "warning": CX_WARNING_TEXT,
+    "danger": CX_DANGER_TEXT,
+}
+
+
+# ---------------------------------------------------------------------------
+# Inline checklist
+# ---------------------------------------------------------------------------
+
+class _Checklist(QWidget):
+    """Three verifiable rows plus numbered next steps, rendered inline on a
+    connection card so the outcome of Connect / Verify never disappears."""
+
+    def __init__(self, row_keys: tuple[str, ...], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._rows: dict[str, QLabel] = {}
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(SP2)
+        for key in row_keys:
+            row = QLabel("")
+            row.setFont(mac_native.system_font(FS_CAPTION, "medium"))
+            row.setWordWrap(True)
+            set_accessible_name(row, _ROW_COPY[key][2].split(" —")[0] + " status")
+            self._rows[key] = row
+            layout.addWidget(row)
+            self.set_row(key, None)
+        self._note = QLabel("")
+        self._note.setWordWrap(True)
+        self._note.setFont(mac_native.system_font(FS_CAPTION, "regular"))
+        self._note.setVisible(False)
+        set_accessible_name(self._note, "Connection note")
+        layout.addWidget(self._note)
+        self._steps = QLabel("")
+        self._steps.setWordWrap(True)
+        self._steps.setFont(mac_native.system_font(FS_CAPTION, "regular"))
+        self._steps.setStyleSheet(
+            f"color: {CX_TEXT}; border: none; background: transparent;"
+        )
+        self._steps.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self._steps.setVisible(False)
+        set_accessible_name(self._steps, "Next steps")
+        layout.addWidget(self._steps)
+
+    def set_row(self, key: str, state: bool | None) -> None:
+        row = self._rows.get(key)
+        if row is None:
+            return
+        done, failed, pending = _ROW_COPY[key]
+        if state is True:
+            row.setText(f"✓  {done}")
+            color = CX_SUCCESS_TEXT
+        elif state is False:
+            row.setText(f"✗  {failed}")
+            color = CX_DANGER_TEXT
+        else:
+            row.setText(f"○  {pending}")
+            color = CX_TEXT_TERTIARY
+        row.setStyleSheet(f"color: {color}; border: none; background: transparent;")
+
+    def set_note(self, text: str, tone: str) -> None:
+        self._note.setText(text)
+        self._note.setStyleSheet(
+            f"color: {_TONE_COLOR.get(tone, CX_TEXT_SECONDARY)};"
+            " border: none; background: transparent;"
+        )
+        self._note.setVisible(bool(text))
+
+    def set_steps(self, steps: list[str]) -> None:
+        if not steps:
+            self._steps.setText("")
+            self._steps.setVisible(False)
+            return
+        self._steps.setText(
+            "\n".join(f"{i}. {step}" for i, step in enumerate(steps, start=1))
+        )
+        self._steps.setVisible(True)
+
+
 # ---------------------------------------------------------------------------
 # ConnectionsPanel
 # ---------------------------------------------------------------------------
 
 class ConnectionsPanel(QWidget):
-    """Popover-style panel for one-click browser + editor connect."""
+    """Window for one-click browser + editor connect with inline results."""
 
     back_requested = Signal()
+    # Emitted with the display name when every locally verifiable layer
+    # for that browser passes (bridge, extension present, Cortex running).
+    connection_verified = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Cortex — Connect")
         self.setFixedWidth(480)
-        self.setStyleSheet(f"background: {_WINDOW_BG}; color: {_LABEL};")
+        self.setMinimumHeight(560)
+        self.setStyleSheet(f"background: {CX_BG}; color: {CX_TEXT};")
+        set_accessible_name(self, "Connect extensions")
+        set_accessible_description(
+            self, "Connect the Cortex browser and editor extensions. Escape closes.",
+        )
+
+        # Plain status model per card so tests and the host can read what
+        # the checklist shows without walking widgets.
+        self._status_model: dict[str, dict[str, Any]] = {}
+        self._checklists: dict[str, _Checklist] = {}
+        self._browser_cards: list[tuple[str, str, bool]] = []
+        self._editor_name: str = "Editor"
+        self._editor_found = False
+        self._reprobe_on_show = True
 
         # audit-w2 (F55 carry-over): keep button refs so we can chain
         # tab order at the end of __init__ once every card is built.
         self._tab_order_chain: list[QPushButton] = []
 
-        layout = QVBoxLayout(self)
+        try:
+            from PySide6.QtWidgets import QScrollArea
+        except ImportError:  # pragma: no cover - test stub path
+            QScrollArea = None
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        content = QWidget()
+        content.setObjectName("CortexConnectionsContent")
+        content.setStyleSheet(
+            f"#CortexConnectionsContent {{ background: {CX_BG}; }}"
+        )
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(SP6, SP5, SP6, SP6)
         layout.setSpacing(SP5)
 
-        # ── Header (back link) ───────────────────────────────────────
-        header = QHBoxLayout()
-        header.setContentsMargins(0, 0, 0, 0)
-        back_btn = QPushButton("←  Back")
-        back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        back_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
-        back_btn.setStyleSheet(
-            "QPushButton {"
-            f"  color: {_LABEL_SECONDARY};"
-            "  background: transparent; border: none; padding: 4px 0;"
-            "}"
-            f"QPushButton:hover {{ color: {_LABEL}; }}"
-        )
-        back_btn.clicked.connect(self._on_back)
-        set_accessible_name(back_btn, "Back to dashboard")
-        # Phase J-5: keyboard-reachable Back button.
-        try:
-            back_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        except Exception:
-            pass
-        self._tab_order_chain.append(back_btn)
-        header.addWidget(back_btn)
-        header.addStretch()
-        layout.addLayout(header)
+        if QScrollArea is not None:
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            try:
+                scroll.setFrameShape(QFrame.Shape.NoFrame)
+            except AttributeError:  # pragma: no cover - stub harness
+                pass
+            scroll.setStyleSheet(
+                "QScrollArea { border: none; background: transparent; }"
+                "QScrollBar:vertical { background: transparent; width: 8px; }"
+                "QScrollBar::handle:vertical {"
+                "  background: rgba(0,0,0,0.18); border-radius: 4px; min-height: 24px;"
+                "}"
+                "QScrollBar::handle:vertical:hover { background: rgba(0,0,0,0.32); }"
+                "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+            )
+            scroll.setWidget(content)
+            outer.addWidget(scroll)
+        else:  # pragma: no cover - test stub path
+            outer.addWidget(content)
 
-        # ── Title (Cormorant italic — brand preserved) ───────────────
-        title = QLabel("Connect Extensions")
-        title.setStyleSheet(
-            f"font-family: {BRAND_DISPLAY_FONT}, ui-serif, Georgia, serif;"
-            f"font-size: {FS_TITLE}px;"
-            "font-style: italic;"
-            f"font-weight: {FW_REGULAR};"
-            f"color: {_LABEL}; background: transparent;"
-        )
+        # ── Title ────────────────────────────────────────────────────
+        title = QLabel("Connect extensions")
+        title.setStyleSheet(PAGE_TITLE_QSS)
         layout.addWidget(title)
 
         subtitle = QLabel(
-            "Link your browser and editor to enable real-time workspace "
-            "restructuring."
+            "Link your browser and editor so Cortex can see what you're "
+            "working on and act on it. Results stay on each card."
         )
         subtitle.setWordWrap(True)
         subtitle.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
         subtitle.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
         layout.addWidget(subtitle)
         layout.addSpacing(SP2)
 
-        # ── Translocation warning (yellow info banner) ────────────────
+        # ── Translocation warning ────────────────────────────────────
         self._transloc_warning = QFrame()
         self._transloc_warning.setObjectName("CortexTranslocWarn")
         self._transloc_warning.setStyleSheet(
             "QFrame#CortexTranslocWarn {"
             f"  background: {_WARNING_BG};"
-            f"  border: 0.5px solid rgba(217, 161, 0, 0.30);"
+            "  border: 1px solid rgba(217, 161, 0, 0.30);"
             f"  border-radius: {RADIUS_CARD}px;"
             "}"
         )
         warn_layout = QVBoxLayout(self._transloc_warning)
         warn_layout.setContentsMargins(SP4, SP3, SP4, SP3)
-        warn_title = QLabel("⚠︎  App Sandbox Detected")
+        warn_title = QLabel("Cortex is running from a temporary location")
         warn_title.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
         warn_title.setStyleSheet(
-            f"color: {_WARNING}; border: none; background: transparent;"
+            f"color: {CX_WARNING_TEXT}; border: none; background: transparent;"
         )
         warn_layout.addWidget(warn_title)
         warn_body = QLabel(
-            "Cortex is running in a temporary sandbox. Move it to Applications, "
-            "then run this command in Terminal and relaunch:"
+            "macOS opened this copy in a sandbox, so the browser bridge can't "
+            "be registered. Move Cortex into your Applications folder and open "
+            "it from there. If this keeps happening, re-download Cortex from "
+            "the release page and verify the download before opening it."
         )
         warn_body.setWordWrap(True)
         warn_body.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         warn_body.setStyleSheet(
-            f"color: {_LABEL}; border: none; background: transparent;"
+            f"color: {CX_TEXT}; border: none; background: transparent;"
         )
         warn_layout.addWidget(warn_body)
-        warn_cmd = QLabel("xattr -cr /Applications/Cortex.app")
-        warn_cmd.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
-        warn_cmd.setStyleSheet(
-            f"font-family: {FONT_MONO};"
-            f"font-size: {FS_CAPTION}px;"
-            f"color: {_LABEL};"
-            f"background: rgba(0,0,0,0.06);"
-            f"border: 0.5px solid rgba(0,0,0,0.10);"
-            f"border-radius: {RADIUS_BUTTON}px;"
-            "padding: 4px 8px;"
-        )
-        warn_layout.addWidget(warn_cmd)
         self._transloc_warning.setVisible(False)
         layout.addWidget(self._transloc_warning)
 
         translocated = is_translocated()
+        self._translocated = translocated
         if translocated:
             self._transloc_warning.setVisible(True)
 
         # ── Browsers ──────────────────────────────────────────────────
         browser_label = QLabel("Browsers")
-        browser_label.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
-        browser_label.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
-        )
+        browser_label.setStyleSheet(SECTION_HEADING_QSS)
         layout.addWidget(browser_label)
 
         for name, app_path, scheme in _BROWSERS:
             installed = os.path.exists(app_path)
+            self._browser_cards.append((name, scheme, installed))
             card = self._make_browser_card(name, app_path, scheme, installed, translocated)
             layout.addWidget(card)
 
         # ── Editor ────────────────────────────────────────────────────
         editor_label = QLabel("Editor")
-        editor_label.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
-        editor_label.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
-        )
+        editor_label.setStyleSheet(SECTION_HEADING_QSS)
         layout.addWidget(editor_label)
 
         editor = find_editor_cli()
@@ -377,8 +524,8 @@ class ConnectionsPanel(QWidget):
         layout.addStretch()
 
         # audit-w2 (F55 carry-over): chain tab order across every action
-        # button. VoiceOver users can now walk Back → browser Connect
-        # buttons → editor Connect with the keyboard alone.
+        # button so a keyboard user walks Connect → Verify → editor
+        # Connect without bouncing through labels.
         chain_tab_order(*self._tab_order_chain)
 
     # -- Lifecycle ------------------------------------------------------
@@ -387,9 +534,25 @@ class ConnectionsPanel(QWidget):
         super().showEvent(event)
         try:
             mac_native.apply_unified_titlebar(self)
-            mac_native.apply_vibrancy(self, material="popover")
+            mac_native.apply_vibrancy(self)
         except Exception:
             pass
+        if getattr(self, "_reprobe_on_show", False):
+            try:
+                self.reprobe()
+            except Exception:
+                logger.debug("connections re-probe failed", exc_info=True)
+
+    def keyPressEvent(self, event: object) -> None:  # noqa: D401 - Qt override
+        key = getattr(event, "key", lambda: None)()
+        if key == Qt.Key.Key_Escape:
+            self._on_back()
+            try:
+                event.accept()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            return
+        super().keyPressEvent(event)
 
     # -- Navigation -----------------------------------------------------
 
@@ -397,37 +560,92 @@ class ConnectionsPanel(QWidget):
         self.hide()
         self.back_requested.emit()
 
+    # -- Status model ---------------------------------------------------
+
+    def _set_status(
+        self,
+        name: str,
+        *,
+        rows: dict[str, bool | None] | None = None,
+        steps: list[str] | None = None,
+        note: str | None = None,
+        tone: str | None = None,
+    ) -> None:
+        """Merge an update into the card's status model and re-render."""
+        model = self.__dict__.setdefault("_status_model", {})
+        entry = model.setdefault(
+            name, {"rows": {}, "steps": [], "note": "", "tone": "neutral"},
+        )
+        if rows:
+            entry["rows"].update(rows)
+        if steps is not None:
+            entry["steps"] = list(steps)
+        if note is not None:
+            entry["note"] = note
+        if tone is not None:
+            entry["tone"] = tone
+        self._render_status(name)
+
+    def _render_status(self, name: str) -> None:
+        checklist = getattr(self, "_checklists", {}).get(name)
+        entry = getattr(self, "_status_model", {}).get(name)
+        if checklist is None or entry is None:
+            return
+        try:
+            for key, state in entry["rows"].items():
+                checklist.set_row(key, state)
+            checklist.set_note(str(entry["note"]), str(entry["tone"]))
+            checklist.set_steps(list(entry["steps"]))
+        except Exception:
+            logger.debug("checklist render failed for %s", name, exc_info=True)
+
+    def status_for(self, name: str) -> dict[str, Any]:
+        """Read-only view of a card's checklist model (for hosts/tests)."""
+        entry = getattr(self, "_status_model", {}).get(name, {})
+        return {
+            "rows": dict(entry.get("rows", {})),
+            "steps": list(entry.get("steps", [])),
+            "note": str(entry.get("note", "")),
+            "tone": str(entry.get("tone", "neutral")),
+        }
+
+    def reprobe(self) -> None:
+        """Re-check everything the shell can verify without user action:
+        bridge registration + extension presence per installed browser,
+        editor presence, and whether Cortex is running."""
+        daemon_ok = self._daemon_reachable()
+        for name, _scheme, installed in getattr(self, "_browser_cards", []):
+            if not installed or getattr(self, "_translocated", False):
+                continue
+            probe = _probe_bridge(_browser_app_name(name))
+            rows: dict[str, bool | None] = {"daemon": daemon_ok}
+            if probe is not None:
+                bridge_ok, extension_found, _error = probe
+                rows["bridge"] = bridge_ok
+                rows["extension"] = extension_found if bridge_ok else None
+            entry = getattr(self, "_status_model", {}).get(name, {})
+            steps = list(entry.get("steps", []))
+            if probe is not None and not probe[0] and not steps:
+                steps = [f"Click Connect {name} to register the browser bridge."]
+            self._set_status(name, rows=rows, steps=steps)
+        editor_name = getattr(self, "_editor_name", "Editor")
+        self._set_status(
+            editor_name,
+            rows={"editor": getattr(self, "_editor_found", False), "daemon": daemon_ok},
+        )
+
     # -- Card builders --------------------------------------------------
 
     def _row_card(self) -> QFrame:
         card = QFrame()
         card.setObjectName("CortexConnRow")
-        # Give cards a comfortable minimum height so Qt can't squish
-        # their inner widgets into invisibility on small windows.
-        card.setMinimumHeight(110)
-        card.setStyleSheet(
-            "QFrame#CortexConnRow {"
-            f"  background: {_CONTROL_BG};"
-            f"  border: 0.5px solid {_SEPARATOR};"
-            f"  border-radius: {RADIUS_CARD}px;"
-            "}"
-        )
+        card.setStyleSheet(f"QFrame#CortexConnRow {{ {CARD_QSS} }}")
         return card
 
     def _status_pill(self, text: str, *, ok: bool) -> QLabel:
-        if ok:
-            color = _SUCCESS
-            bg = _SUCCESS_DIM
-        else:
-            color = _LABEL_TERTIARY
-            bg = "rgba(0,0,0,0.05)"
         lbl = QLabel(text)
         lbl.setFont(mac_native.system_font(FS_CAPTION, "medium"))
-        lbl.setStyleSheet(
-            f"color: {color}; background: {bg};"
-            f" border: none; border-radius: {RADIUS_BUTTON}px;"
-            "  padding: 3px 8px;"
-        )
+        lbl.setStyleSheet(status_pill_qss("success" if ok else "neutral"))
         return lbl
 
     def _primary_button(self, text: str) -> QPushButton:
@@ -435,48 +653,25 @@ class ConnectionsPanel(QWidget):
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.setMinimumHeight(34)
         btn.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
-        # Phase J-5: ensure every primary action button on the
-        # connections panel is keyboard-reachable. QPushButton's
-        # default on macOS can fall back to WheelFocus which excludes
-        # the button from the tab cycle.
+        # Phase J-5: every action button is keyboard-reachable.
         try:
             btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         except Exception:
             pass
-        btn.setStyleSheet(
-            "QPushButton {"
-            "  padding: 6px 16px;"
-            f"  border-radius: {RADIUS_BUTTON}px;"
-            f"  background: {BRAND_ACCENT};"
-            f"  color: {SEMANTIC_LIGHT['label_primary']}; border: none;"
-            "}"
-            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"
-            f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"
-            "QPushButton:disabled { background: rgba(0,0,0,0.12); color: rgba(0,0,0,0.35); }"
-        )
+        btn.setStyleSheet(BTN_ACCENT_QSS)
         return btn
 
     def _secondary_button(self, text: str) -> QPushButton:
-        """Outlined secondary action (e.g. 'Verify connection')."""
+        """Ghost secondary action (e.g. 'Verify connection')."""
         btn = QPushButton(text)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.setMinimumHeight(30)
-        btn.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
+        btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
         try:
             btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         except Exception:
             pass
-        btn.setStyleSheet(
-            "QPushButton {"
-            "  padding: 5px 14px;"
-            f"  border-radius: {RADIUS_BUTTON}px;"
-            "  background: transparent;"
-            f"  color: {BRAND_ACCENT_TEXT};"
-            f"  border: 1px solid {BRAND_ACCENT};"
-            "}"
-            "QPushButton:hover { background: rgba(0,0,0,0.04); }"
-            "QPushButton:disabled { color: rgba(0,0,0,0.30); border-color: rgba(0,0,0,0.18); }"
-        )
+        btn.setStyleSheet(BTN_GHOST_QSS)
         return btn
 
     def _make_browser_card(
@@ -497,29 +692,37 @@ class ConnectionsPanel(QWidget):
         title = QLabel(name)
         title.setFont(mac_native.system_font(FS_BODY, "semibold"))
         title.setStyleSheet(
-            f"color: {_LABEL}; border: none; background: transparent;"
+            f"color: {CX_TEXT}; border: none; background: transparent;"
         )
         header.addWidget(title)
         header.addStretch()
         header.addWidget(
             self._status_pill(
-                "Browser found" if installed else "Not found",
+                "Browser found" if installed else "Not installed",
                 ok=installed,
             )
         )
         layout.addLayout(header)
 
         desc = QLabel(
-            "Install native messaging host and load the Cortex extension."
+            "Registers the Cortex bridge, copies the extension folder, and "
+            "opens the extensions page so you can load it."
             if installed else f"{name} is not installed on this Mac."
         )
         desc.setWordWrap(True)
         desc.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         desc.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; border: none; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; border: none; background: transparent;"
         )
         layout.addWidget(desc)
 
+        checklist = _Checklist(("bridge", "extension", "daemon"))
+        self._checklists[name] = checklist
+        layout.addWidget(checklist)
+        self._set_status(name, rows={"bridge": None, "extension": None, "daemon": None})
+
+        actions = QHBoxLayout()
+        actions.setSpacing(SP3)
         btn = self._primary_button(f"Connect {name}")
         btn.setEnabled(installed and not translocated)
         btn.clicked.connect(
@@ -528,18 +731,17 @@ class ConnectionsPanel(QWidget):
         set_accessible_name(btn, f"Connect {name}")
         set_accessible_description(
             btn,
-            f"Install Cortex native messaging host for {name} and open "
-            f"{name}'s extensions page so you can load the Cortex extension.",
+            f"Register the Cortex bridge for {name} and open {name}'s "
+            "extensions page so you can load the Cortex extension.",
         )
         self._tab_order_chain.append(btn)
-        layout.addWidget(btn)
+        actions.addWidget(btn)
 
         # Honest verification affordance: loading an unpacked extension is
         # a manual step the desktop shell cannot perform, so after the
-        # guide the user clicks "Verify connection" to confirm the pieces
-        # the shell CAN check — the native-messaging manifest is installed
-        # and the daemon is reachable for the extension to connect to.
-        verify_btn = self._secondary_button("Verify connection")
+        # guide the user clicks "Verify" to confirm the pieces the shell
+        # CAN check.
+        verify_btn = self._secondary_button("Verify")
         verify_btn.setEnabled(installed and not translocated)
         verify_btn.clicked.connect(
             lambda checked=False, n=name: self._verify_browser_connection(n)
@@ -547,11 +749,13 @@ class ConnectionsPanel(QWidget):
         set_accessible_name(verify_btn, f"Verify {name} connection")
         set_accessible_description(
             verify_btn,
-            f"Check that the Cortex native messaging host is installed for "
-            f"{name} and that the Cortex daemon is running.",
+            f"Check that the Cortex bridge is registered for {name}, the "
+            "extension is loaded, and Cortex is running.",
         )
         self._tab_order_chain.append(verify_btn)
-        layout.addWidget(verify_btn)
+        actions.addWidget(verify_btn)
+        actions.addStretch()
+        layout.addLayout(actions)
 
         return card
 
@@ -566,32 +770,43 @@ class ConnectionsPanel(QWidget):
         layout.setSpacing(SP3)
 
         editor_name = editor[1] if editor else "Editor"
+        self._editor_name = editor_name
+        self._editor_found = editor is not None
 
         header = QHBoxLayout()
         header.setSpacing(SP3)
         title = QLabel(editor_name)
         title.setFont(mac_native.system_font(FS_BODY, "semibold"))
         title.setStyleSheet(
-            f"color: {_LABEL}; border: none; background: transparent;"
+            f"color: {CX_TEXT}; border: none; background: transparent;"
         )
         header.addWidget(title)
         header.addStretch()
         header.addWidget(self._status_pill(
-            "Available" if editor else "Not found", ok=bool(editor),
+            "Editor found" if editor else "Not found", ok=bool(editor),
         ))
         layout.addLayout(header)
 
         desc = QLabel(
-            "Install the Cortex VS Code extension for editor integration."
+            "Installs the Cortex extension into your editor."
             if editor else
             "No compatible editor found (VS Code, Cursor, VSCodium)."
         )
         desc.setWordWrap(True)
         desc.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         desc.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; border: none; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; border: none; background: transparent;"
         )
+        wrap_capped(desc, 400)
         layout.addWidget(desc)
+
+        checklist = _Checklist(("editor", "installed", "daemon"))
+        self._checklists[editor_name] = checklist
+        layout.addWidget(checklist)
+        self._set_status(
+            editor_name,
+            rows={"editor": editor is not None, "installed": None, "daemon": None},
+        )
 
         btn = self._primary_button(f"Connect {editor_name}")
         btn.setEnabled(editor is not None and not translocated)
@@ -604,13 +819,23 @@ class ConnectionsPanel(QWidget):
             f"Install the Cortex extension into {editor_name}.",
         )
         self._tab_order_chain.append(btn)
-        layout.addWidget(btn)
+        actions = QHBoxLayout()
+        actions.addWidget(btn)
+        actions.addStretch()
+        layout.addLayout(actions)
         return card
 
     # -- Actions --------------------------------------------------------
 
     def _connect_browser(self, name: str, scheme: str) -> None:
-        app_name = "Google Chrome" if "chrome" in name.lower() else "Microsoft Edge"
+        app_name = _browser_app_name(name)
+        self._set_status(
+            name,
+            rows={"bridge": None},
+            steps=[],
+            note=f"Registering the {name} bridge…",
+            tone="neutral",
+        )
         try:
             from cortex.scripts.install_native_host import (
                 install,
@@ -622,10 +847,18 @@ class ConnectionsPanel(QWidget):
                 project_root=app_root,
                 target_browsers=(app_name,),
             ):
-                QMessageBox.warning(
-                    self,
-                    f"Connect {name}",
-                    f"Cortex could not register its native messaging host for {name}.",
+                self._set_status(
+                    name,
+                    rows={"bridge": False},
+                    note=(
+                        f"Cortex could not register its browser bridge for {name}. "
+                        "No connection was reported as successful."
+                    ),
+                    tone="danger",
+                    steps=[
+                        "Make sure Cortex is in your Applications folder.",
+                        f"Click Connect {name} again.",
+                    ],
                 )
                 return
             verification = verify_browser_installation(app_name)
@@ -635,12 +868,19 @@ class ConnectionsPanel(QWidget):
                 )
         except Exception as exc:
             logger.exception("Failed to install native messaging host")
-            QMessageBox.warning(
-                self,
-                f"Couldn’t connect {name}",
-                "Cortex could not install and verify the browser bridge. "
-                "No connection was reported as successful.\n\n"
-                f"Details: {str(exc)[:500]}",
+            self._set_status(
+                name,
+                rows={"bridge": False},
+                note=(
+                    "Cortex could not install and verify the browser bridge. "
+                    "No connection was reported as successful. "
+                    f"Details: {str(exc)[:300]}"
+                ),
+                tone="danger",
+                steps=[
+                    "Make sure Cortex is in your Applications folder.",
+                    f"Click Connect {name} again.",
+                ],
             )
             return
 
@@ -651,7 +891,16 @@ class ConnectionsPanel(QWidget):
         )
         ext_path = canonical_app_path() / "Contents" / "Resources" / ext_subdir
         if not ext_path.exists():
-            QMessageBox.warning(self, "Error", f"Extension bundle not found at:\n{ext_path}")
+            self._set_status(
+                name,
+                rows={"bridge": True, "extension": False},
+                note=f"Bridge registered, but the extension folder is missing at {ext_path}.",
+                tone="danger",
+                steps=[
+                    "Re-download Cortex from the release page and verify the "
+                    "download, then try again.",
+                ],
+            )
             return
 
         clipboard = QApplication.clipboard()
@@ -671,80 +920,88 @@ class ConnectionsPanel(QWidget):
                 raise RuntimeError(detail)
         except Exception as exc:
             logger.exception("Failed to open %s", app_name)
-            QMessageBox.warning(
-                self,
-                f"Open {name}",
-                f"The browser bridge is installed and verified, but Cortex "
-                f"could not open {name}'s extensions page. Open {scheme} "
-                f"manually.\n\nDetails: {str(exc)[:300]}",
+            self._set_status(
+                name,
+                rows={"bridge": True, "extension": None, "daemon": self._daemon_reachable()},
+                note=(
+                    f"The bridge passed a real protocol check, but Cortex could not "
+                    f"open {name}'s extensions page. Open {scheme} yourself, then "
+                    f"finish these steps. Details: {str(exc)[:200]}"
+                ),
+                tone="warning",
+                steps=_finish_steps(name),
             )
             return
 
-        QMessageBox.information(
-            self,
-            f"Finish connecting {name}",
-            "The browser bridge passed a real protocol check. The Cortex "
-            "extension folder is copied to your clipboard.\n\n"
-            "Finish these browser-required steps:\n\n"
-            "1. Enable Developer Mode (top-right toggle)\n"
-            "2. Click 'Load unpacked'\n"
-            "3. In the folder picker, press Cmd+Shift+G\n"
-            "4. Paste the copied path, press Return, then click Open\n"
-            "5. Fully quit the browser with Cmd+Q, then reopen it\n"
-            "6. Pin Cortex and open its popup\n\n"
-            "The full quit is required after native-host registration. "
-            "When the popup is open, click 'Verify connection' here.",
+        self._set_status(
+            name,
+            rows={"bridge": True, "extension": None, "daemon": self._daemon_reachable()},
+            note=(
+                "The bridge passed a real protocol check. The extension folder "
+                f"is on your clipboard — finish these steps in {name}:"
+            ),
+            tone="success",
+            steps=_finish_steps(name),
         )
 
     def _verify_browser_connection(self, name: str) -> None:
-        """Honestly report what the desktop shell CAN confirm about the
-        browser connection: the native-messaging manifest is installed
-        for this browser, and the Cortex daemon is reachable for the
-        extension to connect to. Loading the unpacked extension is a
-        manual step the shell cannot observe directly, so we never claim
-        the extension is 'connected' — we report each verifiable piece."""
+        """Report what the desktop shell CAN confirm about the browser
+        connection: the bridge is registered and answers, the extension
+        is present in the browser profile, and Cortex is running for it
+        to connect to. Live WebSocket status is the popup's to show."""
         from cortex.scripts.install_native_host import verify_browser_installation
 
-        app_name = "Google Chrome" if "chrome" in name.lower() else "Microsoft Edge"
+        app_name = _browser_app_name(name)
         verification = verify_browser_installation(app_name)
-        host_ok = verification.ok
-        extension_found = bool(verification.extension_ids)
+        host_ok = bool(verification.ok)
+        extension_found = bool(getattr(verification, "extension_ids", ()))
         daemon_ok = self._daemon_reachable()
 
+        rows: dict[str, bool | None] = {
+            "bridge": host_ok,
+            "extension": extension_found,
+            "daemon": daemon_ok,
+        }
         if host_ok and extension_found and daemon_ok:
-            QMessageBox.information(
-                self,
-                f"Verify {name}",
-                "Browser bridge: protocol verified ✓\n"
-                "Cortex extension: found in browser profile ✓\n"
-                "Cortex daemon: running ✓\n\n"
-                "All locally verifiable connection layers are ready. The "
-                "extension popup is the final authority for live WebSocket status.",
+            self._set_status(
+                name,
+                rows=rows,
+                note=(
+                    "Everything Cortex can check here is ready. The extension "
+                    "popup shows the live connection."
+                ),
+                tone="success",
+                steps=[],
             )
+            try:
+                self.connection_verified.emit(name)
+            except Exception:
+                logger.debug("connection_verified emit failed", exc_info=True)
             return
 
-        lines = [
-            f"Browser bridge: {'protocol verified ✓' if host_ok else 'FAILED ✗'}",
-            f"Cortex extension: {'found in browser profile ✓' if extension_found else 'not detected ✗'}",
-            f"Cortex daemon: {'running ✓' if daemon_ok else 'not reachable ✗'}",
-            "",
-        ]
+        steps: list[str] = []
         if not host_ok:
-            lines.append(
-                "Click Connect to repair the browser bridge. "
-                f"Details: {verification.error or 'verification failed'}"
+            detail = getattr(verification, "error", None) or "verification failed"
+            steps.append(
+                f"Click Connect {name} to repair the browser bridge. Details: {detail}"
             )
         if not extension_found:
-            lines.append(
-                "Load the copied extension folder, then fully quit with Cmd+Q "
-                "and reopen the browser."
+            steps.append(
+                "Load the copied extension folder, then quit the browser fully "
+                "with Cmd+Q and reopen it."
             )
         if not daemon_ok:
-            lines.append(
-                "Start Cortex (the daemon listens on port 9473) so the "
-                "extension has something to connect to."
+            steps.append(
+                "Start a session in Cortex so the extension has something to "
+                "connect to."
             )
-        QMessageBox.warning(self, f"Verify {name}", "\n".join(lines))
+        self._set_status(
+            name,
+            rows=rows,
+            note="Not connected yet — the checks below say what is missing.",
+            tone="danger",
+            steps=steps,
+        )
 
     def _native_host_manifest_installed(self, name: str) -> bool:
         """Compatibility wrapper for the strong native-host verification.
@@ -762,7 +1019,7 @@ class ConnectionsPanel(QWidget):
         except (OSError, RuntimeError, ValueError):
             return False
 
-    def _daemon_reachable(self, *, host: str = "127.0.0.1", port: int = 9473) -> bool:
+    def _daemon_reachable(self, *, host: str = "127.0.0.1", port: int = _DAEMON_PORT) -> bool:
         """Best-effort TCP reachability probe for the daemon WebSocket
         port. A successful connect means the extension has somewhere to
         connect to. 250 ms timeout so the UI never stalls."""
@@ -787,9 +1044,25 @@ class ConnectionsPanel(QWidget):
         vsix = matches[-1] if matches else vsix_dir / "cortex-somatic.vsix"
 
         if not vsix.exists():
-            QMessageBox.warning(self, "Error", f"VSIX not found at:\n{vsix}")
+            self._set_status(
+                editor_name,
+                rows={"editor": True, "installed": False},
+                note=f"The extension package is missing at {vsix}.",
+                tone="danger",
+                steps=[
+                    "Re-download Cortex from the release page and verify the "
+                    "download, then try again.",
+                ],
+            )
             return
 
+        self._set_status(
+            editor_name,
+            rows={"editor": True, "installed": None},
+            note=f"Installing into {editor_name}…",
+            tone="neutral",
+            steps=[],
+        )
         try:
             result = subprocess.run(
                 [cli_path, "--install-extension", str(vsix)],
@@ -798,18 +1071,44 @@ class ConnectionsPanel(QWidget):
                 timeout=30,
             )
             if result.returncode == 0:
-                QMessageBox.information(
-                    self,
-                    "Success",
-                    f"{editor_name} extension installed!\n\nReload {editor_name} to activate.",
+                self._set_status(
+                    editor_name,
+                    rows={"installed": True, "daemon": self._daemon_reachable()},
+                    note=f"Installed into {editor_name}.",
+                    tone="success",
+                    steps=[
+                        f"Reload {editor_name} (Cmd+Shift+P → “Developer: Reload Window”).",
+                        "Start a session in Cortex — the editor's status bar item "
+                        "connects on its own.",
+                    ],
                 )
             else:
-                QMessageBox.warning(
-                    self,
-                    "Error",
-                    f"Installation failed:\n{result.stderr[:300]}",
+                self._set_status(
+                    editor_name,
+                    rows={"installed": False},
+                    note=f"Installation failed: {result.stderr[:300]}",
+                    tone="danger",
+                    steps=[
+                        "Try again. If it keeps failing, install the .vsix from the "
+                        "Extensions view (… menu → Install from VSIX).",
+                    ],
                 )
         except subprocess.TimeoutExpired:
-            QMessageBox.warning(self, "Error", "Installation timed out")
+            self._set_status(
+                editor_name,
+                rows={"installed": False},
+                note="Installation timed out.",
+                tone="danger",
+                steps=[f"Quit {editor_name} fully, then try again."],
+            )
         except FileNotFoundError:
-            QMessageBox.warning(self, "Error", f"{editor_name} CLI not found at:\n{cli_path}")
+            self._set_status(
+                editor_name,
+                rows={"editor": False, "installed": False},
+                note=f"{editor_name} command-line tool not found at {cli_path}.",
+                tone="danger",
+                steps=[
+                    f"In {editor_name}, run “Shell Command: Install 'code' command "
+                    "in PATH”, then try again.",
+                ],
+            )

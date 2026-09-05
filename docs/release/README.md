@@ -25,11 +25,13 @@ MediaPipe 0.10.21 also caps Intel Protobuf below 5. The resulting
 `PYSEC-2026-1805` finding concerns `google.protobuf.json_format.ParseDict` on
 attacker-controlled nested `Any` dictionaries. Neither Cortex nor the installed
 MediaPipe Python sources import that boundary, and the product accepts no
-Protobuf/JSON model graphs from clients. The reviewed Intel-only exception
-expires on 2026-09-22, is revalidated on every architecture build, and is
-included in release evidence alongside the raw audit. A compatible patched
-MediaPipe wheel, a replacement backend, or removal of Intel release support is
-required before expiry; silently extending the exception is not permitted.
+Protobuf/JSON model graphs from clients. The reviewed Intel-only exception was
+re-reviewed on 2026-09-04 (no patched Intel wheel exists), expires on
+2026-10-15, is revalidated on every architecture build, and is included in
+release evidence alongside the raw audit. Each renewal must record the review
+date and the upstream check in the exception itself; a compatible patched
+backend or retirement of the Intel artifact to CI-only status is the decision
+due before that date. Silently extending the exception is not permitted.
 
 The locks make resolution repeatable. Apple signing/notarization timestamps and
 DMG metadata mean the final archive is not promised to be byte-for-byte
@@ -60,9 +62,10 @@ when provenance is generated before shell exit cleanup; the clean-tree gate is
 not weakened with an ignore or exception for build-created inputs.
 
 The separate protected `production-publish` environment controls public
-promotion. Its required approver must inspect the real-device evidence and must
-not be an artifact builder. This separates possession of Apple credentials from
-authority to publish a candidate.
+promotion. Its approval is recorded as a maintainer approval of the declared
+assurance tier; it does not claim independence from the builder. Possession of
+Apple credentials (the release environment) and authority to publish (the
+publish environment) remain separate environments.
 
 `CORTEX_REQUIRE_NOTARIZATION=1` makes the build fail before compilation if an
 identity or notary profile is missing. Ad-hoc signing never enables hardened
@@ -81,19 +84,24 @@ For each architecture, the tag workflow:
    the full Python/browser/editor gates from committed locks;
 2. builds Chrome, Edge, VSIX, then PyInstaller `Cortex.app` with the dedicated
    console-capable `CortexNativeHost` entry point;
-3. signs the native host and app with hardened runtime and verifies both
-   nested and outer signatures;
-4. creates `Cortex-<version>-macos-<arch>.dmg`, signs that outer disk image
-   with the same Developer ID Application identity and a secure timestamp, and
-   verifies the DMG signature before upload;
-5. submits the signed DMG to Apple with `notarytool --wait`, requires
+3. signs every nested library and framework with the hardened runtime and no
+   entitlements, signs the native host explicitly, then seals the outer app
+   with the camera/automation/input-monitoring entitlements; verifies nested
+   and outer signatures; submits the zipped bundle to Apple, requires
+   `Accepted`, and staples the application itself so a dragged-out copy
+   launches offline;
+4. creates `Cortex-<version>-macos-<arch>.dmg` from the stapled bundle, signs
+   that outer disk image with the same Developer ID Application identity and a
+   secure timestamp, and verifies the DMG signature before upload;
+5. submits the signed DMG to Apple with `notarytool --wait --timeout`, requires
    `Accepted`, captures the request log, staples, and validates the ticket;
 6. verifies DMG integrity, mounts read-only, validates bundle ID/version/minimum
-   OS/single architecture/signature, scans generic credential forms only in
-   text-like members, scans exact exported secrets and actual non-generic build
-   home roots across all bytes, and runs
-   a framed native-host `status` exchange and `Cortex --release-smoke` before
-   any UI/network/camera;
+   OS/single architecture/signature, rejects a background-only or UI-element
+   GUI bundle, validates the stapled ticket on the bundle inside the image,
+   scans generic credential forms only in text-like members, scans exact
+   exported secrets and actual non-generic build home roots across all bytes,
+   and runs a framed native-host `status` exchange and `Cortex --release-smoke`
+   under an isolated `HOME` before any UI/network/camera;
 7. generates application SPDX and locked-Python CycloneDX SBOMs,
    architecture-specific `SHA256SUMS-<arch>`, `release-metadata.json`, and
    command evidence;
@@ -112,7 +120,7 @@ Run the same artifact verifier locally:
 
 ```bash
 uv run --project cortex --locked python -m cortex.scripts.verify_macos_release \
-  dist/Cortex-0.3.15-macos-arm64.dmg \
+  dist/Cortex-<version>-macos-arm64.dmg \
   --expected-arch arm64 \
   --require-notarized \
   --output dist/evidence-arm64/release-verification.json
@@ -126,13 +134,13 @@ the checksum file before running:
 
 ```bash
 shasum -a 256 -c SHA256SUMS-arm64
-gh attestation verify Cortex-0.3.15-macos-arm64.dmg \
+gh attestation verify Cortex-<version>-macos-arm64.dmg \
   --repo StevenWang-CY/cortex
-codesign --verify --strict --verbose=2 Cortex-0.3.15-macos-arm64.dmg
-codesign -dv --verbose=4 Cortex-0.3.15-macos-arm64.dmg
-xcrun stapler validate Cortex-0.3.15-macos-arm64.dmg
+codesign --verify --strict --verbose=2 Cortex-<version>-macos-arm64.dmg
+codesign -dv --verbose=4 Cortex-<version>-macos-arm64.dmg
+xcrun stapler validate Cortex-<version>-macos-arm64.dmg
 spctl -a -vv --type open --context context:primary-signature \
-  Cortex-0.3.15-macos-arm64.dmg
+  Cortex-<version>-macos-arm64.dmg
 ```
 
 The checksum file covers the DMG, metadata, SBOMs, verifier output, and command
@@ -144,16 +152,28 @@ full evidence bundle.
 Automation cannot grant TCC permissions, judge onboarding copy, fully restart a
 real browser profile, or prove camera ownership after a crash. Before public
 promotion, execute [manual-release-validation.md](manual-release-validation.md)
-on at least one clean supported arm64 Mac and one clean supported Intel Mac,
-using the signed/notarized candidates staged by CI. Upload exactly
-`manual-release-evidence-arm64.json` and
-`manual-release-evidence-x86_64.json`, plus every non-sensitive evidence file
-they reference, to the same draft release. An unexecuted template is not
-passing evidence.
+on at least one clean supported Mac using the exact signed/notarized candidate
+staged by CI, and upload a `manual-release-evidence-<arch>.json` record plus
+every non-sensitive evidence file it references to the same draft release.
 
-Dispatch **Publish validated macOS release** only after those uploads. The
-promotion workflow revalidates the tag, commit, version, artifact names and
-hashes, both host architectures, the fixed 14-case catalog, evidence-file
-existence, globally disjoint builder/reviewer identities, checksum coverage,
-and GitHub provenance attestations. Only then can a protected-environment
-approver publish the draft.
+Publication carries an explicit **assurance tier**
+([ADR 0007](../adr/0007-tiered-release-assurance.md)) that the promotion
+workflow validates and renders into the release notes:
+
+| Tier | Human evidence required | How it is labelled |
+| --- | --- | --- |
+| `self-attested` | One or two clean-profile records signed by the maintainer. The core cases (`artifact.identity`, `install.launch`, `browser.chrome_native`, `runtime.lifecycle_camera_tcc`, `uninstall.cleanup`) must pass on hardware; every other case is `passed` or `not_run` with a reason. | "Tier: self-attested"; architectures without a record are marked *CI-verified only*; the notes list every case not run. |
+| `independently-reviewed` | Records for both architectures, every case passed, builder and independent-reviewer identities disjoint across records. | "Tier: independently reviewed". |
+
+Both tiers require the complete automated chain above. An unexecuted template,
+a `failed` case, a `passed` case without an uploaded evidence asset, or a
+missing core case blocks promotion in every tier.
+
+Dispatch **Publish validated macOS release** with the tier the records declare.
+The promotion workflow revalidates the tag, commit, version, artifact names and
+hashes, the fixed 14-case catalog, evidence-file existence, the tier rules,
+checksum coverage, and GitHub provenance attestations for both DMGs and both
+evidence bundles. It then appends an *Assurance* section to the release notes,
+uploads `release-promotion-validation.json`, and converts the draft into the
+latest public release. The `production-publish` environment approval is a
+maintainer approval and is not represented as independent review.

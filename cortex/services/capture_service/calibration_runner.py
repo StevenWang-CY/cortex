@@ -45,6 +45,7 @@ from cortex.libs.schemas.observations import (
 )
 from cortex.libs.schemas.physiology import SignalAlgorithmIdentity
 from cortex.libs.schemas.state import UserBaselines
+from cortex.libs.signal.angles import circular_mean_deg, wrapped_angle_delta
 from cortex.libs.utils.atomic_write import atomic_write_json
 from cortex.services.capture_service.calibration_store import (
     CalibrationProfileStore,
@@ -442,7 +443,6 @@ async def _collect_live_calibration(
             latest_motion_ok = output.quality.motion_score >= 0.3
             valid = latest_face_ok and output.frame is not None
             rgb_value: NDArray[np.float64] | None = None
-            head_jitter_deg = 0.0
             if valid:
                 assert output.landmarks_px is not None
                 assert output.frame is not None
@@ -454,11 +454,15 @@ async def _collect_live_calibration(
                 combined = roi.combined_rgb()
                 if combined is not None and bool(np.isfinite(combined).all()):
                     rgb_value = np.asarray(combined, dtype=np.float64)
-                    head_jitter_deg = float(roi.head_jitter_px) * (
-                        45.0 / max(1.0, float(config.capture.width))
-                    )
                 else:
                     valid = False
+            # Motion evidence in face widths/second (resolution and FPS
+            # independent) computed by the face tracker for this frame.
+            motion_fw_s = (
+                getattr(observation.value, "motion_face_widths_per_second", None)
+                if valid
+                else None
+            )
 
             numeric = NumericObservation(
                 observed_at_unix_ms=observation.observed_at_unix_ms,
@@ -475,7 +479,7 @@ async def _collect_live_calibration(
                     else observation.missing_reason or MissingReason.ARTIFACT
                 ),
                 quality=observation.quality if valid else 0.0,
-                head_jitter_deg=head_jitter_deg,
+                motion_face_widths_per_second=motion_fw_s,
             )
             observations.append(numeric)
 
@@ -543,7 +547,9 @@ async def _collect_live_calibration(
                         sample_rate_hz=prepared.sample_rate_hz,
                         boot_id=observation.boot_id,
                         observation_quality=prepared.quality,
-                        head_jitter_deg=prepared.mean_head_jitter_deg,
+                        motion_face_widths_per_second=(
+                            prepared.mean_motion_face_widths_per_second
+                        ),
                         face_presence_ratio=prepared.valid_fraction,
                     )
                     capture.algorithms["physiology"] = pulse.summary.algorithm
@@ -663,6 +669,31 @@ def _distribution(values: list[float]) -> CalibrationDistribution | None:
     )
 
 
+def _circular_distribution_deg(values: list[float]) -> CalibrationDistribution | None:
+    """Distribution of angles (degrees) centred on their circular mean.
+
+    ``mean`` is the circular mean in ``[-180, 180]``; spread and percentiles
+    are computed on the samples unwrapped around that mean so a neutral pose
+    straddling +/-180 deg is summarised as a tight cluster rather than as a
+    bimodal distribution with a meaningless linear mean.
+    """
+
+    finite = np.asarray([value for value in values if np.isfinite(value)], dtype=np.float64)
+    if finite.size == 0:
+        return None
+    mean = circular_mean_deg(finite)
+    unwrapped = mean + np.asarray(
+        [wrapped_angle_delta(float(value), mean) for value in finite], dtype=np.float64
+    )
+    return CalibrationDistribution(
+        mean=mean,
+        std=float(np.std(unwrapped, ddof=1)) if unwrapped.size >= 2 else 0.0,
+        p10=float(np.percentile(unwrapped, 10)),
+        median=float(np.median(unwrapped)),
+        p90=float(np.percentile(unwrapped, 90)),
+    )
+
+
 def _quality_percentiles(values: list[float]) -> tuple[float, float, float]:
     finite = np.asarray([value for value in values if np.isfinite(value)], dtype=np.float64)
     if finite.size == 0:
@@ -684,9 +715,12 @@ def _metric_summary(
     maturity: CalibrationMetricMaturity,
     algorithm_key: str,
     effective_window_seconds: float,
+    circular_degrees: bool = False,
 ) -> CalibrationMetricSummary:
     samples = capture.samples[sample_key]
-    distribution = _distribution(samples)
+    distribution = (
+        _circular_distribution_deg(samples) if circular_degrees else _distribution(samples)
+    )
     evidence_phases = (
         ("camera_quality_check", "physiological_rest")
         if task == CalibrationReferenceTask.NEUTRAL_HEAD_POSE
@@ -1014,6 +1048,7 @@ class CalibrationRunner:
                 maturity=CalibrationMetricMaturity.OBSERVED,
                 algorithm_key="head_pose",
                 effective_window_seconds=1.0,
+                circular_degrees=True,
             ),
             _metric_summary(
                 capture,

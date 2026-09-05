@@ -54,8 +54,11 @@ function dispatchAmbient(payload: Record<string, unknown>): void {
     );
 }
 
-async function importAmbient(): Promise<void> {
-    await import("../contents/ambient");
+async function importAmbient(hostname: string | null = null): Promise<void> {
+    const ambient = await import("../contents/ambient");
+    // The shield only touches the named sites' own sidebars; jsdom serves
+    // from localhost, so tests name the site they stand in for.
+    ambient._setAmbientHostnameForTests(hostname);
     if (!document.getElementById("cortex-ambient-engine")) {
         document.dispatchEvent(new Event("DOMContentLoaded"));
     }
@@ -125,7 +128,7 @@ describe("ambient motion lifecycle", () => {
         distractor.style.cssText = "color: red; opacity: 0.8;";
         document.body.appendChild(distractor);
         const originalStyle = distractor.style.cssText;
-        await importAmbient();
+        await importAmbient("www.reddit.com");
 
         let now = 1_000;
         dispatchAmbient(ESTIMATED);
@@ -145,5 +148,37 @@ describe("ambient motion lifecycle", () => {
         motion.frames.shift()?.(now += 100);
         vi.advanceTimersByTime(230);
         expect(distractor.style.cssText).toBe(originalStyle);
+    });
+});
+
+describe("flow shield scope", () => {
+    beforeEach(() => {
+        vi.resetModules();
+        vi.useRealTimers();
+        document.body.innerHTML = "";
+        Object.defineProperty(document, "visibilityState", {
+            configurable: true,
+            value: "visible",
+        });
+    });
+
+    it("leaves site dialogs, consent banners, and chat widgets alone on unlisted hosts", async () => {
+        const motion = installMotionEnvironment();
+        const dialog = document.createElement("div");
+        dialog.className = "popup cookie-banner chat-widget";
+        document.body.appendChild(dialog);
+        await importAmbient("docs.example.com");
+        dispatchAmbient(ESTIMATED);
+        motion.frames.shift()?.(1_000);
+        expect(dialog.style.opacity).toBe("");
+        expect(dialog.style.filter).toBe("");
+    });
+
+    it("matches a listed site through its www. host and only dims that site's own sidebars", async () => {
+        const ambient = await import("../contents/ambient");
+        expect(ambient.resolveDistractionSelectors("www.youtube.com")).toContain("#related");
+        expect(ambient.resolveDistractionSelectors("m.youtube.com")).toContain("#related");
+        expect(ambient.resolveDistractionSelectors("news.example.org")).toEqual([]);
+        expect(ambient.resolveDistractionSelectors("github.com")).not.toContain('[class*="popup"]');
     });
 });

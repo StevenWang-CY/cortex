@@ -1,40 +1,63 @@
 """Anthropic SDK intervention planner — production LLM path.
 
-Single concrete implementation of the ``LLMClient`` Protocol. Replaces
-the deprecated Azure / Qwen / Ollama clients. Uses ``AsyncAnthropicBedrock``
-as the production transport with ``AsyncAnthropic`` / ``AsyncAnthropicVertex``
-as drop-in escape hatches selected by ``ANTHROPIC_PROVIDER``.
+Single concrete implementation of the ``LLMClient`` Protocol. Uses
+``AsyncAnthropicBedrockMantle`` as the production transport with
+``AsyncAnthropic`` / ``AsyncAnthropicVertex`` as drop-in escape hatches
+selected by ``LLMConfig.provider``.
 
 Design notes
 ------------
-* **Structured output via tool-use.** The Anthropic Messages API has no
-  ``response_format: json_object`` equivalent. Instead we attach the
-  Pydantic-derived schema as a forced tool call. The model returns a
-  ``tool_use`` block whose ``input`` is a typed dict matching
-  :class:`InterventionPlan`.
-* **Per-template model tier.** Latency-critical short outputs go to
-  Haiku; standard planning to Sonnet; multi-step debugging to Opus.
-  Configurable via ``LLMConfig.template_tier_overrides``.
-* **Prompt caching.** The 3-4k-token system prompt is marked
-  ``cache_control: ephemeral`` so back-to-back interventions reuse it.
-* **Resilience.** Per-call retries with bounded exponential jitter, a
-  consecutive-failure circuit breaker, and a bounded semaphore that caps
-  in-flight Bedrock concurrency. Graceful degrade to
-  :func:`build_fallback_plan` (deterministic, schema-valid).
+* **Structured outputs.** Every request carries
+  ``output_config={"format": {"type": "json_schema", "schema": ...}}`` built
+  from :class:`~cortex.services.llm_engine.plan_draft.PlanDraft`, the only
+  shape the model may author. The first ``text`` block of the response is
+  JSON valid against that schema; no tools, no forced ``tool_choice``, no
+  sampling parameters (current models reject ``temperature`` with 400).
+* **Per-template model tier.** Latency-critical short outputs go to the
+  fast tier (Haiku); standard planning to the default tier (Sonnet);
+  multi-step debugging to the deep tier (Opus). ``_TEMPLATE_TIER`` covers
+  every ``PROMPT_TEMPLATES`` key; ``LLMConfig.template_tier_overrides``
+  wins per template.
+* **Prompt caching.** The system prompt is marked ``cache_control:
+  ephemeral`` so back-to-back interventions reuse it (subject to each
+  model's minimum cacheable prefix; see ``MODEL_CAPABILITIES``).
+* **Resilience.** The SDK client is built with ``max_retries=0`` so this
+  module owns the only retry policy: retry ``RateLimitError`` /
+  ``APITimeoutError`` / ``APIConnectionError`` and HTTP 408/409/429/5xx
+  with bounded jittered backoff; 401/403 → ``auth_error``, 400/422 →
+  ``bad_request``, 404 → ``model_unavailable`` (non-retryable, trip the
+  tier's breaker immediately); ``stop_reason`` ``refusal`` /
+  ``max_tokens`` → non-retryable fallbacks. One circuit breaker per tier
+  so a broken deep-tier model id cannot black out fast-tier calls. A
+  bounded semaphore caps in-flight concurrency.
+* **Cancellation.** The SDK call runs as its own task behind
+  ``asyncio.shield``. If the caller is cancelled mid-flight the task keeps
+  running to completion (bounded by the SDK timeout); a done-callback
+  records its real usage/cost (or failure) and releases the semaphore, so
+  orphaned calls never leak slots or spend.
 * **Observability.** Each call emits a structured ``llm.request`` log
-  event (model id, template, latency, cache hit/write, status).
+  event (model id, template, tier, latency, cache hit/write, stop reason).
 """
 
 from __future__ import annotations
 
 import asyncio
+import functools
+import json
 import logging
 import os
 import random
 from collections import deque
-from typing import Any, Literal, cast
+from dataclasses import dataclass
+from typing import Any, Literal
 
-from anthropic import APIError, APIStatusError, APITimeoutError, RateLimitError
+from anthropic import (
+    APIConnectionError,
+    APIError,
+    APIStatusError,
+    APITimeoutError,
+    RateLimitError,
+)
 from pydantic import ValidationError
 
 from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
@@ -48,7 +71,9 @@ from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 # guard lives in ``cortex/tests/performance/test_startup_latency.py``.
 from cortex.libs.config.settings import LLMConfig
 from cortex.libs.llm.anthropic_client import (
+    EffortLevel,
     build_anthropic_sdk_client,
+    model_capabilities_or_conservative,
     resolve_anthropic_model_id,
 )
 from cortex.libs.llm.pricing import usd_cost
@@ -69,6 +94,11 @@ from cortex.services.llm_engine.parser import (
     enrich_plan_with_context,
     validate_intervention_plan,
 )
+from cortex.services.llm_engine.plan_draft import (
+    PlanDraft,
+    draft_to_plan_data,
+    structured_output_schema,
+)
 from cortex.services.llm_engine.prompts import (
     build_anthropic_messages,
     capture_truncation_report,
@@ -77,71 +107,199 @@ from cortex.services.llm_engine.prompts import (
 logger = logging.getLogger(__name__)
 
 ModelTier = Literal["fast", "default", "deep"]
+_TIERS: tuple[ModelTier, ...] = ("fast", "default", "deep")
 
 # Map every Cortex prompt template to a model tier. Latency-critical
-# short outputs use Haiku; multi-step causal reasoning uses Opus.
+# short outputs use the fast tier; multi-step causal reasoning the deep
+# tier. ``test_anthropic_planner.py`` asserts this covers exactly the
+# ``PROMPT_TEMPLATES`` key set.
 _TEMPLATE_TIER: dict[str, ModelTier] = {
+    # fast — short overlay copy, tab triage, ambient nudges
     "calm_overlay_writer": "fast",
     "browser_tab_reduction": "fast",
+    "breathing_overlay": "fast",
+    "pre_break_warning": "fast",
+    "recovery_reinforcer": "fast",
+    # default — standard planning
     "micro_step_planner": "default",
     "code_focus_reduction": "default",
-    "debug_error_summary": "deep",
-    "causal_explanation_grounding": "fast",
-    "prompt_text_sanitizer": "fast",
-    # v2 templates
     "active_recall": "default",
-    "morning_briefing": "fast",
-    "pre_break_warning": "fast",
-    "breathing_overlay": "fast",
-    "rabbit_hole_intervention": "default",
+    "rabbit_hole": "default",
+    "alignment_summary": "default",
+    "re_engage_planner": "default",
+    # deep — multi-step debugging diagnosis
+    "debug_error_summary": "deep",
+    "deep_bottleneck_diagnosis": "deep",
 }
 
-# Tool definition forcing the model to emit a structured plan.
-_PLAN_TOOL_NAME = "emit_intervention_plan"
+# HTTP statuses (besides 5xx) worth a retry: request timeout, conflict,
+# rate limit. Everything else in 4xx is a request/config problem that a
+# retry cannot fix.
+_RETRYABLE_HTTP_STATUS: frozenset[int] = frozenset({408, 409, 429})
 
 
-def _make_intervention_plan_tool() -> dict[str, Any]:
-    """Build the Anthropic tool definition from the Pydantic schema.
+# ---------------------------------------------------------------------------
+# Pure helpers (unit-testable without a planner instance)
+# ---------------------------------------------------------------------------
 
-    ``InterventionPlan.model_json_schema()`` produces a $ref-rich
-    schema. Anthropic accepts that as long as it's a valid JSONSchema
-    object (the SDK doesn't try to resolve refs itself — it forwards
-    them to the model). We attach ``cache_control`` so the tool spec
-    is included in the ephemeral prompt cache alongside the system
-    prompt.
+
+def build_request_kwargs(
+    *,
+    model_id: str,
+    max_tokens: int,
+    effort: EffortLevel | None,
+    system_blocks: list[dict[str, Any]],
+    messages: list[dict[str, Any]],
+    timeout_seconds: float,
+    output_schema: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Assemble the ``messages.create`` keyword arguments for one call.
+
+    * ``output_config.format`` always carries the :class:`PlanDraft`
+      structured-output schema (no ``tools`` / ``tool_choice``).
+    * ``output_config.effort`` is included only for models that accept it
+      (Opus 4.7/5, Sonnet 5, Sonnet 4.6); Haiku 4.5 rejects it.
+    * No sampling parameters are ever sent — ``temperature`` / ``top_p`` /
+      ``top_k`` return HTTP 400 on Opus 4.7/5 and Sonnet 5.
+    * ``thinking`` is omitted: Opus 5 / Sonnet 5 run adaptive thinking by
+      default and ``max_tokens`` caps thinking plus text.
     """
-    schema = InterventionPlan.model_json_schema()
+    capabilities = model_capabilities_or_conservative(model_id)
+    schema = output_schema if output_schema is not None else structured_output_schema()
+    output_config: dict[str, Any] = {
+        "format": {"type": "json_schema", "schema": schema},
+    }
+    if effort is not None and capabilities.supports_effort:
+        output_config["effort"] = effort
     return {
-        "name": _PLAN_TOOL_NAME,
-        "description": (
-            "Emit a structured intervention plan that the Cortex daemon "
-            "will validate and present as a non-authoritative proposal. "
-            "The plan cannot grant permission or execute by itself. Always "
-            "call this tool — never reply with plain text."
-        ),
-        "input_schema": schema,
-        "cache_control": {"type": "ephemeral"},
+        "model": model_id,
+        "max_tokens": int(max_tokens),
+        "system": system_blocks,
+        "messages": messages,
+        "output_config": output_config,
+        "timeout": float(timeout_seconds),
     }
 
 
-def _extract_tool_use_input(response: Any) -> dict[str, Any]:
-    """Pull the dict the model passed to ``emit_intervention_plan``.
+@dataclass(frozen=True, slots=True)
+class ParsedPlanResponse:
+    """Outcome of turning one HTTP response into an :class:`InterventionPlan`.
 
-    Raises:
-        ValueError: when no tool_use block is present or it targets the
-            wrong tool name.
+    ``plan`` is set on success. Otherwise ``failure_reason`` is one of
+    ``refusal`` / ``max_tokens_truncated`` / ``context_window_exceeded``
+    (non-retryable — the same prompt would fail again) or
+    ``invalid_response`` (retryable — transient model glitch).
     """
-    for block in getattr(response, "content", []) or []:
-        if (
-            getattr(block, "type", None) == "tool_use"
-            and getattr(block, "name", None) == _PLAN_TOOL_NAME
-        ):
-            payload = getattr(block, "input", None)
-            if isinstance(payload, dict):
-                return payload
-    raise ValueError(
-        f"Anthropic response missing tool_use({_PLAN_TOOL_NAME!r}) block",
-    )
+
+    plan: InterventionPlan | None
+    draft: PlanDraft | None
+    stop_reason: str | None
+    failure_reason: str | None
+    retryable: bool
+    detail: str = ""
+
+
+def _first_text_block(response: Any) -> str | None:
+    for block in getattr(response, "content", None) or []:
+        if getattr(block, "type", None) == "text":
+            text = getattr(block, "text", None)
+            if isinstance(text, str):
+                return text
+    return None
+
+
+def parse_plan_response(response: Any) -> ParsedPlanResponse:
+    """Validate a Messages API response into a plan (never raises).
+
+    ``stop_reason`` is inspected first: ``refusal`` (HTTP 200 from the
+    safety classifiers on Opus 5 / Sonnet 5) and ``max_tokens`` (truncated
+    JSON) are terminal for this request. Otherwise the first ``text``
+    block is parsed as JSON, validated as a :class:`PlanDraft` (which
+    forbids every daemon-owned field), rejected when degenerate (empty
+    headline / summary / steps), and finally normalised into an
+    :class:`InterventionPlan`.
+    """
+    raw_stop = getattr(response, "stop_reason", None)
+    stop_reason = raw_stop if isinstance(raw_stop, str) else None
+    if stop_reason == "refusal":
+        return ParsedPlanResponse(None, None, stop_reason, "refusal", False, "model refused")
+    if stop_reason == "max_tokens":
+        return ParsedPlanResponse(
+            None, None, stop_reason, "max_tokens_truncated", False, "output hit max_tokens"
+        )
+    if stop_reason == "model_context_window_exceeded":
+        return ParsedPlanResponse(
+            None, None, stop_reason, "context_window_exceeded", False, "context window exceeded"
+        )
+
+    text = _first_text_block(response)
+    if text is None:
+        return ParsedPlanResponse(
+            None, None, stop_reason, "invalid_response", True, "no text block in response"
+        )
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        return ParsedPlanResponse(
+            None, None, stop_reason, "invalid_response", True, f"JSON decode failed: {exc}"
+        )
+    if not isinstance(data, dict):
+        return ParsedPlanResponse(
+            None, None, stop_reason, "invalid_response", True, "JSON payload is not an object"
+        )
+    try:
+        draft = PlanDraft.model_validate(data)
+    except ValidationError as exc:
+        return ParsedPlanResponse(
+            None,
+            None,
+            stop_reason,
+            "invalid_response",
+            True,
+            f"PlanDraft validation failed ({exc.error_count()} errors)",
+        )
+    if draft.is_degenerate():
+        return ParsedPlanResponse(
+            None, draft, stop_reason, "invalid_response", True, "degenerate draft (empty plan)"
+        )
+    plan = validate_intervention_plan(draft_to_plan_data(draft))
+    if plan is None:
+        return ParsedPlanResponse(
+            None, draft, stop_reason, "invalid_response", True, "InterventionPlan validation failed"
+        )
+    return ParsedPlanResponse(plan, draft, stop_reason, None, False)
+
+
+@dataclass(frozen=True, slots=True)
+class _ErrorDecision:
+    retryable: bool
+    reason: str  # ``retry`` or the fallback reason
+    http_status: int | None
+
+
+def classify_api_error(exc: BaseException) -> _ErrorDecision:
+    """Map an SDK exception to retry / distinct non-retryable fallback.
+
+    The ``isinstance`` checks read the module globals at call time so a
+    test can substitute the SDK exception classes.
+    """
+    status_raw = getattr(exc, "status_code", None)
+    status = status_raw if isinstance(status_raw, int) and not isinstance(status_raw, bool) else None
+    if isinstance(exc, APIStatusError) or status is not None:
+        if status in (401, 403):
+            return _ErrorDecision(False, "auth_error", status)
+        if status == 404:
+            return _ErrorDecision(False, "model_unavailable", status)
+        if status in (400, 422):
+            return _ErrorDecision(False, "bad_request", status)
+        if status is not None and (status in _RETRYABLE_HTTP_STATUS or status >= 500):
+            return _ErrorDecision(True, "retry", status)
+        if status is not None:
+            # Any other 4xx (413 payload too large, ...) is a request problem.
+            return _ErrorDecision(False, "bad_request", status)
+    if isinstance(exc, RateLimitError | APITimeoutError | APIConnectionError):
+        return _ErrorDecision(True, "retry", status)
+    return _ErrorDecision(False, "api_error", status)
 
 
 def _estimate_request_input_tokens(
@@ -150,10 +308,10 @@ def _estimate_request_input_tokens(
 ) -> int:
     """Best-effort input-token estimate for the assembled request.
 
-    Used by F30's cancellation cost path: if the shielded Bedrock call
-    is cancelled before any response arrives, ``response.usage`` is
-    unavailable, so we approximate from the request payload. The chars/4
-    heuristic matches :func:`cortex.services.llm_engine.prompts._estimate_tokens`
+    Used by the orphaned-call cost path: if a shielded call never
+    completes (event-loop teardown), ``response.usage`` is unavailable,
+    so we approximate from the request payload. The chars/4 heuristic
+    matches :func:`cortex.services.llm_engine.prompts._estimate_tokens`
     so the two layers agree on what "a token" means.
     """
     total_chars = 0
@@ -177,8 +335,9 @@ def _estimate_request_input_tokens(
 def _keychain_get_bedrock_token(config: LLMConfig) -> str | None:
     """Fetch the Bedrock bearer token from the macOS Keychain.
 
-    Returns ``None`` when keyring is unavailable or no entry exists,
-    in which case the SDK reads ``AWS_BEARER_TOKEN_BEDROCK`` from env.
+    Returns ``None`` when keyring is unavailable or no entry exists, in
+    which case the transport factory falls back to the
+    ``AWS_BEARER_TOKEN_BEDROCK`` environment variable.
 
     audit Phase-I: ``keyring`` is imported lazily here (rather than at
     module top) so importing :mod:`anthropic_planner` does not drag the
@@ -216,10 +375,11 @@ class PlannerResult:
     ``failure_mode`` literal values:
       * ``"ok"`` — live LLM call succeeded, no degradation.
       * ``"timeout"`` — call exhausted retries or the SDK timed out.
-      * ``"parse_error"`` — response was malformed (no tool_use block,
-        Pydantic validation failed).
+      * ``"parse_error"`` — response was unusable (invalid JSON / draft,
+        truncated by ``max_tokens``, context window exceeded).
       * ``"empty_response"`` — fallback used because of an upstream
-        constraint (budget kill, circuit open, auth error).
+        constraint (budget kill, circuit open, auth error, bad request,
+        model unavailable, refusal).
       * ``"cache_hit"`` — served from the in-process plan cache.
 
     The plan field is always populated (the daemon never returns no
@@ -237,6 +397,22 @@ class PlannerResult:
         return f"PlannerResult(failure_mode={self.failure_mode!r})"
 
 
+_EMPTY_RESPONSE_REASONS: frozenset[str] = frozenset(
+    {
+        "budget_killed",
+        "circuit_open",
+        "auth_error",
+        "bad_request",
+        "model_unavailable",
+        "api_error",
+        "refusal",
+    }
+)
+_PARSE_ERROR_REASONS: frozenset[str] = frozenset(
+    {"invalid_response", "max_tokens_truncated", "context_window_exceeded"}
+)
+
+
 def classify_plan_failure_mode(plan: Any) -> str:
     """B11 (Phase 4.1): map an :class:`InterventionPlan` to a failure_mode.
 
@@ -247,11 +423,11 @@ def classify_plan_failure_mode(plan: Any) -> str:
     meta = getattr(plan, "metadata", None) or {}
     reason = str(meta.get("fallback_reason") or "")
     source = str(meta.get("source") or "")
-    if reason == "budget_killed" or reason == "circuit_open" or reason == "auth_error":
+    if reason in _EMPTY_RESPONSE_REASONS:
         return "empty_response"
     if reason == "retries_exhausted":
         return "timeout"
-    if reason == "invalid_response":
+    if reason in _PARSE_ERROR_REASONS:
         return "parse_error"
     if source == "fallback":
         return "empty_response"
@@ -291,9 +467,19 @@ class _CircuitBreaker:
                 self._window,
             )
 
+    def trip(self, now: float) -> None:
+        """Open immediately (deterministic request/config failure)."""
+        self._failures.append(now)
+        self._opened_at = now
+        logger.warning("Anthropic circuit tripped open for %.0fs", self._open_seconds)
+
     def record_success(self) -> None:
         self._failures.clear()
         self._opened_at = None
+
+    @property
+    def is_open(self) -> bool:
+        return self._opened_at is not None
 
 
 class AnthropicPlanner:
@@ -317,46 +503,20 @@ class AnthropicPlanner:
         self._clock = clock or SYSTEM_CLOCK
         self._allow_unbrokered_test_requests = _allow_unbrokered_test_requests
 
-        # F11: previously the keychain-sourced Bedrock token was written
-        # to ``os.environ`` permanently, which then propagated to every
-        # subprocess the daemon spawned (capture worker, native host
-        # re-launches, project launcher terminals). A debugger or
-        # crash-dump tool attached to any descendant could read it.
-        # The Anthropic SDK reads ``AWS_BEARER_TOKEN_BEDROCK`` at
-        # construction time only, so we narrow the env mutation to that
-        # window and restore the prior value (or unset) on exit.
-        if sdk is None and self._config.provider == "bedrock":
-            keychain_token = (
-                _keychain_get_bedrock_token(self._config)
-                if not os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
-                else None
-            )
-            prior = os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
-            try:
-                if keychain_token:
-                    os.environ["AWS_BEARER_TOKEN_BEDROCK"] = keychain_token
-                self._sdk = build_anthropic_sdk_client(
-                    provider=self._config.provider,
-                    bedrock_region=self._config.bedrock.aws_region,
-                )
-            finally:
-                if keychain_token:
-                    # Restore the prior state precisely: re-set or unset.
-                    if prior is None:
-                        os.environ.pop("AWS_BEARER_TOKEN_BEDROCK", None)
-                    else:
-                        os.environ["AWS_BEARER_TOKEN_BEDROCK"] = prior
-        else:
-            self._sdk = sdk or build_anthropic_sdk_client(
-                provider=self._config.provider,
-                bedrock_region=self._config.bedrock.aws_region,
-            )
+        # The Bedrock bearer token is passed to the SDK constructor
+        # explicitly (see ``_build_sdk``); ``os.environ`` is never mutated,
+        # so no child process (capture worker, native host, launcher
+        # terminals) can inherit the credential.
+        self._sdk: Any = sdk if sdk is not None else self._build_sdk()
 
         # Resolve each tier's provider-specific model identifier once.
-        # ``model_fast`` / ``model_default`` / ``model_deep`` are already
-        # typed as ``LogicalModelId`` (the same literal ``LogicalModel``
-        # aliases), so no cast is needed — the single-source-of-truth
-        # re-export keeps the two names identical.
+        # ``model_fast`` / ``model_default`` / ``model_deep`` are typed as
+        # ``LogicalModelId`` so the resolver tables stay in lock-step.
+        self._logical_models: dict[ModelTier, str] = {
+            "fast": self._config.model_fast,
+            "default": self._config.model_default,
+            "deep": self._config.model_deep,
+        }
         self._models: dict[ModelTier, str] = {
             "fast": resolve_anthropic_model_id(
                 self._config.model_fast,
@@ -377,12 +537,20 @@ class AnthropicPlanner:
             clock=self._clock,
         )
         self._semaphore = asyncio.Semaphore(self._config.max_concurrent_requests)
-        self._circuit = _CircuitBreaker(
-            threshold=self._config.circuit_failure_threshold,
-            window_seconds=self._config.circuit_window_seconds,
-            open_seconds=self._config.circuit_open_seconds,
-        )
-        self._plan_tool = _make_intervention_plan_tool()
+        # One breaker per tier: five 400s from a misconfigured deep-tier
+        # model id must not black out fast-tier overlay copy.
+        self._circuits: dict[ModelTier, _CircuitBreaker] = {
+            tier: _CircuitBreaker(
+                threshold=self._config.circuit_failure_threshold,
+                window_seconds=self._config.circuit_window_seconds,
+                open_seconds=self._config.circuit_open_seconds,
+            )
+            for tier in _TIERS
+        }
+        # Historical single-breaker attribute: aliases the default tier.
+        self._circuit = self._circuits["default"]
+        # Compiled once; the API caches the compiled grammar for 24 h.
+        self._output_schema = structured_output_schema()
 
         # F20: per-day USD spend ledger + kill-switch. Use the injected
         # tracker in tests; in production fall back to the per-user
@@ -410,63 +578,76 @@ class AnthropicPlanner:
                 )
                 self._cost_tracker = None
 
+    # ------------------------------------------------------------------
+    # Transport construction / credential reload
+    # ------------------------------------------------------------------
+
+    def _bedrock_token(self, *, prefer_env: bool) -> str | None:
+        """Resolve the Bedrock bearer token without touching ``os.environ``.
+
+        Construction prefers an operator-supplied environment token and
+        consults the Keychain only when the env is empty; a hot reload
+        after the BYOK step reads the Keychain only (the env cannot have
+        changed underneath a running daemon).
+        """
+        if self._config.provider != "bedrock":
+            return None
+        env_token = os.environ.get("AWS_BEARER_TOKEN_BEDROCK") if prefer_env else None
+        if env_token:
+            return env_token
+        return _keychain_get_bedrock_token(self._config)
+
+    def _build_sdk(self) -> Any:
+        return build_anthropic_sdk_client(
+            provider=self._config.provider,
+            bedrock_region=self._config.bedrock.aws_region,
+            bedrock_bearer_token=self._bedrock_token(prefer_env=True),
+        )
+
     def reload_credentials(self) -> bool:
         """Rebuild the SDK client using the latest BYOK token.
 
         Audit-2 fix: previously the keychain-sourced Bedrock token was
         read once at planner construction. After the onboarding "save
         token" step or a Settings "rotate token" action, the running
-        planner kept using the prior cached SDK client (or no client at
-        all for first-run installs), so the very next intervention
-        silently fell through to the rule-based fallback even though
-        the user had just supplied a valid token.
+        planner kept using the prior cached SDK client, so the very next
+        intervention silently fell through to the rule-based fallback
+        even though the user had just supplied a valid token.
+
+        The token is passed explicitly to the transport factory — no
+        ``os.environ`` mutation anywhere.
 
         Returns True if a working SDK client was constructed, False
         if no token is available or the rebuild raised. Callers can
         surface a UI toast on failure.
         """
-        if self._config.provider != "bedrock":
-            # Vertex / Direct providers acquire credentials via Google
-            # ADC / ANTHROPIC_API_KEY env at SDK build; rebuild is still
-            # useful so we honour any env mutation the caller performed.
-            try:
-                self._sdk = build_anthropic_sdk_client(
-                    provider=self._config.provider,
-                    bedrock_region=self._config.bedrock.aws_region,
-                )
-                self._cache.clear()
-                logger.info("Planner SDK rebuilt for provider=%s", self._config.provider)
-                return True
-            except Exception:
-                logger.exception("Planner SDK rebuild failed")
+        token: str | None = None
+        if self._config.provider == "bedrock":
+            token = self._bedrock_token(prefer_env=False)
+            if not token:
+                logger.warning("reload_credentials: no Bedrock token in keychain")
                 return False
-
-        keychain_token = _keychain_get_bedrock_token(self._config)
-        if not keychain_token:
-            logger.warning("reload_credentials: no Bedrock token in keychain")
-            return False
-        prior = os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
         try:
-            os.environ["AWS_BEARER_TOKEN_BEDROCK"] = keychain_token
             self._sdk = build_anthropic_sdk_client(
                 provider=self._config.provider,
                 bedrock_region=self._config.bedrock.aws_region,
+                bedrock_bearer_token=token,
             )
-            # Drop any cached plan so the next call hits the fresh SDK.
-            self._cache.clear()
-            # If the breaker was OPEN due to prior auth failures, reset it
-            # so the user gets an immediate retry.
-            self._circuit.record_success()
-            logger.info("Planner SDK rebuilt with refreshed Bedrock token")
-            return True
         except Exception:
             logger.exception("Planner SDK rebuild failed")
             return False
-        finally:
-            if prior is None:
-                os.environ.pop("AWS_BEARER_TOKEN_BEDROCK", None)
-            else:
-                os.environ["AWS_BEARER_TOKEN_BEDROCK"] = prior
+        # Drop any cached plan so the next call hits the fresh SDK.
+        self._cache.clear()
+        # If a breaker was OPEN due to prior auth failures, reset it so
+        # the user gets an immediate retry.
+        for breaker in self._circuits.values():
+            breaker.record_success()
+        logger.info("Planner SDK rebuilt for provider=%s", self._config.provider)
+        return True
+
+    # ------------------------------------------------------------------
+    # Routing helpers
+    # ------------------------------------------------------------------
 
     def _select_tier(self, template_name: str | None) -> ModelTier:
         if template_name:
@@ -481,6 +662,48 @@ class AnthropicPlanner:
         """Return the exact provider model id a request would use."""
 
         return self._models[self._select_tier(template_name)]
+
+    @property
+    def worst_case_seconds(self) -> float:
+        """Upper bound on one ``generate_intervention_plan`` wall-clock time."""
+
+        return self._config.planner_worst_case_seconds
+
+    def _fallback(
+        self,
+        context: TaskContext,
+        reason: str,
+        *,
+        tier: ModelTier | None = None,
+        model_id: str | None = None,
+        **extra: Any,
+    ) -> InterventionPlan:
+        """Deterministic plan stamped with a specific ``fallback_reason``.
+
+        ``build_fallback_plan`` already stamps ``source=fallback``; the
+        specific cause lets the overlay / dashboard explain "offline
+        mode" and the dismissal model skip the outcome (F27).
+        """
+        logger.info(
+            "%s reason=%s tier=%s model=%s cid=%s",
+            EventType.LLM_FALLBACK.value,
+            reason,
+            tier,
+            model_id,
+            get_correlation_id() or "-",
+        )
+        plan = build_fallback_plan(context)
+        plan.metadata["fallback_reason"] = reason
+        if tier is not None:
+            plan.metadata["tier"] = tier
+        if model_id is not None:
+            plan.metadata["model"] = model_id
+        plan.metadata.update(extra)
+        return plan
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
 
     async def generate_intervention_plan(
         self,
@@ -532,34 +755,19 @@ class AnthropicPlanner:
                 "LLM daily budget exceeded; serving deterministic fallback (cid=%s)",
                 get_correlation_id() or "-",
             )
-            killed = build_fallback_plan(context)
-            killed.metadata["fallback_reason"] = "budget_killed"
-            killed.metadata["budget_killed"] = True
-            return killed
-
-        if not self._circuit.allow(now_mono):
-            # F27: surface the fact that this plan came from the rule-
-            # based fallback path, not the LLM. ``build_fallback_plan``
-            # already stamps ``source=fallback``; we overwrite
-            # ``fallback_reason`` with the specific cause so the overlay
-            # / dashboard can present it. ``LLM_FALLBACK`` is emitted
-            # so an aggregator can count breaker openings without
-            # parsing the warning-text format.
-            logger.warning(
-                "LLM circuit open; serving deterministic fallback (cid=%s)",
-                get_correlation_id() or "-",
-            )
-            logger.info(
-                "%s reason=circuit_open cid=%s",
-                EventType.LLM_FALLBACK.value,
-                get_correlation_id() or "-",
-            )
-            fallback = build_fallback_plan(context)
-            fallback.metadata["fallback_reason"] = "circuit_open"
-            return fallback
+            return self._fallback(context, "budget_killed", budget_killed=True)
 
         tier = self._select_tier(template_name)
         model_id = self._models[tier]
+        breaker = self._circuits[tier]
+        if not breaker.allow(now_mono):
+            logger.warning(
+                "LLM circuit open for tier=%s; serving deterministic fallback (cid=%s)",
+                tier,
+                get_correlation_id() or "-",
+            )
+            return self._fallback(context, "circuit_open", tier=tier, model_id=model_id)
+
         # F29 (audit): scope a TruncationReport across the prompt-build
         # so we know which sections lost content. The report is stamped
         # onto ``InterventionPlan.metadata["context_truncated_sections"]``
@@ -575,24 +783,31 @@ class AnthropicPlanner:
                 disclosure_manifest=disclosure_manifest,
             )
 
-        # F30: estimate the input-token cost before issuing the call so
-        # the cancellation cost path can bill *something* if the response
-        # never arrives. The Anthropic SDK does not echo back the
-        # request tokens on cancellation, so we approximate with a
-        # chars/4 heuristic over the assembled prompt — same heuristic
-        # ``prompts._estimate_tokens`` uses internally.
-        estimated_input_tokens = _estimate_request_input_tokens(
-            system_blocks,
-            messages,
-        )
+        # Request-side token estimate for the orphaned-call cost path
+        # (a shielded call cancelled at event-loop teardown never yields
+        # ``usage``). Same chars/4 heuristic as ``prompts._estimate_tokens``.
+        estimated_input_tokens = _estimate_request_input_tokens(system_blocks, messages)
 
-        attempts = 3
+        effort: EffortLevel = self._config.effort
+        request_kwargs = build_request_kwargs(
+            model_id=model_id,
+            max_tokens=self._config.max_tokens,
+            effort=effort,
+            system_blocks=system_blocks,
+            messages=messages,
+            timeout_seconds=self._config.timeout_seconds,
+            output_schema=self._output_schema,
+        )
+        effort_sent = "effort" in request_kwargs["output_config"]
+
+        attempts = self._config.planner_attempts
+        outcome = "retries_exhausted"
+        outcome_extra: dict[str, Any] = {}
         for attempt in range(attempts):
             # audit-w2: re-consult the daily cost ceiling on every retry,
             # not just on the first attempt. A successful but token-heavy
-            # response on attempt 1 (or a partial response billed via the
-            # cancellation path in F30) can push the day's spend over
-            # ``BUDGET_KILL`` mid-call. Without this re-check the retry
+            # response on attempt 1 can push the day's spend over
+            # ``BUDGET_KILL`` mid-call; without this re-check the retry
             # loop happily burns another two attempts past the ceiling.
             if (
                 attempt > 0
@@ -605,181 +820,145 @@ class AnthropicPlanner:
                     get_correlation_id() or "-",
                     attempt + 1,
                 )
-                killed = build_fallback_plan(context)
-                killed.metadata["fallback_reason"] = "budget_killed"
-                killed.metadata["budget_killed"] = True
-                killed.metadata["budget_killed_on_retry"] = attempt + 1
-                return killed
+                return self._fallback(
+                    context,
+                    "budget_killed",
+                    budget_killed=True,
+                    budget_killed_on_retry=attempt + 1,
+                )
             t0 = monotonic_seconds(self._clock)
-            response: Any = None
             try:
-                async with self._semaphore:
-                    # swift-concurrency-pro rule (transferred to asyncio):
-                    # shield the Bedrock call from cooperative cancellation.
-                    # If the caller cancels mid-flight (state pipeline
-                    # tear-down, daemon SIGTERM), we still let the SDK
-                    # finish its current HTTP transaction cleanly so the
-                    # Bedrock connection isn't left in a half-open state.
-                    # F30: catch CancelledError so we still record the
-                    # cost — the shielded call kept billing tokens even
-                    # though the caller stopped waiting.
-                    try:
-                        # The SDK's ``messages.create`` overloads are typed
-                        # against ``Iterable[MessageParam]`` /
-                        # ``Iterable[TextBlockParam]`` / ``Iterable[ToolParam]``
-                        # TypedDicts. We construct these as plain runtime
-                        # dicts (the SDK accepts them and serialises directly),
-                        # so the static overload can't match without
-                        # re-deriving every nested TypedDict here. Cast to the
-                        # SDK param types — the runtime shape is correct.
-                        response = await asyncio.shield(
-                            self._sdk.messages.create(
-                                model=model_id,
-                                max_tokens=self._config.max_tokens,
-                                temperature=self._config.temperature,
-                                system=cast("Any", system_blocks),
-                                messages=cast("Any", messages),
-                                tools=cast("Any", [self._plan_tool]),
-                                tool_choice=cast(
-                                    "Any",
-                                    {
-                                        "type": "tool",
-                                        "name": _PLAN_TOOL_NAME,
-                                    },
-                                ),
-                                timeout=self._config.timeout_seconds,
-                            )
-                        )
-                    except asyncio.CancelledError:
-                        # The SDK call may have completed before the
-                        # cancellation propagated. Record cost from the
-                        # response if available; otherwise bill the
-                        # best-estimate input tokens with ``output=0``.
-                        self._record_cost_on_cancellation(
-                            model_id,
-                            response,
-                            estimated_input_tokens,
-                        )
-                        raise
-            except (RateLimitError, APITimeoutError, APIStatusError) as exc:
+                response = await self._call_sdk(request_kwargs, model_id, estimated_input_tokens)
+            except (RateLimitError, APITimeoutError, APIConnectionError, APIStatusError) as exc:
                 latency_ms = (monotonic_seconds(self._clock) - t0) * 1000.0
-                # Audit-2 fix: surface 401 / 403 (revoked or invalid
-                # BYOK token) as a distinct, non-retryable failure so the
-                # user gets an immediate signal that their token is bad.
-                # The plain backoff path used to retry 401s up to
-                # ``attempts`` times, then silently fall back to the
-                # rule-based plan — the user never knew their token had
-                # been revoked.
-                status = getattr(exc, "status_code", None)
-                if isinstance(exc, APIStatusError) and status in (401, 403):
+                decision = classify_api_error(exc)
+                now = monotonic_seconds(self._clock)
+                if not decision.retryable:
+                    # Audit-2 fix: surface 401 / 403 (revoked or invalid
+                    # BYOK token) as a distinct, non-retryable failure so
+                    # the user gets an immediate signal that their token is
+                    # bad. 400/404/422 are request/config problems that a
+                    # retry cannot fix: trip this tier's breaker at once
+                    # instead of burning ``attempts`` calls per intervention.
                     logger.error(
-                        "llm.request status=auth_error model=%s template=%s "
-                        "latency_ms=%.0f http=%s err=%s — token may be revoked",
+                        "llm.request status=%s model=%s tier=%s template=%s "
+                        "latency_ms=%.0f http=%s err=%s",
+                        decision.reason,
                         model_id,
+                        tier,
                         template_name,
                         latency_ms,
-                        status,
+                        decision.http_status,
                         type(exc).__name__,
                     )
-                    self._circuit.record_failure(monotonic_seconds(self._clock))
-                    auth_fallback = build_fallback_plan(context)
-                    auth_fallback.metadata["fallback_reason"] = "auth_error"
-                    auth_fallback.metadata["source"] = "fallback"
-                    auth_fallback.metadata["http_status"] = status
-                    return auth_fallback
+                    if decision.reason == "auth_error":
+                        breaker.record_failure(now)
+                    else:
+                        breaker.trip(now)
+                    return self._fallback(
+                        context,
+                        decision.reason,
+                        tier=tier,
+                        model_id=model_id,
+                        http_status=decision.http_status,
+                    )
                 logger.warning(
-                    "llm.request status=error model=%s template=%s "
-                    "latency_ms=%.0f attempt=%d err=%s",
+                    "llm.request status=error model=%s tier=%s template=%s "
+                    "latency_ms=%.0f attempt=%d http=%s err=%s",
                     model_id,
+                    tier,
                     template_name,
                     latency_ms,
                     attempt + 1,
+                    decision.http_status,
                     type(exc).__name__,
                 )
                 if attempt == attempts - 1:
-                    self._circuit.record_failure(monotonic_seconds(self._clock))
+                    breaker.record_failure(now)
+                    outcome = "retries_exhausted"
                     break
-                # Bounded exponential backoff with jitter. Wrap in
-                # try/finally so a cancellation during the sleep still
-                # records best-effort cost telemetry for the prior
-                # attempt's billed call (audit-2 fix for F30 retry-loop
-                # gap).
-                try:
-                    await asyncio.sleep(min(2**attempt + random.random(), 8.0))
-                except asyncio.CancelledError:
-                    self._record_cost_on_cancellation(
-                        model_id,
-                        response,
-                        estimated_input_tokens,
-                    )
-                    raise
+                await self._backoff(attempt)
                 continue
             except APIError as exc:
                 latency_ms = (monotonic_seconds(self._clock) - t0) * 1000.0
                 logger.error(
-                    "llm.request status=fatal model=%s template=%s latency_ms=%.0f err=%s",
+                    "llm.request status=fatal model=%s tier=%s template=%s "
+                    "latency_ms=%.0f err=%s",
                     model_id,
+                    tier,
                     template_name,
                     latency_ms,
                     type(exc).__name__,
                 )
-                self._circuit.record_failure(monotonic_seconds(self._clock))
+                breaker.record_failure(monotonic_seconds(self._clock))
+                outcome = "api_error"
                 break
 
-            # Successful HTTP — now validate the tool_use payload.
-            try:
-                tool_input = _extract_tool_use_input(response)
-                plan = validate_intervention_plan(tool_input)
-                if plan is None:
-                    raise ValidationError.from_exception_data(
-                        title="InterventionPlan",
-                        line_errors=[],
-                    )
-            except (ValueError, ValidationError) as exc:
-                latency_ms = (monotonic_seconds(self._clock) - t0) * 1000.0
+            # The HTTP transaction completed: bill its real usage whatever
+            # the parse outcome — the provider charged for it either way.
+            latency_ms = (monotonic_seconds(self._clock) - t0) * 1000.0
+            usage = getattr(response, "usage", None)
+            self._record_cost(model_id, usage, cancelled=False)
+
+            parsed = parse_plan_response(response)
+            if parsed.plan is None:
                 logger.warning(
-                    "llm.request status=invalid model=%s template=%s latency_ms=%.0f err=%s",
+                    "llm.request status=%s model=%s tier=%s template=%s "
+                    "latency_ms=%.0f attempt=%d stop_reason=%s detail=%s",
+                    parsed.failure_reason,
                     model_id,
+                    tier,
                     template_name,
                     latency_ms,
-                    type(exc).__name__,
+                    attempt + 1,
+                    parsed.stop_reason,
+                    parsed.detail,
                 )
+                if not parsed.retryable:
+                    breaker.record_failure(monotonic_seconds(self._clock))
+                    outcome = parsed.failure_reason or "invalid_response"
+                    outcome_extra = {"stop_reason": parsed.stop_reason}
+                    break
                 if attempt == attempts - 1:
-                    self._circuit.record_failure(monotonic_seconds(self._clock))
-                    # B11 (Phase 4.1): stash the discriminator so the
-                    # post-loop fallback path can stamp the right
-                    # failure_mode (parse_error vs. timeout). Without
-                    # this stamp the caller sees ``retries_exhausted``
-                    # which conflates the two cases.
-                    self._last_validation_error = True
+                    breaker.record_failure(monotonic_seconds(self._clock))
+                    outcome = "invalid_response"
+                    outcome_extra = {"stop_reason": parsed.stop_reason}
                     break
                 continue
 
-            self._circuit.record_success()
-            self._last_validation_error = False
-            latency_ms = (monotonic_seconds(self._clock) - t0) * 1000.0
-            usage = getattr(response, "usage", None)
+            plan = parsed.plan
+            breaker.record_success()
             # F19: include the active correlation id so downstream cost
             # accounting (F20) can group spend by originating request.
             logger.info(
-                "llm.request status=ok model=%s template=%s tier=%s "
+                "llm.request status=ok model=%s template=%s tier=%s effort=%s "
                 "latency_ms=%.0f tokens_in=%s tokens_out=%s "
-                "cache_read=%s cache_write=%s cid=%s",
+                "cache_read=%s cache_write=%s stop_reason=%s cid=%s",
                 model_id,
                 template_name,
                 tier,
+                effort if effort_sent else None,
                 latency_ms,
                 getattr(usage, "input_tokens", None),
                 getattr(usage, "output_tokens", None),
                 getattr(usage, "cache_read_input_tokens", None),
                 getattr(usage, "cache_creation_input_tokens", None),
+                parsed.stop_reason,
                 get_correlation_id() or "-",
             )
 
-            # F20: persist the per-call USD cost into the daily ledger
-            # and emit ``LLM_COST``. Best-effort — never let an
-            # accounting bug propagate up and break the planner result.
-            self._record_cost(model_id, usage, cancelled=False)
+            # Daemon-owned provenance. ``PlanDraft`` cannot carry any of
+            # these keys, so model output never reaches them.
+            plan.metadata.update(
+                {
+                    "source": "llm",
+                    "provider": self._config.provider,
+                    "model": model_id,
+                    "tier": tier,
+                    "effort": effort if effort_sent else None,
+                    "stop_reason": parsed.stop_reason,
+                }
+            )
 
             enriched = enrich_plan_with_context(plan, context)
             # D.6: surface the simplification constraint window into the
@@ -811,31 +990,105 @@ class AnthropicPlanner:
             )
             return enriched
 
-        # All retries exhausted → deterministic fallback.
+        # Retries exhausted or a terminal response → deterministic fallback.
         # F27: stamp metadata so the overlay can surface "offline mode"
         # and so dismissal-model training can exclude fallback outcomes.
         logger.warning(
-            "LLM call exhausted retries for template=%s; using fallback",
+            "LLM call ended with %s for template=%s tier=%s; using fallback",
+            outcome,
             template_name,
+            tier,
         )
-        logger.info(
-            "%s reason=retries_exhausted cid=%s",
-            EventType.LLM_FALLBACK.value,
-            get_correlation_id() or "-",
-        )
-        fallback = build_fallback_plan(context)
-        # B11 (Phase 4.1): the discriminator depends on which retry path
-        # exhausted — a string of malformed responses is a ``parse_error``
-        # while transport timeouts / 5xx are ``timeout``.
-        if getattr(self, "_last_validation_error", False):
-            fallback.metadata["fallback_reason"] = "invalid_response"
-            self._last_validation_error = False
-        else:
-            fallback.metadata["fallback_reason"] = "retries_exhausted"
-        return fallback
+        return self._fallback(context, outcome, tier=tier, model_id=model_id, **outcome_extra)
 
     # ------------------------------------------------------------------
-    # F20: cost accounting helper
+    # SDK call with cancellation-safe accounting
+    # ------------------------------------------------------------------
+
+    async def _backoff(self, attempt: int) -> None:
+        """Bounded exponential backoff with jitter between attempts."""
+        cap = self._config.planner_backoff_cap_seconds
+        await asyncio.sleep(min(2**attempt + random.random(), cap))
+
+    async def _call_sdk(
+        self,
+        request_kwargs: dict[str, Any],
+        model_id: str,
+        estimated_input_tokens: int,
+    ) -> Any:
+        """Run one ``messages.create`` behind the semaphore and a shield.
+
+        The HTTP transaction runs as its own task so a cancelled caller
+        (state-pipeline tear-down, daemon SIGTERM, the daemon's outer
+        ``wait_for``) never leaves the connection half-open. When the
+        caller *is* cancelled mid-flight, the task keeps running to
+        completion (bounded by the SDK timeout, ``max_retries=0``) and a
+        done-callback records its real usage / failure and releases the
+        semaphore slot — nothing is orphaned.
+        """
+        await self._semaphore.acquire()
+        task: asyncio.Future[Any] = asyncio.ensure_future(
+            self._sdk.messages.create(**request_kwargs)
+        )
+        try:
+            response = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            task.add_done_callback(
+                functools.partial(
+                    self._finalise_orphaned_call,
+                    model_id=model_id,
+                    estimated_input_tokens=estimated_input_tokens,
+                )
+            )
+            raise
+        except BaseException:
+            self._semaphore.release()
+            raise
+        self._semaphore.release()
+        return response
+
+    def _finalise_orphaned_call(
+        self,
+        task: asyncio.Future[Any],
+        *,
+        model_id: str,
+        estimated_input_tokens: int,
+    ) -> None:
+        """Done-callback for a call whose awaiting caller was cancelled."""
+        try:
+            if task.cancelled():
+                # Never completed (event-loop teardown): bill the
+                # request-side estimate with ``output_tokens=0``.
+                logger.warning(
+                    "llm.request status=orphan_cancelled model=%s cid=%s",
+                    model_id,
+                    get_correlation_id() or "-",
+                )
+                self._record_cost_on_cancellation(model_id, None, estimated_input_tokens)
+                return
+            exc = task.exception()
+            if exc is not None:
+                logger.warning(
+                    "llm.request status=orphan_failed model=%s err=%s cid=%s",
+                    model_id,
+                    type(exc).__name__,
+                    get_correlation_id() or "-",
+                )
+                return
+            response = task.result()
+            logger.info(
+                "llm.request status=orphan_completed model=%s cid=%s",
+                model_id,
+                get_correlation_id() or "-",
+            )
+            self._record_cost_on_cancellation(model_id, response, estimated_input_tokens)
+        except Exception:  # noqa: BLE001 — accounting must never raise inside a callback
+            logger.exception("orphaned LLM call finalisation failed")
+        finally:
+            self._semaphore.release()
+
+    # ------------------------------------------------------------------
+    # F20: cost accounting helpers
     # ------------------------------------------------------------------
 
     def _record_cost(
@@ -845,7 +1098,7 @@ class AnthropicPlanner:
         *,
         cancelled: bool,
     ) -> None:
-        """Persist the per-call USD cost into the daily ledger.
+        """Persist the per-call USD cost and token counts into the ledger.
 
         Best-effort: surfaces an exception only if the ledger path is
         broken at the file-system level, in which case the tracker has
@@ -878,6 +1131,8 @@ class AnthropicPlanner:
                 model_id,
                 usd,
                 cancelled=cancelled,
+                prompt_tokens=input_tokens + cache_read + cache_write,
+                completion_tokens=output_tokens,
             )
         except Exception:  # noqa: BLE001 — telemetry must never break the planner
             logger.exception("cost_tracker.record failed")
@@ -888,14 +1143,14 @@ class AnthropicPlanner:
         response: Any,
         estimated_input_tokens: int,
     ) -> None:
-        """Cost path taken when the shielded SDK call was cancelled (F30).
+        """Cost path for a call whose caller stopped waiting (F30).
 
-        If the response arrived before cancellation propagated we have
-        real ``usage`` numbers; otherwise we bill the request-side
-        estimate with ``output_tokens=0`` so the day's spend at least
-        reflects the tokens the request shipped. The ``cancelled=True``
-        flag on the cost record lets the aggregator distinguish
-        cancellation cost from successful spend.
+        If the orphaned call completed we have real ``usage`` numbers;
+        otherwise we bill the request-side estimate with
+        ``output_tokens=0`` so the day's spend at least reflects the
+        tokens the request shipped. The ``cancelled=True`` flag on the
+        cost record lets the aggregator distinguish cancellation cost
+        from successful spend.
         """
         if self._cost_tracker is None:
             return
@@ -904,13 +1159,10 @@ class AnthropicPlanner:
             # Response arrived — bill real numbers but tag cancelled.
             self._record_cost(model_id, usage, cancelled=True)
             return
-        # Pre-response cancellation — bill the best estimate.
+        # Never completed — bill the best estimate.
+        estimate = max(0, int(estimated_input_tokens))
         try:
-            usd = usd_cost(
-                model_id,
-                input_tokens=max(0, int(estimated_input_tokens)),
-                output_tokens=0,
-            )
+            usd = usd_cost(model_id, input_tokens=estimate, output_tokens=0)
         except (KeyError, ValueError) as exc:
             logger.warning(
                 "cost_tracker: cancellation cost skipped for %s (%s)",
@@ -924,6 +1176,8 @@ class AnthropicPlanner:
                 model_id,
                 usd,
                 cancelled=True,
+                prompt_tokens=estimate,
+                completion_tokens=0,
             )
         except Exception:  # noqa: BLE001
             logger.exception("cost_tracker.record (cancellation) failed")
@@ -936,3 +1190,15 @@ class AnthropicPlanner:
             return True
         except Exception:  # noqa: BLE001
             return False
+
+
+__all__ = [
+    "AnthropicPlanner",
+    "ModelTier",
+    "ParsedPlanResponse",
+    "PlannerResult",
+    "build_request_kwargs",
+    "classify_api_error",
+    "classify_plan_failure_mode",
+    "parse_plan_response",
+]

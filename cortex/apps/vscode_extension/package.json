@@ -2,13 +2,21 @@
   "name": "cortex-somatic",
   "displayName": "Cortex — Workspace Support",
   "description": "Local workspace context and conservative, user-controlled support proposals.",
-  "version": "0.3.15",
+  "version": "0.4.0",
   "publisher": "cortex",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/StevenWang-CY/cortex.git"
   },
+  "keywords": [
+    "cortex",
+    "focus",
+    "wellbeing",
+    "biofeedback",
+    "cognitive load",
+    "breathing"
+  ],
   "engines": {
     "vscode": "^1.120.0"
   },
@@ -19,6 +27,15 @@
     "onStartupFinished"
   ],
   "main": "./out/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "The daemon URL is machine-scoped and only loopback hosts are accepted; untrusted workspaces cannot redirect editor context or the local auth token.",
+      "restrictedConfigurations": [
+        "cortex.daemonUrl"
+      ]
+    }
+  },
   "dependencies": {
     "ws": "^8.20.1"
   },
@@ -59,16 +76,36 @@
       {
         "command": "cortex.disconnect",
         "title": "Cortex: Disconnect from Daemon"
-      },
-      {
-        "command": "cortex.disableInlineSuggestions",
-        "title": "Cortex: Disable Inline Suggestions (HYPER mode)"
-      },
-      {
-        "command": "cortex.enableInlineSuggestions",
-        "title": "Cortex: Enable Inline Suggestions (FLOW mode)"
       }
     ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "cortex.getActiveFile",
+          "when": "false"
+        },
+        {
+          "command": "cortex.getDiagnostics",
+          "when": "false"
+        },
+        {
+          "command": "cortex.getSymbolAtCursor",
+          "when": "false"
+        },
+        {
+          "command": "cortex.foldExcept",
+          "when": "false"
+        },
+        {
+          "command": "cortex.unfoldAll",
+          "when": "false"
+        },
+        {
+          "command": "cortex.restoreFoldState",
+          "when": "false"
+        }
+      ]
+    },
     "viewsContainers": {
       "activitybar": [
         {
@@ -93,7 +130,8 @@
         "cortex.daemonUrl": {
           "type": "string",
           "default": "ws://127.0.0.1:9473",
-          "description": "WebSocket URL of the Cortex daemon"
+          "scope": "machine",
+          "description": "WebSocket URL of the local Cortex daemon. Only loopback hosts are accepted (ws://127.0.0.1, ws://localhost, ws://[::1]); other hosts are refused because the connection carries the local auth token and editor content."
         },
         "cortex.autoConnect": {
           "type": "boolean",
@@ -104,6 +142,16 @@
           "type": "boolean",
           "default": true,
           "description": "Show Cortex state in the status bar"
+        },
+        "cortex.shareEditorContent": {
+          "type": "boolean",
+          "default": true,
+          "description": "Send the visible code of the active file to the local Cortex daemon when it asks for editor context. When off, only the file path, visible line range, symbol name and diagnostics are shared."
+        },
+        "cortex.shareUntitledDocuments": {
+          "type": "boolean",
+          "default": false,
+          "description": "Also share unsaved (untitled) documents as editor context. Off by default; other non-file documents (output panels, settings, diffs) are never shared."
         },
         "cortex.debug": {
           "type": "boolean",
@@ -157,5 +205,9 @@
     "ts-jest": "^29.4.11",
     "typescript": "^5.3.0",
     "typescript-eslint": "^8.68.0"
+  },
+  "overrides": {
+    "browserslist": "^4.28.7",
+    "qs": "^6.16.0"
   }
 }

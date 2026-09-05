@@ -18,6 +18,7 @@
  */
 
 import type { PlasmoCSConfig } from "plasmo";
+import { STATE_COLORS_RGB } from "../design-tokens";
 
 export const config: PlasmoCSConfig = {
     matches: [
@@ -77,20 +78,28 @@ const DISTRACTION_SELECTORS: Record<string, string[]> = {
         ".promotedlink",
     ],
     "news.ycombinator.com": [".pagetop"],
-    "*": [
-        // Universal distractors
-        '[class*="cookie"]',
-        '[class*="Cookie"]',
-        '[id*="cookie"]',
-        '[class*="newsletter"]',
-        '[class*="popup"]',
-        '[class*="chat-widget"]',
-        '[class*="intercom"]',
-        '[id*="intercom"]',
-        '[class*="drift"]',
-        '[id*="hubspot"]',
-    ],
 };
+
+// Only the explicitly named sites above are shielded, and only their own
+// optional sidebars: a universal ``[class*="popup"]`` / ``[class*="cookie"]``
+// / chat-widget sweep used to dim site dialogs and consent controls the
+// user still needed to operate.
+
+let hostnameOverrideForTests: string | null = null;
+
+/** Test-only: pretend the page is served from ``hostname``. */
+export function _setAmbientHostnameForTests(hostname: string | null): void {
+    hostnameOverrideForTests = hostname;
+}
+
+/** Selectors for the current site, matched on the registrable host. */
+export function resolveDistractionSelectors(rawHostname: string): string[] {
+    const hostname = rawHostname.toLowerCase().replace(/^www\./, "");
+    for (const [site, selectors] of Object.entries(DISTRACTION_SELECTORS)) {
+        if (hostname === site || hostname.endsWith(`.${site}`)) return selectors;
+    }
+    return [];
+}
 
 // --- State ---
 
@@ -387,14 +396,9 @@ function updateWeather(): void {
         particles.push(createParticle("calm", w, h));
     }
 
-    // Get state color for dots
-    const STATE_COLORS_RGB: Record<string, { r: number; g: number; b: number }> = {
-        FLOW: { r: 52, g: 211, b: 153 },
-        HYPER: { r: 249, g: 115, b: 22 },
-        HYPO: { r: 96, g: 165, b: 250 },
-        RECOVERY: { r: 167, g: 139, b: 250 },
-    };
-    const col = STATE_COLORS_RGB[state] || { r: 142, g: 142, b: 147 };
+    // Dot colour comes from the shared state palette (design-tokens.ts) so
+    // the ambient field, popup, and new tab agree on what each state looks like.
+    const col = STATE_COLORS_RGB[state] || STATE_COLORS_RGB.UNKNOWN;
 
     // Update and draw — all gentle floating dots at 4% opacity
     particles = particles.filter((p) => {
@@ -455,11 +459,8 @@ function updateFlowShield(): void {
 }
 
 function activateFlowShield(): void {
-    const hostname = window.location.hostname;
-    const selectors = [
-        ...(DISTRACTION_SELECTORS["*"] || []),
-        ...(DISTRACTION_SELECTORS[hostname] || []),
-    ];
+    const hostname = hostnameOverrideForTests ?? window.location.hostname;
+    const selectors = resolveDistractionSelectors(hostname);
 
     for (const selector of selectors) {
         try {

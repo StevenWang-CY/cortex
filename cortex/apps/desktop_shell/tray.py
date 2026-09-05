@@ -20,6 +20,7 @@ from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPainterPath, QPixma
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from cortex.apps.desktop_shell import mac_native
+from cortex.apps.desktop_shell.palette_runtime import active_state_color
 from cortex.apps.desktop_shell.tokens import STATE_COLORS as _STATE_HEX
 from cortex.apps.desktop_shell.tokens import STATE_LABELS
 
@@ -33,6 +34,15 @@ STATE_COLORS: dict[str, QColor] = {
 }
 
 DISCONNECTED_COLOR = QColor(140, 140, 140)
+
+# Native NSStatusItem menu titles (the Qt fallback menu mirrors them).
+_NATIVE_PAUSE = "Pause"
+_NATIVE_RESUME = "Resume"
+_NATIVE_SNOOZE = "Snooze 15 min"
+_NATIVE_QUIET_SESSION = "Quiet for this session"
+_NATIVE_TURN_OFF = "Turn off suggestions this session"
+_QUIT_IDLE = "Quit Cortex"
+_QUIT_ACTIVE = "End Session and Quit Cortex"
 
 # F34: keep the tray Quit action disabled for this long after a stop is
 # requested. Re-enables earlier on ``notify_daemon_stopped``. Mirrors the
@@ -169,18 +179,22 @@ class CortexTrayIcon(QSystemTrayIcon):
             )
             status.add_separator()
             status.add_action(
-                "Pause", lambda: self.pause_requested.emit(),
+                _NATIVE_PAUSE, lambda: self.pause_requested.emit(),
             )
             status.add_action(
                 "Restore Workspace",
                 lambda: self.restore_requested.emit(),
             )
             status.add_action(
-                "Snooze 15 min",
+                _NATIVE_SNOOZE,
                 lambda: self.snooze_requested.emit(),
             )
             status.add_action(
-                "Turn Off This Session",
+                _NATIVE_QUIET_SESSION,
+                lambda: self.quiet_mode_requested.emit("quiet_session", 0),
+            )
+            status.add_action(
+                _NATIVE_TURN_OFF,
                 lambda: self.disable_session_requested.emit(),
             )
             status.add_separator()
@@ -190,9 +204,12 @@ class CortexTrayIcon(QSystemTrayIcon):
             )
             status.add_separator()
             status.add_action(
-                "Quit Cortex", lambda: self.quit_requested.emit(), key="q",
+                self._quit_label(), self._handle_quit_triggered, key="q",
             )
             self._native_status = status
+            self._native_quit_title = self._quit_label()
+            self._native_pause_title = _NATIVE_PAUSE
+            self._sync_native_checkmarks()
             # AppKit owns the menu-bar slot now — hide the Qt fallback so
             # we don't double up.
             try:
@@ -206,10 +223,45 @@ class CortexTrayIcon(QSystemTrayIcon):
     # Menu (Qt fallback — runs on all platforms)
     # ------------------------------------------------------------------
 
+    def _quit_label(self) -> str:
+        """The quit item names its consequence while a session is live."""
+        return _QUIT_ACTIVE if self._connected else _QUIT_IDLE
+
+    def _sync_native_checkmarks(self) -> None:
+        """Mirror the quiet-mode / pause state onto the NSStatusItem menu."""
+        status = self._native_status
+        if status is None:
+            return
+        try:
+            status.set_action_checked(
+                _NATIVE_SNOOZE, self._quiet_mode_kind == "snooze_15",
+            )
+            status.set_action_checked(
+                _NATIVE_QUIET_SESSION, self._quiet_mode_kind == "quiet_session",
+            )
+            current_pause = getattr(self, "_native_pause_title", _NATIVE_PAUSE)
+            wanted_pause = _NATIVE_RESUME if self._paused else _NATIVE_PAUSE
+            if current_pause != wanted_pause:
+                status.set_action_title(current_pause, wanted_pause)
+                self._native_pause_title = wanted_pause
+            status.set_action_checked(wanted_pause, self._paused)
+            current_quit = getattr(self, "_native_quit_title", _QUIT_IDLE)
+            wanted_quit = "Stopping…" if self._stopping else self._quit_label()
+            if current_quit != wanted_quit:
+                status.set_action_title(current_quit, wanted_quit)
+                self._native_quit_title = wanted_quit
+            status.set_action_enabled(wanted_quit, not self._stopping)
+        except Exception:
+            logger.debug("native checkmark sync failed", exc_info=True)
+
     def _build_menu(self) -> None:
         self._menu.clear()
+        try:
+            self._menu.setToolTipsVisible(True)
+        except Exception:
+            pass
 
-        self._state_action = QAction("State: —", self._menu)
+        self._state_action = QAction("Status: —", self._menu)
         self._state_action.setEnabled(False)
         self._menu.addAction(self._state_action)
 
@@ -231,7 +283,7 @@ class CortexTrayIcon(QSystemTrayIcon):
         restore_action.triggered.connect(self.restore_requested.emit)
         self._menu.addAction(restore_action)
 
-        snooze_action = QAction("Snooze 15 min", self._menu)
+        snooze_action = QAction(_NATIVE_SNOOZE, self._menu)
         snooze_action.triggered.connect(self.snooze_requested.emit)
         try:
             snooze_action.setCheckable(True)
@@ -242,7 +294,7 @@ class CortexTrayIcon(QSystemTrayIcon):
         self._snooze_action = snooze_action
 
         # P0 §3.11: full quiet-mode kind set under a checkmark menu.
-        quiet_session_action = QAction("Quiet for session", self._menu)
+        quiet_session_action = QAction(_NATIVE_QUIET_SESSION, self._menu)
         try:
             quiet_session_action.setCheckable(True)
             quiet_session_action.setChecked(self._quiet_mode_kind == "quiet_session")
@@ -254,7 +306,7 @@ class CortexTrayIcon(QSystemTrayIcon):
         self._menu.addAction(quiet_session_action)
         self._quiet_session_action = quiet_session_action
 
-        disable_action = QAction("Turn Off This Session", self._menu)
+        disable_action = QAction(_NATIVE_TURN_OFF, self._menu)
         disable_action.triggered.connect(self.disable_session_requested.emit)
         self._menu.addAction(disable_action)
 
@@ -265,8 +317,14 @@ class CortexTrayIcon(QSystemTrayIcon):
 
         self._menu.addSeparator()
 
-        quit_action = QAction("Quit Cortex", self._menu)
+        quit_action = QAction(self._quit_label(), self._menu)
         quit_action.setShortcut("Ctrl+Q")
+        try:
+            quit_action.setToolTip(
+                "Stops sensing, shows the session summary, then quits Cortex."
+            )
+        except Exception:
+            pass
         # F34: route through ``_handle_quit_triggered`` so we can disable the
         # action and swap the label to "Stopping…" on first click, coalescing
         # double-clicks to a single ``quit_requested`` emission.
@@ -289,26 +347,34 @@ class CortexTrayIcon(QSystemTrayIcon):
         self._state = state
         self._confidence = confidence
 
-        color = STATE_COLORS.get(state, DISCONNECTED_COLOR)
-        self.setIcon(_make_heart_icon(color))
-        if self._native_status is not None:
-            self._native_status.set_state_tint(color.name())
-
         if status == "warming_up":
             label = "Still gathering"
         elif status != "estimated":
             label = "Not enough evidence"
         else:
-            label = STATE_LABELS.get(state, state)
+            label = STATE_LABELS.get(state, "Status unavailable")
+
+        # Tint only when there is a real estimate — colour must never
+        # claim a state the evidence does not support.
+        if status == "estimated" and state in STATE_LABELS and state != "UNKNOWN":
+            color = QColor(active_state_color(state))
+        else:
+            color = DISCONNECTED_COLOR
+        self.setIcon(_make_heart_icon(color))
+        if self._native_status is not None:
+            self._native_status.set_state_tint(
+                color.name() if color is not DISCONNECTED_COLOR else None
+            )
+
         tooltip = (
             f"Cortex — {label} · {confidence:.0%} evidence strength · "
             f"{evidence_coverage:.0%} coverage"
         )
         if self._paused:
-            tooltip += " [Paused]"
+            tooltip += " · Paused"
         self.setToolTip(tooltip)
 
-        self._state_action.setText(f"Support: {label}")
+        self._state_action.setText(f"Status: {label}")
 
     def set_connected(self, connected: bool) -> None:
         self._connected = connected
@@ -317,7 +383,8 @@ class CortexTrayIcon(QSystemTrayIcon):
             if self._native_status is not None:
                 self._native_status.set_state_tint(None)
             self.setToolTip("Cortex — Disconnected")
-            self._state_action.setText("State: Disconnected")
+            self._state_action.setText("Status: Disconnected")
+        self._refresh_quit_label()
 
     def set_starting(self) -> None:
         """Show lifecycle startup without claiming a live daemon."""
@@ -327,19 +394,31 @@ class CortexTrayIcon(QSystemTrayIcon):
         if self._native_status is not None:
             self._native_status.set_state_tint(None)
         self.setToolTip("Cortex — Starting…")
-        self._state_action.setText("State: Starting…")
+        self._state_action.setText("Status: Starting…")
+        self._refresh_quit_label()
+
+    def _refresh_quit_label(self) -> None:
+        if self._stopping:
+            return
+        try:
+            self._quit_action.setText(self._quit_label())
+        except RuntimeError:
+            pass
+        self._sync_native_checkmarks()
 
     def set_paused(self, paused: bool) -> None:
         self._paused = paused
-        self._pause_action.setText("Resume" if paused else "Pause")
+        self._pause_action.setText(_NATIVE_RESUME if paused else _NATIVE_PAUSE)
         if paused:
-            self.setToolTip(f"Cortex — {self._state} [Paused]")
+            label = STATE_LABELS.get(self._state, "Status unavailable")
+            self.setToolTip(f"Cortex — {label} · Paused")
         # Pause is one of the quiet-mode kinds — keep the menu in sync.
         try:
             self._pause_action.setCheckable(True)
             self._pause_action.setChecked(paused)
         except Exception:
             pass
+        self._sync_native_checkmarks()
 
     def set_quiet_mode_kind(self, kind: str) -> None:
         """P0 §3.11: surface the active quiet-mode kind in the menu so
@@ -368,6 +447,7 @@ class CortexTrayIcon(QSystemTrayIcon):
             self._pause_action.setChecked(self._quiet_mode_kind == "pause")
         except Exception:
             pass
+        self._sync_native_checkmarks()
 
     def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
@@ -391,6 +471,7 @@ class CortexTrayIcon(QSystemTrayIcon):
         except RuntimeError:
             # Action torn down; safe to ignore.
             pass
+        self._sync_native_checkmarks()
         self._stop_safety_timer.start()
         self.quit_requested.emit()
 
@@ -409,9 +490,10 @@ class CortexTrayIcon(QSystemTrayIcon):
         self._stopping = False
         try:
             self._quit_action.setEnabled(True)
-            self._quit_action.setText("Quit Cortex")
+            self._quit_action.setText(self._quit_label())
         except RuntimeError:
             pass
+        self._sync_native_checkmarks()
 
     def set_stop_safety_timeout_ms(self, ms: int) -> None:
         """Allow tests to shorten the safety-timer budget."""

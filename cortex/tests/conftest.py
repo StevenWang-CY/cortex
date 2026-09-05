@@ -11,12 +11,68 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import sys
+import tempfile
 import types
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+# ---------------------------------------------------------------------------
+# Session-wide HOME sandbox
+# ---------------------------------------------------------------------------
+# Every platform path helper (``cortex.libs.utils.platform``), the desktop
+# controller's ``_APP_SUPPORT`` constant, the native host's ``_LOG_DIRECTORY``,
+# the goal store, the cost ledger, and onboarding state resolve through
+# ``Path.home()``. Several suites exercised those code paths without patching
+# them and therefore rewrote the signed-in developer's real
+# ``~/Library/Application Support/Cortex`` and ``~/Library/Logs/Cortex``
+# contents on every ``pytest`` run. Redirecting ``HOME`` (and the XDG
+# equivalents) before any Cortex module is imported makes that structurally
+# impossible: module-level constants are computed after this file loads, and
+# ``Path.home()``/``os.path.expanduser`` read the variable at call time.
+#
+# Set ``CORTEX_TEST_REAL_HOME=1`` only for a deliberate local experiment that
+# must observe the real profile; CI never does.
+_SANDBOX_HOME: Path | None = None
+_REAL_HOME = os.environ.get("HOME")
+
+
+def _install_home_sandbox() -> None:
+    global _SANDBOX_HOME
+    if os.environ.get("CORTEX_TEST_REAL_HOME") == "1":
+        return
+    sandbox = Path(tempfile.mkdtemp(prefix="cortex-test-home-"))
+    # Keep the macOS/XDG layouts the production helpers expect so tests that
+    # assert on ``~/Library/...`` structure still see a realistic tree.
+    (sandbox / "Library" / "Application Support").mkdir(parents=True, exist_ok=True)
+    (sandbox / "Library" / "Logs").mkdir(parents=True, exist_ok=True)
+    os.environ["HOME"] = str(sandbox)
+    os.environ["XDG_CONFIG_HOME"] = str(sandbox / ".config")
+    os.environ["XDG_DATA_HOME"] = str(sandbox / ".local" / "share")
+    os.environ["XDG_STATE_HOME"] = str(sandbox / ".local" / "state")
+    os.environ["XDG_CACHE_HOME"] = str(sandbox / ".cache")
+    _SANDBOX_HOME = sandbox
+
+
+_install_home_sandbox()
+
+
+def pytest_unconfigure(config: pytest.Config) -> None:
+    """Remove the sandbox home once the session is over."""
+
+    if _SANDBOX_HOME is not None and _SANDBOX_HOME.is_dir():
+        shutil.rmtree(_SANDBOX_HOME, ignore_errors=True)
+
+
+@pytest.fixture(scope="session")
+def sandbox_home() -> Path:
+    """The per-session fake ``$HOME`` every Cortex path helper resolves into."""
+
+    assert _SANDBOX_HOME is not None, "HOME sandbox disabled via CORTEX_TEST_REAL_HOME=1"
+    return _SANDBOX_HOME
 
 # ``test_desktop_shell.py`` is a legacy, deliberately stubbed Qt suite. Its
 # stubs replace process-global PySide6 modules and therefore must never be

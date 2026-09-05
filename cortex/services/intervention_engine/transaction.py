@@ -352,9 +352,20 @@ class InterventionTransactionCoordinator:
         clock: Clock | None = None,
         execution_mode: ExecutionMode = "suggest_only",
         authorization_ttl_ms: int = 30_000,
+        terminal_retention_days: int = 7,
+        max_terminal_transactions: int = 200,
     ) -> None:
         if not 1 <= authorization_ttl_ms <= 300_000:
             raise ValueError("authorization_ttl_ms must be in 1..300000")
+        if terminal_retention_days < 1 or max_terminal_transactions < 1:
+            raise ValueError("terminal retention bounds must be positive")
+        # Audit D9: RESTORED/ABANDONED rows carry no authority and were never
+        # evicted, so the store re-mirrored an ever-growing journal on every
+        # save. Terminal rows are archived (dropped from the journal, hence
+        # from the mirrored store) once older than the retention window, and
+        # the retained terminal set is capped in size regardless of age.
+        self._terminal_retention_ms = int(terminal_retention_days) * 86_400_000
+        self._max_terminal_transactions = int(max_terminal_transactions)
         self._consent_ladder = consent_ladder
         self._store = store or InMemoryInterventionTransactionStore()
         self._clock = clock or SYSTEM_CLOCK
@@ -389,8 +400,69 @@ class InterventionTransactionCoordinator:
                 transaction.revision += 1
                 self._touch(transaction)
         self._loaded = True
+        if self._archive_terminal_unlocked():
+            changed = True
         if changed:
             await self._store.save(self._journal)
+
+    def _archive_terminal_unlocked(self) -> bool:
+        """Drop terminal rows past retention or beyond the size cap (audit D9).
+
+        Only RESTORED/ABANDONED transactions are eligible: every other state
+        still carries authority or an outstanding restore obligation. Returns
+        True when the journal changed.
+        """
+        now = self._clock.unix_ms()
+        terminal = [
+            transaction
+            for transaction in self._journal.transactions.values()
+            if _lifecycle_value(transaction.state) in _TERMINAL_STATES
+        ]
+        if not terminal:
+            return False
+        expired = [
+            transaction
+            for transaction in terminal
+            if now - transaction.updated_at_unix_ms > self._terminal_retention_ms
+        ]
+        retained = [transaction for transaction in terminal if transaction not in expired]
+        retained.sort(key=lambda item: (item.updated_at_unix_ms, item.intervention_id))
+        overflow = retained[: max(0, len(retained) - self._max_terminal_transactions)]
+        evicted = {item.intervention_id for item in expired} | {
+            item.intervention_id for item in overflow
+        }
+        if not evicted:
+            return False
+        for intervention_id in evicted:
+            self._journal.transactions.pop(intervention_id, None)
+        logger.info("Archived %d terminal intervention transaction(s)", len(evicted))
+        return True
+
+    def _reusable_restore_unlocked(
+        self,
+        transaction: InterventionTransaction,
+    ) -> InterventionRestoreCommand | None:
+        """Return the outstanding exact inverse when one already exists.
+
+        A RESTORING transaction re-sends its active command; a
+        RESTORE_FAILED one retries the *same* command (receipts carry an
+        ``attempt`` counter) instead of appending a fresh command to
+        ``restore_history`` on every retry tick (audit D9).
+        """
+        state = _lifecycle_value(transaction.state)
+        command = transaction.active_restore
+        if command is None or not command.actions:
+            return None
+        if state == InterventionLifecycleState.RESTORING.value:
+            return command
+        if state == InterventionLifecycleState.RESTORE_FAILED.value:
+            self._transition(
+                transaction,
+                InterventionLifecycleState.RESTORING,
+                "restore_retry_reuses_active_command",
+            )
+            return command
+        return None
 
     def _transition(
         self,
@@ -467,6 +539,7 @@ class InterventionTransactionCoordinator:
                 ],
             )
             self._journal.transactions[manifest.intervention_id] = transaction
+            self._archive_terminal_unlocked()
             await self._store.save(self._journal)
             return transaction.model_copy(deep=True)
 
@@ -1251,6 +1324,8 @@ class InterventionTransactionCoordinator:
                     InterventionLifecycleState.RESTORED,
                 }:
                     transaction.active_restore = None
+                if target_state == InterventionLifecycleState.RESTORED:
+                    self._archive_terminal_unlocked()
                 await self._store.save(self._journal)
                 return InterventionLifecycleState(
                     _lifecycle_value(transaction.state)
@@ -1697,14 +1772,14 @@ class InterventionTransactionCoordinator:
                     InterventionLifecycleState.ABANDONED,
                     "closed_before_workspace_effect",
                 )
+                self._archive_terminal_unlocked()
                 await self._store.save(self._journal)
                 return None
-            if (
-                state
-                == InterventionLifecycleState.RESTORING.value
-                and transaction.active_restore is not None
-            ):
-                return transaction.active_restore.model_copy(deep=True)
+            reusable = self._reusable_restore_unlocked(transaction)
+            if reusable is not None:
+                if state != InterventionLifecycleState.RESTORING.value:
+                    await self._store.save(self._journal)
+                return reusable.model_copy(deep=True)
             command = self._build_restore_unlocked(transaction, reason=reason)
             if not command.actions:
                 self._transition(
@@ -1713,6 +1788,7 @@ class InterventionTransactionCoordinator:
                     "no_workspace_effect_to_restore",
                 )
                 transaction.active_restore = None
+                self._archive_terminal_unlocked()
                 await self._store.save(self._journal)
                 return None
             await self._store.save(self._journal)
@@ -1752,13 +1828,9 @@ class InterventionTransactionCoordinator:
                             entry.state = AuthorizationState.REVOKED
                             entry.state_reason = str(reason)
                     continue
-                if (
-                    state == InterventionLifecycleState.RESTORING.value
-                    and transaction.active_restore is not None
-                ):
-                    commands.append(
-                        transaction.active_restore.model_copy(deep=True)
-                    )
+                reusable = self._reusable_restore_unlocked(transaction)
+                if reusable is not None:
+                    commands.append(reusable.model_copy(deep=True))
                     continue
                 command = self._build_restore_unlocked(
                     transaction,
@@ -1773,6 +1845,7 @@ class InterventionTransactionCoordinator:
                         "global_restore_found_no_workspace_effect",
                     )
                     transaction.active_restore = None
+            self._archive_terminal_unlocked()
             await self._store.save(self._journal)
             return commands
 
@@ -1802,8 +1875,9 @@ class InterventionTransactionCoordinator:
                     InterventionLifecycleState.RESTORING.value,
                     InterventionLifecycleState.RESTORE_FAILED.value,
                 }:
-                    if state == InterventionLifecycleState.RESTORING.value and transaction.active_restore:
-                        command = transaction.active_restore
+                    reusable = self._reusable_restore_unlocked(transaction)
+                    if reusable is not None:
+                        command = reusable
                     else:
                         command = self._build_restore_unlocked(
                             transaction,
@@ -1818,6 +1892,7 @@ class InterventionTransactionCoordinator:
                             "startup_found_no_workspace_effect",
                         )
                         transaction.active_restore = None
+            self._archive_terminal_unlocked()
             await self._store.save(self._journal)
             return restores
 
@@ -1861,6 +1936,7 @@ class InterventionTransactionCoordinator:
                 if entry.state == AuthorizationState.ISSUED.value:
                     entry.state = AuthorizationState.REVOKED
                     entry.state_reason = reason[:500]
+            self._archive_terminal_unlocked()
             await self._store.save(self._journal)
             return True
 

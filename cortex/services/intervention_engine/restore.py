@@ -8,6 +8,7 @@ Manages intervention lifecycle: auto-timeout (5 min), recovery detection
 from __future__ import annotations
 
 import logging
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -29,6 +30,15 @@ from cortex.services.intervention_engine.executor import InterventionExecutor
 logger = logging.getLogger(__name__)
 
 TransactionRestoreCallback = Callable[[str, str], Awaitable[bool]]
+
+# Audit D6: outcomes are a bounded ring, not an unbounded list; the durable
+# record lives in the session recorder / SQLite, this is a hot cache only.
+MAX_RETAINED_OUTCOMES: int = 256
+# Audit D6: an unverified automatic restore is retried with exponential
+# backoff instead of on every 0.5 s state tick (each attempt can block the
+# caller for up to the receipt timeout).
+RESTORE_RETRY_BASE_BACKOFF_SECONDS: float = 5.0
+RESTORE_RETRY_MAX_BACKOFF_SECONDS: float = 300.0
 
 
 def merge_micro_steps(
@@ -84,6 +94,25 @@ class ActiveIntervention:
 
     # Recovery tracking
     flow_start_time: float | None = None
+
+    # Audit D6: automatic restore retry schedule. ``restore_attempts`` counts
+    # unverified restore attempts; ``next_restore_attempt_at`` is the
+    # earliest policy-clock instant ``RestoreManager.update`` may retry.
+    restore_attempts: int = 0
+    next_restore_attempt_at: float | None = None
+
+    def schedule_restore_retry(self, now: float) -> float:
+        """Record a failed restore and return the next allowed attempt time."""
+        self.restore_attempts += 1
+        backoff = min(
+            RESTORE_RETRY_MAX_BACKOFF_SECONDS,
+            RESTORE_RETRY_BASE_BACKOFF_SECONDS * (2 ** (self.restore_attempts - 1)),
+        )
+        self.next_restore_attempt_at = now + backoff
+        return self.next_restore_attempt_at
+
+    def restore_retry_due(self, now: float) -> bool:
+        return self.next_restore_attempt_at is None or now >= self.next_restore_attempt_at
 
     @property
     def is_timed_out(self) -> bool:
@@ -150,7 +179,7 @@ class RestoreManager:
         self._recovery_dwell = recovery_dwell_seconds
         self._restore_callback = restore_callback
         self._active: dict[str, ActiveIntervention] = {}
-        self._outcomes: list[InterventionOutcome] = []
+        self._outcomes: deque[InterventionOutcome] = deque(maxlen=MAX_RETAINED_OUTCOMES)
 
     def set_restore_callback(
         self,
@@ -208,6 +237,12 @@ class RestoreManager:
 
         for iid in list(self._active.keys()):
             active = self._active[iid]
+
+            # Audit D6: an intervention whose automatic close could not be
+            # verified stays active, but is only retried on its backoff
+            # schedule — not on every state tick.
+            if not active.restore_retry_due(now):
+                continue
 
             # Check timeout
             if active.timed_out_at(now):
@@ -396,6 +431,14 @@ class RestoreManager:
         # recovery path except a process restart.
         if workspace_restored:
             self._active.pop(iid, None)
+        else:
+            next_attempt = active.schedule_restore_retry(now)
+            logger.info(
+                "Restore for %s unverified (attempt %d); next automatic retry at +%.0fs",
+                iid,
+                active.restore_attempts,
+                max(0.0, next_attempt - now),
+            )
 
         logger.info(
             "Intervention %s ended: action=%s, duration=%.1fs, restored=%s",

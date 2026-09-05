@@ -1,15 +1,16 @@
 # Cortex: Rigorous Algorithm, Architecture, and Implementation Plan
 
 **Status:** release-relevant software implementation complete through the
-v0.3.15 Chrome/Edge native-bridge correction; credentialed dual-architecture
-release-candidate, reference-sensor,
-participant, and independent-review gates remain external
+v0.4.0 full-stack correctness, honesty, and design-quality cycle (Section 30);
+reference-sensor, participant, and independent-review gates remain external,
+and the release is published at the self-attested assurance tier (ADR 0007)
 
 **Historical audit snapshot:** `fac5db965b0568a73ea64d78fbb6eb594080073c`
 on `main`, reviewed 2026-08-24
 
 **Implementation record:** `implementation-hardening`, implemented and verified
-through 2026-08-29; immutable WP commits are listed in
+through 2026-08-29, plus the v0.4.0 cycle recorded in Section 30 (audited
+2026-09-04, implemented 2026-09-04/05); immutable WP commits are listed in
 [`audit/execution-log.md`](audit/execution-log.md)
 
 **Scope:** macOS application, in-process daemon, HTTP/WebSocket gateways, webcam physiology and kinematics, state inference, intervention planning/execution/restoration, adaptive policy evaluation, Chrome/Edge extension, optional VS Code extension, persistence, packaging, tests, documentation, privacy, and supply chain
@@ -25,7 +26,7 @@ closed it. Sections 1–11 preserve the as-built evidence and design reasoning a
 the historical snapshot above; present-tense defect descriptions in those
 sections must not be read as claims about the hardened branch. Sections 12,
 15, and 18 record implementation and closure. Current operational truth lives
-in the [architecture](Architecture.md), [limitations](docs/limitations.md),
+in the [architecture](wiki/Architecture.md), [limitations](docs/limitations.md),
 [data-flow](docs/data-flow.md), and [release evidence](docs/release/README.md)
 documents.
 
@@ -5139,3 +5140,426 @@ The local package is deliberately ad-hoc and is not a distributable substitute
 for the Developer ID/notarized native matrix. It proves the changed packaging
 path and hardware-disabled frozen startup on ARM64; the hosted release workflow
 must still produce and validate both credentialed architectures.
+
+## 30. v0.4.0 — full-stack correctness, honesty, and design-quality cycle
+
+Sections 21–29 each closed one release incident. This section records a
+different kind of pass: a complete re-audit of the v0.3.15 source and of the
+artifact it produced, followed by a coordinated implementation across every
+layer. The trigger was not a single failure. It was the observation that the
+last three candidates (v0.3.14, v0.3.15, and the hand-published v0.3.11 that
+still served as “Latest”) had each passed every automated gate while shipping
+defects that no gate could see: a GUI that could not take keyboard focus, an
+extension overlay that threw on every real trigger, an LLM tier that could
+never answer, an inference state that could never be reached, and a stop
+button that killed the browser’s own network process. The gates were measuring
+the wrong invariants. This section fixes the invariants first and the code
+second.
+
+### 30.1 Method and confidence labels
+
+The audit was performed on `codex/browser-connect-fix` at `91d7063`, which is
+byte-identical to `main` at the v0.3.15 tag, with every gate green at the
+start (Ruff, strict mypy over 525 files, 2,723 Python tests, TypeScript
+checks, 257 Vitest and 32 Jest tests). Ten independent read-only reviews were
+run in parallel, one per subsystem, each restricted to reading code and
+running hardware-free snippets, and each required to label every claim:
+
+| Label | Meaning |
+| --- | --- |
+| **Observed** | Read directly in code, or verified with a snippet, a socket, a PySide6 colour probe, or the built `Info.plist` |
+| **Repro** | Reproduced numerically without hardware (scipy/OpenCV/PySide6 one-liners, fake sockets) |
+| **Inferred** | Follows from documented platform semantics (macOS TCC, MV3 lifecycle, Qt threading, Anthropic API behaviour) but was not executed here |
+
+Every finding carried forward into a work package was re-verified against the
+cited lines before the package was written. Findings that could not be
+re-verified were dropped. The Anthropic API facts used by the LLM package
+(model catalogue, pricing, sampling-parameter rejection, structured outputs,
+Bedrock Mantle client, cache-prefix minima) were taken from the current API
+reference rather than from memory, because the previous implementation had
+encoded a stale catalogue and a stale price table.
+
+### 30.2 Executive determination
+
+At v0.3.15 the product had a strong verification story and a weak
+truthfulness story. Concretely:
+
+1. **The shipped app was a background-only process.** The two-executable
+   bundle introduced for the native host made PyInstaller inherit
+   `console=True` from the last `EXE`, which its macOS bundler turns into
+   `LSBackgroundOnly=1`. No Dock icon, no Cmd-Tab, no key window: every text
+   field in the app was dead to the keyboard. The verifier checked six plist
+   keys and not this one.
+2. **The extension overlay crashed on every real intervention.** The injected
+   function treated `micro_steps` as strings; the wire shape (generated from
+   the Pydantic schema the repository is proud of) is a list of objects. The
+   test fixture used strings, so CI passed.
+3. **The LLM path could not succeed on current models.** Every request sent
+   `temperature=0.3`, which current Claude models reject with HTTP 400; the
+   400 was retried three times and then replaced by the offline fallback, and
+   the shared circuit breaker then silenced the other tiers. Pricing
+   over-counted Opus by 3× and cache reads by 10×, so the daily kill-switch
+   tripped early on the rare calls that did go through.
+4. **A whole inference state was unreachable.** Inactivity was computed only
+   from events inside a 15 s window, so it could never exceed 15 s, while the
+   under-engaged transform starts at 30 s. HYPO, the zombie-reading detector,
+   and the flow inactivity clause were dead, and the model card said
+   otherwise.
+5. **Stopping Cortex killed its own clients.** `lsof -ti tcp:9473` lists both
+   ends of every socket. The kill chain therefore SIGTERMed and SIGKILLed
+   Chrome’s network service, the VS Code extension host, and the WebSocket
+   desktop shell. The rule was written down in `CLAUDE.md` as a lesson
+   learned.
+6. **The publish gate could not be satisfied by the project’s only
+   maintainer.** Two hardware classes, two people in disjoint roles, and
+   fourteen passed cases per architecture were required; the GitHub
+   environments the docs described had no reviewers; six draft releases were
+   stuck and the one public “Latest” had bypassed the gate by hand.
+7. **The test suite wrote into the user’s real profile.** Fixture goals,
+   cost ledgers, onboarding markers, and native-host logs landed in
+   `~/Library/Application Support/Cortex` on every run.
+8. **Design tokens with alpha were mis-rendered in every Qt surface.** The
+   emitter wrote CSS `#RRGGBBAA`; Qt reads `#AARRGGBB`. Every hairline was a
+   24 % olive line and the UNKNOWN/HYPO state dots were near-invisible.
+
+None of these were regressions in the algorithmic core that Sections 1–18
+hardened. They were boundary failures: packaging, wire shapes, provider
+contracts, dead reachability, process control, governance, and rendering
+conventions. The cycle therefore prioritises **invariant honesty** (make the
+gates see what users see), **reachability** (every documented state and
+tier must be reachable), and **interaction truth** (every indicator, button,
+and motion must mean what it says) over new capability.
+
+### 30.3 Verified findings by layer
+
+Each table lists the defect, its consequence, the correction chosen, and the
+work package (§30.6) that carries it. Line references are to the v0.3.15
+source; they are the audit citations, not the post-fix positions.
+
+#### 30.3.1 Packaging, native host, and release pipeline
+
+| ID | Where | Defect | Consequence | Correction | WP |
+| --- | --- | --- | --- | --- | --- |
+| R1 | `cortex.spec` COLLECT/BUNDLE | Last `EXE` (`console=True`) sets `LSBackgroundOnly=1` (Observed in built plist) | GUI cannot become key; keyboard dead; no Dock presence | `info_plist["LSBackgroundOnly"]=False`; verifier rejects any truthy `LSBackgroundOnly`/`LSUIElement` | H |
+| R2 | `native_host.py:311-321`, `launcher_agent.py:279` | Unanchored `pgrep` prefix matches the host’s own `CortexNativeHost` argv; `stop` SIGTERMs itself (Observed) | Stop from the extension dies mid-reply; order-dependent daemon kill | Anchored pattern on the GUI executable, self/parent PID excluded, daemon pidfile preferred | D |
+| R3 | `native_host.py:162-167, 219-267` | Frozen host outside `/Applications` takes the dev path and opens Terminal running the host binary as Python (Inferred) | Confusing Terminal window for any non-standard install location | Frozen mode never takes the dev path: launch by bundle id, structured “install to /Applications” error | D |
+| R4 | `validate_release_records.py:80-82, 182-190`; schema | Two hardware classes, two disjoint humans, 14/14 cases required; no environment reviewers exist (Observed via API) | Publication impossible without bypass; “Latest” was hand-published | Tiered assurance (ADR 0007): `self-attested` and `independently-reviewed`; core-case set; truthful notes | H |
+| R5 | `cortex/security/*-audit-exceptions.json` | Exceptions expiring 2026-09-22 and 2026-09-30 inside a 45-day review cap | Recurring monthly release breakage | Re-reviewed with dated reasons and mitigations; expiry 2026-10-15; policy text in release README | H |
+| R6 | `build_macos_app.sh:70`, `generate_release_evidence.py:93-99` | Stale files in `dist/evidence-<arch>` are hashed into the new SHA256SUMS (Observed locally: v0.3.4 codesign output bound into 0.3.14) | Misleading local evidence | Evidence dir is reset only when under `dist/`, otherwise fatal | H |
+| R7 | `build_macos_app.sh:357-360, 493` | `--deep --entitlements` stamps camera/automation entitlements onto every nested library; only the DMG is stapled | Entitlement sprawl; offline first launch depends on Apple ticket lookup | Nested code signed without entitlements, outer app with; app notarized and stapled before imaging, DMG after | H |
+| R8 | `build_macos_app.sh:459-464` | `notarytool submit --wait` without timeout | Job can hang to the 90-minute limit | `--timeout ${CORTEX_NOTARIZE_TIMEOUT:-30m}` and per-label evidence files | H |
+| R9 | `verify_macos_release.py:850-870` | Release smoke runs with the builder’s real `HOME` | Verification writes into the maintainer’s profile | Isolated temporary `HOME`, recorded as `probe_home_isolated` | H |
+| R10 | `tests/conftest.py` (absent) | Test suite mutates `~/Library/Application Support/Cortex` and `~/Library/Logs/Cortex` (Observed by mtime diff) | Real goals/cost ledger/onboarding state overwritten by fixtures | Session `HOME` sandbox with XDG variables; opt-out `CORTEX_TEST_REAL_HOME=1` | H |
+| R11 | `Makefile` `wiki` target; nine root wiki pages | `make wiki` pushed the whole source tree to the wiki’s unrendered `main`; page links assumed repo paths | Wiki showed a May snapshot with retracted claims; links broken on the wiki | Pages moved to `wiki/`, links rewritten; subtree split pushed to `master` | H |
+
+#### 30.3.2 Runtime, transport, auth, and persistence
+
+| ID | Where | Defect | Consequence | Correction | WP |
+| --- | --- | --- | --- | --- | --- |
+| T1 | `launcher_agent.py:253-264`, `native_host.py:278-292`, `install_launcher.py:53` | `lsof -ti tcp:<port>` returns both socket ends (Observed with a scratch socket) | Kill chain terminates Chrome’s network service, the VS Code host, and the WS desktop shell | `-sTCP:LISTEN`; anchored `pgrep`; daemon-written `daemon.pid` preferred | D |
+| T2 | `launcher_agent.py:296-300`, `native_host.py:335-341` | `POST /shutdown` sent without the capability token to a token-gated router | Graceful stop is dead code; SIGKILL after 3 s interrupts recap and DB close | Token header sent; poll `/health` for connection-refused ≥20 s before SIGTERM; SIGKILL last | D |
+| T3 | `app.py:117, 190` | Rate limiter wraps the app while auth is a route dependency; buckets key on `127.0.0.1` | Any local page can starve `/shutdown`, `/consent/reset`, `/api/launch` | Budget consumed only after the token validates | D |
+| T4 | `routes.py:463-468` → `maintenance.health` | `/health` is tokenless, unlimited, and runs `PRAGMA quick_check` on the single DB worker | O(DB) work per anonymous call, serialized ahead of consent transactions | DB-free `/health` with `ready`/`ws_listening`/capture fields; probes on authenticated `/storage/status` | D |
+| T5 | `database.py:421-435` | Any sha256 drift of a shipped migration file raises `StorageCorruptionError` at startup | A whitespace edit bricks every existing install | Mismatch on applied versions is a logged compatibility warning; hashes pinned by test; upgrade fixture from `user_version=1` | D |
+| T6 | `retention.py:150, 296-298`; `settings.py:909` | Session files deleted after 7 days; budget counts only `.json` | History disappears after a week; 2 Hz JSONL unbounded | Retention default 180 days; `.jsonl` budgeted; recorder writes transitions only, `0o600`, lazily created | D, C |
+| T7 | `launcher.py:334` | Project-YAML `hide_apps` interpolated into AppleScript | Quote breaks out into arbitrary AppleScript via token-gated `/api/launch` | Name allow-list `^[A-Za-z0-9 ._+-]{1,64}$` | D |
+| T8 | `websocket_server.py:1497-1503`, `local_token.py:134-138`, `routes.py:1990-1996`, `database.py:730` | Synchronous DB commit, per-request token file read, whole-log read, and executor shutdown on the event loop | Loop stalls during calibration commit and feedback | `to_thread`, mtime-cached token, bounded tail, loop-thread assertion in `call_sync` | D |
+| T9 | `local_token.py:78-87` | Token written under umask then chmodded | Brief world-readable window | `O_CREAT\|O_EXCL` with `0o600`, then atomic replace | D |
+| T10 | `websocket_server.py:3316-3317, 3405-3420` | 0.1 s total broadcast budget cancels sends the transport already buffered | INTERVENTION_TRIGGER/SESSION_RECAP delivery ambiguous | Per-client timeout kept; total-budget cancel removed | D |
+| T11 | `app.py:143-157`, `metrics.py` | Credentialed CORS for every localhost port; `/metrics` tokenless | Biometric-derived counters readable by any local page | Token required on `/metrics` | D |
+| T12 | `maintenance.py:454-457` | Research policy rows pruned at 90 days through FK cascades | Fixed-epoch MRT study silently loses data | `research_randomized` rows exempt | D |
+| T13 | `runtime_daemon.py:~2303` | Unguarded `input_hooks.stop(); window_tracker.stop()` in shutdown | A listener that failed to start skips recap, WS close, DB close | Each guarded and logged | C |
+
+#### 30.3.3 Signal pipeline
+
+| ID | Where | Defect | Consequence | Correction | WP |
+| --- | --- | --- | --- | --- | --- |
+| S1 | `v2/pulse.py:74-84` | Welch `nperseg=8·fs`, `noverlap=nperseg/2` on a 10 s window forms one 240-sample segment (Repro) | Last 2 s of every window never enter the PSD; +2 s latency; “10 s window” false | Whole-window Hann periodogram with zero-padding; true analysed span reported | B |
+| S2 | `head_pose.py:17-28, 80-89, 180-196`; `posture.py:155`; `calibration_runner.py:653-663` | Model is y-up/z-toward-camera; OpenCV is y-down/z-away; frontal pose solves to pitch ±180° with a wrap at neutral (Repro) | Flexion either never registers or jumps to 350°; calibration averages across the wrap | Model points mirrored `[1,−1,−1]`; wrapped delta; circular calibration mean; profiles auto-invalidated by digest | B |
+| S3 | `observation_buffer.py:153, 183, 191` | `expected_count = round(window × nominal fps)` | Any steady stream below 24 fps is `INSUFFICIENT_WINDOW` forever | Valid fraction and quality mass over scheduled observations; temporal coverage remains the time gate | B |
+| S4 | `face_tracker.py:473-477` + daemon glue | 167 ms face loss resets the RGB buffer, beat ledger, blink history, head pose | Every hand-to-face gesture restarts 10/45/15 s warm-ups | Reset only when loss exceeds the interpolation gap; ledger and blink exposure retained | B, C |
+| S5 | `runtime_daemon.py:3336-3338`; `pulse.py:264` | Jitter “degrees” are px×45/width; the 7.5° gate needs 107 px/frame | Motion SQI term is decorative | Motion term driven by `motion_face_widths_per_second` with an honest unit | B, C |
+| S6 | `v2/rppg.py:192-203` | Registered CHROM computes α on unfiltered chrominance | Drift-dominated α; not de Haan & Jeanne (2013) | Band-pass before α; registry version/digest bumped | B |
+| S7 | `peak_detection.py:54-61` | Library Welch quantises HR to 6 BPM | Exported estimator misleading | Zero-padding plus parabolic refinement consistent with v2 | B |
+| S8 | `pulse.py:194, 306-307` | HR prior never ages | A true 36 BPM change is penalised ≈7× in power after a low-quality stretch | Age-decayed prior penalty with a documented constant | B |
+| S9 | `pulse.py:282-301`, `respiration.py:301-357` | Heuristic bounds labelled `confidence_level=0.95` | Statistical claim without a statistical basis | `EstimateUncertainty.interval_kind` (`statistical` \| `heuristic`); heuristic bounds carry no level and the schema rejects one | B, H |
+| S10 | Readiness registry keys | `physio_window_readiness` written, never read | “Reading your pulse…” shown when the window can never become ready | Structured `unavailable_reasons` surfaced in capture status | B, C |
+| S11 | `webcam.py:1115-1118` | Camera identity from requested, not delivered, resolution | Intrinsics and jitter scale wrong on a 1280×720 stream | Identity from the first delivered frame where safe | B |
+| S12 | `runtime_daemon.py:3410-3423` | Legacy stabiliser/NSQI/SNR gates run into an unread registry key | Six documented knobs do nothing | Left in place; documented as dead pending removal decision (§30.9) | — |
+
+#### 30.3.4 Inference, trigger, intervention, and consent
+
+| ID | Where | Defect | Consequence | Correction | WP |
+| --- | --- | --- | --- | --- | --- |
+| I1 | `feature_aggregator.py:125-128, 436-472`; `rule_scorer.py:191` | Inactivity ≤ window (15 s); under-engaged ramp starts at 30 s (Observed; enshrined by a test) | HYPO, zombie detector, flow inactivity clause unreachable; model card false | Last-input timestamp kept in the hooks; inactivity bounded by exposure, decoupled from the window | C |
+| I2 | `rule_scorer.py:790-794`; `calibration_runner.py:779-780` | Division by a calibrated mouse-variance baseline of 0 (Repro) | Every state tick raises; no estimates ever | Baseline floored at 1.0 in scorer and calibration | C |
+| I3 | `smoother.py:300-310`; `trigger_policy.py:725-746` | Dwell measures label age, not time above the gate (Repro: 20 min at 0.26–0.30 then a 2.5 s spike passes “30 s dwell”) | Trigger dwell is not what the docs say | Seconds-above-gate tracked and reset below the gate; exit-dwell to UNKNOWN | C |
+| I4 | `trigger_policy.py:1440-1462` | `adaptive_threshold_min=0.75` clips the configured base (Repro) | `overlay_threshold=0.70` and any slider value below 0.75 ignored; docstring numbers wrong | Only the feedback offset is clipped; docstring corrected | C |
+| I5 | `runtime_daemon.py:4060-4090, 4752-4770, 7169-7176` | Zombie/rabbit-hole/LeetCode surfaces bypass enable flag, quiet mode, receptivity, hourly cap, cooldown, and never record | Interruptions the user turned off can still fire | One shared interruption gate for every surface | C |
+| I6 | `runtime_daemon.py:4783, 4043`; `restore.py:153, 392-398` | Special path awaits the LLM without `wait_for`; unverified restore re-runs `_end_intervention` every tick with an uncapped outcomes list | State loop stalls; 10 s blocks; unbounded growth | `wait_for` aligned to planner worst case; per-intervention restore backoff off-loop; bounded deque | C |
+| I7 | `runtime_daemon.py:4176, 4181, 4203` | `continue` skips the loop sleep; decision gate not advanced on exception | Busy loop while `decide()` fails (locked SQLite) | Sleep in `finally`; gate advanced | C |
+| I8 | `trigger_policy.py:748-751, 1013-1016, 1153-1170` | Dismissal model locks closed after 10 outcomes; double penalty; persisted | Only `reset()` recovers; user sees nothing | Time-boxed, visible pause with a stated reason that decays | C |
+| I9 | `transaction.py`, `intervention_store.py:144-168` | Terminal transactions never evicted; each RESTORE_FAILED retry appends a command | Journal grows for the install lifetime | Bounded archival; last failed command reused | C |
+| I10 | `trigger_policy.py:559-560`; `runtime_daemon.py:4121-4168` | Weekly “quiet” slots ignored; receptivity-blocked points never logged | Config lies; research availability rule unverifiable | Quiet slots honoured; blocked points recorded with `available=False` | C |
+| I11 | `runtime_daemon.py:4125` | Legacy `signal_quality.acceptable` gate ties eligibility to camera presence | Camera-off with rich telemetry cannot trigger; contradicts “camera cannot change support” | Gate dropped; `evidence_coverage` authoritative | C |
+| I12 | `policy_repository.py:114-126, 499-501, 560`; `runtime_daemon.py:3709-3716, 4611/4668, 6498` | Interruption term penalises delivery by construction; late finalize marked `finalized`; UTC day for local-hour diagnostics; helpfulness leak; delivery marked after send | MRT outcome biased; stale snapshots analysed; partial-day diagnostics; early observations dropped | Each corrected with tests (late → `censored`, null-effect reward ≈ 0, completed local day) | C |
+| I13 | `feature_aggregator.py:489`; `feature_fusion.py:345, 354`; `generator.py:107-153` | Switch rate undercounts by one; 15 s features stamped as 60 s; state transition appended every 2 Hz tick | ~57 k transitions per 8 h re-serialised every 90 s | Counting corrected; provenance stamped truthfully; transitions recorded on change only | C |
+| I14 | `executor.py:313`, `zombie_detector.py:93`, `leetcode_interventions.py:83` | Direct `time.monotonic()` | Injected clocks defeated in tests | Routed through the injected clock | C |
+
+#### 30.3.5 LLM planning and privacy path
+
+| ID | Where | Defect | Consequence | Correction | WP |
+| --- | --- | --- | --- | --- | --- |
+| L1 | `anthropic_planner.py:639`; `settings.py:291` | `temperature=0.3` on models that reject sampling parameters; 400 retried 3× | Deep tier dead; shared breaker silences other tiers | No sampling parameters for any model; 400/404/422 non-retryable; breaker per tier | A |
+| L2 | `anthropic_client.py:41-52` | Stale Vertex snapshot dates, legacy Bedrock profile ids, token passed through a temporary `os.environ` window | 404/400 → generic “offline” fallback; secret visible to any subprocess in the window | Capability table; `AsyncAnthropicBedrockMantle(api_key=…)`; bare Vertex ids; `max_retries=0` | A |
+| L3 | `pricing.py:30, 113` | Opus priced 3× too high; cache reads billed at full input rate | Daily kill-switch trips early | Five-model table; cache read 0.1×, write 1.25×; provider-id normaliser | A |
+| L4 | `anthropic_planner.py:635-663` | `response` assigned after the shield returns; orphaned coroutine keeps its semaphore slot and loses its cost | Cancellation accounting dead; slots leak; daemon 35 s wait below a 3×30 s×3 worst case | `ensure_future` + done-callback records usage/failure and releases the slot; `worst_case_seconds` exposed and used by the daemon | A, C |
+| L5 | `settings.py:290` | `max_tokens=1024`; `stop_reason` unchecked | Truncated plans parsed as errors, retried, billed | 8192 default; `refusal`/`max_tokens` are terminal outcomes | A |
+| L6 | `prompts.py:146` | Brace doubling on a `.format()` argument (Observed; enshrined by a test) | All code sent to the model has `{{ }}` | Removed; fidelity test | A |
+| L7 | `context_broker.py:160-162` | Only seven path roots minimised | `/Applications`, `/etc`, `/usr/local` … leak despite the privacy doc | Any absolute path with ≥2 segments | A |
+| L8 | `anthropic_planner.py:113` | Tool schema is the full `InterventionPlan` | Model can set `intervention_id`, `metadata.source`, consent level, causal signals | `PlanDraft` model of model-authored fields only; daemon-owned fields stamped locally | A |
+| L9 | `parser.py:505-518` | Every required field defaulted | `{}` validates as a live plan and is cached as `source=llm` | Empty headline/steps/summary rejected as `invalid_response` | A |
+| L10 | `llm_engine/__init__.py:89-93`; `context_broker.py:1013-1017` | Missing credential swallowed; reload cannot construct the transport | First-run BYOK needs a restart with a misleading error | Lazy transport construction on reload; `credentials_missing` status | A |
+| L11 | `anthropic_planner.py:83-97` | Template→tier map names three non-existent templates, omits five | Tier routing silently wrong | Map covers every template; identity test | A |
+| L12 | `prompts.py:196-348` | Hand-written JSON schema and “output only JSON” in the system prompt while a tool was forced | ~1.5 k wasted tokens per call | Schema removed; behaviour rules kept; structured outputs enforce format | A |
+| L13 | `context_broker.py:582` | Full `StateEstimate` forwarded to the transport | Disclosure wider than the catalogue | Projected to state/confidence/dwell | A |
+| L14 | `cost_tracker.py:461-475` | No token counters | `probe_token_totals` always `None` | Per-day prompt/completion counters persisted | A |
+
+#### 30.3.6 Desktop shell (PySide6)
+
+| ID | Where | Defect | Consequence | Correction | WP |
+| --- | --- | --- | --- | --- | --- |
+| U1 | `dashboard.py:3535-3576` | “View full report →” finalises the stop and quits | The report is requested from a stopping daemon and the window closes | Daemon stops, Qt stays alive, detail shown; explicit “Quit Cortex” in the recap sheet | E |
+| U2 | `dashboard.py:1411-1434`; tray | “Stop Cortex” is Quit; two names for one destructive action; no consequence named | Users cannot stop sensing without exiting | Split end-session vs quit; destructive control names its consequence; Cmd+Q on quit only | E |
+| U3 | `mac_native.py:172-176`; `dashboard.py:459-461`; `SEMANTIC_DARK` unused | Light constants painted over a system-appearance window | Dark mode unreadable | Aqua appearance pinned per window and a light application palette until dark tokens are wired; `palette()` accessor added | E |
+| U4 | `dashboard.py:2090-2100, 1207` | Parentless button shown after a swallowed `AttributeError`; orphan HRV label | Stray top-level window | Removed | E |
+| U5 | `overlay.py:746, 768, 1150-1152` | Overlay activates and binds bare `S`/`Q` | A nudge steals focus; a stray “q” quiets Cortex | Non-activating notification anchored top-right; Cmd-modified shortcuts; single “Why”; pacer only for breathing plans | E |
+| U6 | `dashboard.py:2352-2356, 1306-1320, 2255-2321, 892-914`; `settings.py:1626-1634`; `onboarding.py:1055-1057`; `main.py:894-896` | Connectivity painted in the FLOW colour; colour-only rows; hard-coded “Sessions 1”; permanent `$—`; a palette combo that does nothing but demands a restart; onboarding marks every step complete; WS tray shows a state without evidence | Indicators lie | Info colour for connectivity; text plus accessible names; rows hidden until data exists; palette control wired or removed; completion reflects grants; evidence status passed | E |
+| U7 | `dashboard.py:1212-1243`; `onboarding.py:1305-1310`; `connections.py:417-431`; `settings.py:1776`; `history_tab.py:1973-1975` | Accent and success colours as 11 px text at 3.1:1, 2.0:1, 2.8:1 | Contrast contract violated | Secondary text with a coloured dot; `success_text` token; contrast tests extended | E |
+| U8 | Stylesheets | No `:focus` rule on any styled button | Keyboard users cannot see focus | `BTN_*` recipes with a no-shift 2 px ring applied everywhere | E |
+| U9 | `settings.py` | No scroll area around ten cards including a 7×4 combo grid; no Escape on Settings/Connections/Onboarding | Apply/Close off-screen on a 13″ display | `QScrollArea`; Escape closes; weekly schedule collapsed; Debug moved to Advanced | E |
+| U10 | `dashboard.py:3109-3115`; `components.py:399-403` | Toast inside the main layout shifts the page 70 px; error colour is the brand colour | Geometry animation on a live path; semantics wrong | Floating toast, 160 ms opacity, hover pauses; danger for errors | E |
+| U11 | `connections.py:683-747, 322-331` | Twelve modals; the six-step procedure sits inside a dialog the user must dismiss; advice to strip quarantine | Users cannot follow steps; Gatekeeper bypass taught | Inline checklist per card; re-probe on show; quarantine advice removed | E |
+| U12 | `main.py:1037, 1736, 1762`; `controller.py:2188, 2224`; `recap_sheet.py:484-537` | Overlay hidden without stopping timers; non-interruptible sheet animation | 30 Hz pacer runs on hidden windows | One dismiss path; retargetable animation | E |
+| U13 | `main.py:1353-1359`; `controller.py:1439, 1674, 1861, 2467` | Direct cross-thread widget call; `QTimer.singleShot` from the asyncio thread | Qt threading contract violated | Queued signals through the existing bridge | E |
+| U14 | Copy and typography (multiple) | “Start a session…”, “daemon”, “AWS Bedrock bearer token”, a one-minute promise, FLOW enum in tooltips; Cormorant on 12 sites; `pt` units; off-scale sizes; hover without press | Vocabulary and scale drift | Consumer copy; display serif restricted to wordmark and hero numerals; px scale; two button recipes; press feedback | E |
+
+#### 30.3.7 Browser extension (Plasmo MV3)
+
+| ID | Where | Defect | Consequence | Correction | WP |
+| --- | --- | --- | --- | --- | --- |
+| X1 | `background.ts:1768, 1833` | `micro_steps as string[]` then `.toLowerCase()`; wire shape is `MicroStep[]` | Overlay throws on every real trigger; rejection swallowed | `normaliseMicroSteps` before injection; schema-shaped fixture with `satisfies` | F |
+| X2 | `popup.tsx:3177-3178, 3380-3381`; `newtab.tsx:637-706` | `textInverse` hard-coded white; white glass with white text | Primary CTAs invisible in dark mode | `--cx-label-inverse` token; `color-mix` glass; jsdom contrast test for both schemes | F |
+| X3 | `background.ts:5584-5590`; `popup.tsx:1235-1251, 2444-2446, 2021-2025` | RESTORE broadcast before results; failure labelled “Done”; no pending state; duplicate authorize on double click | Apply feedback unreachable or false | `INTERVENTION_APPLIED {results}`; one `idle\|pending\|applied\|partial\|failed` machine shared by popup and overlay | F |
+| X4 | `background.ts:2414, 7004-7033` | No receiver for `REMOVE_OVERLAY` | Overlays outlive the intervention | Self-contained `removeCortexOverlay` executed on restore/timeout/command | F |
+| X5 | `package.json:65-66`; `background.ts:1075, 1501, 6861, 6891, 2068-2217` | `bookmarks` and `webNavigation` requested for dead paths; dead senders; lockout dead code; a “Tab closing” switch for an unauthorisable action | Install prompt warns about history and bookmarks for nothing; setting lies | Permissions and dead code removed; switch removed | F |
+| X6 | `background.ts:1005-1011`; `popup-view-model.ts:100, 170` | Stale `websocket_failed` classified as handshake failure after reconnect | Raw code shown with a useless retry on a healthy connection | Cleared on connect; codes never printed | F |
+| X7 | `popup-view-model.ts:101-106`; `background.ts:2464-2481` | Exact version-string equality with a dead-end CTA | Any patch skew blocks the popup | Major.minor comparison; dismissible “Cortex needs an update” banner | F |
+| X8 | `background.ts:953, 976-979, 6916` | Native host probed on every close; 30 s keepalive reconnect | Spawn storm while the daemon is down | Probe on popup open/install or every 5 min with caching | F |
+| X9 | `background.ts:1968-1970, 2001, 2052` | Document-level Escape sends `dismissed` → 30-min cooldown; timer sends `dismissed` | Closing any site modal teaches “user dismissed” | Escape scoped to the panel; timer sends `expired` | F |
+| X10 | `popup.tsx:2815-2835`; `background.ts:772` | One-click destructive Stop; keepalive undoes the intent | Accidental shutdown | Two-step confirm naming the consequence; sticky intent | F |
+| X11 | Copy (multiple) | “daemon”, “handshake”, “bridge”, “VISUAL ENGINE OFFLINE”, raw enums, terminal instructions in a packaged product, motivational filler | Developer vocabulary in a consumer surface | Calm consumer copy with `STATE_LABELS` | F |
+| X12 | `background.ts:1878-1942, 2270-2274, 5684-5691`; `ambient.ts:391-396` | Four palettes and two font stacks across injected surfaces; no dark scheme in shadow roots | Incoherent product | `shadowTokensCss()` injected into every shadow root; one panel component with variants | F |
+| X13 | `popup.tsx:214, 216, 1959`; `newtab.tsx:437, 572, 581`; `background.ts:1872-1893` | Undefined keyframes; per-frame `filter` animation; keyframe enter/exit | State dot never breathes; paint-bound new tab; non-interruptible overlay | Correct keyframe names; pre-rendered glow with opacity/transform; transition-based enter/exit | F |
+| X14 | `background.ts:1960, 2288-2306, 2770-2774`; popup header | Overlay never focused; coach card without Escape; interceptor blanks fresh tabs; duplicate Connect pill | Keyboard users unaware; dead ends | Focus to heading with restore; Escape everywhere; one status pill plus one CTA | F |
+| X15 | `activity-tracker.ts:43`; `ambient.ts:80-92, 480-481`; new-tab override | Tracks every `localhost` dev server; dims any element whose class contains “popup”/“cookie”/“chat-widget”; no new-tab opt-out | Functional UI hidden; developer surprise | Selectors removed; localhost dropped; opt-out and onboarding mention | F |
+| X16 | `background.ts:1038-1052, 739/7125` | `onSuspend` never fires in MV3; `restoreState` races `connect` | Dismissed intervention can re-show before cooldowns hydrate | Debounced persistence; restore awaited before connect | F |
+
+#### 30.3.8 VS Code extension
+
+| ID | Where | Defect | Consequence | Correction | WP |
+| --- | --- | --- | --- | --- | --- |
+| V1 | `package.json:93-97`; `ws-client.ts:286, 311-327` | `cortex.daemonUrl` workspace-overridable; token and editor content follow it | A cloned repository can exfiltrate the token and visible code | `scope: machine`; non-loopback hosts refused; `untrustedWorkspaces` restriction | G |
+| V2 | `panel-provider.ts:412, 443-452` | No CSP; inline handler; JSON injected into `<script>` without `</script>` escaping | Daemon-supplied string can break out | Nonce CSP; handlers in the nonce script; signals via `postMessage` | G |
+| V3 | `context-provider.ts:85-110, 272-291` | Guards on a proposed API that is absent; would send 50 raw terminal lines | Dead code that contradicts the data-flow doc | Terminal capture deleted | G |
+| V4 | `ws-client.ts:49-56, 295, 311-342, 365-368` | Missing token → AUTH skipped → 1011; “Connected” flashed on every open | Silent infinite reconnect | Warning with the token path; connected only after `AUTH_OK`; IDENTIFY after AUTH | G |
+| V5 | `ws-client.ts:842-852` | PROTOCOL_ERROR logged to console only | Permanent silent disconnect | Error message with Retry | G |
+| V6 | `extension.ts:141-143, 511-538`; `panel-provider.ts:106-112` | Full HTML rebuild on every micro-step toggle | Pacer restarts, drill-down collapses, rating lost, toast repeats | Patch via `postMessage` when the id is unchanged; toast de-dup | G |
+| V7 | `panel-provider.ts:202` | WHY_DETAIL promise discarded; timeout unhandled | Empty panel; unhandled rejection | Loading/timeout copy; `payload.error` honoured | G |
+| V8 | `panel-provider.ts:82` | No `onDidDispose` | Hidden view throws on next show, swallowed | View cleared on dispose | G |
+| V9 | `fold-controller.ts:57-128` | Palette invocation with undefined args unfolds everything | Surprising editor mutation | Args validated; internal commands hidden from the palette | G |
+| V10 | `panel-provider.ts:543-548, 633-643, 682-771`; `design-tokens.ts:35-38` | Terracotta text at 3.1:1; white fills on light themes; 18 %-alpha state dots | Contrast and theme contracts violated | VS Code theme variables; terracotta for borders and pacer only | G |
+| V11 | `extension.ts:311-314, 391-411`; `ws-client.ts:502-777` | `detail` on a non-modal message; global settings rewritten by unused commands; four dead senders | Dead and unsafe surface | Removed; briefing inlined with an `Array.isArray` guard | G |
+| V12 | `context-provider.ts:118-151` | Up to 8,000 chars from any document scheme | Output panel, settings, diffs leave the editor | `file` scheme only; `cortex.shareEditorContent` setting | G |
+
+#### 30.3.9 Documentation and links
+
+Root wiki pages linked to repository paths that do not exist on the GitHub
+wiki; `AGENTS.md` and the README described a four-step wizard for a six-step
+one; the README kept an author placeholder comment; `Troubleshooting` still
+described camera-driven classification, Terminal.app camera grants, and
+`pkill run_dev` for a product whose daemon runs in-process; `CONTRIBUTING`
+described a brew/pip path the locked toolchain replaced; `SECURITY.md` pointed
+at a dead mailbox; API documents named message types that the catalogue
+rejects. All are corrected in this cycle (H), and the release documents now
+describe the tiered gate rather than the unreachable one.
+
+### 30.4 Design decisions and rejected alternatives
+
+| Decision | Chosen | Rejected | Why |
+| --- | --- | --- | --- |
+| LLM output contract | Structured outputs (`output_config.format = json_schema`) against a `PlanDraft` of model-authored fields only; local Pydantic validation kept as defence in depth | Forced `tool_choice` with the full `InterventionPlan` schema | Forced tool choice returns 400 on the newest models and requires disabling thinking on Bedrock; the full schema let the model author daemon-owned identity and provenance fields |
+| Model catalogue | `claude-sonnet-5` default, `claude-haiku-4-5` fast, `claude-opus-5` deep, with a capability table per logical id | Keep `opus-4-7 / sonnet-4-6 / haiku-4-5` and add sampling-parameter special cases | The current models are cheaper per token at higher quality; a capability table keeps per-model behaviour (effort, sampling, cache prefix) explicit and testable |
+| Bedrock transport | `AsyncAnthropicBedrockMantle` with the bearer token passed explicitly, `max_retries=0` | Environment-variable window around SDK construction; SDK retries plus planner retries | Secrets must not be visible to child processes; two retry policies made the worst case unbounded |
+| Planner cancellation | `ensure_future` + done-callback that records real usage and releases the semaphore; `worst_case_seconds` exported and used by the daemon | Shielded await with post-hoc accounting | The post-hoc branch could never observe the response; orphaned calls leaked cost and concurrency slots |
+| Process control | `lsof … -sTCP:LISTEN`, anchored `pgrep`, daemon pidfile preferred, tokened graceful stop with a bounded wait before signals | Port heuristics as written in the project rules | The rule was empirically wrong and killed clients; the pidfile makes the daemon the authority on its own identity |
+| Health and readiness | DB-free `/health` with readiness fields; integrity probes behind the token | Keep `quick_check` on `/health` | Anonymous, unlimited O(DB) work on the single DB worker is a local denial-of-service vector |
+| Migration integrity | Hash mismatch on applied versions is a warning; hashes pinned by test; newer `user_version` still refused | Fail closed on any hash drift | Fail-closed here bricks every install on a whitespace edit; the pin moves the check to CI where it belongs |
+| Inactivity | Last-input timestamp, bounded by exposure | Widen the telemetry window to 300 s | A wider window changes every other rate feature; the timestamp is exact and cheap |
+| Trigger dwell | Seconds above the gate, reset below it; exit-dwell to UNKNOWN | Keep label-age dwell and raise the threshold | Label age does not measure what the docs promise; raising the threshold would make an already rare trigger rarer |
+| Dismissal handling | Visible, time-boxed pause with a stated reason that decays | Opaque persisted logistic model | A model that locks closed with no user-visible cause and no recovery path is a trust failure, not a safeguard |
+| Interruption authority | One shared gate for standard, special, LeetCode, and break surfaces | Per-surface checks | Every bypass found was a surface that grew its own partial gate |
+| Face-loss policy | Reset physio state only when the loss exceeds the interpolation gap; keep the ledger and blink exposure | Keep the 167 ms reset | The pipeline already handles gaps; resetting discards up to 600 s of evidence for a hand gesture |
+| HR spectrum | Whole-window Hann periodogram with zero-padding and the true span reported | Keep Welch with the same parameters | The parameters silently discarded 20 % of every window |
+| Release governance | Tiered assurance with truthful notes (ADR 0007); maintainer approval is labelled as such | Pre-release flag only; delete the reviewer-overlap check; drop Intel | The alternatives either left a broken “Latest”, made a field named `independent_reviewer` lie, or abandoned users without a decision |
+| Dark mode on desktop | Pin the Aqua appearance now; add a `palette()` accessor for a real dark theme later | Ship the untested dark token set | Half-wired dark tokens are worse than an honest light-only app; the browser and VS Code surfaces already have real dark palettes |
+| Stop semantics (desktop, extension) | End session vs quit are distinct; the destructive control names its consequence and confirms | One “Stop Cortex” | Two names for one destructive action, and a one-click camera-and-app shutdown, violate the explicit-destructive-action contract |
+| Injected-surface styling | One `shadowTokensCss()` sheet (light and dark) injected into every shadow root | Per-surface palettes | Three palettes and two font stacks in one product are a coherence failure users feel even when they cannot name it |
+| Extension permissions | Remove `bookmarks` and `webNavigation`; remove the unauthorisable “Tab closing” switch | Keep for future features | Permissions must describe what the product does today; a setting for an action the policy can never authorise is a lie |
+| VS Code configuration | `cortex.daemonUrl` machine-scoped, loopback-only, restricted in untrusted workspaces | Trust workspace settings | A cloned repository must not be able to redirect the token and editor content |
+| Test isolation | Session `HOME` sandbox in `conftest.py` | Per-test fixtures where noticed | The leak was systemic; one sandbox makes every future test safe by default |
+
+### 30.5 Interaction design contract
+
+The v0.3.x UI already cited Emil Kowalski’s design-engineering principles.
+This cycle turns the citation into contracts that tests can hold, applied
+identically to the PySide6 shell, the extension, and the VS Code panel:
+
+1. **Every indicator is truthful.** Connectivity uses the info colour, never a
+   state colour. Colour is never the only channel: every status row carries
+   text and an accessible name. Counters that are not measured are not shown.
+   Warm-up copy distinguishes “filling n/10 s” from “blocked: <reason>”.
+2. **Motion communicates state.** Entrances ease out in ≤200 ms; exits in
+   ≤160 ms; only `transform` and `opacity` animate; transitions are
+   preferred over keyframes so an update or dismissal retargets instead of
+   restarting; reduced motion is gentler, never zero (a 120–160 ms opacity
+   change remains). No geometry animation on a live dashboard path: the
+   toast floats over content instead of pushing it.
+3. **Pressable things respond to press.** Every button has `:pressed`
+   feedback and a visible, no-shift focus ring; hover is gated to
+   pointer-fine devices in the browser.
+4. **Destructive and authority-bearing actions are explicit.** Quit names its
+   consequence; Stop in the extension confirms and holds the intent; the
+   overlay never activates or steals keyboard focus; single-letter shortcuts
+   are gone.
+5. **Hierarchy comes from tokens.** New semantic tokens `label_inverse`,
+   `success_text`, `warning_text`, `info_text` exist in all three outputs;
+   alpha tokens are emitted in each host’s channel order; the display serif is
+   restricted to the wordmark and hero numerals; text sits on a single px
+   scale with an 11 px floor.
+6. **Contrast is a test, not a review note.** Every text/background pair used
+   by buttons and status text must clear 4.5:1 in both colour schemes; the
+   contract test enumerates the pairs.
+7. **Keyboard is a first-class path.** Escape closes every window and overlay
+   where it is safe; overlays move focus to their heading and restore it on
+   dismiss; internal commands are hidden from the palette.
+8. **Vocabulary is the user’s.** No “daemon”, “handshake”, “native host”,
+   “bridge”, raw enums, or terminal instructions in a packaged product; no
+   motivational filler; one “Why” affordance per surface.
+9. **One channel per event.** An intervention is a badge plus one surface; a
+   health alert is one toast; badge priorities are stated.
+
+### 30.6 Work packages and ownership
+
+The implementation ran as eight disjoint packages so that no two writers
+touched the same file. Ownership was enforced by instruction; where a package
+needed a change in a file it did not own, it emitted an exact patch note that
+the owner applied.
+
+| WP | Scope | Owner boundary | Status |
+| --- | --- | --- | --- |
+| A | LLM path: settings/defaults `llm` block, client, pricing, `PlanDraft`, planner, prompts, broker, cost tracker, deploy and privacy docs | `cortex/libs/llm/**`, `cortex/services/llm_engine/**`, LLM config only | implemented; 397 targeted tests passed; four new test modules (`test_llm_request_kwargs`, `test_llm_pricing`, `test_plan_draft`, `test_anthropic_planner_outcomes`); daemon wait alignment and the activity summariser's stray `temperature` applied at integration |
+| B | Signal pipeline: pulse spectrum, head pose, coverage, face-loss policy, jitter units, CHROM, library estimator, prior ageing, readiness reasons, camera identity | `physio_engine/**`, `kinematics_engine/**`, `capture_service/**`, `libs/signal/**` | implemented; 308 physio/unit tests passed with the synthetic end-to-end suite holding \|HR−true\| ≤ 0.2 BPM at 30/24/15 fps; daemon glue (face-loss tracker, motion term, readiness diagnostics) applied at integration from the package's patch note |
+| C | Inference, trigger, intervention, consent, eval, telemetry, session report, handover, daemon | `state_engine/**`, `telemetry_engine/**`, `intervention_engine/**`, `consent/**`, `eval/**`, `session_report/**`, `handover/**`, `throttle/**`, `runtime_daemon.py`, `application/**` | implemented; 52 new defect tests across state_engine, services, unit, and eval; 2,987 tests passed with no failure in scope; the eval regression baseline is byte-identical; the legacy `InterventionTrigger` and physiology scorers are deleted; the daemon glue from packages B and D (face-loss tracker, motion term, readiness diagnostics, pidfile, budget delegation) was applied by H afterwards with 92 daemon-dependent tests passing |
+| D | Runtime: gateway, auth, store/storage, launcher, janitor, native host, installers, launcher agent | `api_gateway/**`, `libs/auth/**`, `libs/store/**`, `libs/storage/**`, `storage/**`, `services/launcher/**`, `services/janitor/**`, host and installer scripts | implemented; ten new test modules (stop chain, frozen-host launch, auth-gated rate limiting, DB-free health, migration ledger, retention defaults, AppleScript injection, token-file hardening, transport hardening with a real loopback WebSocket client, pidfile); 2,905 tests passed with no failure in scope; daemon pidfile write and budget delegation applied at integration |
+| E | Desktop shell UX | `apps/desktop_shell/**`, `libs/design/tokens.yaml`, `sync_design_tokens.py`, `docs/ui-design.md` | implemented; session-phase machine (starting/live/stopping/ended/disconnected) separating end-session from quit; Aqua pinned per window with an application palette; non-activating overlay; truthful indicators; generated button/pill/segment recipes with focus rings; scrolling Settings; floating toast; inline connection checklists; `DaemonBridge.ui_task` for cross-thread UI; new `test_desktop_shell_contracts.py`; strict mypy clean over 553 files, 2,663 unit tests and 67 isolated Qt tests passed |
+| F | Browser extension UX and correctness | `apps/browser_extension/**` except generated files | implemented; 306 Vitest tests across 62 files (was 257), TypeScript clean, Chrome and Edge MV3 builds; new `bg/surfaces/*`, `popup/components/*`, `lib/apply-state.ts`, `lib/extension-protocol.ts`; `bookmarks` and `webNavigation` permissions removed; bundle total 792 K → 840 K |
+| G | VS Code extension security and UX | `apps/vscode_extension/**` except generated tokens | implemented; lint, compile, 121 Jest tests (was 32), and VSIX packaging passed |
+| H | Release pipeline, governance, test isolation, tokens emitter, documentation, wiki, version, PR, e2e, publication | Everything not listed above | implemented; release evidence recorded in §30.8 |
+
+### 30.7 Verification program
+
+Static and unit gates are unchanged in kind and extended in coverage. New
+tests introduced by this cycle fall into eight families, each of which would
+have caught a v0.3.15 defect:
+
+| Family | Representative assertions |
+| --- | --- |
+| Artifact truth | Built `Info.plist` is not background-only or UI-element; smoke `HOME` is isolated; stapled app validates |
+| Wire-shape fidelity | Extension fixtures are typed with `satisfies` against the generated schema; overlay renders `MicroStep.text` |
+| Provider contract | Request kwargs per model family carry no sampling parameters, carry `effort` only where supported, and carry `output_config.format`; every provider id resolves for all three providers; pricing and cache discounts; `refusal`/`max_tokens`/400/404 are terminal with distinct reasons; orphaned calls record cost and release their slot |
+| Reachability | 40 s of silence yields `under_engaged > 0`; a zero mouse-variance baseline never raises; `overlay_threshold=0.55` is effective; camera-off with telemetry coverage can trigger; every special surface respects quiet mode, the enable flag, receptivity, and the hourly cap |
+| Process control | The daemon PID set never includes the caller, a `CortexNativeHost` command line, or a client socket owner; the graceful stop sends the token and waits before signalling |
+| Persistence safety | Shipped migration hashes are pinned; upgrade from `user_version=1` runs backup, prune, and ledger; token files are never created with a mode above `0600`; session files survive the retention window and `.jsonl` is budgeted |
+| Interaction contracts | No stray top-level windows after dashboard construction; the overlay does not activate; Escape closes Settings and Connections; the toast does not move the content layout; every enumerated text/background pair clears 4.5:1 in both schemes; onboarding completion reflects real grants; CSP nonce present and `</script>` cannot break out; non-loopback daemon URLs are refused |
+| Release governance | Self-attested records with one architecture and honest `not_run` cases validate; independently-reviewed records still require disjoint identities; assurance notes render from the report |
+| Qt font resolution | The Qt token output contains only families Qt resolves (`.AppleSystemUIFont`); the CSS system stack (`-apple-system`, `system-ui`, SF Pro names) never reaches a stylesheet. Added after the first v0.4.0 local build's smoke probe rejected the bundle on Qt's missing-font warning, which the newly adopted button recipes had introduced |
+
+The full gate list run before the pull request: Ruff; strict mypy; the
+Python suite with the desktop-shell suite in isolation; schema, version,
+design-token, config-reference, and repository-contract checks; browser
+`tsc`, Vitest, and both MV3 builds; VS Code lint, compile, Jest, and VSIX
+packaging; the dependency audits for all three ecosystems; and the recorded
+eval regression baselines. Results on the integrated tree (2026-09-05):
+
+| Gate | Result |
+| --- | --- |
+| Ruff / mypy `--strict` | pass / 553 files clean |
+| Python tests | 3,089 passed and 3 documented skips outside Qt; 67 isolated Qt tests passed (v0.3.15: 2,723 total) |
+| Generated surfaces and contracts | schema, version, token, config-reference, support-model identity, and repository contracts all pass |
+| Eval regression harness | committed baseline byte-identical |
+| Browser | TypeScript clean; 309 Vitest tests in 63 files (v0.3.15: 257 in 55); Chrome and Edge MV3 builds |
+| VS Code | lint, compile, 121 Jest tests in 11 suites (v0.3.15: 32 in 7); 32-file VSIX |
+| Dependency audits | Python and VS Code 0 findings; browser passes with overrides and re-reviewed exceptions |
+
+Hardware validation is deliberately separate from the source gates: a local
+Developer ID–signed (not notarized) build is installed on the maintainer’s
+Apple-silicon Mac and exercised end to end (first launch as a foreground app,
+onboarding, camera acquisition, Chrome and Edge connection through the
+rebuilt native host, VS Code connection, an intervention round trip, stop and
+quit semantics, dark and light appearance), and then the CI-built notarized
+DMG is installed and the core release cases are recorded in the self-attested
+manual record.
+
+### 30.8 Release assurance for v0.4.0
+
+The release follows ADR 0007. The automated chain is unchanged in strength:
+locked audit gate, two native builders, Developer ID signing with entitlements
+only on the outer app, notarization and stapling of the app and then the DMG,
+mounted verification with an isolated `HOME`, evidence generation, SBOMs,
+attestations, and a draft release. Publication requires a validated manual
+record for every architecture the maintainer physically owns, with the five
+core cases passed and every other catalogue case recorded honestly as
+`passed` or `not_run` with a reason, and the release body carries an
+Assurance section stating the tier, the hardware-verified and CI-only
+architectures, and the absence of an independent reviewer.
+
+_Evidence for this version is appended at publication time._
+
+### 30.9 Residual risks and deferred decisions
+
+| Item | State | Decision needed |
+| --- | --- | --- |
+| Legacy pulse stabiliser, NSQI, and SNR knobs | Still wired to an unread registry key; documented as dead | Remove the shadow path and the six knobs, or port hold/median into v2 with an explicit `held` flag |
+| Intel (x86_64) artifact | Built, signed, notarized, and probed by CI; not exercised on hardware | Keep as a CI-only tier-1 artifact or retire the target |
+| Desktop dark mode | Aqua pinned; `SEMANTIC_DARK` and `palette()` ready but unwired | Wire the dark palette through every module in a dedicated pass with screenshots |
+| Independent review | No second reviewer exists | Recruit one to reach the independently-reviewed tier |
+| Physiological accuracy claims | Unchanged: pulse remains `EXPERIMENTAL`; HRV and respiration stay disabled | Reference-sensor study before any accuracy claim |
+| Dependency exceptions | Re-reviewed to 2026-10-15 | Upstream fixes or replacement before expiry |
+| Head-pose intrinsics | Camera identity now follows delivered geometry, but the pose estimator's intrinsics still come from the configured size | Rebuild the estimator when the delivered geometry changes |
+| `active_recall` template | Asks the model for `recall_*` fields the closed draft schema cannot carry (pre-existing; never reached a plan) | Model the fields in `PlanDraft` or retire the template |
+| VS Code marketplace identity | `publisher` is a placeholder and there is no marketplace icon | Choose a publisher and icon before any marketplace listing |
+| Session recorder stream | The recorder now writes state transitions only (`0600`, lazily created); the offline replay harness therefore sees fewer `state_estimate` events per session | Enable the daemon's full-stream debug flag when capturing a session for replay, or expose it as a setting |
+| Trigger and journal constants | The 10 s exit dwell, the 7-day/200-row terminal-transaction archive, and the dismissal-pause length are code constants derived from existing settings | Expose as configuration if operators need to tune them |
+
+### 30.10 Definition of done for v0.4.0
+
+- [ ] Every finding in §30.3 is implemented or explicitly deferred in §30.9.
+- [ ] All source gates in §30.7 pass on the merge commit.
+- [ ] The CI-built arm64 DMG launches as a foreground app, connects Chrome,
+      Edge, and VS Code, completes an intervention round trip, and stops
+      without killing any client process.
+- [ ] The manual record validates at the self-attested tier and the release
+      body carries the Assurance section.
+- [ ] v0.4.0 is the public “Latest” release, and the wiki reflects the
+      shipped behaviour.

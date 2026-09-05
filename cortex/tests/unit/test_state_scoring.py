@@ -41,7 +41,7 @@ def make_flow_features() -> FeatureVector:
     ``telemetry_seen_count`` is set past the warm-up gate (>=5) because
     this fixture carries real telemetry values (mouse / tab) — the FLOW
     telemetry contributions only count once the warm-up gate is cleared
-    (see ``RuleScorer._compute_flow_score``).
+    (see ``RuleScorer._flow_transform``).
     """
     return FeatureVector(
         timestamp=1.0,
@@ -334,46 +334,16 @@ class TestRuleScorer:
 
 
 class TestSubScores:
-    """Test individual sub-score functions."""
+    """Test the sub-score transforms that survive in the Level-A rules.
+
+    The pre-v2 physiology/posture sub-scores (pulse elevation, HRV drop,
+    blink suppression, posture collapse, workspace complexity) were removed
+    with the legacy composite scorers (audit D17); only the two behaviour
+    transforms used by ``_support_transform`` remain.
+    """
 
     def _make_scorer(self) -> RuleScorer:
         return RuleScorer(baselines=UserBaselines(hr_baseline=72.0))
-
-    def test_pulse_elevation_above_threshold(self):
-        scorer = self._make_scorer()
-        # HR 90 > 72 * 1.15 = 82.8
-        score = scorer.score_pulse_elevation(90.0)
-        assert score > 0.3
-
-    def test_pulse_elevation_normal(self):
-        scorer = self._make_scorer()
-        score = scorer.score_pulse_elevation(72.0)
-        assert score == 0.0
-
-    def test_pulse_elevation_none(self):
-        scorer = self._make_scorer()
-        score = scorer.score_pulse_elevation(None)
-        assert score == 0.0
-
-    def test_hrv_drop_low(self):
-        scorer = self._make_scorer()
-        score = scorer.score_hrv_drop(12.0)
-        assert score > 0.8
-
-    def test_hrv_drop_normal(self):
-        scorer = self._make_scorer()
-        score = scorer.score_hrv_drop(50.0)
-        assert score == 0.0
-
-    def test_blink_suppression_low_rate(self):
-        scorer = self._make_scorer()
-        score = scorer.score_blink_suppression(3.0)
-        assert score > 0.5
-
-    def test_blink_suppression_normal(self):
-        scorer = self._make_scorer()
-        score = scorer.score_blink_suppression(16.0)
-        assert score == 0.0
 
     def test_mouse_thrash_high_variance(self):
         scorer = self._make_scorer()
@@ -386,6 +356,20 @@ class TestSubScores:
         score = scorer.score_mouse_thrash(5000.0)
         assert score == 0.0
 
+    def test_mouse_thrash_zero_baseline_does_not_raise(self):
+        """Audit D2: calibration may persist ``mouse_variance_baseline=0``.
+
+        The scorer floors the baseline at 1.0 (as ``_flow_transform`` already
+        did) instead of dividing by zero on every state-loop tick.
+        """
+        scorer = RuleScorer(baselines=UserBaselines(mouse_variance_baseline=0.0))
+        assert scorer.score_mouse_thrash(0.0) == 0.0
+        assert 0.0 < scorer.score_mouse_thrash(50000.0) <= 1.0
+        # And the full evaluation path stays alive with a zero baseline.
+        fv = make_hyper_features()
+        scores = scorer.compute_scores(fv)
+        assert 0.0 <= scores.hyper <= 1.0
+
     def test_window_switch_high(self):
         scorer = self._make_scorer()
         score = scorer.score_window_switch(30.0)
@@ -395,50 +379,6 @@ class TestSubScores:
         scorer = self._make_scorer()
         score = scorer.score_window_switch(5.0)
         assert score == 0.0
-
-    def test_s6_weighted_blend(self):
-        """thrashing_score=0.2, switch_rate=25 → s6 weighted blend result."""
-        scorer = self._make_scorer()
-        FeatureVector(
-            timestamp=1.0,
-            hr=72.0,
-            hrv_rmssd=50.0,
-            blink_rate=16.0,
-            mouse_velocity_mean=400.0,
-            mouse_velocity_variance=5000.0,
-            tab_switch_frequency=25.0,
-            thrashing_score=0.2,
-        )
-        s6_switch = scorer.score_window_switch(25.0)
-        # thrashing_score=0.2 > 0.1, so weighted blend applies
-        expected_s6 = 0.6 * 0.2 + 0.4 * s6_switch
-        # Verify the blend formula: 0.6 * thrash + 0.4 * switch
-        assert abs(expected_s6 - (0.6 * 0.2 + 0.4 * s6_switch)) < 1e-9
-
-    def test_blink_suppression_attenuated_with_normal_hr(self):
-        """Normal HR + low blink → attenuated score (x0.3)."""
-        scorer = self._make_scorer()
-        # HR=72.0 is exactly baseline (72.0), within 110% of baseline
-        score = scorer.score_blink_suppression(3.0, hr=72.0)
-        # Without HR attenuation: (8-3)/8 = 0.625
-        # With attenuation: 0.625 * 0.3 = 0.1875
-        expected = (8.0 - 3.0) / 8.0 * 0.3
-        assert abs(score - expected) < 1e-6
-
-    def test_blink_suppression_full_with_high_hr(self):
-        """High HR + low blink → full score (no attenuation)."""
-        scorer = self._make_scorer()
-        # HR=95.0 is well above 72 * 1.10 = 79.2
-        score = scorer.score_blink_suppression(3.0, hr=95.0)
-        expected = (8.0 - 3.0) / 8.0  # 0.625
-        assert abs(score - expected) < 1e-6
-
-    def test_blink_suppression_no_hr_full_score(self):
-        """No HR provided → full score (no attenuation)."""
-        scorer = self._make_scorer()
-        score = scorer.score_blink_suppression(3.0, hr=None)
-        expected = (8.0 - 3.0) / 8.0  # 0.625
-        assert abs(score - expected) < 1e-6
 
 
 # =============================================================================
@@ -655,8 +595,10 @@ class TestTriggerPolicy:
         Mirrors the real daemon dismiss path, which calls BOTH
         ``record_dismissal`` (quiet-mode escalation + threshold bump) and
         ``record_outcome(dismissed=True)`` (adaptive feedback counter).
-        The adaptive feedback offset (+0.01 per net dismissal) is what
-        lifts the effective threshold above the adaptive floor.
+        The time-boxed +0.05 bump lifts the threshold above the configured
+        base; the long-run +0.01 increment only applies once that bump has
+        expired (audit D4/D8: the base is never clipped upward and one
+        dismissal is never penalised twice at once).
         """
         policy = self._make_policy()
         base_decision = policy.evaluate(

@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import logging
 import math
-import time
 from typing import Any, Protocol
 
+from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 from cortex.libs.schemas.leetcode import (
     LeetCodeContext,
     LeetCodeMode,
@@ -64,7 +64,9 @@ class RestatementScratchpad:
     _COOLDOWN_S: float = 300.0
     _TRIGGER_STAGES = {LeetCodeStage.READ, LeetCodeStage.PLAN}
 
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Clock | None = None) -> None:
+        # Audit D16: cooldown arithmetic uses the injected clock.
+        self._clock = clock or SYSTEM_CLOCK
         self._last_trigger_time: float | None = None
 
     def should_trigger(
@@ -80,7 +82,7 @@ class RestatementScratchpad:
         if mode_estimate.destructive.pathway != "comprehension":
             return False
         if self._last_trigger_time is not None:
-            elapsed = time.monotonic() - self._last_trigger_time
+            elapsed = monotonic_seconds(self._clock) - self._last_trigger_time
             if elapsed < self._COOLDOWN_S:
                 return False
         return True
@@ -91,7 +93,7 @@ class RestatementScratchpad:
         leetcode_ctx: LeetCodeContext,
     ) -> dict[str, Any]:
         """Build the action payload to send via the LeetCode adapter."""
-        self._last_trigger_time = time.monotonic()
+        self._last_trigger_time = monotonic_seconds(self._clock)
         logger.info(
             "RestatementScratchpad fired for problem %s (%s)",
             leetcode_ctx.problem_id,
@@ -125,7 +127,9 @@ class PatternLadder:
     _COOLDOWN_S: float = 120.0
     _TRIGGER_STAGES = {LeetCodeStage.PLAN, LeetCodeStage.IMPLEMENT}
 
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Clock | None = None) -> None:
+        # Audit D16: cooldown arithmetic uses the injected clock.
+        self._clock = clock or SYSTEM_CLOCK
         self._last_trigger_time: float | None = None
 
     def should_trigger(
@@ -139,7 +143,7 @@ class PatternLadder:
         if mode_estimate.mode != LeetCodeMode.PRODUCTIVE_STRUGGLE:
             return False
         if self._last_trigger_time is not None:
-            elapsed = time.monotonic() - self._last_trigger_time
+            elapsed = monotonic_seconds(self._clock) - self._last_trigger_time
             if elapsed < self._COOLDOWN_S:
                 return False
         return True
@@ -150,7 +154,7 @@ class PatternLadder:
         leetcode_ctx: LeetCodeContext,
     ) -> dict[str, Any]:
         """Build the action payload to send via the LeetCode adapter."""
-        self._last_trigger_time = time.monotonic()
+        self._last_trigger_time = monotonic_seconds(self._clock)
         logger.info(
             "PatternLadder fired for problem %s (difficulty=%s)",
             leetcode_ctx.title,
@@ -190,7 +194,9 @@ class AmygdalaLockout:
     _MAX_DURATION_S: int = 180
     _ESCALATION_WA_FLOOR: int = 3
 
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Clock | None = None) -> None:
+        # Audit D16: cooldown arithmetic uses the injected clock.
+        self._clock = clock or SYSTEM_CLOCK
         self._last_trigger_time: float | None = None
 
     def should_trigger(
@@ -205,7 +211,7 @@ class AmygdalaLockout:
             return False
         # Debounce: don't re-fire within the lockout period
         if self._last_trigger_time is not None:
-            elapsed = time.monotonic() - self._last_trigger_time
+            elapsed = monotonic_seconds(self._clock) - self._last_trigger_time
             if elapsed < self._DEBOUNCE_S:
                 return False
         return True
@@ -224,7 +230,7 @@ class AmygdalaLockout:
         leetcode_ctx: LeetCodeContext,
     ) -> dict[str, Any]:
         """Build the action payload to send via the LeetCode adapter."""
-        self._last_trigger_time = time.monotonic()
+        self._last_trigger_time = monotonic_seconds(self._clock)
         duration = self._compute_duration(leetcode_ctx.wrong_answer_count)
         logger.info(
             "AmygdalaLockout fired — locking out for %d s (WA=%d, last result: %s)",
@@ -261,7 +267,9 @@ class SubmissionDisciplineGuard:
     _TRIGGER_STAGES = {LeetCodeStage.IMPLEMENT, LeetCodeStage.DEBUG}
     _WA_THRESHOLD: int = 2
 
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Clock | None = None) -> None:
+        # Audit D16: cooldown arithmetic uses the injected clock.
+        self._clock = clock or SYSTEM_CLOCK
         self._last_trigger_time: float | None = None
 
     def should_trigger(
@@ -282,7 +290,7 @@ class SubmissionDisciplineGuard:
         leetcode_ctx: LeetCodeContext,
     ) -> dict[str, Any]:
         """Build the action payload to send via the LeetCode adapter."""
-        self._last_trigger_time = time.monotonic()
+        self._last_trigger_time = monotonic_seconds(self._clock)
         logger.info(
             "SubmissionDisciplineGuard fired — WA count %d, submissions %d",
             leetcode_ctx.wrong_answer_count,
@@ -315,7 +323,9 @@ class SolutionEscapeFriction:
 
     _TRIGGER_MODES = {LeetCodeMode.PANIC, LeetCodeMode.FATIGUE}
 
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Clock | None = None) -> None:
+        # Audit D16: cooldown arithmetic uses the injected clock.
+        self._clock = clock or SYSTEM_CLOCK
         self._last_trigger_time: float | None = None
 
     @staticmethod
@@ -347,7 +357,7 @@ class SolutionEscapeFriction:
         if not leetcode_ctx.solutions_tab_attempted:
             return False
         if self._last_trigger_time is not None:
-            elapsed = time.monotonic() - self._last_trigger_time
+            elapsed = monotonic_seconds(self._clock) - self._last_trigger_time
             cooldown = self._compute_friction(
                 leetcode_ctx.time_elapsed_s, leetcode_ctx.difficulty,
             )
@@ -361,7 +371,7 @@ class SolutionEscapeFriction:
         leetcode_ctx: LeetCodeContext,
     ) -> dict[str, Any]:
         """Build the action payload to send via the LeetCode adapter."""
-        self._last_trigger_time = time.monotonic()
+        self._last_trigger_time = monotonic_seconds(self._clock)
         friction = self._compute_friction(
             leetcode_ctx.time_elapsed_s, leetcode_ctx.difficulty,
         )
@@ -395,13 +405,15 @@ class InterventionMatrix:
     trigger condition is satisfied for the current state.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Clock | None = None) -> None:
+        # Audit D16: one injected clock drives every cell's cooldown.
+        self._clock = clock or SYSTEM_CLOCK
         self._interventions: list[_LeetCodeIntervention] = [
-            RestatementScratchpad(),
-            PatternLadder(),
-            AmygdalaLockout(),
-            SubmissionDisciplineGuard(),
-            SolutionEscapeFriction(),
+            RestatementScratchpad(clock=self._clock),
+            PatternLadder(clock=self._clock),
+            AmygdalaLockout(clock=self._clock),
+            SubmissionDisciplineGuard(clock=self._clock),
+            SolutionEscapeFriction(clock=self._clock),
         ]
 
     def select(

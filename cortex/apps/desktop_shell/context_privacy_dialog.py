@@ -34,34 +34,31 @@ from cortex.apps.desktop_shell.a11y import (
     set_accessible_name,
 )
 from cortex.apps.desktop_shell.tokens import (
-    BRAND_ACCENT,
-    BRAND_ACCENT_HOVER,
-    BRAND_ACCENT_PRESSED,
     BRAND_ACCENT_TEXT,
-    BRAND_DISPLAY_FONT,
+    BTN_ACCENT_QSS,
+    BTN_FOCUS_RING,
+    BTN_GHOST_QSS,
+    CX_BG,
+    CX_BG_SECONDARY,
+    CX_BORDER_DEFAULT,
+    CX_SUCCESS_TEXT,
+    CX_SURFACE,
+    CX_TEXT,
     CX_TEXT_SECONDARY,
     CX_TEXT_TERTIARY,
+    CX_WARNING_TEXT,
+    FONT_MONO,
     FS_CAPTION,
     FS_FOOTNOTE,
-    FS_TITLE,
+    FS_LARGE_TITLE,
+    PAGE_TITLE_QSS,
     RADIUS_BUTTON,
     RADIUS_CARD,
-    SEMANTIC_LIGHT,
     SP2,
     SP3,
     SP4,
     SP5,
 )
-
-_BG = SEMANTIC_LIGHT["window_bg"]
-_CARD = SEMANTIC_LIGHT["control_bg"]
-_GROUPED = SEMANTIC_LIGHT["grouped_bg"]
-_LABEL = SEMANTIC_LIGHT["label_primary"]
-_SECONDARY = CX_TEXT_SECONDARY
-_TERTIARY = CX_TEXT_TERTIARY
-_SEPARATOR = SEMANTIC_LIGHT["separator"]
-_SUCCESS = "#267A4A"
-_WARNING = "#9A5B18"
 
 _SOURCE_ROWS: tuple[tuple[str, str, str], ...] = (
     (
@@ -109,24 +106,8 @@ _SOURCE_ROWS: tuple[tuple[str, str, str], ...] = (
 
 
 def _button_qss(*, primary: bool) -> str:
-    if primary:
-        return (
-            "QPushButton {"
-            f" background: {BRAND_ACCENT}; color: {_LABEL}; border: none;"
-            f" border-radius: {RADIUS_BUTTON}px; padding: 8px 16px;"
-            "}"
-            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"
-            f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"
-            "QPushButton:disabled { background: rgba(120,120,128,0.24); color: rgba(60,60,67,0.45); }"
-        )
-    return (
-        "QPushButton { background: transparent;"
-        f" color: {_SECONDARY}; border: 0.5px solid {_SEPARATOR};"
-        f" border-radius: {RADIUS_BUTTON}px; padding: 7px 14px; }}"
-        f"QPushButton:hover {{ color: {_LABEL}; background: rgba(0,0,0,0.035); }}"
-        f"QPushButton:pressed {{ color: {_LABEL}; background: rgba(0,0,0,0.075); }}"
-        "QPushButton:disabled { color: rgba(60,60,67,0.30); }"
-    )
+    """The two shared button recipes (filled accent / ghost)."""
+    return BTN_ACCENT_QSS if primary else BTN_GHOST_QSS
 
 
 class ContextPrivacyDialog(QDialog):
@@ -143,7 +124,7 @@ class ContextPrivacyDialog(QDialog):
         self.setMinimumSize(620, 680)
         self.resize(680, 760)
         self.setModal(True)
-        self.setStyleSheet(f"background: {_BG}; color: {_LABEL};")
+        self.setStyleSheet(f"background: {CX_BG}; color: {CX_TEXT};")
         self._source_checks: dict[str, QCheckBox] = {}
         self._preview: dict[str, Any] | None = None
         self._retention_url = ""
@@ -161,7 +142,7 @@ class ContextPrivacyDialog(QDialog):
         header = QHBoxLayout()
         eyebrow = QLabel("External request")
         eyebrow.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
-        eyebrow.setStyleSheet(f"color: {_SECONDARY}; background: transparent;")
+        eyebrow.setStyleSheet(f"color: {CX_TEXT_SECONDARY}; background: transparent;")
         header.addWidget(eyebrow)
         header.addStretch()
         close = QPushButton("Close")
@@ -180,15 +161,12 @@ class ContextPrivacyDialog(QDialog):
 
     def _page_title(self, title: str, detail: str) -> tuple[QLabel, QLabel]:
         title_label = QLabel(title)
-        title_label.setFont(mac_native.system_font(FS_TITLE, "regular"))
-        title_label.setStyleSheet(
-            f"font-family: {BRAND_DISPLAY_FONT}, ui-serif, Georgia, serif;"
-            f" color: {_LABEL}; background: transparent;"
-        )
+        title_label.setStyleSheet(PAGE_TITLE_QSS)
+        title_label.setWordWrap(True)
         detail_label = QLabel(detail)
         detail_label.setWordWrap(True)
         detail_label.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
-        detail_label.setStyleSheet(f"color: {_SECONDARY}; background: transparent;")
+        detail_label.setStyleSheet(f"color: {CX_TEXT_SECONDARY}; background: transparent;")
         return title_label, detail_label
 
     def _build_choice_page(self) -> QWidget:
@@ -207,7 +185,7 @@ class ContextPrivacyDialog(QDialog):
         self._posture_label.setWordWrap(True)
         self._posture_label.setFont(mac_native.system_font(FS_CAPTION, "medium"))
         self._posture_label.setStyleSheet(
-            f"color: {_SECONDARY}; background: {_GROUPED};"
+            f"color: {CX_TEXT_SECONDARY}; background: {CX_BG_SECONDARY};"
             f" border-radius: {RADIUS_BUTTON}px; padding: 8px 10px;"
         )
         layout.addWidget(self._posture_label)
@@ -223,7 +201,7 @@ class ContextPrivacyDialog(QDialog):
         for key, label, description in _SOURCE_ROWS:
             card = QFrame()
             card.setStyleSheet(
-                f"QFrame {{ background: {_CARD}; border: 0.5px solid {_SEPARATOR};"
+                f"QFrame {{ background: {CX_SURFACE}; border: 1px solid {CX_BORDER_DEFAULT};"
                 f" border-radius: {RADIUS_BUTTON}px; }}"
             )
             row = QVBoxLayout(card)
@@ -234,14 +212,14 @@ class ContextPrivacyDialog(QDialog):
             check.setCursor(Qt.CursorShape.PointingHandCursor)
             check.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
             check.setStyleSheet(
-                f"QCheckBox {{ color: {_LABEL}; spacing: 8px; background: transparent; }}"
+                f"QCheckBox {{ color: {CX_TEXT}; spacing: 8px; background: transparent; }}"
             )
             set_accessible_description(check, description)
             row.addWidget(check)
             supporting = QLabel(description)
             supporting.setWordWrap(True)
             supporting.setFont(mac_native.system_font(FS_CAPTION, "regular"))
-            supporting.setStyleSheet(f"color: {_TERTIARY}; background: transparent;")
+            supporting.setStyleSheet(f"color: {CX_TEXT_TERTIARY}; background: transparent;")
             row.addWidget(supporting)
             source_layout.addWidget(card)
             self._source_checks[key] = check
@@ -251,15 +229,15 @@ class ContextPrivacyDialog(QDialog):
 
         note_label = QLabel("Optional note to the planner")
         note_label.setFont(mac_native.system_font(FS_CAPTION, "medium"))
-        note_label.setStyleSheet(f"color: {_SECONDARY}; background: transparent;")
+        note_label.setStyleSheet(f"color: {CX_TEXT_SECONDARY}; background: transparent;")
         layout.addWidget(note_label)
         self._extra_note = QPlainTextEdit()
         self._extra_note.setPlaceholderText("Add only what you intend to send…")
         self._extra_note.setMaximumHeight(68)
         self._extra_note.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
         self._extra_note.setStyleSheet(
-            f"QPlainTextEdit {{ background: {_CARD}; border: 0.5px solid {_SEPARATOR};"
-            f" border-radius: {RADIUS_BUTTON}px; color: {_LABEL}; padding: 7px; }}"
+            f"QPlainTextEdit {{ background: {CX_SURFACE}; border: 1px solid {CX_BORDER_DEFAULT};"
+            f" border-radius: {RADIUS_BUTTON}px; color: {CX_TEXT}; padding: 7px; }}"
         )
         set_accessible_description(
             self._extra_note,
@@ -299,35 +277,37 @@ class ContextPrivacyDialog(QDialog):
         self._preview_summary.setWordWrap(True)
         self._preview_summary.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
         self._preview_summary.setStyleSheet(
-            f"color: {_SUCCESS}; background: rgba(38,122,74,0.08);"
+            f"color: {CX_SUCCESS_TEXT}; background: rgba(38,122,74,0.08);"
             f" border-radius: {RADIUS_BUTTON}px; padding: 8px 10px;"
         )
         layout.addWidget(self._preview_summary)
 
         retention_card = QFrame()
         retention_card.setStyleSheet(
-            f"QFrame {{ background: {_GROUPED}; border-radius: {RADIUS_CARD}px; }}"
+            f"QFrame {{ background: {CX_BG_SECONDARY}; border-radius: {RADIUS_CARD}px; }}"
         )
         retention_layout = QVBoxLayout(retention_card)
         retention_layout.setContentsMargins(SP3, SP3, SP3, SP3)
         retention_layout.setSpacing(SP2)
         self._destination_label = QLabel("")
         self._destination_label.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
-        self._destination_label.setStyleSheet(f"color: {_LABEL}; background: transparent;")
+        self._destination_label.setStyleSheet(f"color: {CX_TEXT}; background: transparent;")
         retention_layout.addWidget(self._destination_label)
         self._retention_label = QLabel("")
         self._retention_label.setWordWrap(True)
         self._retention_label.setFont(mac_native.system_font(FS_CAPTION, "regular"))
-        self._retention_label.setStyleSheet(f"color: {_SECONDARY}; background: transparent;")
+        self._retention_label.setStyleSheet(f"color: {CX_TEXT_SECONDARY}; background: transparent;")
         retention_layout.addWidget(self._retention_label)
         self._policy_button = QPushButton("Read provider policy ↗")
         self._policy_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self._policy_button.setFont(mac_native.system_font(FS_CAPTION, "medium"))
         self._policy_button.setStyleSheet(
-            f"QPushButton {{ color: {BRAND_ACCENT_TEXT}; background: transparent; border: none;"
-            " text-align: left; padding: 2px 0; }}"
+            f"QPushButton {{ color: {BRAND_ACCENT_TEXT}; background: transparent;"
+            " border: 2px solid transparent; text-align: left; padding: 2px 6px;"
+            f" border-radius: {RADIUS_BUTTON}px; }}"
             f"QPushButton:hover {{ color: {BRAND_ACCENT_TEXT}; background: rgba(217,119,87,0.08); }}"
             f"QPushButton:pressed {{ color: {BRAND_ACCENT_TEXT}; background: rgba(217,119,87,0.14); }}"
+            f"QPushButton:focus {{ border: {BTN_FOCUS_RING}; }}"
         )
         self._policy_button.clicked.connect(self._open_retention_policy)
         retention_layout.addWidget(self._policy_button, alignment=Qt.AlignmentFlag.AlignLeft)
@@ -335,29 +315,29 @@ class ContextPrivacyDialog(QDialog):
 
         prompt_label = QLabel("Exact outbound prompt")
         prompt_label.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
-        prompt_label.setStyleSheet(f"color: {_SECONDARY}; background: transparent;")
+        prompt_label.setStyleSheet(f"color: {CX_TEXT_SECONDARY}; background: transparent;")
         layout.addWidget(prompt_label)
         self._prompt_preview = QPlainTextEdit()
         self._prompt_preview.setReadOnly(True)
         self._prompt_preview.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         self._prompt_preview.setStyleSheet(
-            f"QPlainTextEdit {{ background: {_CARD}; border: 0.5px solid {_SEPARATOR};"
-            f" border-radius: {RADIUS_BUTTON}px; color: {_LABEL}; padding: 10px;"
-            " font-family: ui-monospace, Menlo, monospace; font-size: 11px; }}"
+            f"QPlainTextEdit {{ background: {CX_SURFACE}; border: 1px solid {CX_BORDER_DEFAULT};"
+            f" border-radius: {RADIUS_BUTTON}px; color: {CX_TEXT}; padding: 10px;"
+            f" font-family: {FONT_MONO}; font-size: {FS_CAPTION}px; }}"
         )
         set_accessible_name(self._prompt_preview, "Exact outbound model prompt")
         layout.addWidget(self._prompt_preview, stretch=3)
 
         disclosure_label = QLabel("Included and redacted fields")
         disclosure_label.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
-        disclosure_label.setStyleSheet(f"color: {_SECONDARY}; background: transparent;")
+        disclosure_label.setStyleSheet(f"color: {CX_TEXT_SECONDARY}; background: transparent;")
         layout.addWidget(disclosure_label)
         self._disclosure_preview = QPlainTextEdit()
         self._disclosure_preview.setReadOnly(True)
         self._disclosure_preview.setMaximumHeight(110)
         self._disclosure_preview.setStyleSheet(
-            f"QPlainTextEdit {{ background: {_GROUPED}; border: none;"
-            f" border-radius: {RADIUS_BUTTON}px; color: {_SECONDARY}; padding: 8px; }}"
+            f"QPlainTextEdit {{ background: {CX_BG_SECONDARY}; border: none;"
+            f" border-radius: {RADIUS_BUTTON}px; color: {CX_TEXT_SECONDARY}; padding: 8px; }}"
         )
         layout.addWidget(self._disclosure_preview)
 
@@ -390,25 +370,24 @@ class ContextPrivacyDialog(QDialog):
         layout.addStretch()
         self._result_mark = QLabel("✓")
         self._result_mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._result_mark.setFont(mac_native.system_font(32, "semibold"))
-        self._result_mark.setStyleSheet(f"color: {_SUCCESS}; background: transparent;")
+        self._result_mark.setFont(mac_native.system_font(FS_LARGE_TITLE, "semibold"))
+        self._result_mark.setStyleSheet(f"color: {CX_SUCCESS_TEXT}; background: transparent;")
         layout.addWidget(self._result_mark)
         self._result_title = QLabel("Request sent once")
         self._result_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._result_title.setFont(mac_native.system_font(FS_TITLE, "semibold"))
-        self._result_title.setStyleSheet(f"color: {_LABEL}; background: transparent;")
+        self._result_title.setStyleSheet(PAGE_TITLE_QSS)
         layout.addWidget(self._result_title)
         self._result_detail = QLabel("")
         self._result_detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._result_detail.setWordWrap(True)
         self._result_detail.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
-        self._result_detail.setStyleSheet(f"color: {_SECONDARY}; background: transparent;")
+        self._result_detail.setStyleSheet(f"color: {CX_TEXT_SECONDARY}; background: transparent;")
         layout.addWidget(self._result_detail)
         self._result_plan = QLabel("")
         self._result_plan.setWordWrap(True)
         self._result_plan.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
         self._result_plan.setStyleSheet(
-            f"color: {_LABEL}; background: {_CARD}; border: 0.5px solid {_SEPARATOR};"
+            f"color: {CX_TEXT}; background: {CX_SURFACE}; border: 1px solid {CX_BORDER_DEFAULT};"
             f" border-radius: {RADIUS_CARD}px; padding: 14px;"
         )
         layout.addWidget(self._result_plan)
@@ -432,7 +411,7 @@ class ContextPrivacyDialog(QDialog):
         self._stack.setCurrentIndex(0)
         self._posture_label.setText("Checking the active privacy posture…")
         self._posture_label.setStyleSheet(
-            f"color: {_SECONDARY}; background: {_GROUPED};"
+            f"color: {CX_TEXT_SECONDARY}; background: {CX_BG_SECONDARY};"
             f" border-radius: {RADIUS_BUTTON}px; padding: 8px 10px;"
         )
         self._review_button.setEnabled(False)
@@ -457,10 +436,20 @@ class ContextPrivacyDialog(QDialog):
                 f"Ready to preview · destination: {destination}. Previewing remains local."
             )
             self._posture_label.setStyleSheet(
-                f"color: {_SUCCESS}; background: rgba(38,122,74,0.08);"
+                f"color: {CX_SUCCESS_TEXT}; background: rgba(38,122,74,0.08);"
                 f" border-radius: {RADIUS_BUTTON}px; padding: 8px 10px;"
             )
             self._review_button.setEnabled(True)
+        elif str(payload.get("transport_state") or "") == "credentials_missing":
+            self._posture_label.setText(
+                "Claude access is turned on, but no credential is saved · add your "
+                "token under Claude access in Settings. No restart is needed."
+            )
+            self._posture_label.setStyleSheet(
+                f"color: {CX_WARNING_TEXT}; background: rgba(154,91,24,0.08);"
+                f" border-radius: {RADIUS_BUTTON}px; padding: 8px 10px;"
+            )
+            self._review_button.setEnabled(False)
         else:
             friendly_mode = {
                 "no_llm": "Local planner",
@@ -471,7 +460,7 @@ class ContextPrivacyDialog(QDialog):
                 f"{friendly_mode} · choose External model, acknowledge the disclosure, and Apply before reviewing a request."
             )
             self._posture_label.setStyleSheet(
-                f"color: {_WARNING}; background: rgba(154,91,24,0.08);"
+                f"color: {CX_WARNING_TEXT}; background: rgba(154,91,24,0.08);"
                 f" border-radius: {RADIUS_BUTTON}px; padding: 8px 10px;"
             )
             self._review_button.setEnabled(False)
@@ -566,7 +555,7 @@ class ContextPrivacyDialog(QDialog):
         if operation == "status":
             self._posture_label.setText(message)
             self._posture_label.setStyleSheet(
-                f"color: {_WARNING}; background: rgba(154,91,24,0.08);"
+                f"color: {CX_WARNING_TEXT}; background: rgba(154,91,24,0.08);"
                 f" border-radius: {RADIUS_BUTTON}px; padding: 8px 10px;"
             )
             self._review_button.setEnabled(False)
@@ -578,7 +567,7 @@ class ContextPrivacyDialog(QDialog):
             self._posture_label.setText(message)
             return
         self._result_mark.setText("!")
-        self._result_mark.setStyleSheet(f"color: {_WARNING}; background: transparent;")
+        self._result_mark.setStyleSheet(f"color: {CX_WARNING_TEXT}; background: transparent;")
         self._result_title.setText("Request was not sent")
         self._result_detail.setText(
             f"{message}\n\nThe one-time preview was consumed. Build a new preview to try again."

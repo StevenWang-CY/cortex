@@ -48,14 +48,23 @@ def _check_launcher_health() -> bool:
 
 
 def _find_launcher_pid() -> int | None:
+    """PID of the process *listening* on the launcher port.
+
+    D1: ``lsof -ti tcp:<port>`` lists both ends of every socket, so the
+    previous probe could return the extension's browser process (a
+    client of 9471) and ``--stop`` would SIGTERM it. ``-sTCP:LISTEN``
+    restricts the answer to the listening owner; our own PID and our
+    parent's are never candidates.
+    """
+    protected = {os.getpid(), os.getppid()}
     try:
         result = subprocess.run(
-            ["lsof", "-ti", f"tcp:{LAUNCHER_PORT}"],
+            ["lsof", "-ti", f"tcp:{LAUNCHER_PORT}", "-sTCP:LISTEN"],
             capture_output=True, text=True, timeout=5,
         )
         for line in result.stdout.strip().split("\n"):
             line = line.strip()
-            if line.isdigit():
+            if line.isdigit() and int(line) not in protected:
                 return int(line)
     except Exception:
         pass

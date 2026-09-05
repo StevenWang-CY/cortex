@@ -1,12 +1,24 @@
 """macOS AppKit bridge — keeps the desktop shell visually native.
 
 This module is the single point where Qt widgets cross over into AppKit so
-windows pick up a safe system background tint, a unified title bar, the user's
-effective appearance (light/dark), the system menu bar, and SF system fonts.
-It deliberately leaves Qt's content view in place: replacing it with an
-``NSVisualEffectView`` caused packaged windows to disappear during launch.
-Every entry point is guarded so non-mac harnesses + headless tests stub cleanly
-— see :func:`is_macos`.
+windows pick up a safe system background tint, a unified title bar, a pinned
+appearance that matches the stylesheet they were designed for, the system
+menu bar, and SF system fonts. It deliberately leaves Qt's content view in
+place: replacing it with an ``NSVisualEffectView`` caused packaged windows to
+disappear during launch. Every entry point is guarded so non-mac harnesses +
+headless tests stub cleanly — see :func:`is_macos`.
+
+Appearance contract
+===================
+
+Every Qt stylesheet in the shell is authored against the *light* semantic
+palette (``tokens.SEMANTIC_LIGHT``); the intervention HUD is authored against
+the dark HUD palette. Until a real dark theme is wired through
+:func:`palette`, each window pins the AppKit appearance its stylesheet was
+designed for (``NSAppearanceNameAqua`` for windows, ``DarkAqua`` for the HUD)
+so a system-wide Dark Mode cannot render light text on a dark native
+background. :func:`application_palette` gives Qt-drawn controls (menus,
+message boxes, combo popups) the same light palette.
 
 Usage pattern (called once per window after construction)::
 
@@ -14,7 +26,8 @@ Usage pattern (called once per window after construction)::
 
     window.show()  # must be shown so winId() is non-zero
     mac_native.apply_unified_titlebar(window)
-    mac_native.apply_vibrancy(window, material="window_background")
+    mac_native.apply_vibrancy(window)               # light chrome
+    mac_native.apply_vibrancy(hud, appearance="dark")  # HUD chrome
 
 Brand identity is *preserved* — the system accent color is read for focus
 rings only; the Cortex terracotta accent is layered on top.
@@ -25,10 +38,25 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, Literal
 
+from cortex.apps.desktop_shell.tokens import (
+    BRAND_ACCENT,
+    BRAND_ACCENT_TEXT,
+    CX_TEXT_TERTIARY,
+    SEMANTIC_DARK,
+    SEMANTIC_LIGHT,
+)
+
 logger = logging.getLogger(__name__)
+
+Appearance = Literal["light", "dark"]
+
+_APPEARANCE_NAMES: dict[str, str] = {
+    "light": "NSAppearanceNameAqua",
+    "dark": "NSAppearanceNameDarkAqua",
+}
 
 # ---------------------------------------------------------------------------
 # Platform guard — all AppKit calls live behind this. Tests stub via
@@ -44,30 +72,6 @@ def is_macos() -> bool:
     # decoration/observers in the explicit probe; real Finder launches retain
     # the complete macOS path and are verified separately.
     return sys.platform == "darwin" and os.environ.get("CORTEX_HEADLESS_STARTUP") != "1"
-
-
-# Compatibility material vocabulary retained at call sites. The current safe
-# implementation applies only ``NSColor.windowBackgroundColor`` and never
-# installs an ``NSVisualEffectView``; see :func:`apply_vibrancy`.
-Material = Literal[
-    "window_background",  # ``NSVisualEffectMaterialWindowBackground`` (default chrome)
-    "sidebar",            # ``NSVisualEffectMaterialSidebar`` (Mail-style sidebar)
-    "hudWindow",          # ``NSVisualEffectMaterialHUDWindow`` (Spotlight overlay)
-    "popover",            # ``NSVisualEffectMaterialPopover``
-    "menu",               # ``NSVisualEffectMaterialMenu``
-    "titlebar",           # ``NSVisualEffectMaterialTitlebar``
-]
-
-
-_MATERIAL_INDEX: dict[str, int] = {
-    # AppKit raw values for NSVisualEffectMaterial. Stable since 10.14.
-    "window_background": 12,
-    "sidebar": 7,
-    "hudWindow": 13,
-    "popover": 6,
-    "menu": 5,
-    "titlebar": 3,
-}
 
 
 # ---------------------------------------------------------------------------
@@ -139,8 +143,8 @@ def _ns_window_for(widget: Any) -> Any | None:
 # ---------------------------------------------------------------------------
 
 
-def apply_vibrancy(widget: Any, material: Material = "window_background") -> bool:
-    """Tint the widget's NSWindow background to the system window colour.
+def apply_vibrancy(widget: Any, *, appearance: Appearance = "light") -> bool:
+    """Tint the widget's NSWindow background and pin its appearance.
 
     NOTE: this does NOT install an ``NSVisualEffectView`` — true vibrancy
     (the blurred translucent material) is intentionally disabled. Two
@@ -150,10 +154,13 @@ def apply_vibrancy(widget: Any, material: Material = "window_background") -> boo
     WindowServer and the Dock icon bounced forever with no visible
     window). The safe behaviour is to leave the contentView untouched and
     only tint the window background so the unified titlebar + Qt content
-    read as one continuous surface. The ``material`` argument is accepted
-    for call-site compatibility but ignored; the native look is carried by
-    the surrounding chrome (titlebar transparency, SF Pro fonts,
-    NSStatusItem, HIG palette + radii).
+    read as one continuous surface.
+
+    ``appearance`` names the palette the window's stylesheet was authored
+    against. Pinning it on the ``NSWindow`` keeps the native chrome
+    (titlebar, window background, traffic lights) consistent with the Qt
+    content when the system is in Dark Mode — the shell's stylesheets are
+    light constants until a dark theme is wired through :func:`palette`.
 
     Returns:
         True when the background tint was actually applied, False when
@@ -161,13 +168,19 @@ def apply_vibrancy(widget: Any, material: Material = "window_background") -> boo
         tint call raised. Callers must NOT interpret a True result as
         "vibrancy installed" — it means "background tint applied".
     """
-    del material  # accepted for API compatibility; tint-only path ignores it
     AppKit = _appkit()
     if AppKit is None:
         return False
     window = _ns_window_for(widget)
     if window is None:
         return False
+    try:
+        name = _APPEARANCE_NAMES.get(appearance, _APPEARANCE_NAMES["light"])
+        ns_appearance = AppKit.NSAppearance.appearanceNamed_(name)
+        if ns_appearance is not None:
+            window.setAppearance_(ns_appearance)
+    except Exception as exc:  # pragma: no cover - mac-only
+        logger.debug("apply_vibrancy appearance pin failed: %s", exc)
     try:
         # Make the titlebar share the window background colour so the
         # transparency from ``apply_unified_titlebar`` reads as one
@@ -177,6 +190,55 @@ def apply_vibrancy(widget: Any, material: Material = "window_background") -> boo
     except Exception as exc:  # pragma: no cover - mac-only
         logger.debug("apply_vibrancy background tint failed: %s", exc)
         return False
+
+
+def palette(scheme: Appearance = "light") -> Mapping[str, str]:
+    """Semantic palette for ``scheme``.
+
+    The desktop stylesheets currently read ``tokens.SEMANTIC_LIGHT`` (and the
+    ``CX_*`` aliases derived from it) directly; this accessor is the seam a
+    real dark theme wires into. Returning the mapping — rather than
+    resolving through ``NSColor`` — keeps dev mode and the offscreen test
+    harness identical to the packaged app.
+    """
+    return SEMANTIC_DARK if scheme == "dark" else SEMANTIC_LIGHT
+
+
+def application_palette(scheme: Appearance = "light") -> Any:
+    """A ``QPalette`` for ``scheme`` built from the semantic tokens.
+
+    Applied once at the ``QApplication`` boundary so Qt-drawn controls that
+    no stylesheet reaches (menus, message boxes, combo popups, tooltips)
+    resolve the same palette as the styled surfaces instead of whatever
+    the system appearance implies. Returns ``None`` when PySide6 is
+    unavailable.
+    """
+    try:
+        from PySide6.QtGui import QColor, QPalette
+    except Exception as exc:  # pragma: no cover - PySide6 unavailable
+        logger.debug("application_palette fallback: %s", exc)
+        return None
+    tokens = palette(scheme)
+    qp = QPalette()
+    role = QPalette.ColorRole
+    mapping = {
+        role.Window: tokens["window_bg"],
+        role.WindowText: tokens["label_primary"],
+        role.Base: tokens["control_bg"],
+        role.AlternateBase: tokens["grouped_bg"],
+        role.Text: tokens["label_primary"],
+        role.Button: tokens["control_bg"],
+        role.ButtonText: tokens["label_primary"],
+        role.ToolTipBase: tokens["control_bg"],
+        role.ToolTipText: tokens["label_primary"],
+        role.Highlight: BRAND_ACCENT,
+        role.HighlightedText: tokens["label_primary"],
+        role.PlaceholderText: CX_TEXT_TERTIARY,
+        role.Link: BRAND_ACCENT_TEXT,
+    }
+    for color_role, value in mapping.items():
+        qp.setColor(color_role, QColor(value))
+    return qp
 
 
 def apply_unified_titlebar(widget: Any, *, transparent: bool = True) -> bool:
@@ -428,6 +490,9 @@ class StatusBarItem:
         self._item: Any = None
         self._menu: Any = None
         self._actions: list[Any] = []  # keep references alive
+        # Menu items by title so callers can flip a checkmark / label
+        # without rebuilding the menu.
+        self._items: dict[str, Any] = {}
         if self._appkit is not None:
             self._build_native()
 
@@ -512,8 +577,39 @@ class StatusBarItem:
             item.setEnabled_(bool(enabled))
             self._menu.addItem_(item)
             self._actions.append(target)  # keep alive
+            self._items[title] = item
         except Exception:  # pragma: no cover
             logger.debug("add_action failed", exc_info=True)
+
+    def set_action_checked(self, title: str, checked: bool) -> None:
+        """Show (or clear) the checkmark next to the item titled ``title``."""
+        item = self._items.get(title)
+        if item is None:
+            return
+        try:
+            item.setState_(1 if checked else 0)  # NSControlStateValueOn / Off
+        except Exception:  # pragma: no cover
+            logger.debug("set_action_checked failed", exc_info=True)
+
+    def set_action_title(self, title: str, new_title: str) -> None:
+        """Rename an existing item (e.g. ``Pause`` → ``Resume``)."""
+        item = self._items.pop(title, None)
+        if item is None:
+            return
+        try:
+            item.setTitle_(new_title)
+        except Exception:  # pragma: no cover
+            logger.debug("set_action_title failed", exc_info=True)
+        self._items[new_title] = item
+
+    def set_action_enabled(self, title: str, enabled: bool) -> None:
+        item = self._items.get(title)
+        if item is None:
+            return
+        try:
+            item.setEnabled_(bool(enabled))
+        except Exception:  # pragma: no cover
+            logger.debug("set_action_enabled failed", exc_info=True)
 
     def add_separator(self) -> None:
         if self._appkit is None or self._menu is None:
@@ -645,13 +741,15 @@ def _hex_to_nscolor(hex_color: str) -> Any | None:
 
 
 __all__ = [
-    "Material",
+    "Appearance",
     "StatusBarItem",
+    "application_palette",
     "apply_unified_titlebar",
     "apply_vibrancy",
     "install_appearance_observer",
     "is_dark_appearance",
     "is_macos",
+    "palette",
     "screen_share_active",
     "system_accent_hex",
     "system_font",

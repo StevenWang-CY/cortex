@@ -11,8 +11,10 @@ import numpy as np
 from numpy.typing import NDArray
 
 from cortex.libs.schemas.physiology import SignalAlgorithmIdentity
+from cortex.libs.signal.filters import bandpass_filter, design_bandpass
 from cortex.services.physio_engine.rppg import (
     RPPGAlgorithm,
+    _chrom_bandpass,
     _pos_single_window,
     extract_bvp_chrom,
     extract_bvp_green,
@@ -116,8 +118,19 @@ class RPPGBackendRegistry:
                 implementation_components=(_pos_single_window,),
             )
         )
+        # chrom/2.1.0: alpha is tuned on the band-passed chrominance signals
+        # (de Haan & Jeanne 2013), so the digest covers the filter as well.
         registry.register(
-            BackendDefinition(RPPGAlgorithm.CHROM, "chrom/2.0.0", extract_bvp_chrom)
+            BackendDefinition(
+                RPPGAlgorithm.CHROM,
+                "chrom/2.1.0",
+                extract_bvp_chrom,
+                implementation_components=(
+                    _chrom_bandpass,
+                    bandpass_filter,
+                    design_bandpass,
+                ),
+            )
         )
         registry.register(
             BackendDefinition(RPPGAlgorithm.GREEN, "green/2.0.0", extract_bvp_green)

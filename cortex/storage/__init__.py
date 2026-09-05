@@ -10,6 +10,7 @@ boundary.
 from cortex.storage.database import (
     CORTEX_APPLICATION_ID,
     CURRENT_SCHEMA_VERSION,
+    DEFAULT_SESSION_RETENTION_DAYS,
     MINIMUM_SQLITE_VERSION,
     SQLiteDatabase,
     StorageBusyError,
@@ -23,6 +24,7 @@ from cortex.storage.database import (
 __all__ = [
     "CORTEX_APPLICATION_ID",
     "CURRENT_SCHEMA_VERSION",
+    "DEFAULT_SESSION_RETENTION_DAYS",
     "MINIMUM_SQLITE_VERSION",
     "SQLiteDatabase",
     "StorageBusyError",

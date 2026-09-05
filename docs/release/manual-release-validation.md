@@ -1,9 +1,10 @@
 # Signed release-candidate validation protocol
 
-Complete this on clean supported arm64 and Intel Macs. Use the exact notarized
-DMG hashes staged in the CI-created draft release. Create
-`manual-release-evidence-arm64.json` and
-`manual-release-evidence-x86_64.json` from
+Complete this on a clean supported Mac for every architecture you can exercise
+(both arm64 and Intel for an independently reviewed release; at least one for a
+self-attested release). Use the exact notarized DMG hashes staged in the
+CI-created draft release. Create one `manual-release-evidence-<arch>.json` per
+exercised architecture from
 [`manual-release-evidence.template.json`](manual-release-evidence.template.json),
 validated against
 [`manual-release-evidence.schema.json`](manual-release-evidence.schema.json).
@@ -82,13 +83,22 @@ when one redacted recording or log genuinely covers them.
 
 ## Acceptance
 
-Each record must contain exactly the 14 catalogued case IDs, every case must be
-`passed`, and every case must reference at least one evidence asset uploaded to
-the draft. “Not run,” screenshots without artifact hash, ad-hoc builds, and
-tests against a source checkout do not satisfy the signed-release gate. A
-builder and an independent reviewer sign each record using stable organization
-handles in `reviewer_id`; no independent reviewer may also be a builder on
-either architecture.
+Each record must contain exactly the 14 catalogued case IDs and declare its
+`assurance_tier` ([ADR 0007](../adr/0007-tiered-release-assurance.md)):
+
+- `self-attested` — at least one architecture record signed by the
+  `maintainer`; the core cases `artifact.identity`, `install.launch`,
+  `browser.chrome_native`, `runtime.lifecycle_camera_tcc`, and
+  `uninstall.cleanup` are `passed` with evidence; every other case is `passed`
+  with evidence or `not_run` with a `reason` of at least 20 characters. An
+  architecture without a record is published as CI-verified only.
+- `independently-reviewed` — records for both architectures, every case
+  `passed`, a `builder` and an `independent_reviewer` on each record, and no
+  identity appearing in both roles on either architecture.
+
+"Not run" is an honest, published state; "passed" without an artifact hash,
+screenshots of an ad-hoc build, or tests against a source checkout never
+satisfy either tier. `failed` and `blocked` cases block promotion.
 
 Before requesting protected-environment approval, download all draft assets and
 run the same promotion validator locally:
@@ -98,11 +108,14 @@ uv run --project cortex --locked --extra dev \
   python -m cortex.scripts.validate_release_records \
   --records-dir release-assets \
   --asset-dir release-assets \
-  --expected-version 0.3.15 \
+  --expected-version "$(uv run --project cortex --locked python -m cortex.scripts.sync_versions --print)" \
   --expected-commit "$(git rev-parse HEAD)" \
-  --output release-assets/release-promotion-validation.json
+  --tier self-attested \
+  --output release-assets/release-promotion-validation.json \
+  --notes-output release-assets/assurance-notes.md
 ```
 
 The `Publish validated macOS release` workflow repeats this validation, verifies
-GitHub provenance for both DMGs, records the machine-readable promotion
-decision, and only then converts the draft into a public release.
+GitHub provenance for both DMGs, appends the rendered assurance section to the
+release notes, records the machine-readable promotion decision, and only then
+converts the draft into the latest public release.

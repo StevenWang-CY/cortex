@@ -30,6 +30,15 @@
     --cx-success: #30B257;
     --cx-warning: #D9A100;
     --cx-info: #0A84FF;
+    /* Foreground on a filled label_primary control (flips with scheme). */
+    --cx-label-inverse: #FFFFFF;
+    /* Contrast-safe status text; the fills above are for dots and bars. */
+    --cx-success-text: #1B6B3C;
+    --cx-warning-text: #7A5600;
+    --cx-info-text: #0062CC;
+    /* Danger as small text. The fill (#D70015 / #FF453A) is for banners and
+       dots; #FF453A on the dark control surface is only ~4.1:1. */
+    --cx-danger-text: #B3000F;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -54,6 +63,11 @@
         --cx-success: #32D74B;
         --cx-warning: #FFD60A;
         --cx-info: #0A84FF;
+        --cx-label-inverse: #1A1A1A;
+        --cx-success-text: #5FD37E;
+        --cx-warning-text: #E8B84A;
+        --cx-info-text: #5CA8FF;
+        --cx-danger-text: #FF6961;
     }
 }
 

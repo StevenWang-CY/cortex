@@ -51,13 +51,25 @@ def test_launcher_launch_daemon_surfaces_open_failure(monkeypatch):
 
 
 def test_launcher_pid_scan_includes_bundled_app(monkeypatch):
+    """D1: the bundled app is found through an *anchored* ``pgrep`` pattern.
+
+    The previous expectation enshrined the unanchored
+    ``/Applications/Cortex.app/Contents/MacOS/Cortex`` pattern, which also
+    matched ``.../MacOS/CortexNativeHost`` — i.e. the native host killed
+    itself mid-reply.
+    """
+    monkeypatch.setattr(launcher_agent, "_pidfile_daemon_pid", lambda: None)
+
     def fake_run(cmd, **_kwargs):
-        if cmd[:2] == ["pgrep", "-f"] and cmd[2] == f"{launcher_agent.CORTEX_APP_PATH}/Contents/MacOS/Cortex":
+        if cmd[:2] == ["pgrep", "-f"] and cmd[2] == launcher_agent.PGREP_APP_PATTERN:
             return SimpleNamespace(returncode=0, stdout="1234\n", stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(launcher_agent.subprocess, "run", fake_run)
 
+    assert launcher_agent.PGREP_APP_PATTERN == (
+        r"^/Applications/Cortex\.app/Contents/MacOS/Cortex( |$)"
+    )
     assert launcher_agent._find_all_daemon_pids() == {1234}
 
 
@@ -77,11 +89,15 @@ def test_native_host_launch_daemon_surfaces_open_failure(monkeypatch):
 
 
 def test_native_host_pid_scan_includes_bundled_app(monkeypatch):
+    """D1: the native host shares the launcher's anchored discovery."""
+    monkeypatch.setattr(launcher_agent, "_pidfile_daemon_pid", lambda: None)
+
     def fake_run(cmd, **_kwargs):
-        if cmd[:2] == ["pgrep", "-f"] and cmd[2] == f"{native_host.CORTEX_APP_PATH}/Contents/MacOS/Cortex":
+        if cmd[:2] == ["pgrep", "-f"] and cmd[2] == launcher_agent.PGREP_APP_PATTERN:
             return SimpleNamespace(returncode=0, stdout="4321\n", stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(native_host.subprocess, "run", fake_run)
 
+    assert native_host.CORTEX_APP_PATH == launcher_agent.CORTEX_APP_PATH
     assert native_host._find_all_daemon_pids() == {4321}

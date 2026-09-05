@@ -1,5 +1,7 @@
 /** Pure presentation model for the popup's transport and support state. */
 
+import type { PulseReadinessReason } from "../types/generated/cortex_schemas";
+
 export interface Biometrics {
     heart_rate: number | null;
     hrv_rmssd: number | null;
@@ -10,6 +12,11 @@ export interface Biometrics {
     head_neck_proxy_available: boolean;
 }
 
+/**
+ * The single extension-side declaration of the daemon's state estimate.
+ * ``background.ts`` and the popup both import it; ``reasons`` is emitted on
+ * every STATE_UPDATE but only the worker reads it.
+ */
 export interface CortexState {
     state: string;
     support_state?: string;
@@ -19,11 +26,13 @@ export interface CortexState {
     scores: Record<string, number>;
     signal_quality: Record<string, number>;
     dwell_seconds: number;
+    reasons?: string[];
     biometrics?: Biometrics;
     capture?: {
         frames_flowing?: boolean;
         face_detected?: boolean;
         stale?: boolean;
+        pulse_unavailable?: PulseReadinessReason | null;
     };
     store?: { degraded?: boolean };
 }
@@ -83,6 +92,28 @@ export function normaliseMicroSteps(raw: unknown): MicroStep[] {
     return result;
 }
 
+/**
+ * Compare only ``major.minor``. A DMG patch and an extension patch ship on
+ * different cadences; the negotiated wire protocol (``PROTOCOL_ERROR``)
+ * guards real incompatibility, so a patch-level skew must never block the
+ * popup. Unknown versions are treated as compatible.
+ */
+export function versionsCompatible(
+    daemonVersion: string | null | undefined,
+    expectedVersion: string | null | undefined,
+): boolean {
+    const parse = (value: string | null | undefined): [number, number] | null => {
+        if (typeof value !== "string") return null;
+        const match = /^v?(\d+)\.(\d+)/.exec(value.trim());
+        if (!match) return null;
+        return [Number(match[1]), Number(match[2])];
+    };
+    const left = parse(daemonVersion);
+    const right = parse(expectedVersion);
+    if (!left || !right) return true;
+    return left[0] === right[0] && left[1] === right[1];
+}
+
 export type ConnectivityState =
     | "ok"
     | "not_installed"
@@ -99,15 +130,21 @@ export function classifyConnectivity(input: {
 }): ConnectivityState {
     if (input.connected && input.handshakeError) return "handshake_failed";
     if (input.connected) {
-        return input.daemonVersion
-            && input.expectedVersion
-            && input.daemonVersion !== input.expectedVersion
-            ? "installed_version_mismatch"
-            : "ok";
+        return versionsCompatible(input.daemonVersion, input.expectedVersion)
+            ? "ok"
+            : "installed_version_mismatch";
     }
     return input.nativeHostStatus === "missing"
         ? "not_installed"
         : "installed_no_daemon";
+}
+
+/**
+ * Whether the state blocks the connected UI. A version skew is shown as a
+ * dismissible banner over the live popup; it never hides the session.
+ */
+export function connectivityBlocksSession(state: ConnectivityState): boolean {
+    return state !== "ok" && state !== "installed_version_mismatch";
 }
 
 export type ConnectivityAction = "launch" | "install" | "handshake";
@@ -121,6 +158,14 @@ export interface ConnectivityViewModel {
     disabled: boolean;
 }
 
+/** Copy shown while the launch request is in flight. */
+export const LAUNCH_PENDING_STATUS = "Connecting…";
+/** Copy shown when the launch request did not produce a connection. */
+export const LAUNCH_FAILED_STATUS =
+    "Cortex didn't start. Open Cortex from Applications, then try again.";
+/** Copy shown while the worker is reconnecting after a drop. */
+export const RECONNECTING_STATUS = "Reconnecting…";
+
 export function connectivityViewModel(input: {
     state: ConnectivityState;
     launching: boolean;
@@ -130,11 +175,12 @@ export function connectivityViewModel(input: {
     daemonVersion: string | null;
     handshakeError: string | null;
     nativeHostError?: string | null;
+    reconnecting?: boolean;
 }): ConnectivityViewModel {
     if (input.launching) {
         return {
             title: "Starting Cortex",
-            body: input.launchStatus || "Launching daemon…",
+            body: input.launchStatus || LAUNCH_PENDING_STATUS,
             ctaLabel: "Starting…",
             action: "launch",
             testId: "conn-state-launching",
@@ -142,13 +188,10 @@ export function connectivityViewModel(input: {
         };
     }
     if (input.state === "not_installed") {
-        const diagnostic = input.nativeHostError
-            ? ` Browser check: ${input.nativeHostError}.`
-            : "";
         return {
-            title: "Browser bridge unavailable",
-            body: "Open Cortex → Connect Extensions, choose this browser, and finish the setup steps. Fully quit the browser with Cmd+Q before reopening it." + diagnostic,
-            ctaLabel: "Open connection guide",
+            title: "Cortex app isn't linked to this browser",
+            body: "Open Cortex, choose Connect Extensions, and pick this browser. Then quit the browser fully (Cmd+Q) and reopen it.",
+            ctaLabel: "Finish setup",
             action: "install",
             testId: "conn-state-not_installed",
             disabled: false,
@@ -156,29 +199,41 @@ export function connectivityViewModel(input: {
     }
     if (input.state === "installed_version_mismatch") {
         return {
-            title: "Daemon version mismatch",
-            body: `Extension expects v${input.expectedVersion}; daemon is v${input.daemonVersion ?? "?"}. Update the daemon or downgrade the extension to match.`,
-            ctaLabel: "Restart daemon",
+            title: "Cortex needs an update",
+            body: "This extension and the Cortex app are on different versions. Update Cortex so they stay in step.",
+            ctaLabel: "Open Cortex",
             action: "launch",
             testId: "conn-state-installed_version_mismatch",
             disabled: false,
         };
     }
     if (input.state === "handshake_failed") {
+        // Never print the raw code — it is a diagnostic, not guidance.
         return {
-            title: "Handshake failed",
-            body: input.handshakeError
-                || "The daemon answered but rejected this extension's handshake. Check the local auth token.",
-            ctaLabel: "Retry handshake",
+            title: "Cortex couldn't verify this browser",
+            body: "Open Cortex, choose Connect Extensions, and finish setup for this browser. Then quit the browser fully (Cmd+Q) and reopen it.",
+            ctaLabel: "Try again",
             action: "handshake",
             testId: "conn-state-handshake_failed",
             disabled: false,
         };
     }
+    if (input.reconnecting) {
+        return {
+            title: "Reconnecting to Cortex",
+            body: RECONNECTING_STATUS,
+            ctaLabel: "Open Cortex",
+            action: "launch",
+            testId: "conn-state-installed_no_daemon",
+            disabled: false,
+        };
+    }
     return {
-        title: "Not connected",
-        body: input.launchStatus || "Launch daemon with camera",
-        ctaLabel: input.launchError ? "Retry" : "Start Cortex",
+        title: "Cortex isn't running",
+        body: input.launchError
+            ? LAUNCH_FAILED_STATUS
+            : (input.launchStatus || "Open Cortex to start reading your signals."),
+        ctaLabel: input.launchError ? "Try again" : "Open Cortex",
         action: "launch",
         testId: "conn-state-installed_no_daemon",
         disabled: false,
@@ -208,7 +263,7 @@ export function supportStateViewModel(
                 : labels[stateKey] || "Status unavailable"
         : connected
             ? "Connecting…"
-            : "Disconnected";
+            : "Not running";
     const framesFlowing = state?.capture?.frames_flowing ?? true;
     const faceDetected = state?.capture?.face_detected ?? true;
     return {
@@ -217,11 +272,51 @@ export function supportStateViewModel(
         captureStale: state?.capture?.stale === true,
         storeDegraded: state?.store?.degraded === true,
         bioStatusMessage: !state
-            ? "Connecting to daemon…"
+            ? "Connecting to Cortex…"
             : !framesFlowing
                 ? "Camera offline — open System Settings → Privacy & Security → Camera"
                 : !faceDetected
                     ? "Looking for your face…"
-                    : "Reading your pulse…",
+                    : pulseUnavailableCopy(state.capture?.pulse_unavailable),
     };
+}
+
+const PULSE_MISSING_REASON_COPY: Readonly<Record<string, string>> = {
+    no_face: "Stay in view for a pulse reading",
+    low_light: "Too dark for a pulse reading — add some light",
+    saturated: "Too bright for a pulse reading — reduce glare",
+    motion: "Hold still for a pulse reading",
+    occluded: "Face partly covered — clear the camera's view",
+    camera_warmup: "Camera warming up…",
+    frame_dropped: "Camera frames are dropping — close other camera apps",
+    permission: "Camera permission needed for a pulse reading",
+    source_disconnected: "Camera disconnected",
+};
+
+/**
+ * Consumer copy for the daemon's pulse-readiness reason (v0.4.0, audit S10).
+ * Mirrors ``cortex.apps.desktop_shell.view_models.pulse_unavailable_copy`` so
+ * the popup and the desktop dashboard say the same thing.
+ */
+export function pulseUnavailableCopy(reason: unknown): string {
+    const fallback = "Reading your pulse…";
+    if (!reason || typeof reason !== "object") return fallback;
+    const r = reason as { code?: unknown; missing_reason?: unknown; observed?: unknown; required?: unknown };
+    const code = typeof r.code === "string" ? r.code : "";
+    const missing = typeof r.missing_reason === "string" ? r.missing_reason.toLowerCase() : "";
+    if (code === "filling") {
+        const observed = typeof r.observed === "number" ? r.observed : null;
+        const required = typeof r.required === "number" ? r.required : null;
+        if (observed !== null && required !== null && required > 0) {
+            return `Reading your pulse… ${Math.round(Math.min(observed, required))} of ${Math.round(required)} s`;
+        }
+        return fallback;
+    }
+    if (code === "no_observations") return "Waiting for the camera…";
+    if (code === "duplicate_timestamps" || code === "too_few_valid_samples") return fallback;
+    if (code === "motion_fraction_above_cap") return PULSE_MISSING_REASON_COPY.motion;
+    if (missing in PULSE_MISSING_REASON_COPY) return PULSE_MISSING_REASON_COPY[missing];
+    if (code === "gap_too_long") return PULSE_MISSING_REASON_COPY.no_face;
+    if (code === "valid_fraction_below_gate") return "Not enough usable frames yet — stay in view with steady light";
+    return fallback;
 }

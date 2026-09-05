@@ -67,6 +67,22 @@ if [ "${REQUIRE_NOTARIZATION}" = "1" ]; then
         exit 1
     fi
 fi
+# generate_release_evidence hashes every file it finds in the evidence
+# directory, so members left by a previous local build would be bound into
+# this build's SHA256SUMS. Only a directory under dist/ is cleared
+# automatically; any other non-empty target must be emptied by the caller.
+if [ -d "${EVIDENCE_DIR}" ] && [ -n "$(ls -A "${EVIDENCE_DIR}" 2>/dev/null)" ]; then
+    case "$(cd "${EVIDENCE_DIR}" && pwd)" in
+        "${DIST_DIR}"/*)
+            echo "→ Clearing previous evidence in ${EVIDENCE_DIR}"
+            rm -rf "${EVIDENCE_DIR}"
+            ;;
+        *)
+            echo "[FATAL] Evidence directory ${EVIDENCE_DIR} is not empty and is outside ${DIST_DIR}; refusing to mix builds" >&2
+            exit 1
+            ;;
+    esac
+fi
 mkdir -p "${EVIDENCE_DIR}"
 export CORTEX_ARTIFACT_ARCH="${ARTIFACT_ARCH}"
 
@@ -349,19 +365,21 @@ if [ "${SIGN_IDENTITY}" = "-" ]; then
     codesign --force --sign - --entitlements "${ENTITLEMENTS}" "${APP_PATH}/Contents/MacOS/Cortex"
     codesign --force --sign - --entitlements "${ENTITLEMENTS}" "${APP_PATH}"
 else
-    # Developer ID: recursively establish valid nested signatures first. Then
-    # replace the native host's recursive signature without GUI hardware
-    # entitlements and reseal the outer app without --deep. This ordering keeps
-    # the final browser helper least-privileged while preserving the GUI's TCC
-    # declarations.
-    codesign --force --options runtime --deep \
+    # Developer ID: recursively establish valid nested signatures first,
+    # WITHOUT the GUI entitlements — Python.framework, Qt frameworks, and every
+    # extension module only need the hardened runtime. Then replace the native
+    # host's signature explicitly (Chrome and Edge execute it directly) and
+    # reseal the outer app without --deep but with the camera/automation/
+    # input-monitoring entitlements the GUI executable needs for TCC. This
+    # ordering keeps the browser helper least-privileged and stops stamping
+    # hardware entitlements onto thousands of nested libraries.
+    codesign --force --options runtime --timestamp --deep \
         --sign "${SIGN_IDENTITY}" \
-        --entitlements "${ENTITLEMENTS}" \
         "${APP_PATH}"
-    codesign --force --options runtime \
+    codesign --force --options runtime --timestamp \
         --sign "${SIGN_IDENTITY}" \
         "${NATIVE_HOST_PATH}"
-    codesign --force --options runtime \
+    codesign --force --options runtime --timestamp \
         --sign "${SIGN_IDENTITY}" \
         --entitlements "${ENTITLEMENTS}" \
         "${APP_PATH}"
@@ -380,8 +398,12 @@ if ! codesign --verify --strict --verbose=2 "${NATIVE_HOST_PATH}"; then
     echo "[FATAL] codesign --verify failed for ${NATIVE_HOST_PATH}" >&2
     exit 1
 fi
-spctl -a -vv --type execute "${APP_PATH}" \
-    > "${EVIDENCE_DIR}/spctl-app.txt" 2>&1 || true
+if [ "${SIGN_IDENTITY}" = "-" ]; then
+    # Ad-hoc builds are rejected by Gatekeeper by design; record the assessment
+    # as warn-only evidence. Production builds assess after stapling instead.
+    spctl -a -vv --type execute "${APP_PATH}" \
+        > "${EVIDENCE_DIR}/spctl-app.txt" 2>&1 || true
+fi
 
 BUILT_ARCHS=$(lipo -archs "${APP_PATH}/Contents/MacOS/Cortex")
 if [ "${BUILT_ARCHS}" != "${ARTIFACT_ARCH}" ]; then
@@ -394,6 +416,67 @@ if [ "${NATIVE_HOST_ARCHS}" != "${ARTIFACT_ARCH}" ]; then
     exit 1
 fi
 echo "${BUILT_ARCHS}" > "${EVIDENCE_DIR}/architectures.txt"
+
+# ── Step 7b: Notarize and staple the application bundle ───────────────────
+# Apple's ticket lookup needs a network connection on first launch; stapling
+# the bundle itself (not only the disk image) keeps the dragged-out copy valid
+# offline. The DMG receives its own signature, ticket, and staple below.
+notarize_and_staple() {
+    local submission="$1"
+    local stapled_target="$2"
+    local label="$3"
+    local args=(
+        submit "${submission}"
+        --keychain-profile "${CORTEX_NOTARIZE_PROFILE}"
+        --wait
+        --timeout "${CORTEX_NOTARIZE_TIMEOUT:-30m}"
+        --output-format json
+    )
+    if [ -n "${CORTEX_NOTARIZE_KEYCHAIN:-}" ]; then
+        args+=(--keychain "${CORTEX_NOTARIZE_KEYCHAIN}")
+    fi
+    xcrun notarytool "${args[@]}" \
+        | tee "${EVIDENCE_DIR}/notarytool-submit-${label}.json"
+    "${PYTHON_BIN}" - "${EVIDENCE_DIR}/notarytool-submit-${label}.json" "${EVIDENCE_DIR}/notary-request-id-${label}.txt" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if payload.get("status") != "Accepted":
+    raise SystemExit(f"notarization was not accepted: {payload.get('status')!r}")
+request_id = str(payload.get("id") or "").strip()
+if not request_id:
+    raise SystemExit("accepted notarization response omitted its request id")
+Path(sys.argv[2]).write_text(request_id + "\n", encoding="utf-8")
+PY
+    local request_id
+    IFS= read -r request_id < "${EVIDENCE_DIR}/notary-request-id-${label}.txt"
+    local log_args=(
+        log "${request_id}"
+        --keychain-profile "${CORTEX_NOTARIZE_PROFILE}"
+    )
+    if [ -n "${CORTEX_NOTARIZE_KEYCHAIN:-}" ]; then
+        log_args+=(--keychain "${CORTEX_NOTARIZE_KEYCHAIN}")
+    fi
+    xcrun notarytool "${log_args[@]}" \
+        > "${EVIDENCE_DIR}/notarytool-log-${label}.json"
+    xcrun stapler staple "${stapled_target}"
+    xcrun stapler validate "${stapled_target}" \
+        2>&1 | tee "${EVIDENCE_DIR}/stapler-validate-${label}.txt"
+}
+
+if [ "${SIGN_IDENTITY}" != "-" ] && [ -n "${CORTEX_NOTARIZE_PROFILE:-}" ]; then
+    echo "→ Notarizing application bundle..."
+    APP_NOTARY_ZIP="$(mktemp "${TMPDIR:-/tmp}/cortex-app-notary.XXXXXX").zip"
+    ditto -c -k --keepParent "${APP_PATH}" "${APP_NOTARY_ZIP}"
+    notarize_and_staple "${APP_NOTARY_ZIP}" "${APP_PATH}" "app"
+    rm -f "${APP_NOTARY_ZIP}"
+    # Gatekeeper assessment of the stapled bundle is only meaningful now.
+    spctl -a -vv --type execute "${APP_PATH}" \
+        > "${EVIDENCE_DIR}/spctl-app.txt" 2>&1 || true
+    echo "→ Application bundle notarized and stapled"
+fi
 
 # ── Step 8: Create DMG ────────────────────────────────────────────────────
 DMG_PATH="${DIST_DIR}/Cortex-${CORTEX_VERSION}-macos-${ARTIFACT_ARCH}.dmg"
@@ -453,46 +536,14 @@ else
     echo "→ Skipping DMG signing (ad-hoc development build)"
 fi
 
-# ── Step 9: Notarize (if credentials available) ───────────────────────────
+# ── Step 9: Notarize and staple the disk image ────────────────────────────
 if [ "${SIGN_IDENTITY}" != "-" ] && [ -n "${CORTEX_NOTARIZE_PROFILE:-}" ]; then
     echo "→ Notarizing DMG..."
-    NOTARY_ARGS=(
-        submit "${DMG_PATH}"
-        --keychain-profile "${CORTEX_NOTARIZE_PROFILE}"
-        --wait
-        --output-format json
-    )
-    if [ -n "${CORTEX_NOTARIZE_KEYCHAIN:-}" ]; then
-        NOTARY_ARGS+=(--keychain "${CORTEX_NOTARIZE_KEYCHAIN}")
-    fi
-    xcrun notarytool "${NOTARY_ARGS[@]}" \
-        | tee "${EVIDENCE_DIR}/notarytool-submit.json"
-    "${PYTHON_BIN}" - "${EVIDENCE_DIR}/notarytool-submit.json" "${EVIDENCE_DIR}/notary-request-id.txt" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-if payload.get("status") != "Accepted":
-    raise SystemExit(f"notarization was not accepted: {payload.get('status')!r}")
-request_id = str(payload.get("id") or "").strip()
-if not request_id:
-    raise SystemExit("accepted notarization response omitted its request id")
-Path(sys.argv[2]).write_text(request_id + "\n", encoding="utf-8")
-PY
-    IFS= read -r NOTARY_REQUEST_ID < "${EVIDENCE_DIR}/notary-request-id.txt"
-    NOTARY_LOG_ARGS=(
-        log "${NOTARY_REQUEST_ID}"
-        --keychain-profile "${CORTEX_NOTARIZE_PROFILE}"
-    )
-    if [ -n "${CORTEX_NOTARIZE_KEYCHAIN:-}" ]; then
-        NOTARY_LOG_ARGS+=(--keychain "${CORTEX_NOTARIZE_KEYCHAIN}")
-    fi
-    xcrun notarytool "${NOTARY_LOG_ARGS[@]}" \
-        > "${EVIDENCE_DIR}/notarytool-log.json"
-    xcrun stapler staple "${DMG_PATH}"
-    xcrun stapler validate "${DMG_PATH}" \
-        2>&1 | tee "${EVIDENCE_DIR}/stapler-validate-dmg.txt"
+    notarize_and_staple "${DMG_PATH}" "${DMG_PATH}" "dmg"
+    # Compatibility names consumed by the release verifier and evidence docs.
+    cp "${EVIDENCE_DIR}/notarytool-submit-dmg.json" "${EVIDENCE_DIR}/notarytool-submit.json"
+    cp "${EVIDENCE_DIR}/notarytool-log-dmg.json" "${EVIDENCE_DIR}/notarytool-log.json"
+    cp "${EVIDENCE_DIR}/notary-request-id-dmg.txt" "${EVIDENCE_DIR}/notary-request-id.txt"
     echo "→ Notarization complete"
 else
     echo "→ Skipping notarization (no Developer ID or CORTEX_NOTARIZE_PROFILE not set)"

@@ -17,6 +17,31 @@ restore.
 Production policy is deterministic. The extension does not run a contextual
 bandit, infer biology-driven breaks, or autonomously restructure tabs.
 
+Applying a proposal is one explicit flow with one state machine shared by the
+popup and the in-page panel: *Applying…* (the button is disabled), *Applied ·
+Undo* (undo stays available for at least a minute), *2 of 3 applied · Undo*,
+or *Nothing changed — reason*. A failure is never shown as "Done". The panel
+is removed when the daemon restores or times out an intervention, and a
+timeout is reported as `expired`, never as a user dismissal.
+
+**Stop Cortex** in the popup asks for confirmation because it shuts down the
+camera and the app; the intent is remembered until you start Cortex again, so
+the keep-alive does not silently reconnect.
+
+## Permissions
+
+The extension requests only what shipping features use: `activeTab`,
+`scripting`, `tabs`, `tabGroups`, `storage`, `alarms`, `nativeMessaging`, and
+`notifications`, plus optional per-origin host access that you grant from the
+popup. It does not request `bookmarks` or `webNavigation`.
+
+## New tab page
+
+Installing the extension replaces the browser's new-tab page with the Pulse
+Room. If you prefer the browser's default page, turn the override off in the
+popup settings; the page then shows a single link to the browser's default
+new tab and remembers your choice.
+
 ## Privacy
 
 - Static content scripts are limited to declared learning sites.
@@ -65,5 +90,5 @@ pnpm exec plasmo build --target=edge-mv3
 Never edit `.plasmo/`; it is generated. New capabilities must add required
 manifest permissions, generated wire schemas, producer/consumer tests,
 authorization/receipt behavior if mutating, and reduced-motion/keyboard/focus
-coverage. See [UI design](cortex/docs/ui-design.md) and
-[privacy](cortex/docs/privacy.md).
+coverage. See [UI design](https://github.com/StevenWang-CY/cortex/blob/main/cortex/docs/ui-design.md) and
+[privacy](https://github.com/StevenWang-CY/cortex/blob/main/cortex/docs/privacy.md).

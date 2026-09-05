@@ -583,10 +583,10 @@ Client → server (first frame):
 Server → client on success:
 
 ```json
-{ "type": "AUTH_OK", "payload": {}, "timestamp": 12300.05, "sequence": 0 }
+{ "type": "AUTH_OK", "payload": { "selected_protocol_version": "2" }, "timestamp": 12300.05, "sequence": 0 }
 ```
 
-After `AUTH_OK`, the client follows with `IDENTIFY` (declaring `client_type`) and then exchanges normal traffic.
+`AUTH_OK` carries the protocol version the daemon selected from the client's `AUTH` offer; clients pin their dispatch to it. Only after `AUTH_OK` does the client send `IDENTIFY` (declaring `client_type`) and then exchange normal traffic.
 
 ### Generated TypeScript Types
 
@@ -594,18 +594,24 @@ The full list below is the canonical message-type catalog (Python source of trut
 
 ### Message Types
 
-**Inbound (client → daemon):** `AUTH`, `IDENTIFY`, `USER_ACTION`, `ACTION_EXECUTE`, `USER_RATING`, `CONTEXT_RESPONSE`, `SETTINGS_SYNC`, `ACTIVITY_SYNC`, `TAB_RELEVANCE_FEEDBACK`, `LEETCODE_CONTEXT_UPDATE`, `INTERVENTION_APPLIED`, `SHUTDOWN`.
+The catalogue below is derived from `MessageType` and must stay identical to
+it; `python -m cortex.scripts.verify_repository_contracts` rejects any member
+without a production producer or consumer, and the generated `.d.ts` union
+rejects any literal outside it. Counts: 29 inbound, 33 outbound,
+6 LeetCode cues.
 
-**Outbound (daemon → client):** the generated catalog includes
-`AUTH_OK`, `STATE_UPDATE`, `INTERVENTION_TRIGGER`,
-`INTERVENTION_RESTORE`, `CONTEXT_REQUEST`, `ACTIVE_RECALL`,
-`BREATHING_OVERLAY`, `PRE_BREAK_WARNING`, `BREAK_RECOMMENDATION`,
-`MORNING_BRIEFING`, `COPILOT_THROTTLE`, and
-`AMBIENT_STATE_UPDATE`. The three break/respiration messages are
-decode-only compatibility entries and product clients intentionally ignore
-them.
+**Inbound (client → daemon), dispatched by the WebSocket server:**
+`AUTH`, `IDENTIFY`, `USER_ACTION`, `ACTION_EXECUTE`, `USER_RATING`, `CONTEXT_RESPONSE`, `SETTINGS_SYNC`, `CALIBRATION_RELOAD`, `ACTIVITY_SYNC`, `TAB_RELEVANCE_FEEDBACK`, `LEETCODE_CONTEXT_UPDATE`, `INTERVENTION_APPLIED`, `INTERVENTION_AUTHORIZE`, `INTERVENTION_RECEIPT`, `SHUTDOWN`, `REQUEST_SESSION_LIST`, `REQUEST_SESSION_DETAIL`, `REQUEST_TRENDS`, `REQUEST_SESSION_RECAP`, `SESSION_RECAP_ACKNOWLEDGED`, `MICRO_STEP_TOGGLED`, `WHY_DETAIL_REQUEST`, `QUIET_MODE_TOGGLE`, `SNOOZE_REQUEST`, `COST_REQUEST`, `TEST_PROVIDER`, `GOAL_SET`, `FORCE_RECAP`, `DISMISS_OVERLAY`.
 
-**LeetCode cues (daemon → chrome, `target_client_types=["chrome"]`):** `LEETCODE_SHOW_SCRATCHPAD`, `LEETCODE_SHOW_PATTERN_LADDER`, `LEETCODE_SHOW_LOCKOUT`, `LEETCODE_SHOW_CONSOLIDATION`, `LEETCODE_SHOW_SUBMISSION_GATE`, and `LEETCODE_SHOW_SOLUTION_FRICTION`. The catalogue contains only messages with a production producer or consumer; proposed capabilities do not reserve wire literals.
+**Outbound (daemon → client):**
+`AUTH_OK`, `PROTOCOL_ERROR`, `STATE_UPDATE`, `CALIBRATION_UPDATED`, `CALIBRATION_UPDATE_FAILED`, `INTERVENTION_TRIGGER`, `INTERVENTION_APPLY`, `INTERVENTION_AUTHORIZATION_DENIED`, `INTERVENTION_TRANSACTION_STATE`, `INTERVENTION_RESTORE`, `CONTEXT_REQUEST`, `ACTIVE_RECALL`, `BREATHING_OVERLAY`, `PRE_BREAK_WARNING`, `MORNING_BRIEFING`, `COPILOT_THROTTLE`, `AMBIENT_STATE_UPDATE`, `ACTION_DISPATCH`, `SESSION_LIST`, `SESSION_DETAIL`, `TRENDS_PAYLOAD`, `SESSION_RECAP`, `WHY_DETAIL`, `BREAK_RECOMMENDATION`, `QUIET_MODE_STATE`, `START_FOCUS_AUTO`, `STOP_FOCUS_AUTO`, `INTERVENTION_FAILED`, `INTERVENTION_PROMPT`, `COST_RESPONSE`, `TEST_PROVIDER_RESULT`, `RAISE_DASHBOARD`, `ERROR`.
+
+`BREAK_RECOMMENDATION`, `BREATHING_OVERLAY`, `PRE_BREAK_WARNING` are decode-only compatibility entries: the daemon can
+still emit the legacy break/respiration frames for one migration window, but
+product clients ignore them and they cannot trigger an action.
+
+**LeetCode cues (daemon → chrome, `target_client_types=["chrome"]`):**
+`LEETCODE_SHOW_SCRATCHPAD`, `LEETCODE_SHOW_PATTERN_LADDER`, `LEETCODE_SHOW_LOCKOUT`, `LEETCODE_SHOW_CONSOLIDATION`, `LEETCODE_SHOW_SUBMISSION_GATE`, `LEETCODE_SHOW_SOLUTION_FRICTION`.
 
 Selected payload shapes follow.
 
@@ -761,5 +767,5 @@ Sent by the daemon to request context from a specific extension.
 
 - New clients receive the latest `STATE_UPDATE` immediately on connection
 - Dead connections are automatically cleaned up on next broadcast
-- The server auto-reconnects if the `websockets` package is available
+- The daemon never reconnects to clients; a dropped connection is the client's to re-establish
 - Extensions should implement reconnection with exponential backoff

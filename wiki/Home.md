@@ -1,6 +1,6 @@
 # Cortex
 
-Cortex 0.3.4 is a macOS alpha research prototype for local, user-controlled
+Cortex 0.4.0 is a macOS alpha research prototype for local, user-controlled
 workspace support. It combines bounded activity telemetry, optional
 experimental camera signals, browser/editor context, and a deterministic or
 schema-validated planner to present conservative suggestions.
@@ -19,16 +19,17 @@ postcondition verification, and scoped restore.
 
 ## Start here
 
-- [Setup](Setup.md)
-- [How it works](How-It-Works.md)
-- [Architecture](Architecture.md)
-- [Browser extension](Browser-Extension.md)
-- [Calibration](Calibration.md)
-- [Privacy](Privacy.md)
-- [API reference](API-Reference.md)
-- [Limitations and prohibited uses](docs/limitations.md)
-- [Engineering finding ledger](audit/findings.md)
-- [Release verification](docs/release/README.md)
+- [Setup](Setup)
+- [How it works](How-It-Works)
+- [Architecture](Architecture)
+- [Browser extension](Browser-Extension)
+- [Calibration](Calibration)
+- [Privacy](Privacy)
+- [API reference](API-Reference)
+- [Troubleshooting](Troubleshooting)
+- [Limitations and prohibited uses](https://github.com/StevenWang-CY/cortex/blob/main/docs/limitations.md)
+- [Engineering finding ledger](https://github.com/StevenWang-CY/cortex/blob/main/audit/findings.md)
+- [Release verification](https://github.com/StevenWang-CY/cortex/blob/main/docs/release/README.md)
 
 ## Runtime boundary
 
@@ -37,6 +38,6 @@ The app is a local modular monolith. FastAPI (`127.0.0.1:9472`), WebSocket
 local capability token for sensitive operations. Chrome/Edge and VS Code are
 untrusted clients. The default planner makes no model network request.
 
-See [README.md](README.md) for developer commands and
-[IMPLEMENTATION.md](IMPLEMENTATION.md) for the complete audit, design,
+See [README.md](https://github.com/StevenWang-CY/cortex/blob/main/README.md) for developer commands and
+[IMPLEMENTATION.md](https://github.com/StevenWang-CY/cortex/blob/main/IMPLEMENTATION.md) for the complete audit, design,
 research basis, work packages, risks, and definition of done.

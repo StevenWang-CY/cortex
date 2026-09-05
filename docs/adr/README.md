@@ -11,3 +11,4 @@ the old one; it does not rewrite history.
 | [0004](0004-privacy-context-broker.md) | Preview-bound external context disclosure | Accepted |
 | [0005](0005-application-kernel-and-task-ownership.md) | Modular monolith, application kernel, structured ownership | Accepted |
 | [0006](0006-traceable-macos-release.md) | Locked, signed, notarized, attestable macOS releases | Accepted |
+| [0007](0007-tiered-release-assurance.md) | Tiered release assurance for a solo-maintained project | Accepted |

@@ -66,6 +66,7 @@ from cortex.libs.schemas.realtime import (
     BiometricsSummary,
     CaptureStatus,
     InterventionTriggerPayload,
+    PulseReadinessReason,
     StateUpdatePayload,
     StoreHealth,
 )
@@ -77,6 +78,7 @@ from cortex.libs.schemas.session_history import (
 from cortex.libs.schemas.state import StateEstimate
 from cortex.libs.schemas.ws_message import WSMessage as _PydanticWSMessage
 from cortex.libs.schemas.ws_message_types import MessageType
+from cortex.services.api_gateway.request_ids import sanitize_correlation_id
 
 logger = logging.getLogger(__name__)
 
@@ -797,7 +799,12 @@ class WebSocketServer:
             headers = getattr(request, "headers", None) or {}
             origin: str | None
             if hasattr(headers, "get"):
-                origin = headers.get("Origin") or headers.get("origin")
+                # Distinguish "header absent" (native client, accepted)
+                # from "header present but empty" (never a browser;
+                # rejected like any other non-extension origin).
+                origin = headers.get("Origin")
+                if origin is None:
+                    origin = headers.get("origin")
             else:
                 origin = None
         except Exception:
@@ -973,6 +980,16 @@ class WebSocketServer:
         # one. The scope ensures every log line emitted by the handlers
         # below — and by any downstream service they call (LLM planner,
         # state engine) — carries the same id.
+        # D16: a client-supplied id is echoed on every reply and stamped
+        # on every log line; bound and validate it first so junk bytes
+        # can never ride along. A rejected id is simply replaced.
+        if msg.correlation_id is not None and (
+            sanitize_correlation_id(msg.correlation_id) is None
+        ):
+            logger.debug(
+                "Replacing malformed correlation id from %s", client.client_id,
+            )
+            msg.correlation_id = None
         with correlation_scope(msg.correlation_id) as cid:
             if msg.correlation_id is None:
                 msg.correlation_id = cid
@@ -1500,10 +1517,23 @@ class WebSocketServer:
             )
             return
         try:
-            result = callback(
-                profile_id,
-                expected_sha256=profile_sha256,
-            )
+            if asyncio.iscoroutinefunction(callback):
+                result = await callback(
+                    profile_id,
+                    expected_sha256=profile_sha256,
+                )
+            else:
+                # D9: the daemon's ``activate_calibration_profile`` is
+                # synchronous and reaches SQLite through the blocking
+                # bridge (plus file I/O for the profile store). Running
+                # it inline stalled the loop for every other client;
+                # the sync bridge now refuses loop-thread callers, so it
+                # runs on a worker thread.
+                result = await asyncio.to_thread(
+                    callback,
+                    profile_id,
+                    expected_sha256=profile_sha256,
+                )
             if asyncio.iscoroutine(result):
                 result = await result
             payload = (
@@ -3304,15 +3334,19 @@ class WebSocketServer:
                 WS_COALESCE_DROPS_TOTAL.inc()
                 return False
 
-    # audit Phase-I: per-send timeout (s) and total broadcast budget (s).
-    # The per-send timeout is bumped from 1 s → 2 s so a transient
-    # network blip on one client does not get classified as a dead
-    # consumer; the hard total budget caps how long any single broadcast
-    # can block the loop. A broadcast that exceeds the budget logs a
-    # ``WS_BROADCAST_SLOW`` event and counts the clients that did not
-    # finish in time as dropped frames for that broadcast — they are
-    # not disconnected on the first slow broadcast (only if their
-    # individual per-send timeout actually fires).
+    # audit Phase-I: per-send timeout (s). Bumped from 1 s → 2 s so a
+    # transient network blip on one client does not get classified as a
+    # dead consumer; a send that exceeds it closes the client with the
+    # F22 ``slow consumer`` reason.
+    #
+    # D11: ``_BROADCAST_BUDGET_S`` is no longer a cancellation budget. The
+    # previous code cancelled every send still pending after 0.1 s in
+    # total and counted them as dropped frames — but ``websockets`` has
+    # usually already buffered the frame by then, so the "drop" was
+    # fiction while the cancellation could tear a partially written
+    # frame off a healthy connection. Sends now run to completion (bounded
+    # only by the per-client timeout) and a broadcast slower than this
+    # threshold is merely logged as ``WS_BROADCAST_SLOW``.
     _BROADCAST_PER_CLIENT_TIMEOUT_S: float = 2.0
     _BROADCAST_BUDGET_S: float = 0.1
 
@@ -3330,12 +3364,13 @@ class WebSocketServer:
           than an EPIPE on the next send, and record a
           ``WS_CLIENT_DISCONNECTED`` event with the client id + reason.
         - audit Phase-I: replace the serial ``for client: await send(...)``
-          with ``asyncio.wait`` under a hard total budget. Each send
-          runs as an independent Task so a four-client broadcast costs
-          ~max(client_latencies) instead of ~sum(client_latencies); a
-          slow client that misses the budget logs a ``WS_BROADCAST_SLOW``
-          metric but is NOT disconnected on the first miss (only if its
-          per-send timeout actually fires).
+          with a parallel gather. Each send runs as an independent Task
+          so a four-client broadcast costs ~max(client_latencies) instead
+          of ~sum(client_latencies).
+        - D11: there is no total-budget cancellation. A slow broadcast
+          (slower than ``_BROADCAST_BUDGET_S``) logs ``WS_BROADCAST_SLOW``
+          after every send finished; a client is only disconnected when
+          its own per-send timeout fires.
         """
         # F19: stamp the outgoing message with the caller's correlation id
         # so receivers can echo it back on USER_ACTION / INTERVENTION_APPLIED
@@ -3399,54 +3434,31 @@ class WebSocketServer:
             except Exception:
                 return "send error"
 
-        # audit Phase-I: parallel-gather under a hard total budget. Each
-        # send is wrapped in its own Task so when the budget elapses we
-        # cancel only the unfinished tasks; already-completed tasks keep
-        # their results (a plain ``asyncio.gather`` would cancel every
-        # inner coroutine when the wrapper is cancelled).
+        # audit Phase-I: parallel gather — each send runs as its own
+        # Task so a four-client broadcast costs ~max(client_latencies).
+        # D11: no total-budget cancellation any more (see the class
+        # attribute note); every send runs to completion or to its own
+        # per-client timeout, and a slow broadcast is only logged.
         broadcast_start = monotonic_seconds(self._clock)
         send_tasks = [
             asyncio.create_task(_send_one(client)) for _, client in targets
         ]
-        done, pending = await asyncio.wait(
-            send_tasks, timeout=self._BROADCAST_BUDGET_S,
-        )
-        budget_exceeded = bool(pending)
-        for task in pending:
-            task.cancel()
-        # Drain cancellations so they don't surface as "task was destroyed
-        # but pending" warnings on a busy event loop.
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-
-        results: list[Any] = []
-        for task in send_tasks:
-            if task in pending:
-                results.append(asyncio.CancelledError())
-            else:
-                try:
-                    results.append(task.result())
-                except BaseException as exc:  # noqa: BLE001
-                    results.append(exc)
+        results: list[Any] = await asyncio.gather(*send_tasks, return_exceptions=True)
 
         elapsed_s = monotonic_seconds(self._clock) - broadcast_start
         sent = 0
         # F22: track (client_id, reason) so the post-loop close path can
         # emit the right reason string per disconnect.
         dead_clients: list[tuple[str, str]] = []
-        slow_clients: list[str] = []
         for (client_id, _client), outcome in zip(targets, results, strict=False):
             if outcome is None:
                 sent += 1
-            elif isinstance(outcome, asyncio.CancelledError):
-                # Did not finish inside the budget; not a disconnect.
-                slow_clients.append(client_id)
             elif isinstance(outcome, str):
                 dead_clients.append((client_id, outcome))
             else:  # unexpected exception captured by gather
                 dead_clients.append((client_id, "send error"))
 
-        if budget_exceeded or slow_clients:
+        if elapsed_s > self._BROADCAST_BUDGET_S:
             try:
                 from cortex.libs.logging.structured import EventType, get_logger
 
@@ -3454,9 +3466,9 @@ class WebSocketServer:
                     "ws_broadcast_slow",
                     event_type=EventType.WS_BROADCAST_SLOW.value,
                     elapsed_ms=int(elapsed_s * 1000),
-                    budget_ms=int(self._BROADCAST_BUDGET_S * 1000),
+                    threshold_ms=int(self._BROADCAST_BUDGET_S * 1000),
                     client_count=len(targets),
-                    dropped_for_budget=len(slow_clients),
+                    dead_clients=len(dead_clients),
                 )
             except Exception:
                 # Telemetry must never break the hot path.
@@ -3638,11 +3650,28 @@ class WebSocketServer:
             # Health projection is best-effort; never block a broadcast.
             logger.debug("runtime status lookup failed", exc_info=True)
 
+        # v0.4.0 (audit S10): surface why the pulse window is not publishable
+        # so clients can say "stay in view" / "add light" / "filling 4/10 s"
+        # instead of a permanent "Reading your pulse…". Best-effort: any
+        # malformed registry entry leaves the field absent.
+        pulse_unavailable: PulseReadinessReason | None = None
+        try:
+            readiness = self._service_provider().get("physio_window_readiness")
+            if isinstance(readiness, dict) and not readiness.get("ready", False):
+                diagnostics = readiness.get("diagnostics")
+                reasons = diagnostics.get("reasons") if isinstance(diagnostics, dict) else None
+                first = reasons[0] if isinstance(reasons, list) and reasons else None
+                if isinstance(first, dict):
+                    pulse_unavailable = PulseReadinessReason.model_validate(first)
+        except Exception:
+            logger.debug("pulse readiness projection failed", exc_info=True)
+
         capture_status = CaptureStatus(
             frames_flowing=frames_flowing,
             face_detected=face_detected,
             stale=stale,
             sequence=capture_sequence,
+            pulse_unavailable=pulse_unavailable,
         )
         # B4 (Phase 4.1): expose the store degradation indicator on
         # every broadcast so a late-joining client still learns the

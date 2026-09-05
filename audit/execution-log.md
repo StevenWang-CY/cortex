@@ -231,3 +231,31 @@ The artifact SHA-256 was
 The frozen probe logged hardware acquisition disabled, no camera discovery/open
 markers, then shut down with no listener, process, or mounted image remaining.
 This local ad-hoc artifact is evidence for the changed path, not a release.
+
+## v0.4.0 — full-stack correctness, honesty, and design-quality cycle (2026-09-04/05)
+
+Scope, findings, and decisions are recorded in IMPLEMENTATION.md Section 30;
+ledger rows F70–F89 close the headline defects. The cycle was implemented as
+eight disjoint work packages (LLM, signals, state/daemon, runtime, desktop,
+browser, VS Code, and the coordinating release/docs package) and integrated on
+`codex/browser-connect-fix`.
+
+Source verification on the integrated working tree (2026-09-05, arm64, locked
+toolchain):
+
+| Gate | Result |
+| --- | --- |
+| Ruff | pass |
+| mypy `--strict` | 553 source files, no issues |
+| Python tests (non-Qt) | 3,089 passed, 3 documented skips |
+| Isolated legacy Qt suite | 67 passed |
+| Schema codegen / versions / design tokens / config docs / support-model identity | all in sync at 0.4.0 |
+| Repository contracts (links, config reachability, live messages, generated surfaces, pins, boundaries) | pass |
+| Eval regression harness | baseline byte-identical (1.0 / 0.0 / 0.0) |
+| Browser | TypeScript clean; 309 Vitest tests across 63 files; Chrome and Edge MV3 builds |
+| VS Code | lint, compile, 121 Jest tests across 11 suites, 32-file VSIX |
+| Dependency audits | Python 0 findings; VS Code 0 findings after `browserslist`/`qs` overrides; browser passes with `browserslist`/`fflate` overrides plus the re-reviewed exceptions |
+
+The local signed (Developer ID, not notarized) arm64 build, the on-device
+exercise, and the CI release evidence are appended below as they complete.
+

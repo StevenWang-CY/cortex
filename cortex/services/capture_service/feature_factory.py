@@ -40,7 +40,12 @@ def build_production_camera_feature_components(
 
     return ProductionCameraFeatureComponents(
         roi_extractor=RoiExtractor(config.landmarks),
-        physiology=PhysiologyEngineV2(config.signal.rppg),
+        physiology=PhysiologyEngineV2(
+            config.signal.rppg,
+            max_motion_face_widths_per_second=(
+                config.capture.max_motion_face_widths_per_second
+            ),
+        ),
         blink=BlinkDetector(
             blink_config=config.signal.blink,
             landmarks_config=config.landmarks,

@@ -14,7 +14,6 @@ from cortex.libs.schemas.physiology import (
     BeatCandidate,
     BeatEvent,
     BeatStatus,
-    EstimateUncertainty,
     EvidenceStatus,
     InterBeatInterval,
     PhysiologyMetric,
@@ -31,11 +30,88 @@ from cortex.services.physio_engine.v2.provenance import (
     code_sha256,
     configuration_sha256,
 )
+from cortex.services.physio_engine.v2.uncertainty import heuristic_interval
+
+# --- HR prior ageing (D13) -------------------------------------------------
+# The spectral peak selector prefers peaks near the previously published HR
+# (``|delta_bpm| / PRIOR_PENALTY_SCALE_BPM`` is subtracted from the log-power
+# score).  A prior that never aged penalised genuine rate changes forever
+# after a quality dropout.  The penalty is therefore multiplied by
+# ``0.5 ** (age_s / PRIOR_HALF_LIFE_SECONDS)`` where ``age_s`` is the time
+# between the end of the window that set the prior and the end of the
+# current window, and the prior is discarded entirely once it is older than
+# ``PRIOR_MAX_AGE_SECONDS``.  With a 1 s stride and continuous quality the
+# prior is at most ~1 s old (weight 0.93); after a 10 s dropout it carries
+# half its weight; after 30 s it is dropped.
+PRIOR_PENALTY_SCALE_BPM = 18.0
+PRIOR_HALF_LIFE_SECONDS = 10.0
+PRIOR_MAX_AGE_SECONDS = 30.0
+
+# --- Legacy motion proxy (deprecated) --------------------------------------
+# ``head_jitter_deg`` was ``nose displacement_px * 45 / frame_width`` and was
+# scored as ``1 - jitter / 15`` with a hard gate at 7.5 deg; at 640 px that
+# gate needed a 107 px/frame displacement, so it never fired.  The scale is
+# kept only so un-migrated callers keep their previous (ineffective)
+# behaviour; new callers pass ``motion_face_widths_per_second``.
+LEGACY_HEAD_JITTER_PENALTY_SCALE_DEG = 15.0
 
 
 def _stable_id(prefix: str, *parts: object) -> str:
     payload = "\x1f".join(str(part) for part in parts).encode("utf-8")
     return f"{prefix}_{hashlib.sha256(payload).hexdigest()[:24]}"
+
+
+def prior_weight(age_seconds: float | None) -> float:
+    """Return the multiplicative weight of an HR prior of the given age.
+
+    ``None`` (no prior) and ages beyond :data:`PRIOR_MAX_AGE_SECONDS` yield
+    ``0.0``; a brand-new prior yields ``1.0``.
+    """
+
+    if age_seconds is None or not np.isfinite(age_seconds):
+        return 0.0
+    age = max(0.0, float(age_seconds))
+    if age > PRIOR_MAX_AGE_SECONDS:
+        return 0.0
+    return float(0.5 ** (age / PRIOR_HALF_LIFE_SECONDS))
+
+
+def motion_penalty_from_face_widths(
+    motion_face_widths_per_second: float | None,
+    *,
+    max_motion_face_widths_per_second: float,
+) -> float:
+    """Map window-mean facial translation speed to a ``[0, 1]`` SQI penalty.
+
+    Unit: nose-tip translation speed in *face widths per second*, averaged
+    over the valid samples of the window (see
+    ``PreparedObservationWindow.mean_motion_face_widths_per_second``).  It is
+    independent of resolution and frame rate.  The penalty is linear and
+    reaches ``1.0`` at ``max_motion_face_widths_per_second``, the same
+    threshold that gates publication.  At 30 fps on a 160 px-wide face a
+    2 px/frame nose displacement is 0.375 face widths/s, i.e. a penalty of
+    0.5 against the 0.75 default; 4 px/frame exceeds the gate.
+    """
+
+    if motion_face_widths_per_second is None:
+        return 0.0
+    if max_motion_face_widths_per_second <= 0:
+        raise ValueError("max_motion_face_widths_per_second must be positive")
+    value = float(motion_face_widths_per_second)
+    if not np.isfinite(value) or value <= 0.0:
+        return 0.0
+    return float(np.clip(value / max_motion_face_widths_per_second, 0.0, 1.0))
+
+
+@dataclass(frozen=True)
+class SpectralPeak:
+    """Harmonic-aware spectral HR selection over one whole window."""
+
+    hr_bpm: float | None
+    concentration: float
+    bin_width_hz: float
+    analysed_seconds: float
+    native_resolution_hz: float
 
 
 @dataclass(frozen=True)
@@ -49,6 +125,10 @@ class PulseProcessingResult:
     beat_events: tuple[BeatEvent, ...]
     intervals: tuple[InterBeatInterval, ...]
     hrv_estimates: dict[PhysiologyMetric, SignalEstimate]
+    spectral_analysed_seconds: float = 0.0
+    spectral_native_resolution_hz: float = float("inf")
+    motion_penalty: float = 0.0
+    prior_weight: float = 0.0
 
 
 def _quadratic_peak_offset(signal: NDArray[np.float64], index: int) -> float:
@@ -68,38 +148,53 @@ def _spectral_hr(
     low_hz: float,
     high_hz: float,
     prior_bpm: float | None,
-) -> tuple[float | None, float, float]:
-    """Return harmonic-aware HR, peak concentration and native bin width."""
+    prior_age_seconds: float | None = None,
+) -> SpectralPeak:
+    """Return harmonic-aware HR, peak concentration and spectral geometry.
 
-    if len(signal) < max(8, int(fs * 4.0)):
-        return None, 0.0, float("inf")
-    nperseg = min(len(signal), max(8, int(round(fs * 8.0))))
+    The whole window is analysed as one Hann-windowed periodogram
+    (``nperseg == len(signal)``) with 4x zero padding for peak interpolation.
+    The previous 8 s Welch segmentation silently dropped the tail of every
+    10 s window (a single 240-sample segment at 30 fps), so the last 2 s never
+    entered the estimate.  ``analysed_seconds`` reports the span that
+    actually contributed.
+    """
+
+    count = len(signal)
+    if count < max(8, int(fs * 4.0)):
+        return SpectralPeak(None, 0.0, float("inf"), count / fs if fs > 0 else 0.0, float("inf"))
+    nperseg = count
     nfft = max(nperseg, 2 ** int(np.ceil(np.log2(nperseg * 4))))
     frequencies, power = welch(
         signal,
         fs=fs,
+        window="hann",
         nperseg=nperseg,
-        noverlap=nperseg // 2,
+        noverlap=0,
         nfft=nfft,
+        detrend="constant",
     )
+    analysed_seconds = nperseg / fs
+    native_resolution_hz = fs / nperseg
     mask = (frequencies >= low_hz) & (frequencies <= high_hz)
     band_f = frequencies[mask]
     band_p = power[mask]
     total = float(np.sum(band_p))
     if len(band_p) < 3 or total <= 1e-15:
-        return None, 0.0, float("inf")
+        return SpectralPeak(None, 0.0, float("inf"), analysed_seconds, native_resolution_hz)
     peaks, _ = find_peaks(band_p)
     if len(peaks) == 0:
         peaks = np.asarray([int(np.argmax(band_p))], dtype=np.intp)
 
+    weight = prior_weight(prior_age_seconds) if prior_bpm is not None else 0.0
     strongest = float(np.max(band_p[peaks]))
     scored: list[tuple[float, float, int]] = []
     for index in peaks:
         frequency = float(band_f[index])
         relative_power = float(band_p[index] / max(strongest, 1e-15))
         score = float(np.log(max(float(band_p[index]), 1e-15)))
-        if prior_bpm is not None:
-            score -= abs(frequency * 60.0 - prior_bpm) / 18.0
+        if prior_bpm is not None and weight > 0.0:
+            score -= weight * abs(frequency * 60.0 - prior_bpm) / PRIOR_PENALTY_SCALE_BPM
 
         # A strong sub-harmonic is evidence that this peak is the second
         # harmonic, common with pulse waveforms that have a sharp systolic
@@ -121,7 +216,13 @@ def _spectral_hr(
     frequency = float(band_f[best_index] + offset * bin_width)
     neighbourhood = np.abs(band_f - frequency) <= max(0.10, 2.0 * bin_width)
     concentration = float(np.sum(band_p[neighbourhood]) / total)
-    return frequency * 60.0, float(np.clip(concentration, 0.0, 1.0)), bin_width
+    return SpectralPeak(
+        hr_bpm=frequency * 60.0,
+        concentration=float(np.clip(concentration, 0.0, 1.0)),
+        bin_width_hz=bin_width,
+        analysed_seconds=analysed_seconds,
+        native_resolution_hz=native_resolution_hz,
+    )
 
 
 class PulsePipelineV2:
@@ -137,11 +238,14 @@ class PulsePipelineV2:
         min_hr_bpm: float = 30.0,
         max_hr_bpm: float = 210.0,
         max_head_jitter_deg: float = 7.5,
+        max_motion_face_widths_per_second: float = 0.75,
         minimum_window_quality: float = 0.30,
         experimental_hrv_enabled: bool = False,
         hrv_min_window_seconds: float = 180.0,
         hrv_min_valid_ibi: int = 120,
     ) -> None:
+        if max_motion_face_widths_per_second <= 0:
+            raise ValueError("max_motion_face_widths_per_second must be positive")
         self._backend = backend
         self._low_hz = float(low_hz)
         self._high_hz = float(high_hz)
@@ -149,6 +253,7 @@ class PulsePipelineV2:
         self._min_hr_bpm = float(min_hr_bpm)
         self._max_hr_bpm = float(max_hr_bpm)
         self._max_head_jitter_deg = float(max_head_jitter_deg)
+        self._max_motion_fw_s = float(max_motion_face_widths_per_second)
         self._minimum_window_quality = float(minimum_window_quality)
         self._experimental_hrv_enabled = bool(experimental_hrv_enabled)
         self._hrv_min_window_seconds = float(hrv_min_window_seconds)
@@ -163,20 +268,25 @@ class PulsePipelineV2:
             "min_hr_bpm": self._min_hr_bpm,
             "max_hr_bpm": self._max_hr_bpm,
             "max_head_jitter_deg": self._max_head_jitter_deg,
+            "max_motion_face_widths_per_second": self._max_motion_fw_s,
             "minimum_window_quality": self._minimum_window_quality,
+            "prior_half_life_seconds": PRIOR_HALF_LIFE_SECONDS,
+            "prior_max_age_seconds": PRIOR_MAX_AGE_SECONDS,
             "experimental_hrv_enabled": self._experimental_hrv_enabled,
             "hrv_min_window_seconds": self._hrv_min_window_seconds,
             "hrv_min_valid_ibi": self._hrv_min_valid_ibi,
         }
         self._algorithm_identity = SignalAlgorithmIdentity(
             name=f"pulse-v2:{backend.identity.name}",
-            version="pulse-v2/2.0.0",
+            version="pulse-v2/2.1.0",
             implementation_sha256=code_sha256(
                 (
                     PulsePipelineV2.process_window,
                     PulsePipelineV2._beat_candidates,
                     _spectral_hr,
                     _quadratic_peak_offset,
+                    prior_weight,
+                    motion_penalty_from_face_widths,
                     BeatLedger.ingest,
                     BeatLedger._derive_intervals,
                 ),
@@ -192,6 +302,7 @@ class PulsePipelineV2:
             max_hr_bpm=max_hr_bpm,
         )
         self._prior_hr_bpm: float | None = None
+        self._prior_set_at_mono_ns: int | None = None
 
     @property
     def backend(self) -> ResolvedBackend:
@@ -205,9 +316,21 @@ class PulsePipelineV2:
     def intervals(self) -> tuple[InterBeatInterval, ...]:
         return self._ledger.intervals()
 
+    @property
+    def prior_hr_bpm(self) -> float | None:
+        return self._prior_hr_bpm
+
+    def prior_age_seconds(self, at_mono_ns: int) -> float | None:
+        """Age of the current HR prior relative to a window end time."""
+
+        if self._prior_hr_bpm is None or self._prior_set_at_mono_ns is None:
+            return None
+        return max(0.0, (int(at_mono_ns) - self._prior_set_at_mono_ns) / 1_000_000_000.0)
+
     def reset(self) -> None:
         self._ledger.reset()
         self._prior_hr_bpm = None
+        self._prior_set_at_mono_ns = None
 
     def process_window(
         self,
@@ -217,9 +340,19 @@ class PulsePipelineV2:
         sample_rate_hz: float,
         boot_id: UUID,
         observation_quality: float,
-        head_jitter_deg: float = 0.0,
+        motion_face_widths_per_second: float | None = None,
         face_presence_ratio: float = 1.0,
+        head_jitter_deg: float | None = None,
     ) -> PulseProcessingResult:
+        """Process one uniformly resampled RGB window.
+
+        ``motion_face_widths_per_second`` is the window-mean nose-tip
+        translation speed in face widths per second and is the authoritative
+        motion evidence.  ``head_jitter_deg`` is the deprecated legacy proxy;
+        it is consulted only when the face-width evidence is absent and then
+        keeps its historical (practically unreachable) semantics.
+        """
+
         rgb = np.asarray(rgb_window, dtype=np.float64)
         times = np.asarray(sample_times_mono_ns, dtype=np.int64)
         if rgb.ndim != 2 or rgb.shape[1] != 3 or len(rgb) != len(times):
@@ -247,7 +380,22 @@ class PulsePipelineV2:
             fs=sample_rate_hz,
             order=self._filter_order,
         )
-        motion_penalty = float(np.clip(head_jitter_deg / 15.0, 0.0, 1.0))
+        motion_gate_exceeded = False
+        if motion_face_widths_per_second is not None:
+            motion_penalty = motion_penalty_from_face_widths(
+                motion_face_widths_per_second,
+                max_motion_face_widths_per_second=self._max_motion_fw_s,
+            )
+            motion_gate_exceeded = (
+                float(motion_face_widths_per_second) > self._max_motion_fw_s
+            )
+        elif head_jitter_deg is not None:
+            motion_penalty = float(
+                np.clip(head_jitter_deg / LEGACY_HEAD_JITTER_PENALTY_SCALE_DEG, 0.0, 1.0)
+            )
+            motion_gate_exceeded = head_jitter_deg > self._max_head_jitter_deg
+        else:
+            motion_penalty = 0.0
         physio_sqi, _components = compute_physio_sqi(
             waveform,
             fs=sample_rate_hz,
@@ -261,15 +409,21 @@ class PulsePipelineV2:
         quality = float(
             np.clip(physio_sqi * observation_quality, 0.0, 1.0)
         )
-        if head_jitter_deg > self._max_head_jitter_deg:
+        if motion_gate_exceeded:
             quality = 0.0
-        hr_bpm, hr_confidence, bin_width_hz = _spectral_hr(
+        prior_age = self.prior_age_seconds(end_ns)
+        weight = prior_weight(prior_age) if self._prior_hr_bpm is not None else 0.0
+        peak = _spectral_hr(
             filtered,
             fs=sample_rate_hz,
             low_hz=self._low_hz,
             high_hz=self._high_hz,
             prior_bpm=self._prior_hr_bpm,
+            prior_age_seconds=prior_age,
         )
+        hr_bpm = peak.hr_bpm
+        hr_confidence = peak.concentration
+        bin_width_hz = peak.bin_width_hz
         if hr_bpm is None or not self._min_hr_bpm <= hr_bpm <= self._max_hr_bpm:
             hr = self._unavailable_hr(
                 boot_id, start_ns, end_ns, quality, "no plausible cardiac spectral peak"
@@ -293,10 +447,9 @@ class PulsePipelineV2:
                 status=EvidenceStatus.EXPERIMENTAL,
                 quality=quality,
                 algorithm=self._algorithm_identity,
-                uncertainty=EstimateUncertainty(
+                uncertainty=heuristic_interval(
                     lower=max(self._min_hr_bpm, float(hr_bpm) - half_width),
                     upper=min(self._max_hr_bpm, float(hr_bpm) + half_width),
-                    confidence_level=0.95,
                     method="spectral-resolution-and-window-quality-bound",
                 ),
                 window_start_mono_ns=start_ns,
@@ -305,6 +458,7 @@ class PulsePipelineV2:
             )
             if quality >= 0.45:
                 self._prior_hr_bpm = float(hr_bpm)
+                self._prior_set_at_mono_ns = end_ns
 
         candidates = self._beat_candidates(
             filtered,
@@ -360,6 +514,10 @@ class PulsePipelineV2:
             beat_events=events,
             intervals=intervals,
             hrv_estimates=hrv,
+            spectral_analysed_seconds=peak.analysed_seconds,
+            spectral_native_resolution_hz=peak.native_resolution_hz,
+            motion_penalty=motion_penalty,
+            prior_weight=weight,
         )
 
     def _unavailable_hr(

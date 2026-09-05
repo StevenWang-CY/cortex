@@ -16,7 +16,8 @@ break the trance.
 from __future__ import annotations
 
 import logging
-import time
+
+from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +56,12 @@ class ZombieReadingDetector:
         blink_baseline: float = 17.0,
         min_duration: float = _MIN_DURATION_SECONDS,
         cooldown: float = _COOLDOWN_SECONDS,
+        *,
+        clock: Clock | None = None,
     ) -> None:
+        # Audit D16: elapsed time comes from the injected clock so replay and
+        # tests that freeze/advance time observe the same accumulator.
+        self._clock = clock or SYSTEM_CLOCK
         self._blink_baseline = blink_baseline
         self._min_duration = min_duration
         self._cooldown = cooldown
@@ -84,13 +90,13 @@ class ZombieReadingDetector:
             mouse_velocity: Mean mouse velocity in px/s.
             blink_rate: Current blink rate in blinks/min. None = no data.
             active_app: Name of the currently active application.
-            current_time: Override timestamp. None = use time.monotonic().
+            current_time: Override timestamp. None = use the injected clock.
 
         Returns:
             True if zombie-reading has been sustained long enough to trigger.
         """
         if current_time is None:
-            current_time = time.monotonic()
+            current_time = monotonic_seconds(self._clock)
 
         # Check cooldown
         if current_time - self._last_trigger < self._cooldown:
@@ -174,4 +180,4 @@ class ZombieReadingDetector:
         """How long zombie conditions have been sustained."""
         if self._zombie_start is None:
             return 0.0
-        return time.monotonic() - self._zombie_start
+        return monotonic_seconds(self._clock) - self._zombie_start

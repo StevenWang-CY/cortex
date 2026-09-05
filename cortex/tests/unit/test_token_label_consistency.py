@@ -13,8 +13,9 @@ Test contract:
 1. ``tokens.CX_TEXT_TERTIARY`` equals "#6B6661" (post-F55 value).
 2. The four surfaces (dashboard, connections, settings, onboarding) do **not**
    contain the legacy "#827971" literal anywhere in their source.
-3. The same four surfaces each expose a ``_LABEL_TERTIARY`` that equals
-   ``CX_TEXT_TERTIARY`` — they pull from the registry, not a private copy.
+3. The same four surfaces import ``CX_TEXT_TERTIARY`` / ``CX_TEXT_SECONDARY``
+   from the registry directly and carry no private ``_LABEL_*`` alias
+   block that could drift.
 """
 
 from __future__ import annotations
@@ -60,8 +61,9 @@ def test_surface_has_no_legacy_827971_literal(surface: str) -> None:
         "cortex.apps.desktop_shell.onboarding",
     ),
 )
-def test_surface_label_tertiary_matches_token(module_name: str) -> None:
-    """Every surface's ``_LABEL_TERTIARY`` reads from the token registry."""
+def test_surface_uses_registry_tints_directly(module_name: str) -> None:
+    """Every surface reads the label tints straight from the registry —
+    no private ``_LABEL_*`` alias that a later edit could re-point."""
     import importlib
 
     from cortex.apps.desktop_shell.tokens import (
@@ -70,9 +72,9 @@ def test_surface_label_tertiary_matches_token(module_name: str) -> None:
     )
 
     module = importlib.import_module(module_name)
-    assert module._LABEL_TERTIARY == CX_TEXT_TERTIARY, (
-        f"{module_name}._LABEL_TERTIARY drifted from tokens.CX_TEXT_TERTIARY"
-    )
-    assert module._LABEL_SECONDARY == CX_TEXT_SECONDARY, (
-        f"{module_name}._LABEL_SECONDARY drifted from tokens.CX_TEXT_SECONDARY"
-    )
+    assert module.CX_TEXT_TERTIARY == CX_TEXT_TERTIARY
+    assert module.CX_TEXT_SECONDARY == CX_TEXT_SECONDARY
+    for alias in ("_LABEL_TERTIARY", "_LABEL_SECONDARY", "_LABEL", "_WINDOW_BG"):
+        assert not hasattr(module, alias), (
+            f"{module_name} carries a private {alias} alias — use the CX_* tokens"
+        )

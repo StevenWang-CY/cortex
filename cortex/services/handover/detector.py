@@ -37,6 +37,14 @@ class ShutdownDetector:
     Monitors compound physiological + behavioral signals that indicate
     the user is too fatigued to continue productively.
 
+    Runtime status (audit D13): the production camera pipeline publishes no
+    posture-slump proxy (``KinematicFeatures.slump_score`` is always
+    ``None``) and HRV is contained, so the posture/HRV conjunction below
+    cannot currently be satisfied. The runtime daemon therefore evaluates
+    this detector only when a real slump score is present; until a
+    validated posture input exists the handover path is dormant by design,
+    not silently fed ``0.0``.
+
     Usage:
         detector = ShutdownDetector(hrv_baseline=50.0)
         if detector.should_handover(posture_slump=0.7, hrv=35.0, error_count=5):

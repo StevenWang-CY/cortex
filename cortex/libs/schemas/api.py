@@ -54,6 +54,14 @@ class HealthResponse(DualClockModel):
     services: dict[str, str]
     uptime_seconds: float
     version: str | None = None
+    # D4: cheap readiness fields. ``/health`` is unauthenticated and
+    # unlimited, so everything it reports must be answerable from
+    # in-memory state — no database probe runs behind it any more; the
+    # ``storage`` snapshot below is the cached result of the last
+    # authenticated ``/storage/status`` probe (``None`` before the first).
+    ready: bool = False
+    ws_listening: bool = False
+    capture_state: Literal["running", "stale", "stopped", "unavailable"] = "unavailable"
     duplicate_intervention_acks: int = 0
     frames_dropped_total: int = 0
     capture_stale: bool = False

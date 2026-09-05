@@ -30,6 +30,7 @@ const STEPS = [
             ["Tabs & Tab Groups", "Read tab titles and origins to understand your workspace. Group or collapse tabs only after you approve the exact proposal."],
             ["Storage", "Persist your focus sessions, daily stats, and preferences locally on your machine."],
             ["Webcam (optional)", "Estimate blink timing and a camera-relative head/neck position proxy. Cortex does not measure shoulders or diagnose posture; video is processed locally and is not stored."],
+            ["New tab page", "Cortex replaces your new tab with the Pulse Room. Turn this off anytime from the Cortex popup."],
         ],
         hint: "Camera frames stay on your machine and are never stored. If you enable an external LLM, selected workspace context is sent to that provider under its retention policy.",
     },
@@ -211,18 +212,18 @@ function Onboarding(): React.ReactElement {
                                 borderRadius: "50%",
                                 background:
                                     daemonConnected === true
-                                        ? "#4CAF50"
+                                        ? CX.success
                                         : daemonConnected === false
-                                            ? "#E47A6E"
+                                            ? CX.danger
                                             : CX.textTertiary,
                             }}
                         />
                         <span data-testid="daemon-health-label">
                             {daemonConnected === true
-                                ? "Connected to daemon"
+                                ? "Cortex app connected"
                                 : daemonConnected === false
-                                    ? "Daemon not detected — launch the desktop app"
-                                    : "Checking daemon…"}
+                                    ? "Cortex isn't running — open Cortex from Applications"
+                                    : "Checking for Cortex…"}
                         </span>
                         {daemonConnected !== true && !skippedOffline && (
                             <button
@@ -265,8 +266,8 @@ function Onboarding(): React.ReactElement {
                             fontStyle: "normal",
                         }}
                     >
-                        Continuing without daemon — features will be limited
-                        until you launch the desktop app.
+                        Continuing without Cortex — features will be limited
+                        until you open the Cortex app.
                     </div>
                 )}
 

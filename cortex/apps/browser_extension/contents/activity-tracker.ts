@@ -40,7 +40,6 @@ export const config: PlasmoCSConfig = {
         "https://*.readthedocs.io/*",
         "https://colab.research.google.com/*",
         "https://docs.google.com/presentation/*",
-        "http://localhost/*",
     ],
     run_at: "document_idle",
     all_frames: false,

@@ -74,7 +74,8 @@ describe("Phase 4d Task F — onboarding daemon health gate", () => {
             const label = within(container).getByTestId(
                 "daemon-health-label",
             );
-            expect(label.textContent).toMatch(/not detected/i);
+            expect(label.textContent).toMatch(/isn't running/i);
+            expect(label.textContent).not.toMatch(/daemon/i);
         });
         const nextBtn = within(container).getByTestId(
             "onboarding-next-btn",
