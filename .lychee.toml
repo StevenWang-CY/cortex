@@ -7,6 +7,11 @@ timeout = 20
 accept = [200, 203, 204, 206, 429]
 exclude = [
   "^https://example\\.invalid",
+  # docs.opencv.org answers 403 to every automated client (verified
+  # 2026-09-05, including its own root with a browser user agent). The
+  # reference in IMPLEMENTATION.md stays; only the reachability probe is
+  # excluded, and it is re-checked whenever this list is reviewed.
+  "^https://docs\\.opencv\\.org",
   "^https?://(127\\.0\\.0\\.1|localhost)",
   "^https://github\\.com/StevenWang-CY/cortex/security/advisories/new$"
 ]
