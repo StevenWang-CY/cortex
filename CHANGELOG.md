@@ -4,7 +4,7 @@ All notable changes to Cortex. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [v0.4.0] — 2026-09-04
+## [v0.4.0] — 2026-09-05
 
 This release follows a complete re-audit of the v0.3.15 source and of the
 artifact it produced. Every gate had passed while the shipped app was a
