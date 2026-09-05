@@ -44,5 +44,5 @@ to erase unresolved restore evidence. Uninstalling the app alone does not
 remove browser/editor storage, native-host manifests, Keychain credentials, or
 the configured storage root.
 
-Read the exact [privacy disclosure](cortex/docs/privacy.md) and
-[data-flow/deletion map](docs/data-flow.md) before enabling external context.
+Read the exact [privacy disclosure](https://github.com/StevenWang-CY/cortex/blob/main/cortex/docs/privacy.md) and
+[data-flow/deletion map](https://github.com/StevenWang-CY/cortex/blob/main/docs/data-flow.md) before enabling external context.

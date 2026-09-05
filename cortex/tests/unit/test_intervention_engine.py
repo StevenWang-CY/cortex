@@ -2,13 +2,12 @@
 Tests for Phase 11: Intervention Engine
 
 Covers:
-- Trigger evaluation (level selection, cooldown, dwell, quiet mode, adaptive thresholds)
 - Workspace snapshot capture
 - Plan validation (destructive actions, headline length, step count)
 - hide_targets mapping to adapter commands
 - Executor (apply, reverse, mutation tracking)
 - Restore manager (timeout, recovery detection, dismissal, outcomes)
-- Full cycle: trigger → snapshot → validate → execute → restore
+- Full cycle: snapshot → validate → execute → restore
 - Module imports
 """
 
@@ -39,7 +38,6 @@ from cortex.services.intervention_engine.planner import (
 )
 from cortex.services.intervention_engine.restore import ActiveIntervention, RestoreManager
 from cortex.services.intervention_engine.snapshot import capture_snapshot
-from cortex.services.intervention_engine.trigger import InterventionTrigger
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -180,127 +178,6 @@ class MockAdapter:
 # ===========================================================================
 # Trigger Tests
 # ===========================================================================
-
-
-class TestInterventionTrigger(unittest.TestCase):
-    """Test trigger evaluation logic."""
-
-    def _make_trigger(self, **kwargs) -> InterventionTrigger:
-        return InterventionTrigger(**kwargs)
-
-    def test_triggers_on_hyper_with_high_confidence(self):
-        trigger = self._make_trigger()
-        est = _make_estimate(state="HYPER", confidence=0.90, dwell=10.0)
-        decision = trigger.evaluate(est, complexity_score=0.8, current_time=100.0)
-        assert decision.should_trigger is True
-        assert decision.level is not None
-
-    def test_no_trigger_on_flow(self):
-        trigger = self._make_trigger()
-        est = _make_estimate(state="FLOW", confidence=0.90)
-        decision = trigger.evaluate(est, current_time=100.0)
-        assert decision.should_trigger is False
-        assert "FLOW" in decision.reasons[0]
-
-    def test_no_trigger_low_confidence(self):
-        trigger = self._make_trigger(overlay_threshold=0.80)
-        est = _make_estimate(confidence=0.60)
-        decision = trigger.evaluate(est, current_time=100.0)
-        assert decision.should_trigger is False
-
-    def test_no_trigger_low_dwell(self):
-        trigger = self._make_trigger(dwell_seconds=8.0)
-        est = _make_estimate(dwell=3.0)
-        decision = trigger.evaluate(est, current_time=100.0)
-        assert decision.should_trigger is False
-
-    def test_no_trigger_poor_signal(self):
-        trigger = self._make_trigger()
-        est = _make_estimate(physio_q=0.0, kinematics_q=0.0, telemetry_q=0.0)
-        decision = trigger.evaluate(est, current_time=100.0)
-        assert decision.should_trigger is False
-
-    def test_cooldown_prevents_retrigger(self):
-        trigger = self._make_trigger(cooldown_seconds=60.0)
-        est = _make_estimate()
-        d1 = trigger.evaluate(est, current_time=100.0)
-        assert d1.should_trigger is True
-        d2 = trigger.evaluate(est, current_time=130.0)
-        assert d2.should_trigger is False
-        assert d2.cooldown_remaining > 0
-
-    def test_cooldown_expires(self):
-        trigger = self._make_trigger(cooldown_seconds=60.0)
-        est = _make_estimate()
-        trigger.evaluate(est, current_time=100.0)
-        d2 = trigger.evaluate(est, current_time=200.0)
-        assert d2.should_trigger is True
-
-    def test_level_selection_overlay(self):
-        trigger = self._make_trigger()
-        est = _make_estimate(confidence=0.75)
-        decision = trigger.evaluate(est, current_time=100.0)
-        assert decision.level == "overlay_only"
-
-    def test_level_selection_simplified(self):
-        trigger = self._make_trigger()
-        est = _make_estimate(confidence=0.90)
-        decision = trigger.evaluate(est, current_time=100.0)
-        assert decision.level == "simplified_workspace"
-
-    def test_level_selection_guided(self):
-        trigger = self._make_trigger()
-        est = _make_estimate(confidence=0.97)
-        decision = trigger.evaluate(est, current_time=100.0)
-        assert decision.level == "guided_mode"
-
-    def test_quiet_mode_on_repeated_dismissals(self):
-        trigger = self._make_trigger(
-            max_dismissals=3,
-            dismissal_window_seconds=300.0,
-            quiet_mode_seconds=1800.0,
-        )
-        for i in range(3):
-            trigger.record_dismissal(timestamp=100.0 + i * 10.0)
-
-        est = _make_estimate()
-        decision = trigger.evaluate(est, current_time=150.0)
-        assert decision.should_trigger is False
-        assert decision.quiet_mode_active is True
-
-    def test_quiet_mode_expires(self):
-        trigger = self._make_trigger(
-            max_dismissals=3, quiet_mode_seconds=60.0
-        )
-        for i in range(3):
-            trigger.record_dismissal(timestamp=100.0 + i)
-
-        est = _make_estimate()
-        decision = trigger.evaluate(est, current_time=200.0)
-        assert decision.quiet_mode_active is False
-        assert decision.should_trigger is True
-
-    def test_adaptive_threshold_bump(self):
-        trigger = self._make_trigger(
-            overlay_threshold=0.70,
-            dismissal_bump=0.05,
-            dismissal_decay_seconds=3600.0,
-        )
-        trigger.record_dismissal(timestamp=100.0)
-        trigger.record_dismissal(timestamp=101.0)
-
-        est = _make_estimate(confidence=0.75)
-        # effective threshold = 0.70 + 2*0.05 = 0.80, confidence 0.75 < 0.80
-        decision = trigger.evaluate(est, current_time=102.0)
-        assert decision.should_trigger is False
-
-    def test_reset_cooldown(self):
-        trigger = self._make_trigger(cooldown_seconds=60.0)
-        est = _make_estimate()
-        trigger.evaluate(est, current_time=100.0)
-        trigger.reset_cooldown()
-        d2 = trigger.evaluate(est, current_time=105.0)
-        assert d2.should_trigger is True
 
 
 # ===========================================================================
@@ -765,12 +642,19 @@ async def test_restore_outcomes_tracked():
 @pytest.mark.asyncio
 async def test_full_intervention_cycle():
     """Test complete cycle: trigger → snapshot → validate → execute → restore."""
-    # 1. Trigger
-    trigger = InterventionTrigger()
+    # 1. Trigger (the production TriggerPolicy; the deprecated
+    #    InterventionTrigger was removed — audit D17)
+    from cortex.libs.config.settings import InterventionConfig, StateConfig
+    from cortex.services.state_engine.trigger_policy import TriggerPolicy
+
+    policy = TriggerPolicy(
+        config=InterventionConfig(receptivity_enforced=False),
+        state_config=StateConfig(hyper_dwell_seconds=5),
+    )
     est = _make_estimate(state="HYPER", confidence=0.90, dwell=10.0)
-    decision = trigger.evaluate(est, complexity_score=0.8, current_time=100.0)
+    decision = policy.evaluate(est, context_complexity=0.8, current_time=100.0)
     assert decision.should_trigger is True
-    assert decision.level == "simplified_workspace"
+    level = "simplified_workspace"
 
     # 2. Snapshot
     ctx = _make_context()
@@ -779,7 +663,7 @@ async def test_full_intervention_cycle():
     assert snap.has_browser_state
 
     # 3. Build and validate plan
-    plan = _make_plan(level=decision.level)
+    plan = _make_plan(level=level)
     result, commands = prepare_plan(plan)
     assert result.is_valid is True
     assert len(commands) > 0
@@ -1036,11 +920,6 @@ class TestStalenessCheck(unittest.TestCase):
 
 class TestImports(unittest.TestCase):
     """Verify all public exports are importable."""
-
-    def test_import_trigger(self):
-        from cortex.services.intervention_engine import InterventionTrigger, TriggerDecision
-        assert InterventionTrigger is not None
-        assert TriggerDecision is not None
 
     def test_import_snapshot(self):
         from cortex.services.intervention_engine import capture_snapshot

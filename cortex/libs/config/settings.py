@@ -201,15 +201,22 @@ class RedisConfig(BaseModel):
 
 
 LogicalModelId = Literal[
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-haiku-4-5",
     "claude-opus-4-7",
     "claude-sonnet-4-6",
-    "claude-haiku-4-5",
 ]
 """Cortex-canonical logical model IDs.
 
-Resolved to provider-specific identifiers (Bedrock inference profiles,
-Vertex revisions, or direct Anthropic API names) by
-``cortex.libs.llm.anthropic_client.resolve_anthropic_model_id``.
+Current generation first (``claude-opus-5``, ``claude-sonnet-5``,
+``claude-haiku-4-5``), then the still-served legacy tiers
+(``claude-opus-4-7``, ``claude-sonnet-4-6``). Resolved to provider-specific
+identifiers (Bedrock Mantle ``anthropic.*`` ids, Vertex ids, or direct
+Anthropic API names) by
+``cortex.libs.llm.anthropic_client.resolve_anthropic_model_id``; the
+capability and pricing tables in ``cortex.libs.llm`` are keyed by the same
+literal.
 """
 
 
@@ -269,9 +276,11 @@ class LLMConfig(BaseModel):
 
     Backwards compatibility: ``extra="ignore"`` drops legacy env vars
     (``CORTEX_LLM__MODE``, ``CORTEX_LLM__AZURE__*``, ``CORTEX_LLM__REMOTE__*``,
-    ``CORTEX_LLM__LOCAL__*``, ``CORTEX_LLM__MODEL_NAME``) without raising.
-    Users still on a 0.1.x ``.env`` can rerun ``cortex-dev``/the desktop
-    BYOK step to migrate cleanly.
+    ``CORTEX_LLM__LOCAL__*``, ``CORTEX_LLM__MODEL_NAME``, and the retired
+    ``CORTEX_LLM__TEMPERATURE`` — sampling parameters are never sent because
+    current models reject them with HTTP 400) without raising. Users still
+    on an older ``.env`` can rerun ``cortex-dev``/the desktop BYOK step to
+    migrate cleanly.
     """
 
     model_config = ConfigDict(protected_namespaces=(), extra="ignore")
@@ -283,13 +292,21 @@ class LLMConfig(BaseModel):
 
     # Three logical tiers — actual model selection per template lives in
     # ``cortex/services/llm_engine/anthropic_planner.py:_TEMPLATE_TIER``.
-    model_default: LogicalModelId = "claude-sonnet-4-6"
+    model_default: LogicalModelId = "claude-sonnet-5"
     model_fast: LogicalModelId = "claude-haiku-4-5"
-    model_deep: LogicalModelId = "claude-opus-4-7"
+    model_deep: LogicalModelId = "claude-opus-5"
 
-    max_tokens: int = 1024
-    temperature: float = 0.3
-    # Bedrock cold starts can take 5-10s; Opus calls can exceed 20s.
+    # Structured-output plans carry per-tab recommendations for up to 30
+    # tabs plus an error analysis; 1024 tokens truncated them
+    # (``stop_reason == "max_tokens"``). Opus 5 / Sonnet 5 also spend part
+    # of this budget on adaptive thinking, hence the 1024 floor.
+    max_tokens: int = Field(8192, ge=1024)
+    # ``output_config.effort`` for models that accept it (Opus 4.7/5,
+    # Sonnet 5, Sonnet 4.6); the planner omits it for Haiku 4.5. Sampling
+    # parameters (temperature/top_p/top_k) are never sent for any model.
+    effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
+    # Bedrock cold starts can take 5-10s; Opus calls can exceed 20s. This is
+    # the per-attempt SDK timeout; see ``planner_worst_case_seconds``.
     timeout_seconds: float = 30.0
     # Plans can echo redacted-but-still-private workspace details. Keep them
     # in memory briefly and bound configuration so an old environment value
@@ -338,6 +355,40 @@ class LLMConfig(BaseModel):
     cost_warn_usd: float = 5.0
     daily_cost_budget_usd: float = 20.0
 
+    # Planner retry policy. These are constants, not settings (read-only
+    # properties so ``sync_config_docs`` never treats them as config
+    # leaves); the planner reads them so the retry loop and the published
+    # worst-case bound can never disagree.
+    @property
+    def planner_attempts(self) -> int:
+        """Attempts per ``generate_intervention_plan`` call."""
+
+        return 3
+
+    @property
+    def planner_backoff_cap_seconds(self) -> float:
+        """Cap on the jittered exponential backoff between attempts."""
+
+        return 8.0
+
+    @property
+    def planner_worst_case_seconds(self) -> float:
+        """Upper bound on one planner call's wall-clock time.
+
+        ``planner_attempts × timeout_seconds`` plus the capped backoff gaps
+        (``min(2**attempt + 1.0, cap)`` per retry). The SDK client is built
+        with ``max_retries=0`` so no hidden retry multiplies this. The
+        daemon should size any outer ``wait_for`` from this value rather
+        than from ``timeout_seconds`` alone.
+        """
+
+        attempts = self.planner_attempts
+        backoff = sum(
+            min(2.0**attempt + 1.0, self.planner_backoff_cap_seconds)
+            for attempt in range(max(0, attempts - 1))
+        )
+        return attempts * float(self.timeout_seconds) + backoff
+
 
 class CaptureConfig(BaseModel):
     """Webcam capture configuration."""
@@ -367,18 +418,6 @@ class CaptureConfig(BaseModel):
     face_mesh_subsample_n: int = 1
 
 
-class StateWeights(BaseModel):
-    """Weights for overwhelm score components."""
-
-    pulse_elevation: float = 0.20
-    hrv_drop: float = 0.15
-    blink_suppression: float = 0.12
-    posture_collapse: float = 0.08
-    mouse_thrashing: float = 0.15
-    window_switching: float = 0.15
-    workspace_complexity: float = 0.15
-
-
 class StateConfig(BaseModel):
     """Temporal configuration for deterministic support inference."""
 
@@ -394,7 +433,6 @@ class StateConfig(BaseModel):
     hypo_dwell_seconds: int = 60
     flow_dwell_seconds: int = 120
     ema_alpha: float = 0.3
-    weights: StateWeights = Field(default_factory=StateWeights)
 
     @model_validator(mode="after")
     def _estimate_hysteresis_is_ordered(self) -> StateConfig:
@@ -418,8 +456,6 @@ class InterventionConfig(BaseModel):
     ] = "suggest_only"
 
     overlay_threshold: float = 0.70
-    simplified_threshold: float = 0.85
-    guided_threshold: float = 0.95
     complexity_threshold: float = 0.6
     cooldown_seconds: int = 60
     # B.4 fix: these are *separate* semantic quantities from the trigger
@@ -447,7 +483,7 @@ class InterventionConfig(BaseModel):
     receptivity_work_hours_start: int = 7
     receptivity_work_hours_end: int = 22
     adaptive_threshold_enabled: bool = True
-    adaptive_threshold_min: float = 0.75
+    adaptive_threshold_min: float = 0.60
     adaptive_threshold_max: float = 0.95
     dismissal_model_enabled: bool = True
     dismissal_model_threshold: float = 0.6
@@ -906,7 +942,9 @@ class StorageConfig(BaseModel):
     sqlite_busy_timeout_ms: int = Field(5_000, ge=1, le=60_000)
     backup_retention_count: int = Field(3, ge=1, le=20)
     analytics_queue_capacity: int = Field(256, ge=16, le=16_384)
-    session_retention_days: int = 7
+    # v0.4.0: session reports are the History feature's data; the size budget
+    # below bounds growth, so retention is generous rather than a week.
+    session_retention_days: int = 180
     feature_retention_days: int = 7
     error_retention_days: int = 90
     # F36: hard ceiling on the cumulative size of ``storage/sessions/*.json``.

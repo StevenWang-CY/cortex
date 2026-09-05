@@ -3,10 +3,31 @@
  *
  * Maintains a WebSocket connection to the Cortex daemon (ws://127.0.0.1:9473).
  * Receives STATE_UPDATE and INTERVENTION_TRIGGER messages.
- * Dispatches content script injection on intervention triggers.
+ * Injects the page surfaces under ``bg/surfaces/`` on intervention triggers.
  * Sends IDENTIFY and USER_ACTION messages to the daemon.
  */
 
+import { reduceApplyResults, type ApplyOutcome } from "./lib/apply-state";
+import { BadgeState } from "./lib/badge-state";
+import {
+    isDistractionBlockedRequest,
+    isTerminalUserAction,
+    type ExecuteAllRecommendedResponse,
+} from "./lib/extension-protocol";
+import { NativeHostStatusCache } from "./lib/native-host-status";
+import {
+    LAUNCH_FAILED_STATUS,
+    type CortexState,
+} from "./lib/popup-view-model";
+import { surfaceCss } from "./bg/surfaces/tokens";
+import {
+    buildInterventionPanelModel,
+    injectInterventionPanel,
+} from "./bg/surfaces/intervention-panel";
+import { buildCoachPanelModel, injectCoachPanel } from "./bg/surfaces/coach-panel";
+import { injectDistractionInterceptor } from "./bg/surfaces/interceptor";
+import { injectCortexToast } from "./bg/surfaces/toast";
+import { removeCortexOverlay } from "./bg/surfaces/remove-overlay";
 import {
     groupSpecificTabs,
     hideNonActiveTabs,
@@ -159,18 +180,9 @@ type SuggestedAction = Omit<
 };
 
 // --- Types (extension-local — not part of any Pydantic schema) ---
-
-interface CortexState {
-    state: string;
-    support_state?: string;
-    status?: "estimated" | "insufficient_evidence" | "warming_up";
-    confidence: number;
-    evidence_coverage?: number;
-    scores: Record<string, number>;
-    signal_quality: Record<string, number>;
-    dwell_seconds: number;
-    reasons: string[];
-}
+//
+// ``CortexState`` has exactly one declaration, in ``lib/popup-view-model.ts``;
+// the worker and the popup both import it.
 
 // --- Debug ---
 // F46: DEBUG is now a *variable* with two layered sources:
@@ -230,6 +242,25 @@ let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 const reconnectBackoff = new ReconnectBackoff(3_000, 30_000);
 let intentionalDisconnect = false;
 let sequence = 0;
+// True from the moment the user asks to stop Cortex until they press Start
+// again (or a launch succeeds). While set, neither the keepalive alarm nor a
+// worker restart reconnects, so a stop cannot be undone by the reconnect loop.
+let stopRequested = false;
+const STOP_REQUESTED_KEY = "cortex_stop_requested";
+// Close bookkeeping for the connectivity diagnostic: a socket that opened and
+// was then closed by the daemon with a policy code is a handshake failure; a
+// socket that never opened is simply "not running".
+let socketWasOpen = false;
+let lastCloseCode: number | null = null;
+// Native-host reachability is cached (lib/native-host-status.ts) so socket
+// churn while the app is closed never spawns the host process repeatedly.
+const nativeHostStatusCache = new NativeHostStatusCache();
+// One badge, fixed priority (pending intervention > unread recap).
+const badgeState = new BadgeState();
+// Stylesheet handed to every injected page surface.
+const SURFACE_CSS = surfaceCss();
+// Set by ``schedulePersist``; cleared by ``flushPersistedState``.
+let persistDirty = false;
 // Browser WebSocket callbacks do not await an async `onmessage` handler. The
 // envelope is still parsed and sequence-checked synchronously, while exact
 // APPLY/RESTORE capability work is serialized on this dedicated chain.
@@ -665,6 +696,7 @@ async function restoreAutoFocusStateLocal(): Promise<void> {
 }
 
 function schedulePersist(): void {
+    persistDirty = true;
     browserSessionStore.scheduleSession(persistedSessionSnapshot());
 }
 
@@ -726,6 +758,17 @@ async function restoreState(): Promise<void> {
     if (autoFocusArmed && autoFocusEndsAt !== null && Date.now() > autoFocusEndsAt) {
         stopAutoFocusSession("duration_elapsed_post_restore");
     }
+    // A stop the user asked for survives a worker restart; only a Start
+    // press (CONNECT / LAUNCH_CORTEX) clears it.
+    try {
+        const stop = await chrome.storage.session.get(STOP_REQUESTED_KEY);
+        if (stop[STOP_REQUESTED_KEY] === true) {
+            stopRequested = true;
+            if (connected || ws) disconnect();
+        }
+    } catch {
+        // session storage unavailable — default to the in-memory flag.
+    }
     // Phase 4d Task A: also rehydrate from chrome.storage.local — the
     // session bucket clears on browser restart so a HYPER-armed session
     // that survived a Chrome relaunch loses its blocklist otherwise.
@@ -735,8 +778,18 @@ async function restoreState(): Promise<void> {
     await restoreAutoFocusStateLocal();
 }
 
-// Restore persisted state on service worker startup
-restoreState();
+// Restore persisted state on service worker startup. ``handleMessage`` awaits
+// this promise before dispatching any frame, so a trigger that lands during
+// boot cannot re-show an intervention whose dismissal cooldown has not been
+// hydrated yet. ``connect()`` itself still runs synchronously at activation.
+let stateHydrated = false;
+const stateRestored: Promise<void> = restoreState()
+    .catch((err: unknown) => {
+        console.warn("[cortex.bg] restoreState failed:", err);
+    })
+    .then(() => {
+        stateHydrated = true;
+    });
 
 // Health alert state
 let lastHeadNeckAlert = 0;
@@ -775,6 +828,13 @@ function connect(): void {
         ws = new WebSocket(DAEMON_WS_URL);
 
         ws.onopen = () => {
+            socketWasOpen = true;
+            if (stopRequested) {
+                // The user asked Cortex to stop; a socket that raced the
+                // hydrated intent closes again without authenticating.
+                disconnect();
+                return;
+            }
             connected = true;
             // F32: reset the reconnect backoff on every successful open so a
             // long-running disconnect cycle that finally succeeds doesn't
@@ -866,14 +926,18 @@ function connect(): void {
                 }
             })();
 
-            // Notify popup
+            // Notify popup, then refresh the diagnostic from cache so a
+            // stale handshake error cannot outlive a healthy connection.
             broadcastToPopup({ type: "CONNECTION_CHANGED", connected: true });
+            void probeConnectivity("connected").catch((err: unknown) => {
+                if (DEBUG) console.debug("[cortex.bg] probeConnectivity(connected) failed: %o", err);
+            });
         };
 
         ws.onmessage = (event) => handleMessage(event.data as string);
 
-        ws.onclose = () => {
-            handleDisconnect();
+        ws.onclose = (event) => {
+            handleDisconnect(typeof event?.code === "number" ? event.code : null);
         };
 
         ws.onerror = () => {
@@ -899,6 +963,25 @@ function disconnect(): void {
         connected = false;
         broadcastToPopup({ type: "CONNECTION_CHANGED", connected: false });
     }
+}
+
+/** Remember that the user asked Cortex to stop; survives a worker restart. */
+async function setStopIntent(): Promise<void> {
+    stopRequested = true;
+    try {
+        await chrome.storage.session.set({ [STOP_REQUESTED_KEY]: true });
+    } catch { /* session storage unavailable */ }
+    broadcastToPopup({ type: "STOP_INTENT", stopRequested: true });
+}
+
+/** The user pressed Start: reconnects may resume. */
+async function clearStopIntent(): Promise<void> {
+    if (!stopRequested) return;
+    stopRequested = false;
+    try {
+        await chrome.storage.session.remove(STOP_REQUESTED_KEY);
+    } catch { /* session storage unavailable */ }
+    broadcastToPopup({ type: "STOP_INTENT", stopRequested: false });
 }
 
 function send(msg: WSMessage): void {
@@ -941,50 +1024,53 @@ function sendInterventionApplied(
     });
 }
 
-function handleDisconnect(): void {
+function handleDisconnect(closeCode: number | null = null): void {
     ws = null;
+    const wasOpen = socketWasOpen;
+    socketWasOpen = false;
+    lastCloseCode = closeCode;
     if (connected) {
         connected = false;
         broadcastToPopup({ type: "CONNECTION_CHANGED", connected: false });
     }
-    // G2 (audit-prod): probe the four-state diagnostic on disconnect so
-    // the popup can render an actionable error (not_installed /
-    // installed_no_daemon / version_mismatch / handshake_failed).
-    void probeConnectivity("disconnected").catch((err: unknown) => {
-        if (DEBUG) console.debug("[cortex.bg] probeConnectivity(disconnected) failed: %o", err);
-    });
-    if (!intentionalDisconnect) {
+    // Refresh the popup diagnostic from the cached native-host status. A
+    // socket that opened and was then closed by the daemon is the only
+    // disconnect that can mean "handshake rejected".
+    void probeConnectivity(wasOpen ? "closed_after_open" : "disconnected")
+        .catch((err: unknown) => {
+            if (DEBUG) console.debug("[cortex.bg] probeConnectivity(disconnected) failed: %o", err);
+        });
+    if (!intentionalDisconnect && !stopRequested) {
         scheduleReconnect();
     }
 }
 
+/** Close codes the daemon uses to refuse a client it will not serve. */
+const HANDSHAKE_REJECTION_CLOSE_CODES = new Set([1002, 1008, 1011]);
+
+type ConnectivityProbeTrigger =
+    | "activation"
+    | "install"
+    | "startup"
+    | "popup_open"
+    | "connected"
+    | "disconnected"
+    | "closed_after_open";
+
 /**
- * G2 (audit-prod): emit a ``CONNECTIVITY_DIAGNOSTIC`` extension-internal
- * message that the popup consumes (popup.tsx:423). Three probes:
- *  1. native-host present? (chrome.runtime.sendNativeMessage round-trip)
- *  2. daemon version (HTTP /health → ``version`` field)
- *  3. last WS close reason (handshake error?)
+ * Emit a ``CONNECTIVITY_DIAGNOSTIC`` extension-internal message that the
+ * popup maps onto its distinct states (not linked / not running / needs an
+ * update / couldn't verify this browser).
  *
- * Each probe is best-effort with a tight timeout; failures slot into
- * the diagnostic payload as ``missing`` / ``null`` so the popup can map
- * to its four-state UI.
+ * The native host is a separate process: it is only spawned on popup open
+ * and install, or when the cached answer is older than five minutes. Every
+ * other trigger (socket churn, the keepalive reconnect) answers from cache.
+ * The daemon version comes from a 1.5 s ``/health`` fetch; the handshake
+ * verdict comes from the last socket close, not from guesswork.
  */
-async function probeConnectivity(trigger: string): Promise<void> {
-    let nativeHostStatus: "present" | "missing" = "missing";
-    let nativeHostError: string | null = null;
-    try {
-        const response = await sendNativeHostMessage(
-            { command: "status" },
-            { timeoutMs: 5_000 },
-        );
-        if (response.command !== "status") {
-            throw new Error("unexpected_native_host_response");
-        }
-        nativeHostStatus = "present";
-    } catch (error) {
-        nativeHostStatus = "missing";
-        nativeHostError = error instanceof Error ? error.message : String(error);
-    }
+async function probeConnectivity(trigger: ConnectivityProbeTrigger): Promise<void> {
+    const forceNativeProbe = trigger === "popup_open" || trigger === "install";
+    const nativeHost = await nativeHostStatusCache.probe(forceNativeProbe);
 
     let daemonVersion: string | null = null;
     try {
@@ -1002,20 +1088,22 @@ async function probeConnectivity(trigger: string): Promise<void> {
         daemonVersion = null;
     }
 
-    let handshakeError: string | null = null;
-    if (trigger === "disconnected" && !connected) {
-        // The close reason is captured by the ws.onclose listener; for
-        // now, surface a generic indicator that the WS path failed.
-        handshakeError = daemonVersion === null && nativeHostStatus === "missing"
-            ? null
-            : "websocket_failed";
-    }
+    // A rejection is only claimed when the daemon is reachable, the socket
+    // had opened, and the daemon closed it with a policy code. Healthy
+    // connects always clear it.
+    const handshakeError = !connected
+        && trigger === "closed_after_open"
+        && daemonVersion !== null
+        && lastCloseCode !== null
+        && HANDSHAKE_REJECTION_CLOSE_CODES.has(lastCloseCode)
+        ? "handshake_rejected"
+        : null;
 
     broadcastToPopup({
         type: "CONNECTIVITY_DIAGNOSTIC",
         payload: {
-            native_host_status: nativeHostStatus,
-            native_host_error: nativeHostError,
+            native_host_status: nativeHost.status,
+            native_host_error: nativeHost.error,
             daemon_version: daemonVersion,
             handshake_error: handshakeError,
         },
@@ -1031,53 +1119,16 @@ function scheduleReconnect(): void {
     }, delay);
 }
 
-// swift-concurrency-pro rule (transferred to JS): tear down all in-flight
-// timers when the service worker is suspended so they don't fire against a
-// torn-down WS instance and cause spurious reconnect attempts. Chrome
-// emits ``runtime.onSuspend`` ~30s before evicting the worker.
-if (typeof chrome !== "undefined" && chrome.runtime?.onSuspend) {
-    chrome.runtime.onSuspend.addListener(() => {
-        if (reconnectTimer) {
-            clearTimeout(reconnectTimer);
-            reconnectTimer = null;
-        }
-        browserSessionStore.cancelPendingWrites();
-        void browserSessionStore.saveSessionNow(persistedSessionSnapshot());
-        try {
-            disconnect();
-        } catch {
-            /* worker is going away anyway */
-        }
-    });
-}
-
-// --- Text Scraping ---
-
-async function scrapeVisibleText(tabId?: number): Promise<string> {
-    try {
-        let targetTabId = tabId;
-        if (!targetTabId) {
-            // F3 (Phase-4 audit): destructure-and-check rather than the
-            // ``[0]?.id`` shorthand. The shorthand worked but obscured
-            // the empty-array contingency; the explicit guard documents
-            // the "no active tab" branch and lets us log it.
-            const tabs = await chrome.tabs.query({
-                active: true,
-                currentWindow: true,
-            });
-            if (!tabs.length) {
-                console.warn("[cortex.bg] scrapeVisibleText: no active tab");
-                return "";
-            }
-            targetTabId = tabs[0]?.id;
-        }
-        if (!targetTabId) return "";
-        const response = await chrome.tabs.sendMessage(targetTabId, { type: "EXTRACT_TEXT" });
-        return response?.text || "";
-    } catch (err) {
-        console.warn("[cortex.bg] scrapeVisibleText failed:", err);
-        return "";
-    }
+// MV3 never dispatches ``runtime.onSuspend`` to an extension service worker,
+// so nothing here relies on a shutdown hook. Durability comes from the
+// debounced writes in ``schedulePersist`` plus an explicit flush on every
+// keepalive alarm tick (``flushPersistedState`` below); a worker that is
+// evicted mid-debounce loses at most half a second of bookkeeping.
+function flushPersistedState(): void {
+    if (!persistDirty) return;
+    persistDirty = false;
+    void browserSessionStore.saveSessionNow(persistedSessionSnapshot())
+        .catch(() => { persistDirty = true; });
 }
 
 // --- Message Handling ---
@@ -1210,6 +1261,13 @@ async function handleMessage(raw: string): Promise<void> {
         }
         return;
     }
+
+    // Parsing and the replay guard above stay synchronous; interpretation
+    // waits for cooldowns and quiet state to hydrate on a cold worker so a
+    // trigger cannot re-show a dismissed intervention. Every invocation
+    // awaits the same promise, so frame order is preserved; once hydrated
+    // the path is synchronous again.
+    if (!stateHydrated) await stateRestored;
 
     switch (msg.type) {
         case "AUTH_OK": {
@@ -1369,18 +1427,16 @@ async function handleMessage(raw: string): Promise<void> {
                     err,
                 );
             }
-            handleIntervention(msg.payload);
-            // P0 §3.12: when the desktop dashboard isn't focused the
-            // daemon stamps ``desktop_not_focused: true`` on the wire.
-            // Bump the toolbar badge + fire ``chrome.notifications`` so
-            // the user notices the intervention from another Space /
-            // fullscreen app. The notification body is the
-            // LLM-generated headline only (already F09-sanitised).
-            // Phase-3 P2-DF-12.5: respect quiet mode — if the user
-            // has snoozed or paused, the OS notification fall-through
-            // is just another surrogate overlay and should also be
-            // suppressed.
-            if (plan.desktop_not_focused && !quietMode) {
+            // One channel per event: the page panel when it can be shown;
+            // otherwise, when the desktop shell isn't focused either, a
+            // single OS notification (P0 §3.12) — never both, and never
+            // while the user has asked for quiet. The badge only lights
+            // when no surface is on screen.
+            const notFocused = plan.desktop_not_focused;
+            void handleIntervention(msg.payload).then((overlayShown) => {
+                if (overlayShown || quietMode) return;
+                setInterventionBadge(true);
+                if (!notFocused) return;
                 try {
                     surfaceInterventionOSNotification(triggerPayload, inboundCid);
                 } catch (err) {
@@ -1391,7 +1447,7 @@ async function handleMessage(raw: string): Promise<void> {
                         err,
                     );
                 }
-            }
+            });
             break;
         }
 
@@ -1466,6 +1522,27 @@ async function handleMessage(raw: string): Promise<void> {
             await enqueueTransactionCommand(() => handleRestore(msg.payload));
             break;
 
+        case "DISMISS_OVERLAY": {
+            // The daemon's cross-surface dismiss cue (keyboard shortcut on
+            // any surface). Presentation only: remove the page panels,
+            // drop the mounted proposal, and tell the popup.
+            const interventionId = typeof msg.payload.intervention_id === "string"
+                ? msg.payload.intervention_id
+                : null;
+            interventionPresentation.clear();
+            setInterventionBadge(false);
+            try {
+                chrome.storage.session.remove([
+                    "cortex_active_intervention",
+                    "cortex_active_intervention_cid",
+                    "cortex_active_intervention_mounted_at",
+                ]);
+            } catch { /* session storage unavailable */ }
+            await removeOverlaysEverywhere();
+            broadcastToPopup({ type: "OVERLAY_DISMISSED", intervention_id: interventionId });
+            break;
+        }
+
         case "SETTINGS_SYNC":
             quietMode = Boolean(msg.payload.quiet_mode);
             currentExecutionMode = parseExecutionMode(
@@ -1487,35 +1564,16 @@ async function handleMessage(raw: string): Promise<void> {
             break;
         }
 
-        case "BREATHING_OVERLAY": {
-            // Disabled compatibility message: the producing algorithm has
-            // not passed reference validation, so do not present its claim.
-            break;
-        }
-        case "ACTIVE_RECALL": {
-            // Get visible text, add to payload, then route to content script
-            const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-            if (tab?.id) {
-                const visibleText = await scrapeVisibleText(tab.id);
-                chrome.tabs.sendMessage(tab.id, {
-                    type: "SHOW_ACTIVE_RECALL",
-                    payload: { ...msg.payload, visible_text: visibleText },
-                });
-            }
-            break;
-        }
-
-        case "PRE_BREAK_WARNING": {
-            // Disabled compatibility message; see BREATHING_OVERLAY above.
-            break;
-        }
-
-
-
+        case "BREATHING_OVERLAY":
+        case "PRE_BREAK_WARNING":
+        case "ACTIVE_RECALL":
         case "LEETCODE_SHOW_LOCKOUT": {
-            // A lockout changes what the user can do on the page. Keep this
-            // compatibility message inert until it has an exact authorization
-            // and receipt-backed escape/restore path.
+            // Compatibility sinks. BREATHING_OVERLAY and PRE_BREAK_WARNING
+            // carry physiology claims that have not passed reference
+            // validation; ACTIVE_RECALL never had a page receiver; a lockout
+            // changes what the user can do on the page and stays inert
+            // until it has an exact authorization and receipt-backed
+            // escape/restore path. None of them presents or mutates.
             break;
         }
 
@@ -1524,17 +1582,20 @@ async function handleMessage(raw: string): Promise<void> {
         case "LEETCODE_SHOW_SUBMISSION_GATE":
         case "LEETCODE_SHOW_SOLUTION_FRICTION":
         case "LEETCODE_SHOW_CONSOLIDATION": {
+            // The coach only belongs on a LeetCode tab: prefer the active
+            // one, otherwise the most recently accessed LeetCode tab, and
+            // never any other page.
             try {
-                const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-                if (tab?.id) {
+                const tabId = await findLeetCodeTabId();
+                if (tabId !== null) {
                     await chrome.scripting.executeScript({
-                        target: { tabId: tab.id },
-                        func: injectLeetCodeCoachOverlay,
-                        args: [msg.type, msg.payload],
+                        target: { tabId },
+                        func: injectCoachPanel,
+                        args: [buildCoachPanelModel(msg.type, msg.payload), SURFACE_CSS],
                     });
                 }
             } catch (e) {
-                if (DEBUG) console.error("Cortex: failed to inject LeetCode coach overlay", e);
+                if (DEBUG) console.error("Cortex: failed to inject LeetCode coach", e);
             }
             break;
         }
@@ -1744,571 +1805,87 @@ async function handleMessage(raw: string): Promise<void> {
     }
 }
 
-/**
- * Injected directly into the page via chrome.scripting.executeScript.
- * Creates the intervention overlay using Shadow DOM.
- *
- * Design: dark, high-end tech (Linear/Raycast-inspired).
- * Consistent with popup and all other Cortex UI.
- */
-export function injectOverlay(
-    payload: Record<string, unknown>,
-    executableActionIds: string[] = [],
-): void {
-    const OID = "cortex-somatic-overlay";
-    type ManagedOverlayHost = HTMLElement & {
-        __cortexCleanup?: () => void;
-    };
-    const existingHost = document.getElementById(OID) as ManagedOverlayHost | null;
-    existingHost?.__cortexCleanup?.();
-    const isUpdate = existingHost !== null;
-
-    const headline = String(payload.headline || "");
-    const summary = String(payload.situation_summary || "");
-    const steps = (payload.micro_steps as string[]) || [];
-    const esc = (s: string) =>
-        s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-
-    const actions: Array<Record<string, unknown>> = [
-        ...((payload.suggested_actions as Array<Record<string, unknown>>) || []),
-    ];
-    const tabRecs = payload.tab_recommendations as { tabs: Array<Record<string, unknown>>; summary: string } | undefined;
-    const errA = payload.error_analysis as Record<string, string> | undefined;
-    // The background worker verified these IDs against the digest-covered
-    // manifest immediately before injection. Recommendations absent from
-    // that set remain readable guidance; they never acquire an affordance.
-    const executableIdSet = new Set(executableActionIds);
-    const executableRecommended = actions.filter((action) =>
-        action.category === "recommended"
-        && typeof action.action_id === "string"
-        && executableIdSet.has(action.action_id)
-    );
-    const canExecute = payload.execution_mode === "authorized"
-        || payload.execution_mode === "research_autonomous";
-
-    // --- Build tab list with per-tab Keep buttons (LAYER 5) ---
-    let closingHtml = "";
-    let keepCount = 0;
-    let closeCount = 0;
-    if (tabRecs && tabRecs.tabs && tabRecs.tabs.length > 0) {
-        const closeTabs = tabRecs.tabs.filter(t => t.action === "close" || t.action === "bookmark_and_close");
-        const keepTabs = tabRecs.tabs.filter(t => t.action === "keep");
-        keepCount = keepTabs.length;
-        closeCount = closeTabs.length;
-
-        if (closeTabs.length > 0) {
-            closingHtml = `<div class="tl">`;
-            for (let ti = 0; ti < closeTabs.length; ti++) {
-                const t = closeTabs[ti];
-                const tabTitle = esc(String(t.tab_title || "Untitled"));
-                const genericReasonPhrases = ["not essential for", "not relevant to", "not related to",
-                    "may be distracting", "could be a distraction", "is a distraction", "not needed for",
-                    "distracting you from", "not useful for"];
-                const rawReason = String(t.reason || "");
-                const cleanReason = genericReasonPhrases.some(p => rawReason.toLowerCase().includes(p)) ? "" : rawReason;
-                const tabReason = cleanReason ? `<div class="trr">${esc(cleanReason)}</div>` : "";
-                closingHtml += `<div class="tr"><span class="tx">\u00b7</span><div class="tc"><span class="tn">${tabTitle}</span>${tabReason}</div></div>`;
-            }
-            closingHtml += `</div>`;
-        }
-    }
-
-    // --- Error (filter generic placeholders) ---
-    let errHtml = "";
-    const genericErrPhrases = ["no specific errors", "no errors detected", "not applicable", "no error", "n/a", "none detected"];
-    const hasRealError = errA && errA.root_cause && !genericErrPhrases.some(
-        p => (errA.root_cause ?? "").toLowerCase().includes(p)
-    );
-    if (hasRealError && errA) {
-        errHtml = `<div class="eb"><div class="eh">Error</div><div class="et">${esc(errA.root_cause)}</div>`;
-        if (errA.suggested_fix) {
-            errHtml += `<pre class="ec">${esc(errA.suggested_fix)}</pre>`;
-        }
-        errHtml += `</div>`;
-    }
-
-    // --- Steps (filter generic advice) ---
-    const genericStepPhrases = ["take a moment to breathe", "take a break", "focus on your current task",
-        "continue focusing", "focus on the task at hand", "stay focused", "keep going", "take a deep breath"];
-    const realSteps = steps.filter(s => !genericStepPhrases.some(p => s.toLowerCase().includes(p)));
-    let stepsHtml = "";
-    if (realSteps.length > 0) {
-        stepsHtml = `<div class="sl">`;
-        for (const s of realSteps) {
-            stepsHtml += `<div class="si">${esc(s)}</div>`;
-        }
-        stepsHtml += `</div>`;
-    }
-
-    // --- CTA label ---
-    let ctaLabel = `Apply ${executableRecommended.length} change${executableRecommended.length !== 1 ? "s" : ""}`;
-    if (executableRecommended.length === 1) {
-        const actionType = String(executableRecommended[0].action_type || "");
-        if (actionType === "search_error") ctaLabel = "Search this error";
-        if (actionType === "open_url") ctaLabel = "Open recommended page";
-        if (actionType === "highlight_tab") ctaLabel = "Switch to recommended tab";
-    }
-    const hasManualSuggestions = closeCount > 0
-        || actions.some((action) =>
-            action.category === "recommended"
-            && typeof action.action_id === "string"
-            && !executableIdSet.has(action.action_id)
-        );
-    const actionNote = !canExecute && executableRecommended.length > 0
-        ? "Suggestions only — workspace changes are off."
-        : hasManualSuggestions
-            ? "Manual review — Cortex won’t close or regroup existing tabs automatically."
-            : "";
-
-    const host = (existingHost ?? document.createElement("div")) as ManagedOverlayHost;
-    if (!existingHost) {
-        host.id = OID;
-        host.style.cssText = "position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483647;pointer-events:none;";
-    }
-
-    const shadow = host.shadowRoot ?? host.attachShadow({ mode: "open" });
-    shadow.innerHTML = `
-<style>
-@keyframes panelIn{from{transform:translateY(8px) scale(.98);opacity:0}to{transform:translateY(0) scale(1);opacity:1}}
-@keyframes panelOut{from{transform:translateY(0) scale(1);opacity:1}to{transform:translateY(8px) scale(.98);opacity:0}}
-@keyframes fadeIn{from{opacity:0}to{opacity:1}}
-@keyframes fadeOut{from{opacity:1}to{opacity:0}}
-*{box-sizing:border-box;margin:0;padding:0}
-
-.bk{position:fixed;inset:0;background:transparent;pointer-events:none;animation:fadeIn 160ms cubic-bezier(.23,1,.32,1)}
-
-.pn{
-  position:fixed;bottom:20px;right:20px;width:340px;max-height:calc(100vh - 40px);overflow-y:auto;
-  pointer-events:auto;
-  background:#111113;
-  border-radius:12px;
-  border:1px solid rgba(255,255,255,.06);
-  box-shadow:0 0 0 .5px rgba(0,0,0,.3),0 4px 20px rgba(0,0,0,.4),0 16px 40px rgba(0,0,0,.2);
-  font-family:-apple-system,BlinkMacSystemFont,'Inter','SF Pro Text',system-ui,sans-serif;
-  color:#e4e4e7;padding:18px 16px 14px;
-  animation:panelIn 200ms cubic-bezier(.23,1,.32,1);
+/** Tabs that may receive an injected surface: http(s), never incognito. */
+function injectableTab(tab: chrome.tabs.Tab): tab is chrome.tabs.Tab & { id: number } {
+    return typeof tab.id === "number"
+        && !tab.incognito
+        && typeof tab.url === "string"
+        && /^https?:/.test(tab.url);
 }
-.pn.cx-update{animation:none}
-.pn.cx-exit{animation:panelOut 160ms cubic-bezier(.4,0,1,1) forwards}
-.bk.cx-exit{animation:fadeOut 160ms cubic-bezier(.4,0,1,1) forwards}
-.pn::-webkit-scrollbar{width:0}
 
-/* Close */
-.xb{position:absolute;top:10px;right:10px;width:30px;height:30px;border:none;background:rgba(255,255,255,.04);border-radius:7px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background-color 120ms cubic-bezier(.23,1,.32,1),transform 120ms cubic-bezier(.23,1,.32,1)}
-.xb:active{transform:scale(.96)}
-.xb:focus-visible,.btn:focus-visible,.dm:focus-visible,.ul:focus-visible{outline:2px solid #dfb15b;outline-offset:2px}
-.xb svg{width:9px;height:9px;stroke:#71717a;stroke-width:2}
-
-/* Text */
-.hd{font-size:13px;font-weight:600;color:#e4e4e7;padding-right:26px;margin-bottom:4px;letter-spacing:-.2px;line-height:1.4}
-.ds{font-size:12px;color:#71717a;line-height:1.5;margin-bottom:14px}
-.dv{height:1px;background:rgba(255,255,255,.04);margin-bottom:12px}
-
-/* Tabs */
-.sh{font-size:11px;font-weight:500;color:#71717a;margin-bottom:6px}
-.tl{margin-bottom:10px}
-.tr{display:flex;align-items:center;gap:7px;padding:3px 0}
-.tx{color:#ef4444;font-size:12px;font-weight:500;width:13px;text-align:center;flex-shrink:0;font-family:'SF Mono','Fira Code',ui-monospace,monospace}
-.tc{overflow:hidden;min-width:0}
-.tn{font-size:12px;color:#71717a;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block}
-.trr{font-size:10px;color:#3f3f46;line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.kn{font-size:11px;color:#3f3f46;margin-bottom:12px}
-.kc{color:#10b981}
-.nt{font-size:10px;color:#71717a;line-height:1.45;margin:0 0 12px;padding:8px 10px;background:rgba(255,255,255,.025);border-radius:6px}
-
-/* Error */
-.eb{padding:10px 12px;background:rgba(239,68,68,.08);border-radius:8px;border:1px solid rgba(239,68,68,.06);margin-bottom:12px}
-.eh{font-size:10px;font-weight:600;color:#ef4444;margin-bottom:3px;font-family:'SF Mono','Fira Code',ui-monospace,monospace;letter-spacing:.5px}
-.et{font-size:12px;color:#e4e4e7;line-height:1.5}
-.ec{font-size:11px;color:#71717a;line-height:1.5;margin-top:6px;padding:8px;background:rgba(0,0,0,.3);border-radius:6px;font-family:'SF Mono','Fira Code',ui-monospace,monospace;white-space:pre-wrap;border:none}
-
-/* Steps */
-.sl{margin-bottom:12px}
-.si{font-size:12px;color:#71717a;line-height:1.5;padding:2px 0 2px 14px;position:relative}
-.si::before{content:'';position:absolute;left:3px;top:8px;width:3px;height:3px;border-radius:50%;background:#3f3f46}
-
-/* CTA */
-.btn{display:block;width:100%;padding:9px;border:none;border-radius:8px;background:#e4e4e7;color:#09090b;font-size:12px;font-weight:600;cursor:pointer;transition:background-color 120ms cubic-bezier(.23,1,.32,1),transform 120ms cubic-bezier(.23,1,.32,1);letter-spacing:-.1px;text-align:center;font-family:inherit}
-.btn:active{transform:scale(.98)}
-.btn.ok{background:#10b981;color:#fff;cursor:default;pointer-events:none}
-
-.ur{display:flex;align-items:center;justify-content:center;gap:6px;padding:6px 0;font-size:11px;color:#3f3f46;margin-top:4px}
-.ul{color:#3b82f6;cursor:pointer;font-weight:500;text-decoration:none;border:none;background:none;font-size:11px;font-family:inherit;padding:0}
-
-/* Dismiss */
-.dm{display:block;width:100%;padding:8px;margin-top:4px;border:none;border-radius:6px;background:none;color:#a1a1aa;cursor:pointer;font-size:11px;font-family:inherit;transition:color 120ms cubic-bezier(.23,1,.32,1),background-color 120ms cubic-bezier(.23,1,.32,1),transform 120ms cubic-bezier(.23,1,.32,1)}
-.dm:active{transform:scale(.98)}
-@media (hover:hover) and (pointer:fine){.xb:hover{background:rgba(255,255,255,.08)}.btn:hover{background:#f4f4f5}.ul:hover{text-decoration:underline}.dm:hover{color:#e4e4e7;background:rgba(255,255,255,.04)}}
-@media (prefers-reduced-motion:reduce){.pn,.bk{animation:none!important}.btn,.xb,.dm{transition-property:background-color,color!important}.btn:active,.xb:active,.dm:active{transform:none}}
-</style>
-
-<div class="bk" id="bk"></div>
-<div class="pn${isUpdate ? " cx-update" : ""}" role="region" aria-labelledby="cortex-intervention-title" aria-describedby="cortex-intervention-summary">
-  <button class="xb" id="xb" type="button" aria-label="Dismiss intervention"><svg viewBox="0 0 10 10" fill="none"><path d="M1 1l8 8M9 1l-8 8"/></svg></button>
-  <div class="hd" id="cortex-intervention-title" role="heading" aria-level="2">${esc(headline)}</div>
-  <div class="ds" id="cortex-intervention-summary" aria-live="polite">${esc(summary)}</div>
-  <div class="dv"></div>
-  ${closingHtml ? `<div class="sh">Review ${closeCount} tab suggestion${closeCount !== 1 ? "s" : ""}</div>${closingHtml}` : ""}
-  ${keepCount > 0 ? `<div class="kn">Keeping <span class="kc">${keepCount}</span> you need</div>` : ""}
-  ${actionNote ? `<div class="nt">${esc(actionNote)}</div>` : ""}
-  ${errHtml}
-  ${stepsHtml ? `<div class="dv"></div>${stepsHtml}` : ""}
-  ${canExecute && executableRecommended.length > 0 ? `<button class="btn" id="cta">${esc(ctaLabel)}</button><div class="ur" id="undo-bar" style="display:none"><span>Done.</span><button class="ul" id="undo-btn">Undo</button></div>` : ""}
-  <button class="dm" id="dm">Dismiss</button>
-</div>`;
-
-    if (!existingHost) document.body.appendChild(host);
-
-    let dismissed = false;
-    let removalTimer = 0;
-    let autoDismissTimer = 0;
-    const reducedMotion = window.matchMedia(
-        "(prefers-reduced-motion: reduce)",
-    ).matches;
-    const handleKeydown = (event: KeyboardEvent) => {
-        if (event.key === "Escape") dismiss();
-    };
-    const dismiss = () => {
-        if (dismissed) return;
-        dismissed = true;
-        // Notify background to record cooldown and restore tabs
-        chrome.runtime.sendMessage({
-            type: "USER_ACTION",
-            action: "dismissed",
-            intervention_id: payload.intervention_id,
+/**
+ * Remove every Cortex page surface from every tab. Injection is
+ * best-effort per tab (a tab without site access simply rejects), so an
+ * overlay can never outlive its intervention on the tabs Cortex can reach.
+ */
+async function removeOverlaysEverywhere(): Promise<void> {
+    let tabs: chrome.tabs.Tab[] = [];
+    try {
+        tabs = await chrome.tabs.query({});
+    } catch {
+        return;
+    }
+    await Promise.all(tabs.filter(injectableTab).map((tab) =>
+        chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            func: removeCortexOverlay,
         }).catch((err: unknown) => {
-            // F4 (Phase-4 audit): this runs in the *page* context via
-            // executeScript injection, so the SW may have been torn
-            // down between the click and the send. Log so we at least
-            // see it in the page console; the UI still tears down.
-            console.warn("[cortex.overlay] dismiss notify failed:", err);
-        });
-        window.clearTimeout(autoDismissTimer);
-        document.removeEventListener("keydown", handleKeydown);
-        const panel = shadow.querySelector<HTMLElement>(".pn");
-        const backdrop = shadow.querySelector<HTMLElement>(".bk");
-        if (reducedMotion || !panel) {
-            host.remove();
-            return;
-        }
-        panel.classList.add("cx-exit");
-        backdrop?.classList.add("cx-exit");
-        removalTimer = window.setTimeout(() => host.remove(), 170);
-    };
-    shadow.getElementById("xb")?.addEventListener("click", dismiss);
-    shadow.getElementById("dm")?.addEventListener("click", dismiss);
-    shadow.getElementById("bk")?.addEventListener("click", dismiss);
-    document.addEventListener("keydown", handleKeydown);
-
-    // CTA
-    const ctaEl = shadow.getElementById("cta");
-    if (ctaEl) {
-        ctaEl.addEventListener("click", () => {
-            const toExecute = executableRecommended;
-            if (toExecute.length === 0) return;
-            (ctaEl as HTMLButtonElement).disabled = true;
-            ctaEl.textContent = "Working\u2026";
-            ctaEl.style.opacity = "0.5";
-
-            chrome.runtime.sendMessage({
-                type: "EXECUTE_ALL_RECOMMENDED",
-                actions: toExecute,
-                intervention_id: payload.intervention_id,
-            }, (results: Array<Record<string, unknown>>) => {
-                const failCount = Array.isArray(results) ? results.filter(r => !r.success).length : 0;
-                const successCount = (Array.isArray(results) ? results.length : 0) - failCount;
-
-                ctaEl.style.opacity = "1";
-                ctaEl.classList.add("ok");
-                ctaEl.textContent = failCount > 0
-                    ? `Done (${failCount} skipped)`
-                    : `${successCount} change${successCount !== 1 ? "s" : ""} applied`;
-
-                const undoBar = shadow.getElementById("undo-bar");
-                if (undoBar) undoBar.style.display = "flex";
-            });
-        });
-    }
-
-    // Undo
-    const undoBtn = shadow.getElementById("undo-btn");
-    if (undoBtn) {
-        undoBtn.addEventListener("click", () => {
-            chrome.runtime.sendMessage({
-                type: "UNDO_ALL_RECENT",
-                intervention_id: payload.intervention_id,
-            }, () => {
-                const undoBar = shadow.getElementById("undo-bar");
-                if (undoBar) undoBar.innerHTML = `<span>Restored.</span>`;
-                if (ctaEl) {
-                    ctaEl.classList.remove("ok");
-                    (ctaEl as HTMLButtonElement).disabled = false;
-                    ctaEl.textContent = esc(ctaLabel);
-                }
-            });
-        });
-    }
-
-    autoDismissTimer = window.setTimeout(dismiss, 5 * 60 * 1000);
-    host.__cortexCleanup = () => {
-        window.clearTimeout(autoDismissTimer);
-        window.clearTimeout(removalTimer);
-        document.removeEventListener("keydown", handleKeydown);
-    };
+            if (DEBUG) console.debug("[cortex.bg] removeCortexOverlay skipped a tab: %o", err);
+        })));
 }
 
+const LEETCODE_TAB_PATTERNS = [
+    "https://leetcode.com/*",
+    "https://*.leetcode.com/*",
+    "https://leetcode.cn/*",
+    "https://*.leetcode.cn/*",
+];
+
+/** The active LeetCode tab if there is one, else the most recent; else null. */
+async function findLeetCodeTabId(): Promise<number | null> {
+    try {
+        const tabs = (await chrome.tabs.query({ url: LEETCODE_TAB_PATTERNS }))
+            .filter(injectableTab);
+        if (tabs.length === 0) return null;
+        const active = tabs.find((tab) => tab.active);
+        if (active) return active.id;
+        tabs.sort((a, b) => (b.lastAccessed ?? 0) - (a.lastAccessed ?? 0));
+        return tabs[0].id;
+    } catch {
+        return null;
+    }
+}
+
+function paintBadge(): void {
+    try {
+        const action = (chrome as unknown as {
+            action?: {
+                setBadgeText: (details: { text: string }) => void;
+                setBadgeBackgroundColor: (details: { color: string }) => void;
+            };
+        }).action;
+        if (!action) return;
+        const text = badgeState.text();
+        action.setBadgeText({ text });
+        if (text) action.setBadgeBackgroundColor({ color: "#D97757" });
+    } catch {
+        // action API may be unavailable in some contexts
+    }
+}
+
+function setInterventionBadge(pending: boolean): void {
+    badgeState.setIntervention(pending);
+    paintBadge();
+}
 
 /**
- * Injected into the active tab to show a lockout countdown overlay.
- * Uses the same Shadow DOM pattern as the intervention overlay.
- *
- * payload.duration_s  — lockout duration in seconds
- * payload.reason      — brief message explaining why
+ * Present a proposal. Returns whether the page panel is showing, so the
+ * trigger path can decide whether any other channel (OS notification,
+ * badge) is needed at all — one channel per event.
  */
-export function injectLockoutOverlay(payload: Record<string, unknown>): void {
-    const OID = "cortex-lockout-overlay";
-    type ManagedLockoutHost = HTMLElement & {
-        __cortexCleanup?: () => void;
-        __cortexPreviousFocus?: HTMLElement | null;
-    };
-    const existingHost = document.getElementById(OID) as ManagedLockoutHost | null;
-    existingHost?.__cortexCleanup?.();
-    const isUpdate = existingHost !== null;
-
-    const durationS = Math.max(1, Math.round(Number(payload.duration_s) || 60));
-    const reason = String(
-        payload.reason || "Take a moment to step back and think before continuing.",
-    );
-    const esc = (s: string) =>
-        s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-
-    function formatCountdown(totalSeconds: number): string {
-        const m = Math.floor(totalSeconds / 60);
-        const s = totalSeconds % 60;
-        return `${m}:${String(s).padStart(2, "0")}`;
-    }
-
-    const host = (existingHost ?? document.createElement("div")) as ManagedLockoutHost;
-    const previousFocus = existingHost?.__cortexPreviousFocus
-        ?? (document.activeElement instanceof HTMLElement
-            ? document.activeElement
-            : null);
-    host.__cortexPreviousFocus = previousFocus;
-    if (!existingHost) {
-        host.id = OID;
-        host.style.cssText =
-            "position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483647;pointer-events:none;";
-    }
-
-    const shadow = host.shadowRoot ?? host.attachShadow({ mode: "open" });
-    shadow.innerHTML = `
-<style>
-@keyframes panelIn{from{transform:translate(-50%,calc(-50% + 8px)) scale(.98);opacity:0}to{transform:translate(-50%,-50%) scale(1);opacity:1}}
-@keyframes panelOut{from{transform:translate(-50%,-50%) scale(1);opacity:1}to{transform:translate(-50%,calc(-50% + 8px)) scale(.98);opacity:0}}
-@keyframes fadeIn{from{opacity:0}to{opacity:1}}
-@keyframes fadeOut{from{opacity:1}to{opacity:0}}
-*{box-sizing:border-box;margin:0;padding:0}
-.bk{position:fixed;inset:0;background:rgba(0,0,0,.55);pointer-events:auto;animation:fadeIn 160ms cubic-bezier(.23,1,.32,1)}
-.pn{
-  position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:360px;
-  pointer-events:auto;
-  background:#111113;
-  border-radius:14px;
-  border:1px solid rgba(255,255,255,.06);
-  box-shadow:0 0 0 .5px rgba(0,0,0,.3),0 4px 20px rgba(0,0,0,.4),0 16px 40px rgba(0,0,0,.2);
-  font-family:-apple-system,BlinkMacSystemFont,'Inter','SF Pro Text',system-ui,sans-serif;
-  color:#e4e4e7;padding:28px 24px 22px;text-align:center;
-  animation:panelIn 200ms cubic-bezier(.23,1,.32,1);
-}
-.pn.cx-update{animation:none}
-.pn.cx-exit{animation:panelOut 160ms cubic-bezier(.4,0,1,1) forwards}
-.bk.cx-exit{animation:fadeOut 160ms cubic-bezier(.4,0,1,1) forwards}
-.hd{font-size:15px;font-weight:600;color:#e4e4e7;margin-bottom:8px;letter-spacing:-.2px}
-.rs{font-size:12px;color:#71717a;line-height:1.5;margin-bottom:20px}
-.tm{font-size:40px;font-weight:700;color:#e4e4e7;font-variant-numeric:tabular-nums;margin-bottom:20px;font-family:'SF Mono','Fira Code',ui-monospace,monospace}
-.sk{display:inline-block;padding:7px 18px;border:1px solid rgba(255,255,255,.08);border-radius:8px;background:none;color:#71717a;font-size:11px;cursor:pointer;font-family:inherit;transition:color 120ms cubic-bezier(.23,1,.32,1),border-color 120ms cubic-bezier(.23,1,.32,1),transform 120ms cubic-bezier(.23,1,.32,1)}
-.sk:active{transform:scale(.97)}
-.sk:focus-visible{outline:2px solid #dfb15b;outline-offset:2px}
-@media (hover:hover) and (pointer:fine){.sk:hover{color:#e4e4e7;border-color:rgba(255,255,255,.15)}}
-@media (prefers-reduced-motion:reduce){.pn,.bk{animation:none!important}.sk{transition:color 120ms cubic-bezier(.23,1,.32,1),border-color 120ms cubic-bezier(.23,1,.32,1)!important}.sk:active{transform:none}}
-</style>
-<div class="bk" id="bk"></div>
-<div class="pn${isUpdate ? " cx-update" : ""}" role="dialog" aria-modal="true" aria-labelledby="cortex-lockout-title" aria-describedby="cortex-lockout-reason cortex-lockout-countdown">
-  <div class="hd" id="cortex-lockout-title">Lockout Active</div>
-  <div class="rs" id="cortex-lockout-reason">${esc(reason)}</div>
-  <div class="tm" id="cortex-lockout-countdown" role="timer">${formatCountdown(durationS)}</div>
-  <button class="sk" id="skip">I need to continue</button>
-</div>
-`;
-
-    if (!existingHost) document.body.appendChild(host);
-
-    let remaining = durationS;
-    let dismissed = false;
-    let removalTimer = 0;
-    const reducedMotion = window.matchMedia(
-        "(prefers-reduced-motion: reduce)",
-    ).matches;
-
-    function removeAndRestoreFocus(): void {
-        host.remove();
-        const target = host.__cortexPreviousFocus;
-        if (!target?.isConnected) return;
-        try {
-            target.focus({ preventScroll: true });
-        } catch {
-            target.focus();
-        }
-    }
-
-    function dismiss(): void {
-        if (dismissed) return;
-        dismissed = true;
-        window.clearInterval(timer);
-        document.removeEventListener("keydown", handleKeydown);
-        if (reducedMotion) {
-            removeAndRestoreFocus();
-            return;
-        }
-        shadow.querySelector(".pn")?.classList.add("cx-exit");
-        shadow.querySelector(".bk")?.classList.add("cx-exit");
-        removalTimer = window.setTimeout(removeAndRestoreFocus, 170);
-    }
-
-    const timer = setInterval(() => {
-        remaining--;
-        const el = shadow.getElementById("cortex-lockout-countdown");
-        if (el) el.textContent = formatCountdown(remaining);
-        if (remaining <= 0) {
-            clearInterval(timer);
-            dismiss();
-        }
-    }, 1000);
-
-    // Skip button — no penalty, just dismiss. Lives in injected page-context
-    // (executeScript), so the service-worker DEBUG flag is out of scope here.
-    const skipButton = shadow.getElementById("skip") as HTMLButtonElement | null;
-    skipButton?.addEventListener("click", () => {
-        dismiss();
-    });
-
-    const handleKeydown = (event: KeyboardEvent) => {
-        if (event.key === "Escape") {
-            event.preventDefault();
-            dismiss();
-            return;
-        }
-        if (event.key === "Tab") {
-            event.preventDefault();
-            skipButton?.focus({ preventScroll: true });
-        }
-    };
-    document.addEventListener("keydown", handleKeydown);
-    skipButton?.focus({ preventScroll: true });
-
-    host.__cortexCleanup = () => {
-        window.clearInterval(timer);
-        window.clearTimeout(removalTimer);
-        document.removeEventListener("keydown", handleKeydown);
-    };
-
-    // Clicking the backdrop does not dismiss. The explicit skip control and
-    // standard Escape key both preserve user agency and restore prior focus.
-}
-
-export function injectLeetCodeCoachOverlay(kind: string, payload: Record<string, unknown>): void {
-    const OID = "cortex-leetcode-coach";
-    type ManagedCoachHost = HTMLElement & {
-        __cortexCleanup?: () => void;
-    };
-    const existingHost = document.getElementById(OID) as ManagedCoachHost | null;
-    existingHost?.__cortexCleanup?.();
-    const isUpdate = existingHost !== null;
-
-    const esc = (s: string) =>
-        s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    const tags = Array.isArray(payload.tags)
-        ? (payload.tags as unknown[]).map(String).slice(0, 5)
-        : [];
-
-    let title = "Cortex LeetCode Coach";
-    let body = "Pause briefly and make the next move explicit.";
-    let extra = "";
-
-    if (kind === "LEETCODE_SHOW_SCRATCHPAD") {
-        title = "Restate Before Solving";
-        body = `Write the input, output, and invariant for ${esc(String(payload.problem_title || "this problem"))}.`;
-        extra = `<textarea id="lc-note" placeholder="In my own words, the problem asks..." spellcheck="false"></textarea>`;
-    } else if (kind === "LEETCODE_SHOW_PATTERN_LADDER") {
-        title = "Pattern Ladder";
-        body = "Reveal only as much help as you need. Start with the category, not code.";
-        const tagHtml = tags.map((t) => `<span>${esc(t)}</span>`).join("");
-        extra = `<div class="tags">${tagHtml || "<span>unknown pattern</span>"}</div><button id="lc-reveal">Reveal next hint</button><div id="lc-hint" class="hint">Hint 1: classify the problem type before choosing data structures.</div>`;
-    } else if (kind === "LEETCODE_SHOW_SUBMISSION_GATE") {
-        title = "Submission Gate";
-        body = `${Number(payload.wrong_answer_count || 0)} wrong answers so far. Add one concrete failing test before the next submit.`;
-        extra = `<label><input id="lc-check" type="checkbox"> I traced one failing case by hand</label>`;
-    } else if (kind === "LEETCODE_SHOW_SOLUTION_FRICTION") {
-        title = "Before Opening Solutions";
-        body = "Write what you expect the editorial's key idea to be. This keeps the solution useful instead of replacing the learning step.";
-        extra = `<textarea id="lc-note" placeholder="My hypothesis is..." spellcheck="false"></textarea>`;
-    } else if (kind === "LEETCODE_SHOW_CONSOLIDATION") {
-        title = "Consolidate the Solve";
-        body = "Capture the reusable pattern while the successful path is still fresh.";
-        extra = `<textarea id="lc-note" placeholder="The transferable pattern was..." spellcheck="false"></textarea>`;
-    }
-
-    const host = (existingHost ?? document.createElement("div")) as ManagedCoachHost;
-    if (!existingHost) {
-        host.id = OID;
-        host.style.cssText = "position:fixed;inset:0;z-index:2147483647;pointer-events:none;";
-    }
-    const shadow = host.shadowRoot ?? host.attachShadow({ mode: "open" });
-    shadow.innerHTML = `
-<style>
-*{box-sizing:border-box}
-.card{position:fixed;right:22px;bottom:22px;width:min(380px,calc(100vw - 28px));pointer-events:auto;background:#101112;color:#f3f0e8;border:1px solid rgba(243,240,232,.12);border-radius:18px;box-shadow:0 18px 60px rgba(0,0,0,.35);font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;padding:18px;animation:in 200ms cubic-bezier(.23,1,.32,1)}
-@keyframes in{from{opacity:0;transform:translateY(10px) scale(.98)}to{opacity:1;transform:translateY(0) scale(1)}}
-@keyframes out{from{opacity:1;transform:translateY(0) scale(1)}to{opacity:0;transform:translateY(10px) scale(.98)}}
-.card.cx-update{animation:none}.card.cx-exit{animation:out 160ms cubic-bezier(.4,0,1,1) forwards}
-.top{display:flex;align-items:center;gap:10px;margin-bottom:10px}.dot{width:9px;height:9px;border-radius:99px;background:#dfb15b;box-shadow:0 0 18px rgba(223,177,91,.55)}.ttl{font-size:14px;font-weight:700;letter-spacing:-.02em;flex:1}.x{display:grid;place-items:center;width:32px;height:32px;padding:0;border:0;background:transparent;color:#9b9488;font-size:18px;line-height:1;cursor:pointer}.body{font-size:13px;line-height:1.5;color:#cfc7b7;margin-bottom:13px}textarea{width:100%;height:92px;resize:vertical;background:#18191a;color:#f3f0e8;border:1px solid rgba(243,240,232,.14);border-radius:12px;padding:10px;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;outline:none}textarea:focus{border-color:#dfb15b}.tags{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}.tags span{font-size:11px;color:#dfb15b;border:1px solid rgba(223,177,91,.25);border-radius:99px;padding:4px 8px;background:rgba(223,177,91,.08)}button{border:1px solid rgba(243,240,232,.14);background:#dfb15b;color:#15110a;border-radius:10px;padding:8px 11px;font-size:12px;font-weight:700;cursor:pointer;transition:transform 120ms cubic-bezier(.23,1,.32,1),filter 120ms cubic-bezier(.23,1,.32,1),background-color 120ms cubic-bezier(.23,1,.32,1)}button:active{transform:scale(.97)}button:focus-visible{outline:2px solid #f3f0e8;outline-offset:2px}.hint{margin-top:10px;font-size:12px;line-height:1.45;color:#cfc7b7;background:#18191a;border-radius:10px;padding:10px}label{display:flex;gap:8px;align-items:center;font-size:12px;color:#cfc7b7}@media (hover:hover) and (pointer:fine){button:hover{filter:brightness(.94)}.x:hover{background:rgba(243,240,232,.08);filter:none}}@media (prefers-reduced-motion:reduce){.card{animation:none!important}button{transition:filter 120ms cubic-bezier(.23,1,.32,1),background-color 120ms cubic-bezier(.23,1,.32,1)!important}button:active{transform:none}}
-</style>
-<div class="card${isUpdate ? " cx-update" : ""}" role="region" aria-labelledby="cortex-coach-title">
-  <div class="top"><span class="dot"></span><div class="ttl" id="cortex-coach-title">${esc(title)}</div><button class="x" id="lc-close" type="button" aria-label="Dismiss Cortex coach">×</button></div>
-  <div class="body">${body}</div>
-  ${extra}
-</div>`;
-    if (!existingHost) document.body.appendChild(host);
-
-    let dismissed = false;
-    let removalTimer = 0;
-    const reducedMotion = window.matchMedia(
-        "(prefers-reduced-motion: reduce)",
-    ).matches;
-    const dismiss = () => {
-        if (dismissed) return;
-        dismissed = true;
-        const card = shadow.querySelector<HTMLElement>(".card");
-        if (reducedMotion || !card) {
-            host.remove();
-            return;
-        }
-        card.classList.add("cx-exit");
-        removalTimer = window.setTimeout(() => host.remove(), 170);
-    };
-    shadow.getElementById("lc-close")?.addEventListener("click", dismiss);
-    shadow.getElementById("lc-reveal")?.addEventListener("click", () => {
-        const hint = shadow.getElementById("lc-hint");
-        if (hint) {
-            hint.textContent = "Hint 2: define the state transition and one invariant before writing more code.";
-        }
-    });
-    host.__cortexCleanup = () => window.clearTimeout(removalTimer);
-}
-
 async function handleIntervention(
     payload: Record<string, unknown>,
-): Promise<void> {
+): Promise<boolean> {
     const uiPlan = payload.ui_plan as Record<string, boolean> | undefined;
     let executableActionIds: string[] = [];
     try {
@@ -2331,18 +1908,26 @@ async function handleIntervention(
     // Presentation is allowed; tab grouping/hiding and action execution require
     // a separate exact authorization transaction. Legacy triggers therefore
     // remain safe even when they contain hide_targets.
+    let overlayShown = false;
     if (uiPlan?.show_overlay || uiPlan?.dim_background) {
         try {
             const [tab] = await chrome.tabs.query({
                 active: true,
                 currentWindow: true,
             });
-            if (tab?.id && !tab.incognito) {
+            if (tab && injectableTab(tab)) {
+                // The page never sees the raw payload: the worker normalises
+                // ``micro_steps`` (``MicroStep`` objects on the wire) and
+                // filters placeholder copy before serialising the model.
                 await chrome.scripting.executeScript({
                     target: { tabId: tab.id },
-                    func: injectOverlay,
-                    args: [payload, executableActionIds],
+                    func: injectInterventionPanel,
+                    args: [
+                        buildInterventionPanelModel(payload, executableActionIds),
+                        SURFACE_CSS,
+                    ],
                 });
+                overlayShown = true;
             }
         } catch (e) {
             if (DEBUG) console.error("Cortex: failed to inject overlay", e);
@@ -2353,6 +1938,7 @@ async function handleIntervention(
         type: "INTERVENTION_TRIGGER",
         payload,
     });
+    return overlayShown;
 }
 
 async function handleContextRequest(msg: WSMessage): Promise<void> {
@@ -2404,20 +1990,10 @@ async function handleRestore(payload: Record<string, unknown>): Promise<void> {
     // requires an exact restore_id plus receipt-derived inverse actions and is
     // handled by the fail-closed transaction adapter below.
     const exactRestore = await handleExactRestoreCommand(payload);
-    try {
-        const tabs = await chrome.tabs.query({});
-        await Promise.all(
-            tabs
-                .filter((tab) => typeof tab.id === "number")
-                .map((tab) =>
-                    chrome.tabs.sendMessage(tab.id as number, {
-                        type: "REMOVE_OVERLAY",
-                    }).catch((err: unknown) => {
-                        if (DEBUG) console.debug("[cortex.bg] REMOVE_OVERLAY sendMessage failed (tab may not have content script): %o", err);
-                    }),
-                ),
-        );
-    } catch { /* best-effort presentation cleanup */ }
+    // No content script receives runtime messages, so the panels are
+    // removed by injecting the self-contained remover into every tab.
+    await removeOverlaysEverywhere();
+    setInterventionBadge(false);
     // F4 (Phase-4 audit): the in-memory latch MUST be nulled even if
     // session-storage clearing throws. The earlier ``try { ... } catch {}``
     // both swallowed the failure and worked correctly, but a noisy
@@ -2460,6 +2036,9 @@ interface LaunchResult {
  */
 async function runLaunchCortex(): Promise<LaunchResult> {
     let lastError = "";
+    // A launch is the user pressing Start: it clears any sticky stop intent
+    // before the reconnect paths below run.
+    await clearStopIntent();
 
     const waitAndEnableCamera = async (maxAttempts: number): Promise<boolean> => {
         if (!connected) connect();
@@ -2538,10 +2117,12 @@ async function runLaunchCortex(): Promise<LaunchResult> {
             return { ok: true, status: "camera_enabled" };
         }
 
+        // ``lastError`` stays in the log; the popup shows consumer copy.
+        if (DEBUG && lastError) console.debug("[cortex.bg] launch failed:", lastError);
         return {
             ok: false,
             status: "not_connected",
-            error: lastError || "Could not start daemon. Run in terminal: python -m cortex.scripts.run_dev",
+            error: LAUNCH_FAILED_STATUS,
         };
     } catch (e) {
         return { ok: false, status: "error", error: String(e) };
@@ -2717,64 +2298,6 @@ function isDistractionUrl(url: string, title?: string): boolean {
         session: focusSession,
         presetPatterns: activeFocusPresetPatterns,
         customDomains: activeFocusCustomDomains,
-    });
-}
-
-function injectDistractionInterceptor(
-    focusMin: number,
-    streakMin: number,
-    distractionsBlocked: number,
-    url: string,
-): void {
-    const domain = new URL(url).hostname.replace("www.", "");
-
-    // Create a full-screen overlay instead of replacing body content.
-    // This preserves the original page underneath so "Continue" can reveal it
-    // without a reload flash.
-    const overlay = document.createElement("div");
-    overlay.id = "cortex-distraction-interceptor";
-    overlay.style.cssText =
-        "position:fixed;inset:0;z-index:2147483647;" +
-        "display:flex;align-items:center;justify-content:center;" +
-        "background:#09090b;font-family:-apple-system,BlinkMacSystemFont,'Inter','SF Pro Text',system-ui,sans-serif;color:#e4e4e7;";
-
-    const container = document.createElement("div");
-    container.style.cssText = "text-align:center;max-width:380px;padding:40px;";
-    container.innerHTML = `
-        <div style="width:48px;height:48px;margin:0 auto 28px;border-radius:50%;background:rgba(16,185,129,.1);display:flex;align-items:center;justify-content:center">
-            <div style="width:8px;height:8px;border-radius:50%;background:#10b981;box-shadow:0 0 10px rgba(16,185,129,.4)"></div>
-        </div>
-        <h1 style="font-size:16px;font-weight:600;margin:0 0 6px;letter-spacing:-.3px;color:#e4e4e7">
-            Focus session active
-        </h1>
-        <p style="font-size:13px;color:#71717a;margin:0 0 28px;line-height:1.6">
-            <span style="color:#e4e4e7;font-family:'SF Mono','Fira Code',ui-monospace,monospace;font-size:12px">${focusMin}m</span> focused,
-            <span style="color:#e4e4e7;font-family:'SF Mono','Fira Code',ui-monospace,monospace;font-size:12px">${streakMin}m</span> streak.
-            <br><span style="color:#3f3f46">${domain}</span> will break your flow.
-        </p>
-        <div style="display:flex;gap:8px;justify-content:center">
-            <button id="cortex-go-back" style="padding:9px 24px;border:none;border-radius:8px;background:#e4e4e7;color:#09090b;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit">
-                Go back
-            </button>
-            <button id="cortex-continue" style="padding:9px 24px;border:1px solid rgba(255,255,255,.06);border-radius:8px;background:transparent;color:#3f3f46;font-size:12px;cursor:pointer;font-family:inherit">
-                Continue
-            </button>
-        </div>
-        <p style="font-size:11px;color:#3f3f46;margin-top:20px;font-family:'SF Mono','Fira Code',ui-monospace,monospace;letter-spacing:.3px">
-            ${distractionsBlocked} blocked
-        </p>
-    `;
-    overlay.appendChild(container);
-    document.body.appendChild(overlay);
-
-    document.getElementById("cortex-go-back")?.addEventListener("click", () => {
-        // Notify background that user resisted distraction
-        try { chrome.runtime.sendMessage({ type: "DISTRACTION_BLOCKED" }); } catch {}
-        history.back();
-    });
-    document.getElementById("cortex-continue")?.addEventListener("click", () => {
-        // Remove overlay to reveal the original page — no reload needed
-        overlay.remove();
     });
 }
 
@@ -3029,7 +2552,7 @@ async function verifyBrowserEffect(
     const originalTabId = typeof inverse.originalTabId === "number"
         ? inverse.originalTabId
         : null;
-    if (action.capability === "close_tab" || action.capability === "bookmark_and_close") {
+    if (action.capability === "close_tab") {
         let originalAbsent = originalTabId !== null;
         if (originalTabId !== null) {
             try {
@@ -3039,30 +2562,12 @@ async function verifyBrowserEffect(
                 originalAbsent = true;
             }
         }
-        let bookmarkVerified = true;
-        const bookmarkId = typeof inverse.bookmarkId === "string"
-            ? inverse.bookmarkId
-            : "";
-        if (action.capability === "bookmark_and_close") {
-            bookmarkVerified = false;
-            if (bookmarkId) {
-                try {
-                    const [bookmark] = await chrome.bookmarks.get(bookmarkId);
-                    bookmarkVerified = Boolean(
-                        bookmark && urlsMatch(bookmark.url, inverse.url),
-                    );
-                } catch {
-                    bookmarkVerified = false;
-                }
-            }
-        }
-        const verified = originalAbsent && bookmarkVerified;
         return {
-            verified,
-            detail: verified
+            verified: originalAbsent,
+            detail: originalAbsent
                 ? "Exact closed-tab postcondition verified"
                 : "Closed-tab postcondition could not be verified",
-            fingerprint: { originalTabId, originalAbsent, bookmarkId, bookmarkVerified },
+            fingerprint: { originalTabId, originalAbsent },
         };
     }
     if (action.capability === "group_tabs") {
@@ -4754,11 +4259,15 @@ const browserCapabilityHandlers: CapabilityHandlers<
         context.preparedInverse,
         context.checkpointInverse,
     ),
-    bookmark_and_close: (action, context) => executeBookmarkAndClose(
-        action,
-        context.preparedInverse,
-        context.checkpointInverse,
-    ),
+    // ``bookmark_and_close`` is never authorised by the capability policy and
+    // the extension no longer holds the ``bookmarks`` permission; the handler
+    // exists only because the executor type covers every wire action_type.
+    bookmark_and_close: async (action) => ({
+        action_id: action.action_id,
+        success: false,
+        message: "Cortex does not bookmark or close existing tabs",
+        reversible: false,
+    }),
     open_url: (action, context) => executeOpenUrl(
         action,
         context.preparedInverse,
@@ -4815,13 +4324,6 @@ async function executeAction(
 async function executeCloseTab(action: SuggestedAction): Promise<ActionExecuteResult> {
     const aid = action.action_id || `close_${Date.now()}`;
 
-    // Check if tab closing is disabled by user toggle
-    try {
-        const { cortex_tab_close_disabled } = await chrome.storage.local.get("cortex_tab_close_disabled");
-        if (cortex_tab_close_disabled === true) {
-            return { action_id: aid, success: false, message: "Tab closing is disabled", reversible: false };
-        }
-    } catch { /* storage read failed — proceed normally */ }
     // Phase 4d Task C: Pydantic's SuggestedAction.tab_index is strict
     // ``int | None`` — a string-typed payload (e.g. from a buggy LLM
     // adapter) gets rejected server-side, so we mirror that contract
@@ -4969,134 +4471,6 @@ async function executeGroupTabs(
         timestamp: Date.now(),
     });
     return { action_id: action.action_id, success: true, message: `${tabIds.length} tabs grouped`, reversible: true };
-}
-
-async function executeBookmarkAndClose(
-    action: SuggestedAction,
-    preparedInverse: Record<string, unknown>,
-    checkpointInverse: (inverse: Record<string, unknown>) => Promise<void>,
-): Promise<ActionExecuteResult> {
-    const aid = action.action_id || `bmc_${Date.now()}`;
-
-    // Check if tab closing is disabled by user toggle
-    try {
-        const { cortex_tab_close_disabled } = await chrome.storage.local.get("cortex_tab_close_disabled");
-        if (cortex_tab_close_disabled === true) {
-            return { action_id: aid, success: false, message: "Tab closing is disabled", reversible: false };
-        }
-    } catch { /* storage read failed — proceed normally */ }
-    // Phase 4d Task C: strict tab_index parity with the Python schema.
-    if (
-        action.tab_index === null
-        || action.tab_index === undefined
-        || typeof action.tab_index !== "number"
-        || !Number.isInteger(action.tab_index)
-        || action.tab_index < 0
-    ) {
-        if (DEBUG) {
-            console.warn(
-                "Cortex: invalid tab_index in bookmark_and_close action, dropping",
-                { action_id: aid, tab_index: action.tab_index },
-            );
-        }
-        return { action_id: aid, success: false, message: "Invalid tab_index", reversible: false };
-    }
-    const tabIndex = action.tab_index;
-
-    const v = await validateTab(tabIndex);
-    if (!v.valid) {
-        return {
-            action_id: aid,
-            success: false,
-            message: v.message || "Exact tab target is unavailable",
-            reversible: false,
-        };
-    }
-    const tabId = v.tabId;
-    const snap = interventionTabSnapshot.get(tabIndex);
-    const tabUrl = snap?.url || "";
-    const tabTitle = snap?.title || "";
-
-    // LAYER 1: Final active-tab guard
-    try {
-        const liveTab = await chrome.tabs.get(tabId);
-        if (liveTab.active) {
-            return { action_id: aid, success: false, message: "Refusing to close the active tab", reversible: false };
-        }
-    } catch {
-        return { action_id: aid, success: false, message: "Tab already closed", reversible: false };
-    }
-
-    if (!tabUrl) {
-        return {
-            action_id: aid,
-            success: false,
-            message: "Exact tab URL is unavailable",
-            reversible: false,
-        };
-    }
-    let bookmarkId: string;
-    let bookmark;
-    try {
-        bookmark = await chrome.bookmarks.create({
-            title: tabTitle || "Cortex bookmark",
-            url: tabUrl,
-        });
-        bookmarkId = bookmark.id;
-    } catch {
-        return {
-            action_id: aid,
-            success: false,
-            message: "Could not create the requested bookmark",
-            reversible: false,
-        };
-    }
-    try {
-        await checkpointInverse({
-            ...preparedInverse,
-            bookmarkId,
-        });
-    } catch (error) {
-        try {
-            await chrome.bookmarks.remove(bookmarkId);
-        } catch {
-            throw new IndeterminateBrowserMutationError(
-                "Bookmark exists but its inverse checkpoint failed",
-                { ...preparedInverse, bookmarkId },
-                error,
-            );
-        }
-        return {
-            action_id: aid,
-            success: false,
-            message: "Bookmark checkpoint failed; the bookmark was rolled back",
-            reversible: false,
-        };
-    }
-    try {
-        await chrome.tabs.remove(tabId);
-    } catch {
-        try {
-            await chrome.bookmarks.remove(bookmarkId);
-        } catch {
-            throw new IndeterminateBrowserMutationError(
-                "Tab close failed and the Cortex bookmark may still exist",
-                { ...preparedInverse, bookmarkId },
-            );
-        }
-        return { action_id: aid, success: false, message: "Failed to close tab", reversible: false };
-    }
-    pushUndo({
-        action_id: aid,
-        action_type: "bookmark_and_close",
-        undo_data: {
-            url: tabUrl,
-            title: tabTitle,
-            bookmarkId,
-        },
-        timestamp: Date.now(),
-    });
-    return { action_id: aid, success: true, message: "Bookmarked & closed", reversible: true };
 }
 
 async function executeOpenUrl(
@@ -5392,8 +4766,8 @@ async function executeSuggestMovementBreak(
     const aid = action.action_id || `movement_${Date.now()}`;
     const rawMinutes = parseInt((action.target || "").trim(), 10);
     const minutes = Number.isFinite(rawMinutes) && rawMinutes > 0 ? rawMinutes : 2;
-    const title = "Time for a 2-minute stand & stretch";
-    const body = `Step away for ${minutes} minute${minutes === 1 ? "" : "s"}. Your back will thank you.`;
+    const title = "Time to stand and stretch";
+    const body = `Step away for ${minutes} minute${minutes === 1 ? "" : "s"}.`;
 
     // Prefer chrome.notifications if available + permitted. We never block
     // on it — a missing permission silently falls through to the toast.
@@ -5528,65 +4902,72 @@ async function undoAction(actionId: string): Promise<boolean> {
     }
 }
 
-async function executeAllRecommended(
+// One apply per intervention at a time: a second click (or a popup and a
+// page panel racing) joins the in-flight authorization instead of sending a
+// duplicate INTERVENTION_AUTHORIZE.
+const applyInFlight = new Map<string, Promise<ExecuteAllRecommendedResponse>>();
+
+function executeAllRecommended(
     interventionId: string,
-): Promise<ActionExecuteResult[]> {
-    if (
-        !interventionPresentation.active
-        || interventionPresentation.active.plan.intervention_id !== interventionId
-    ) {
-        throw new Error("Intervention is no longer active");
-    }
-    const verified = await verifyActionManifest(
-        interventionPresentation.active.plan.action_manifest,
-    );
-    const actionIds = [...verified.actionsById.values()]
-        .filter((action) => {
-            if (action.source !== "suggested_action") return false;
-            try {
-                return suggestedActionFromManifest(action).category === "recommended";
-            } catch {
-                return false;
+): Promise<ExecuteAllRecommendedResponse> {
+    const inFlight = applyInFlight.get(interventionId);
+    if (inFlight) return inFlight;
+    const run = (async (): Promise<ExecuteAllRecommendedResponse> => {
+        let results: ActionExecuteResult[];
+        try {
+            if (
+                !interventionPresentation.active
+                || interventionPresentation.active.plan.intervention_id !== interventionId
+            ) {
+                throw new Error("Intervention is no longer active");
             }
-        })
-        .map((action) => action.action_id);
-    const results = await authorizeActionIds(interventionId, actionIds);
-
-    // Clear the intervention after execution so popup doesn't show stale data
-    const hadIntervention = interventionPresentation.active !== null;
-    const mountedInterventionId =
-        typeof interventionPresentation.active?.plan.intervention_id === "string"
-            ? (interventionPresentation.active.plan.intervention_id as string)
-            : undefined;
-    // F16: outbound USER_ACTION carries the same cid the daemon stamped on
-    // the plan, so a superseded ACK is ignored by `_handle_user_action`.
-    const interventionCid = interventionPresentation.active?.correlation_id;
-    interventionPresentation.clear();
-    // Persist cleared state
-    try { await chrome.storage.session.remove(["cortex_active_intervention", "cortex_active_intervention_cid", "cortex_active_intervention_mounted_at", "cortex_tab_snapshot", "cortex_tab_mgr_snapshots"]); } catch {}
-
-    // Notify daemon that user engaged with the intervention
-    if (hadIntervention && mountedInterventionId) {
-        send({
-            type: "USER_ACTION",
-            payload: {
-                action: "engaged",
-                intervention_id: mountedInterventionId,
-                timestamp: Date.now() / 1000,
-            },
-            timestamp: Date.now() / 1000,
-            sequence: ++sequence,
-            correlation_id: interventionCid,
+            const verified = await verifyActionManifest(
+                interventionPresentation.active.plan.action_manifest,
+            );
+            const actionIds = [...verified.actionsById.values()]
+                .filter((action) => {
+                    if (action.source !== "suggested_action") return false;
+                    try {
+                        return suggestedActionFromManifest(action).category === "recommended";
+                    } catch {
+                        return false;
+                    }
+                })
+                .map((action) => action.action_id);
+            results = await authorizeActionIds(interventionId, actionIds);
+        } catch (error) {
+            const outcome: ApplyOutcome = reduceApplyResults(
+                { success: false, message: String(error) },
+            );
+            return { ok: false, results: [], outcome };
+        }
+        // The proposal stays mounted: an applied change is undoable for the
+        // whole window and the daemon owns the intervention's lifecycle.
+        // Sending ``engaged`` here would make the daemon end (and restore)
+        // the intervention seconds after it was applied.
+        const outcome = reduceApplyResults(results);
+        const response: ExecuteAllRecommendedResponse = {
+            ok: outcome.phase !== "failed",
+            results,
+            outcome,
+        };
+        // Both surfaces render the same outcome: the requester through the
+        // response, every other open surface through this broadcast.
+        broadcastToPopup({
+            type: "INTERVENTION_APPLIED",
+            intervention_id: interventionId,
+            results,
+            outcome,
         });
-    }
-
-    // Broadcast to popup so it clears the intervention card
-    broadcastToPopup({
-        type: "INTERVENTION_RESTORE",
-        payload: { intervention_id: mountedInterventionId },
+        return response;
+    })();
+    applyInFlight.set(interventionId, run);
+    void run.finally(() => {
+        if (applyInFlight.get(interventionId) === run) {
+            applyInFlight.delete(interventionId);
+        }
     });
-
-    return results;
+    return run;
 }
 
 /** Undo all recent actions (used by the overlay's "Undo" button). */
@@ -5656,112 +5037,29 @@ function checkHealthAlerts(payload: Record<string, unknown>): void {
     }
 }
 
+/**
+ * One channel per health nudge: the page toast where the user is looking;
+ * the popup only hears about it when no page could show the toast.
+ */
 function showHealthNotification(title: string, body: string): void {
-    broadcastToPopup({ type: "HEALTH_ALERT", title, body });
-    // Also inject a small toast into active tab
-    injectToast(title, body);
+    void injectToast(title, body).then((shown) => {
+        if (!shown) broadcastToPopup({ type: "HEALTH_ALERT", title, body });
+    });
 }
 
-async function injectToast(title: string, body: string): Promise<void> {
+/** Inject the tokenised toast into the active tab; resolves whether it showed. */
+async function injectToast(title: string, body: string): Promise<boolean> {
     try {
         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (tab?.id && tab.url && !tab.incognito && !tab.url.startsWith("chrome://")) {
-            await chrome.scripting.executeScript({
-                target: { tabId: tab.id },
-                func: (t: string, b: string) => {
-                    const id = "cortex-toast";
-                    document.getElementById(id)?.remove();
-                    const host = document.createElement("div");
-                    host.id = id;
-                    host.style.cssText =
-                        "position:fixed;top:16px;right:16px;z-index:2147483647;";
-                    host.setAttribute("role", "status");
-                    host.setAttribute("aria-live", "polite");
-                    const shadow = host.attachShadow({ mode: "open" });
-                    const style = document.createElement("style");
-                    style.textContent = `
-                        *{box-sizing:border-box}
-                        .toast{position:relative;width:min(320px,calc(100vw - 32px));padding:12px 42px 12px 14px;border-radius:10px;font-family:-apple-system,BlinkMacSystemFont,'Inter','SF Pro Text',system-ui,sans-serif;background:#111113;color:#e4e4e7;border:1px solid rgba(255,255,255,.06);box-shadow:0 4px 20px rgba(0,0,0,.4);font-size:12px;line-height:1.5}
-                        .title{font-weight:600;margin-bottom:3px;font-size:12px;color:#e4e4e7}
-                        .body{color:#a1a1aa;font-size:11px}
-                        .close{position:absolute;top:6px;right:6px;width:32px;height:32px;border:0;border-radius:7px;background:transparent;color:#a1a1aa;font:16px/1 system-ui;cursor:pointer;transition:background-color 120ms cubic-bezier(.23,1,.32,1),color 120ms cubic-bezier(.23,1,.32,1),transform 120ms cubic-bezier(.23,1,.32,1)}
-                        .close:active{transform:scale(.96)}
-                        .close:focus-visible{outline:2px solid #dfb15b;outline-offset:1px}
-                        @media (hover:hover) and (pointer:fine){.close:hover{background:rgba(255,255,255,.07);color:#e4e4e7}}
-                        @media (prefers-reduced-motion:reduce){.close{transition:background-color 120ms cubic-bezier(.23,1,.32,1),color 120ms cubic-bezier(.23,1,.32,1)}.close:active{transform:none}}
-                    `;
-                    const toast = document.createElement("div");
-                    toast.className = "toast";
-                    const titleEl = document.createElement("div");
-                    titleEl.className = "title";
-                    titleEl.textContent = t;
-                    const bodyEl = document.createElement("div");
-                    bodyEl.className = "body";
-                    bodyEl.textContent = b;
-                    const close = document.createElement("button");
-                    close.className = "close";
-                    close.type = "button";
-                    close.setAttribute("aria-label", "Dismiss health notification");
-                    close.textContent = "×";
-                    toast.append(titleEl, bodyEl, close);
-                    shadow.append(style, toast);
-                    document.body.appendChild(host);
-
-                    const reduced = window.matchMedia(
-                        "(prefers-reduced-motion: reduce)",
-                    ).matches;
-                    let dismissed = false;
-                    let timeoutId = 0;
-                    const dismiss = () => {
-                        if (dismissed) return;
-                        dismissed = true;
-                        window.clearTimeout(timeoutId);
-                        toast.getAnimations().forEach((animation) =>
-                            animation.cancel(),
-                        );
-                        if (reduced) {
-                            host.remove();
-                            return;
-                        }
-                        const exit = toast.animate(
-                            [
-                                { opacity: 1, transform: "translateY(0)" },
-                                {
-                                    opacity: 0,
-                                    transform: "translateY(-8px)",
-                                },
-                            ],
-                            {
-                                duration: 140,
-                                easing: "cubic-bezier(.4,0,1,1)",
-                                fill: "forwards",
-                            },
-                        );
-                        exit.onfinish = () => host.remove();
-                    };
-                    close.addEventListener("click", dismiss);
-                    if (!reduced) {
-                        toast.animate(
-                            [
-                                {
-                                    opacity: 0,
-                                    transform: "translateY(-8px)",
-                                },
-                                { opacity: 1, transform: "translateY(0)" },
-                            ],
-                            {
-                                duration: 160,
-                                easing: "cubic-bezier(.23,1,.32,1)",
-                            },
-                        );
-                    }
-                    timeoutId = window.setTimeout(dismiss, 8000);
-                },
-                args: [title, body],
-            });
-        }
+        if (!tab || !injectableTab(tab)) return false;
+        await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            func: injectCortexToast,
+            args: [title, body, SURFACE_CSS],
+        });
+        return true;
     } catch {
-        // Injection failed
+        return false;
     }
 }
 
@@ -5809,19 +5107,8 @@ function surfaceInterventionOSNotification(
     const focusHint = String(payload.primary_focus || "");
     const interventionId = String(payload.intervention_id || "");
 
-    // 1) Badge bump — visible in any tab.
-    try {
-        const action = (chrome as unknown as {
-            action?: { setBadgeText: (d: { text: string }) => void;
-                setBadgeBackgroundColor: (d: { color: string }) => void; };
-        }).action;
-        if (action) {
-            action.setBadgeText({ text: "1" });
-            action.setBadgeBackgroundColor({ color: "#D97757" });
-        }
-    } catch { /* badge unavailable */ }
-
-    // 2) System notification with action buttons.
+    // The badge is owned by ``badgeState`` (set by the trigger path when no
+    // surface is on screen); this function only owns the OS notification.
     try {
         const notifications = (chrome as unknown as {
             notifications?: {
@@ -5884,23 +5171,8 @@ function surfaceInterventionOSNotification(
  * that omit the API.
  */
 function setRecapBadge(on: boolean): void {
-    try {
-        const action = (chrome as unknown as {
-            action?: {
-                setBadgeText: (details: { text: string }) => void;
-                setBadgeBackgroundColor: (details: { color: string }) => void;
-            };
-        }).action;
-        if (!action) return;
-        if (on) {
-            action.setBadgeText({ text: "✓" });
-            action.setBadgeBackgroundColor({ color: "#D97757" });
-        } else {
-            action.setBadgeText({ text: "" });
-        }
-    } catch {
-        // action API may be unavailable in some contexts
-    }
+    badgeState.setRecap(on);
+    paintBadge();
 }
 
 let lastAmbientBroadcast = 0;
@@ -5979,6 +5251,7 @@ chrome.runtime.onMessage.addListener(
                             }
                             sendResponse({
                                 connected,
+                                stopRequested,
                                 state: currentState,
                                 intervention: interventionPresentation.active?.plan ?? null,
                                 focusSession: focusSession ? getFocusSessionSnapshot() : null,
@@ -5989,6 +5262,7 @@ chrome.runtime.onMessage.addListener(
                 }
                 sendResponse({
                     connected,
+                    stopRequested,
                     state: currentState,
                     intervention: interventionPresentation.active.plan,
                     focusSession: focusSession ? getFocusSessionSnapshot() : null,
@@ -6021,7 +5295,8 @@ chrome.runtime.onMessage.addListener(
                 break;
 
             case "CONNECT":
-                connect();
+                // Start: lift any sticky stop intent, then reconnect.
+                void clearStopIntent().then(() => connect());
                 sendResponse({ ok: true });
                 break;
 
@@ -6031,6 +5306,9 @@ chrome.runtime.onMessage.addListener(
                 break;
 
             case "STOP_CORTEX":
+                // Sticky until the user presses Start: the keepalive alarm
+                // and a worker restart must not quietly reconnect.
+                void setStopIntent();
                 // End any active focus session
                 stopFocusSession();
                 // Clear state
@@ -6125,21 +5403,6 @@ chrome.runtime.onMessage.addListener(
                 })();
                 return true; // async response
 
-            case "TOGGLE_QUIET_MODE":
-                quietMode = Boolean(message.quiet);
-                schedulePersist();
-                // Notify daemon if connected
-                if (connected && ws) {
-                    send({
-                        type: "SETTINGS_SYNC",
-                        payload: { quiet_mode: quietMode },
-                        timestamp: Date.now() / 1000,
-                        sequence: ++sequence,
-                    });
-                }
-                sendResponse({ ok: true, quietMode });
-                break;
-
             case "QUIET_MODE_TOGGLE":
                 // P0 §3.11: the popup surfaces the three-kind quiet
                 // menu (Snooze 15 / Quiet rest of session / Pause).
@@ -6204,10 +5467,17 @@ chrome.runtime.onMessage.addListener(
                     typeof message.correlation_id === "string" && message.correlation_id.length > 0
                         ? (message.correlation_id as string)
                         : interventionPresentation.active?.correlation_id;
+                // ``dismissed`` is the only action that records a cooldown.
+                // ``expired`` (a panel that timed out untouched) closes the
+                // intervention without teaching the trigger policy anything;
+                // ``engaged`` / ``restore`` pass through to the daemon.
+                const action = isTerminalUserAction(message.action)
+                    ? message.action
+                    : "dismissed";
                 send({
                     type: "USER_ACTION",
                     payload: {
-                        action: message.action,
+                        action,
                         intervention_id: message.intervention_id,
                         timestamp: Date.now() / 1000,
                     },
@@ -6215,7 +5485,23 @@ chrome.runtime.onMessage.addListener(
                     sequence: ++sequence,
                     correlation_id: outboundCid,
                 });
-                if (message.action === "dismissed") {
+                if (action === "dismissed" || action === "expired") {
+                    // A close from any surface removes the page panels
+                    // everywhere; the popup card follows via the broadcast.
+                    void removeOverlaysEverywhere();
+                    setInterventionBadge(false);
+                }
+                if (action === "expired") {
+                    interventionPresentation.clear();
+                    try {
+                        chrome.storage.session.remove([
+                            "cortex_active_intervention",
+                            "cortex_active_intervention_cid",
+                            "cortex_active_intervention_mounted_at",
+                        ]);
+                    } catch {}
+                }
+                if (action === "dismissed") {
                     const activePlanId =
                         typeof interventionPresentation.active?.plan.intervention_id === "string"
                             ? (interventionPresentation.active.plan.intervention_id as string)
@@ -6274,14 +5560,27 @@ chrome.runtime.onMessage.addListener(
                 sendResponse({ ok: true });
                 break;
 
-            case "DISTRACTION_BLOCKED":
-                // User clicked "Go back" on the distraction interceptor
+            case "DISTRACTION_BLOCKED": {
+                // User chose "Go back" on the distraction interceptor. A
+                // fresh tab has no history to return to, so the page asks
+                // for the tab to be closed rather than left blank.
                 if (focusSession) {
                     focusSession.distractionsBlocked++;
                     schedulePersist();
                 }
+                const senderTabId = sender.tab?.id;
+                if (
+                    isDistractionBlockedRequest(message)
+                    && message.leave === "close"
+                    && typeof senderTabId === "number"
+                ) {
+                    chrome.tabs.remove(senderTabId).catch((err: unknown) => {
+                        if (DEBUG) console.debug("[cortex.bg] close intercepted tab failed: %o", err);
+                    });
+                }
                 sendResponse({ ok: true });
                 break;
+            }
 
             case "USER_RATING":
                 // P0 §3.8: relay 👍/👎 ratings. ``context`` is an
@@ -6371,20 +5670,22 @@ chrome.runtime.onMessage.addListener(
                     }));
                 return true; // async
 
-            case "EXECUTE_ALL_RECOMMENDED":
+            case "EXECUTE_ALL_RECOMMENDED": {
                 if (!workspaceMutationAllowed()) {
-                    sendResponse({
-                        success: false,
-                        message: "Actions unavailable in suggest-only mode",
+                    const denied: ExecuteAllRecommendedResponse = {
+                        ok: false,
                         results: [],
-                    });
+                        outcome: reduceApplyResults({
+                            success: false,
+                            message: "Action unavailable in suggest-only mode",
+                        }),
+                    };
+                    sendResponse(denied);
                     break;
                 }
-                executeAllRecommended(
-                    String(message.intervention_id || ""),
-                )
-                    .then((results) => {
-                        sendResponse(results);
+                executeAllRecommended(String(message.intervention_id || ""))
+                    .then((response) => {
+                        sendResponse(response);
                         // Send per-tab relevance feedback to daemon
                         const keptTabs = message.kept_tabs as Array<{url: string; title: string}> | undefined;
                         const closedTabs = message.closed_tabs as Array<{url: string; title: string}> | undefined;
@@ -6401,22 +5702,52 @@ chrome.runtime.onMessage.addListener(
                             });
                         }
                     })
-                    .catch((error: unknown) => sendResponse({
-                        success: false,
-                        message: String(error),
-                        results: [],
-                    }));
+                    .catch((error: unknown) => {
+                        const failed: ExecuteAllRecommendedResponse = {
+                            ok: false,
+                            results: [],
+                            outcome: reduceApplyResults({
+                                success: false,
+                                message: String(error),
+                            }),
+                        };
+                        sendResponse(failed);
+                    });
                 return true; // async
+            }
 
             case "UNDO_ACTION":
                 undoAction(message.action_id as string)
                     .then((success) => sendResponse({ ok: success }));
                 return true; // async
 
-            case "UNDO_ALL_RECENT":
+            case "UNDO_ALL_RECENT": {
+                // Reverse locally first (works offline), then tell the daemon
+                // so its transaction journal records the user's undo and
+                // any exact inverse it still owns runs against a consistent
+                // workspace.
+                const undoInterventionId = typeof message.intervention_id === "string"
+                    ? message.intervention_id
+                    : interventionPresentation.active?.plan.intervention_id;
                 undoAllRecent()
-                    .then(() => sendResponse({ ok: true }));
+                    .then(() => {
+                        if (typeof undoInterventionId === "string" && undoInterventionId) {
+                            send({
+                                type: "USER_ACTION",
+                                payload: {
+                                    action: "restore",
+                                    intervention_id: undoInterventionId,
+                                    timestamp: Date.now() / 1000,
+                                },
+                                timestamp: Date.now() / 1000,
+                                sequence: ++sequence,
+                                correlation_id: interventionPresentation.active?.correlation_id,
+                            });
+                        }
+                        sendResponse({ ok: true });
+                    });
                 return true; // async
+            }
 
             case "SAVE_TAB_SESSION":
                 saveTabSession(
@@ -6809,96 +6140,37 @@ chrome.storage.onChanged.addListener((changes, area) => {
 // --- Distraction Blocking (tab navigation listener) ---
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, _tab) => {
-    // Distraction blocking during focus sessions
-    if (focusSession && changeInfo.url) {
+    // Distraction blocking during focus sessions. No content script
+    // listens for runtime messages, so the interceptor is injected
+    // directly; incognito tabs are never touched.
+    if (focusSession && changeInfo.url && !_tab.incognito) {
         const url = changeInfo.url;
         if (isDistractionUrl(url, _tab.title)) {
             const snap = getFocusSessionSnapshot();
-            const domain = new URL(url).hostname.replace("www.", "");
-            chrome.tabs.sendMessage(tabId, {
-                type: "SHOW_DISTRACTION_BLOCKER",
-                payload: {
-                    focusMin: Math.round((snap?.focusMs ?? 0) / 60000),
-                    streakMin: snap?.longestStreakMin ?? 0,
-                    distractionsBlocked: snap?.distractionsBlocked ?? 0,
-                    domain,
-                    goal: focusSession?.goal ?? "",
-                },
-            }).catch(() => {
-                // Content script not ready — fall back to executeScript
-                chrome.scripting.executeScript({
-                    target: { tabId },
-                    func: injectDistractionInterceptor,
-                    args: [
-                        Math.round((snap?.focusMs ?? 0) / 60000),
-                        snap?.longestStreakMin ?? 0,
-                        snap?.distractionsBlocked ?? 0,
-                        url,
-                    ],
-                }).catch((err: unknown) => {
-                    if (DEBUG) console.debug("[cortex.bg] scripting.executeScript distraction interceptor failed: %o", err);
-                });
+            let domain = "";
+            try {
+                domain = new URL(url).hostname.replace(/^www\./, "");
+            } catch {
+                domain = "";
+            }
+            chrome.scripting.executeScript({
+                target: { tabId },
+                func: injectDistractionInterceptor,
+                args: [
+                    {
+                        focusMin: Math.round((snap?.focusMs ?? 0) / 60000),
+                        streakMin: snap?.longestStreakMin ?? 0,
+                        distractionsBlocked: snap?.distractionsBlocked ?? 0,
+                        domain,
+                    },
+                    SURFACE_CSS,
+                ],
+            }).catch((err: unknown) => {
+                if (DEBUG) console.debug("[cortex.bg] scripting.executeScript distraction interceptor failed: %o", err);
             });
         }
-    }
-
-    // --- Resume trigger: show resume card when returning to tracked content ---
-    if (changeInfo.status === "complete" && _tab.url) {
-        const tabUrl = _tab.url;
-        // Skip chrome:// and extension pages
-        if (tabUrl.startsWith("chrome://") || tabUrl.startsWith("chrome-extension://") || tabUrl.startsWith("edge://")) return;
-
-        const canonical = canonicalizeUrl(tabUrl);
-        loadActivities().then((activities) => {
-            const activity = activities[canonical];
-            if (
-                activity
-                && Date.now() - activity.last_visited > 3600_000   // >1 hour since last visit
-                && activity.max_completion_pct < 95                 // Not completed
-                && !activity.dismissed                              // Not dismissed
-                && activity.duration_spent_s >= 120                 // Was meaningful (>2 min)
-            ) {
-                chrome.tabs.sendMessage(tabId, {
-                    type: "SHOW_RESUME_CARD",
-                    activity,
-                }).catch(() => {
-                    // Content script not ready yet
-                });
-            }
-        });
     }
 });
-
-// --- SPA Navigation Resume Trigger (backup for tabs.onUpdated) ---
-
-try {
-    chrome.webNavigation.onHistoryStateUpdated.addListener(async (details) => {
-        if (details.frameId !== 0) return; // Only main frame
-        const url = details.url;
-        if (!url || url.startsWith("chrome://") || url.startsWith("edge://")) return;
-
-        const canonical = canonicalizeUrl(url);
-        const activities = await loadActivities();
-        const activity = activities[canonical];
-
-        if (
-            activity
-            && Date.now() - activity.last_visited > 3600_000
-            && activity.max_completion_pct < 95
-            && !activity.dismissed
-            && activity.duration_spent_s >= 120
-        ) {
-            chrome.tabs.sendMessage(details.tabId, {
-                type: "SHOW_RESUME_CARD",
-                activity,
-            }).catch((err: unknown) => {
-                if (DEBUG) console.debug("[cortex.bg] SHOW_RESUME_CARD sendMessage failed (SPA nav, content script may not be ready): %o", err);
-            });
-        }
-    });
-} catch {
-    // webNavigation permission may not be available
-}
 
 // --- Keepalive alarm (prevents MV3 service worker from going idle) ---
 
@@ -6921,11 +6193,15 @@ chrome.alarms.create(TRENDS_REFRESH_ALARM_NAME, {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === "cortex-keepalive") {
-        if (!connected) {
+        // Each tick also flushes debounced session state (MV3 has no
+        // suspend hook) and honours a sticky stop: no reconnect until the
+        // user presses Start.
+        flushPersistedState();
+        if (!connected && !stopRequested) {
             connect();
         }
     } else if (alarm.name === "cortex-break-timer") {
-        injectToast("Break's over!", "Time to get back to work. You've got this.");
+        void injectToast("Break's over", "Ready when you are.");
         broadcastToPopup({ type: "BREAK_TIMER_DONE" });
     } else if (alarm.name === "cortex-activity-cleanup") {
         // Evict activities older than 90 days
@@ -7002,14 +6278,15 @@ function handleCommandPauseCortex(): void {
 }
 
 function handleCommandDismissOverlay(): void {
-    if (!connected || !ws) return;
     const interventionId =
         interventionPresentation.active
         && typeof interventionPresentation.active.plan.intervention_id === "string"
             ? interventionPresentation.active.plan.intervention_id
             : null;
     try {
-        send({
+        // The daemon hears about it when connected; the page panels are
+        // removed either way.
+        if (connected && ws) send({
             type: "USER_ACTION",
             payload: {
                 action: "dismiss_overlay",
@@ -7024,12 +6301,14 @@ function handleCommandDismissOverlay(): void {
     } catch {
         // No active intervention or WS down — both are no-ops.
     }
-    // Also clear the locally-mounted overlay state so the popup
-    // collapses immediately even before the daemon round-trips.
+    // Clear the locally-mounted state and remove the page panels right
+    // away, before the daemon's DISMISS_OVERLAY cue round-trips.
     if (interventionPresentation.active) {
         interventionPresentation.clear();
-        broadcastToPopup({ type: "OVERLAY_DISMISSED" });
     }
+    setInterventionBadge(false);
+    void removeOverlaysEverywhere();
+    broadcastToPopup({ type: "OVERLAY_DISMISSED", intervention_id: interventionId });
 }
 
 function handleCommandViewHistory(): void {
@@ -7203,12 +6482,7 @@ try {
                     } catch { /* clear unavailable */ }
                 }
                 // Drop the action badge once the user dealt with the notification.
-                try {
-                    const action = (chrome as unknown as {
-                        action?: { setBadgeText: (d: { text: string }) => void };
-                    }).action;
-                    if (action) action.setBadgeText({ text: "" });
-                } catch { /* badge unavailable */ }
+                setInterventionBadge(false);
             },
         );
     }
@@ -7239,12 +6513,7 @@ try {
                     notifications.clear(notificationId);
                 } catch { /* clear unavailable */ }
             }
-            try {
-                const action = (chrome as unknown as {
-                    action?: { setBadgeText: (d: { text: string }) => void };
-                }).action;
-                if (action) action.setBadgeText({ text: "" });
-            } catch { /* badge unavailable */ }
+            setInterventionBadge(false);
         });
     }
 } catch {

@@ -166,7 +166,15 @@ class PolicyLifecycleService:
             )
         )
 
-    async def mark_not_delivered(self, decision_id: UUID, reason: str) -> None:
+    async def mark_not_delivered(
+        self,
+        decision_id: UUID,
+        reason: str,
+        *,
+        supersede_delivered: bool = False,
+    ) -> None:
+        """Record non-delivery; ``supersede_delivered`` corrects a pre-send
+        ``delivered`` row when the send reached no surface (audit D12)."""
         await self.repository.mark_delivery(
             PolicyDeliveryRecord(
                 decision_id=decision_id,
@@ -174,7 +182,8 @@ class PolicyLifecycleService:
                 delivered_at_unix_ms=None,
                 intervention_id=None,
                 reason=reason[:160] or "presentation_not_delivered",
-            )
+            ),
+            supersede_delivered=supersede_delivered,
         )
 
     async def observe_intervention(

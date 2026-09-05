@@ -14,7 +14,7 @@ This test fails if any of the dead names reappears in:
 * ``cortex/scripts/seed_config.py`` — what the seeder emits.
 * ``cortex/.env.example`` — what users copy into ``.env``.
 
-User-facing docs (``README.md``, ``Setup.md``, ``Architecture.md``) are
+User-facing docs (``README.md``, ``wiki/Setup.md``, ``wiki/Architecture.md``) are
 exercised in a softer assertion: the dead names may still appear inside
 a deprecation footnote, but the live provider table must include the
 three real provider names.
@@ -162,7 +162,7 @@ def test_docs_name_the_three_real_providers() -> None:
     provider Cortex no longer supports.
     """
     expected_markers = ("Bedrock", "Vertex", "Anthropic")
-    for doc_name in ("README.md", "Setup.md", "Architecture.md"):
+    for doc_name in ("README.md", "wiki/Setup.md", "wiki/Architecture.md"):
         doc = (REPO_ROOT / doc_name).read_text()
         missing = [m for m in expected_markers if m not in doc]
         assert not missing, (
@@ -178,12 +178,12 @@ def test_docs_mention_the_provider_selector_env_var() -> None:
     names the env var that selects the transport.
     """
     found = False
-    for doc_name in ("README.md", "Setup.md"):
+    for doc_name in ("README.md", "wiki/Setup.md"):
         doc = (REPO_ROOT / doc_name).read_text()
         if "CORTEX_LLM__PROVIDER" in doc or "ANTHROPIC_PROVIDER" in doc:
             found = True
             break
     assert found, (
-        "Neither README.md nor Setup.md documents the provider-selector "
+        "Neither README.md nor wiki/Setup.md documents the provider-selector "
         "env var; users won't know how to switch transports."
     )

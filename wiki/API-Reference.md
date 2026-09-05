@@ -1,7 +1,6 @@
 # API reference
 
-The canonical, field-level HTTP/WebSocket/native contract is generated and
-maintained in [cortex/docs/apis.md](cortex/docs/apis.md). Pydantic models under
+The canonical, field-level HTTP/WebSocket/native contract is maintained in [cortex/docs/apis.md](https://github.com/StevenWang-CY/cortex/blob/main/cortex/docs/apis.md). Pydantic models under
 `cortex/libs/schemas/` are the source of truth; browser and VS Code TypeScript
 declarations are generated and rejected by CI when stale.
 
@@ -44,22 +43,25 @@ rejected at schema construction, and clients log defensive unhandled cases.
 High-level flows include:
 
 ```text
-AUTH → IDENTIFY → state/proposal/settings traffic
+AUTH → AUTH_OK → IDENTIFY → STATE_UPDATE / SETTINGS_SYNC / … traffic
 
-INTERVENTION_PROPOSED/PRESENTED
-  → INTERVENTION_AUTHORIZE
-  → ACTION_DISPATCH
-  → INTERVENTION_RECEIPT
-  → INTERVENTION_TRANSACTION_STATE / RESTORE
+INTERVENTION_TRIGGER            (proposal; presentation-only)
+  → INTERVENTION_AUTHORIZE      (client, exact manifest digest + gesture)
+  → INTERVENTION_APPLY          (daemon, only after a persisted grant)
+  → INTERVENTION_RECEIPT        (client, per-action verified receipt)
+  → INTERVENTION_TRANSACTION_STATE / INTERVENTION_RESTORE
 
-CONTEXT_PREVIEW
-  → exact local display
-  → authenticated HTTP one-time confirmation
+HTTP POST /privacy/context/preview/current
+  → exact local display of the redacted payload
+  → HTTP POST /privacy/context/confirm (one-time handle + phrase)
   → proposal only
 ```
 
-Legacy proposal/trigger frames are presentation-only. `ACTION_DISPATCH` is not
-accepted without the exact active authorization transaction.
+`INTERVENTION_TRIGGER` and `INTERVENTION_PROMPT` are presentation-only. An
+`INTERVENTION_APPLY` command is never sent without an active, unexpired
+authorization transaction, and `INTERVENTION_AUTHORIZATION_DENIED` names the
+reason when a request is refused or downgraded. The complete catalogue is
+listed in the canonical API document.
 
 ## Privacy routes
 

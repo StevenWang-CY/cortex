@@ -17,8 +17,17 @@ from cortex.libs.schemas.storage import (
     StorageHealthReport,
 )
 from cortex.libs.utils.atomic_write import atomic_write_json, atomic_write_text
-from cortex.storage.database import SQLiteDatabase
+from cortex.storage.database import DEFAULT_SESSION_RETENTION_DAYS, SQLiteDatabase
 from cortex.storage.event_writer import BoundedAnalyticsWriter
+
+# D13: decisions recorded under the randomized research policy are the
+# study's primary data (propensities, randomization ids, consent version)
+# and must outlive the operational ``error_retention_days`` window that
+# prunes ordinary policy rows; the user's explicit ``delete`` still erases
+# them. Cascades from ``policy_decisions`` take deliveries, outcomes,
+# rewards, outcome windows and observations with them, which is why the
+# exemption lives on the parent row.
+RESEARCH_POLICY_MODE = "research_randomized"
 
 _MUTATION_RISK_STATES = {
     "applying",
@@ -57,6 +66,18 @@ class StorageMaintenance:
             if legacy_store_path is not None
             else None
         )
+        self._last_health_report: StorageHealthReport | None = None
+
+    @property
+    def last_health_report(self) -> StorageHealthReport | None:
+        """Most recent :meth:`health` result, or ``None`` before the first probe.
+
+        D4: the unauthenticated, unlimited ``GET /health`` must not run a
+        ``PRAGMA quick_check`` (O(database) on the single DB worker) per
+        call. It reports this cached snapshot instead; the live probe
+        stays on the authenticated ``GET /storage/status``.
+        """
+        return self._last_health_report
 
     async def health(self, *, full_integrity_check: bool = False) -> StorageHealthReport:
         raw = await self._database.health(full_integrity_check=full_integrity_check)
@@ -67,7 +88,9 @@ class StorageMaintenance:
         raw["pending_operations"] = max(0, int(raw["pending_operations"]) - 1)
         raw["analytics_queue_depth"] = self._writer.queue_depth
         raw["analytics_dropped_total"] = self._writer.dropped_total
-        return StorageHealthReport.model_validate(raw)
+        report = StorageHealthReport.model_validate(raw)
+        self._last_health_report = report
+        return report
 
     async def export(
         self,
@@ -428,7 +451,10 @@ class StorageMaintenance:
         """Delete expired non-authority records; active effects are immortal."""
 
         now = self._clock.unix_ms()
-        session_days = max(0, int(self.retention_days.get("sessions", 7)))
+        session_days = max(
+            0,
+            int(self.retention_days.get("sessions", DEFAULT_SESSION_RETENTION_DAYS)),
+        )
         policy_days = max(0, int(self.retention_days.get("policy", 90)))
         intervention_days = max(
             0,
@@ -452,8 +478,9 @@ class StorageMaintenance:
                     (now - session_days * 86_400_000,),
                 ),
                 "policy": (
-                    "DELETE FROM policy_decisions WHERE occurred_at_unix_ms <= ?",
-                    (now - policy_days * 86_400_000,),
+                    "DELETE FROM policy_decisions WHERE occurred_at_unix_ms <= ? "
+                    "AND policy_mode <> ?",
+                    (now - policy_days * 86_400_000, RESEARCH_POLICY_MODE),
                 ),
                 "interventions": (
                     "DELETE FROM intervention_transactions "
@@ -470,4 +497,4 @@ class StorageMaintenance:
         return await self._database.transaction(sweep)
 
 
-__all__ = ["ActiveInterventionDataError", "StorageMaintenance"]
+__all__ = ["RESEARCH_POLICY_MODE", "ActiveInterventionDataError", "StorageMaintenance"]

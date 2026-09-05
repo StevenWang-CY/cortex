@@ -2,23 +2,32 @@
 
 A frameless slide-up sheet anchored to the bottom of the dashboard window.
 Surfaces the just-finalised :class:`SessionReport` in a single, calm card
-before the daemon actually shuts down. The flow is:
+once the daemon has ended the session. The flow is:
 
-1. User clicks Stop → ``DashboardWindow._arm_stop`` disables the button
-   and arms a 6 s recap-watchdog.
+1. User ends the session (dashboard "End session") or asks to quit (tray
+   "Quit Cortex", Cmd+Q) → ``_ConsumerTab._arm_stop`` arms the recap
+   watchdog and asks the daemon to stop.
 2. Daemon finishes the session report, broadcasts ``SESSION_RECAP``.
 3. Controller relays the payload to ``DashboardWindow.apply_session_recap``
    which constructs this sheet and animates it up over the dashboard.
-4. User clicks ``Close`` (or the 12 s autohide fires) → ``dismissed``
-   → ``_finalize_stop`` → ``stop_requested.emit()`` actually shuts down.
-5. Alternatively user clicks ``View full report →`` → ``view_full_report``
-   carries the ``session_id``; the dashboard switches to the History tab,
-   requests detail, then proceeds with shutdown.
+4. The user picks one of three explicit routes:
 
-The sheet uses the same design tokens (Cormorant Garamond display numerals,
-warm terracotta accent, 10 px card radius, OutCubic 200 ms motion) as the
-rest of the desktop shell so it feels like a continuation of the dashboard,
-not a separate window.
+   * ``View full report`` → ``view_full_report`` carries the ``session_id``
+     and the dashboard opens the History detail **from the recap payload
+     already in hand**. Cortex stays open; nothing is requested from the
+     stopped daemon.
+   * ``Quit Cortex`` → ``quit_requested`` — the only route that exits the
+     app. When the user *started* with Quit, the primary button already
+     reads "Quit Cortex" and closing the sheet completes that quit.
+   * ``Close`` / Escape / the 12 s autohide → ``dismissed`` — finishes the
+     route the user chose at the start (end session and stay open, or
+     quit).
+
+The sheet uses the shared design tokens (hero numerals in the display
+serif, warm terracotta accent, card radius, 200 ms OutCubic motion with an
+instant Reduce Motion path) so it reads as a continuation of the dashboard,
+not a separate window. The entrance and exit share one interruptible
+animation: an exit can start mid-entrance and simply retargets.
 """
 
 from __future__ import annotations
@@ -34,49 +43,35 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-
-try:
-    from PySide6.QtGui import QKeyEvent
-except ImportError:  # pragma: no cover - test stubs
-    QKeyEvent = object
-
-try:
-    from PySide6.QtWidgets import (
-        QFrame,
-        QHBoxLayout,
-        QLabel,
-        QPushButton,
-        QVBoxLayout,
-        QWidget,
-    )
-except ImportError:  # pragma: no cover - lightweight stubs
-    from PySide6.QtWidgets import (
-        QFrame,
-        QHBoxLayout,
-        QLabel,
-        QPushButton,
-        QVBoxLayout,
-        QWidget,
-    )
+from PySide6.QtWidgets import (
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 from cortex.apps.desktop_shell import mac_native
+from cortex.apps.desktop_shell.a11y import (
+    set_accessible_description,
+    set_accessible_name,
+)
 from cortex.apps.desktop_shell.components import install_elide
 from cortex.apps.desktop_shell.tokens import (
-    BRAND_ACCENT,
-    BRAND_ACCENT_HOVER,
-    BRAND_ACCENT_PRESSED,
-    BRAND_DISPLAY_FONT,
+    BTN_ACCENT_QSS,
+    BTN_DESTRUCTIVE_QSS,
+    BTN_GHOST_QSS,
+    CARD_QSS,
+    CX_TEXT,
     CX_TEXT_SECONDARY,
     CX_TEXT_TERTIARY,
+    DURATION_FAST,
     DURATION_NORMAL,
     FS_BODY,
     FS_CAPTION,
     FS_FOOTNOTE,
-    FS_LARGE_TITLE,
-    FW_REGULAR,
-    RADIUS_BUTTON,
-    RADIUS_CARD,
-    SEMANTIC_LIGHT,
+    HERO_NUMERAL_QSS,
     SP2,
     SP3,
     SP4,
@@ -90,23 +85,12 @@ logger = logging.getLogger(__name__)
 # clicks. The 12 s budget mirrors the design-doc spec.
 _AUTOHIDE_MS = 12_000
 
-# Reduced-motion bypass: when the user has Accessibility → Reduce motion
-# enabled the slide animation is replaced by an instant snap. Promoted
-# to a named constant so the bypass path is greppable.
-_REDUCED_MOTION_DURATION_MS = 0
-
 # Fixed sheet geometry — kept independent of DASHBOARD_WIDTH so the sheet
 # always looks like a discrete card even if the dashboard ever gains a
 # resizable mode.
 _SHEET_WIDTH = 360
-_SHEET_HEIGHT = 220
+_SHEET_HEIGHT = 236
 _SHEET_BOTTOM_INSET = SP4  # gap below the sheet at its resting position
-
-_CONTROL_BG = SEMANTIC_LIGHT["control_bg"]
-_SEPARATOR = SEMANTIC_LIGHT["separator"]
-_LABEL = SEMANTIC_LIGHT["label_primary"]
-_LABEL_SECONDARY = CX_TEXT_SECONDARY
-_LABEL_TERTIARY = CX_TEXT_TERTIARY
 
 
 def _safe_call(target: Any, *args: Any, **kwargs: Any) -> Any:
@@ -121,12 +105,8 @@ def _reduced_motion_active() -> bool:
     """Thin wrapper around :func:`mac_native.prefers_reduced_motion`.
 
     Isolated so the recap sheet's animation paths read a single boolean
-    and the test harness can monkeypatch a single helper. Mirrors
-    :class:`OverlayWindow`'s approach in ``overlay.py``. Returns False
-    on any AppKit/platform error so a probing failure still animates
-    (motion is the wrong fail-open here, but matches the rest of the
-    shell's behaviour and avoids accidentally skipping motion on a
-    misconfigured macOS install).
+    and the test harness can monkeypatch a single helper. Returns False
+    on any AppKit/platform error so a probing failure still animates.
     """
     try:
         return bool(mac_native.prefers_reduced_motion())
@@ -155,13 +135,13 @@ class _Stat(QFrame):
         self._caption = QLabel(caption)
         self._caption.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         self._caption.setStyleSheet(
-            f"color: {_LABEL_TERTIARY}; background: transparent;"
+            f"color: {CX_TEXT_TERTIARY}; background: transparent;"
         )
         install_elide(self._caption)
         self._value = QLabel(value)
         self._value.setFont(mac_native.system_font(FS_BODY, "semibold"))
         self._value.setStyleSheet(
-            f"color: {_LABEL}; background: transparent;"
+            f"color: {CX_TEXT}; background: transparent;"
         )
         install_elide(self._value)
         layout.addWidget(self._caption)
@@ -173,12 +153,16 @@ class RecapSheet(QWidget):
 
     Construction is deliberately cheap — the widget hides itself until
     :meth:`show_report` is called with the broadcast payload. Re-showing
-    with a new payload rebuilds the inner layout in place (recap sheets
-    are rare events, so the simplicity is cheap and avoids cache bugs).
+    with a new payload rebuilds the inner layout in place.
     """
 
     view_full_report = Signal(str)
-    """Emitted with ``session_id`` when the user clicks the primary CTA."""
+    """Emitted with ``session_id`` when the user asks to see the report.
+    Cortex stays open."""
+
+    quit_requested = Signal()
+    """Emitted when the user explicitly chooses to quit Cortex from the
+    sheet. Never emitted by Close, Escape, or the autohide."""
 
     dismissed = Signal()
     """Emitted exactly once when the sheet is fully hidden, regardless of
@@ -200,65 +184,67 @@ class RecapSheet(QWidget):
             self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         except Exception:
             pass
-        try:
-            self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, False)
-        except Exception:
-            pass
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setFixedSize(_SHEET_WIDTH, _SHEET_HEIGHT)
+        set_accessible_name(self, "Session recap")
+        set_accessible_description(
+            self,
+            "Summary of the session that just ended. Escape closes the sheet.",
+        )
         self.hide()
 
         self._session_id: str = ""
         self._dismissed_once = False
-        self._anim: QPropertyAnimation | None = None
         self._closing = False
+        self._quit_pending = False
+        self._rest_pos: QPoint | None = None
+        self._start_pos: QPoint | None = None
 
         self._autohide = QTimer(self)
         self._autohide.setSingleShot(True)
         self._autohide.setInterval(_AUTOHIDE_MS)
         self._autohide.timeout.connect(self._on_autohide)
 
+        # One reusable, interruptible position animation. Entrance and
+        # exit both retarget it; ``_on_anim_finished`` reads ``_closing``
+        # to decide whether the finished run was an exit.
+        self._anim: QPropertyAnimation | None = None
+        try:
+            self._anim = QPropertyAnimation(self, b"pos", self)
+            self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._anim.finished.connect(self._on_anim_finished)
+        except Exception:
+            self._anim = None
+
         self._card = QFrame(self)
         self._card.setObjectName("RecapCard")
         self._card.setGeometry(0, 0, _SHEET_WIDTH, _SHEET_HEIGHT)
-        self._card.setStyleSheet(
-            f"#RecapCard {{ background: {_CONTROL_BG};"
-            f" border: 0.5px solid {_SEPARATOR};"
-            f" border-radius: {RADIUS_CARD + 2}px; }}"
-        )
+        self._card.setStyleSheet(f"#RecapCard {{ {CARD_QSS} }}")
 
         # Outer column ─────────────────────────────────────────────
         col = QVBoxLayout(self._card)
         col.setContentsMargins(SP5, SP5, SP5, SP5)
         col.setSpacing(SP3)
 
+        # Hero numeral — the one place outside the wordmark where the
+        # display serif is allowed. Pixel-sized from the type scale.
         self._headline = QLabel("--")
-        headline_font = mac_native.system_font(FS_LARGE_TITLE, "regular")
-        # Override family to the brand serif for the numeric headline; we
-        # do this via stylesheet rather than QFont so the family-stack
-        # fallback resolves correctly when Cormorant is missing on host.
-        self._headline.setFont(headline_font)
-        self._headline.setStyleSheet(
-            f"font-family: {BRAND_DISPLAY_FONT};"
-            f" font-size: {FS_LARGE_TITLE}pt;"
-            f" font-weight: {FW_REGULAR};"
-            f" color: {_LABEL};"
-            " background: transparent;"
-        )
+        self._headline.setStyleSheet(HERO_NUMERAL_QSS)
         self._headline.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        set_accessible_name(self._headline, "Session length")
 
         self._subtext = QLabel("")
         self._subtext.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
         self._subtext.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
         self._subtext.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._subtext.setWordWrap(True)
 
         # Stats row ───────────────────────────────────────────────
         self._stats_row = QHBoxLayout()
         self._stats_row.setContentsMargins(0, 0, 0, 0)
         self._stats_row.setSpacing(SP4)
-
         self._stat_widgets: list[_Stat] = []
 
         # Buttons ─────────────────────────────────────────────────
@@ -266,65 +252,62 @@ class RecapSheet(QWidget):
         buttons_row.setContentsMargins(0, 0, 0, 0)
         buttons_row.setSpacing(SP2)
 
-        self._view_btn = QPushButton("View full report →")
-        self._view_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._view_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
-        self._view_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self._view_btn.setStyleSheet(
-            "QPushButton {"
-            f"  padding: 6px 14px;"
-            f"  border-radius: {RADIUS_BUTTON}px;"
-            f"  background: {BRAND_ACCENT};"
-            f"  color: {SEMANTIC_LIGHT['label_primary']};"
-            "  border: none;"
-            "}"
-            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"
-            f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"
+        self._quit_btn = QPushButton("Quit Cortex")
+        self._quit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._quit_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
+        self._quit_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._quit_btn.setStyleSheet(BTN_DESTRUCTIVE_QSS)
+        self._quit_btn.clicked.connect(self._on_quit_clicked)
+        set_accessible_name(self._quit_btn, "Quit Cortex")
+        set_accessible_description(
+            self._quit_btn,
+            "Closes Cortex. Sensing has already stopped; the menu-bar icon "
+            "goes away until you relaunch.",
         )
+        _safe_call(self._quit_btn.setToolTip, "Closes Cortex and the menu-bar icon")
+
+        self._view_btn = QPushButton("View full report")
+        self._view_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._view_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
+        self._view_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._view_btn.setStyleSheet(BTN_GHOST_QSS)
         self._view_btn.clicked.connect(self._on_view_clicked)
-        _safe_call(
-            self._view_btn.setAccessibleName,
-            "View full session report",
+        set_accessible_name(self._view_btn, "View full session report")
+        set_accessible_description(
+            self._view_btn,
+            "Opens this session in the History tab. Cortex stays open.",
         )
 
         self._close_btn = QPushButton("Close")
         self._close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._close_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
+        self._close_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
         self._close_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self._close_btn.setStyleSheet(
-            "QPushButton {"
-            f"  padding: 6px 14px;"
-            f"  border-radius: {RADIUS_BUTTON}px;"
-            "  background: transparent;"
-            f"  color: {_LABEL_SECONDARY};"
-            f"  border: 0.5px solid {_SEPARATOR};"
-            "}"
-            "QPushButton:hover { background: rgba(0, 0, 0, 0.04);"
-            f" color: {_LABEL}; }}"
-        )
+        self._close_btn.setStyleSheet(BTN_ACCENT_QSS)
         self._close_btn.clicked.connect(self._on_close_clicked)
-        _safe_call(
-            self._close_btn.setAccessibleName,
-            "Close recap and finish stopping Cortex",
-        )
 
+        buttons_row.addWidget(self._quit_btn)
         buttons_row.addStretch(1)
-        buttons_row.addWidget(self._close_btn)
         buttons_row.addWidget(self._view_btn)
+        buttons_row.addWidget(self._close_btn)
 
         col.addWidget(self._headline)
         col.addWidget(self._subtext)
         col.addLayout(self._stats_row, stretch=1)
         col.addStretch(1)
         col.addLayout(buttons_row)
+        self._apply_route_copy()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def show_report(self, report: dict) -> None:
+    def show_report(self, report: dict, *, quit_pending: bool = False) -> None:
         """Render ``report`` (raw ``SessionReport.model_dump`` payload)
         then slide the sheet up over the parent dashboard.
+
+        ``quit_pending`` is True when the user started this stop by asking
+        to quit: the primary button then reads "Quit Cortex" (closing the
+        sheet completes the quit) and the separate quit control is hidden.
 
         Safe to call repeatedly — each call rebuilds the stats row and
         restarts the autohide timer. The ``dismissed`` signal will only
@@ -332,10 +315,8 @@ class RecapSheet(QWidget):
         """
         if not isinstance(report, dict):
             logger.debug("RecapSheet.show_report: payload was %s, skipping", type(report))
-            # Defensive: a non-dict payload (e.g. mis-routed broadcast)
-            # would otherwise leave the dashboard's stop flow waiting on
-            # the 6 s recap watchdog. Emit ``dismissed`` immediately so
-            # ``_finalize_stop`` runs on the same Qt tick.
+            # A non-dict payload (mis-routed broadcast) must not leave the
+            # dashboard waiting on the recap watchdog.
             self._emit_dismissed()
             return
         # Phase 4.B fix (#10): an empty payload (no session_id) is the
@@ -350,7 +331,9 @@ class RecapSheet(QWidget):
             return
         self._dismissed_once = False
         self._closing = False
+        self._quit_pending = bool(quit_pending)
         self._session_id = str(report.get("session_id") or "")
+        self._apply_route_copy()
 
         # Headline: total minutes (round nearest int).
         duration_s = float(report.get("duration_seconds") or 0.0)
@@ -365,7 +348,7 @@ class RecapSheet(QWidget):
         flow_pct = float(report.get("flow_percentage") or 0.0)
         flow_pct = max(0.0, min(100.0, flow_pct))
         self._subtext.setText(
-            f"Session ended  ·  {flow_min}m in flow  ({flow_pct:.0f}%)"
+            f"Session ended  ·  {flow_min}m steady  ({flow_pct:.0f}%)"
         )
 
         # Five stats.
@@ -377,14 +360,12 @@ class RecapSheet(QWidget):
         self.raise_()
         # Activate so the sheet owns keyboard focus — required for the
         # Esc / Enter handlers below to receive the keypress without
-        # the user clicking the sheet first.
+        # the user clicking the sheet first. (The sheet is a deliberate,
+        # user-initiated modal moment, unlike the intervention overlay.)
         try:
             self.activateWindow()
         except Exception:
             logger.debug("RecapSheet.activateWindow raised", exc_info=True)
-        # Esc / Enter need focus on the sheet; default focus to Close so
-        # the user can hit Enter to dismiss without rearming the stop
-        # flow.
         try:
             self._close_btn.setFocus(Qt.FocusReason.OtherFocusReason)
         except Exception:
@@ -399,15 +380,37 @@ class RecapSheet(QWidget):
         self._on_close_clicked()
 
     def current_session_id(self) -> str:
-        """P0 §3.3 (Wave-2 P1): expose the currently-displayed
-        session id so the dashboard can include it in the
-        ``recap_dismissed_ack`` signal payload. Returns ``""`` when
-        no report has been shown yet."""
+        """The currently-displayed session id (``""`` before any report)."""
         return self._session_id
+
+    @property
+    def quit_pending(self) -> bool:
+        return self._quit_pending
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    def _apply_route_copy(self) -> None:
+        """Make the buttons say exactly what closing the sheet does."""
+        if self._quit_pending:
+            self._close_btn.setText("Quit Cortex")
+            self._close_btn.setStyleSheet(BTN_DESTRUCTIVE_QSS)
+            set_accessible_name(self._close_btn, "Quit Cortex")
+            set_accessible_description(
+                self._close_btn,
+                "Finishes quitting Cortex. Sensing has already stopped.",
+            )
+            self._quit_btn.setVisible(False)
+        else:
+            self._close_btn.setText("Close")
+            self._close_btn.setStyleSheet(BTN_ACCENT_QSS)
+            set_accessible_name(self._close_btn, "Close recap")
+            set_accessible_description(
+                self._close_btn,
+                "Closes this summary. Cortex stays open with the session ended.",
+            )
+            self._quit_btn.setVisible(True)
 
     def _rebuild_stats(self, report: dict) -> None:
         # Tear down any prior stat widgets so a re-show with fresh data
@@ -423,8 +426,6 @@ class RecapSheet(QWidget):
         self._stat_widgets = []
 
         flow_pct = float(report.get("flow_percentage") or 0.0)
-        # Phase 4.B fix (#9): clamp to a sane percent range before
-        # rendering so a daemon glitch can't display "112%".
         flow_pct = max(0.0, min(100.0, flow_pct))
         avg_hr = report.get("avg_hr_bpm")
         breaks = int(report.get("breaks_taken") or 0)
@@ -432,11 +433,8 @@ class RecapSheet(QWidget):
         if not isinstance(distraction_domains, list):
             distraction_domains = []
         distractions = len(distraction_domains)
-        # Phase 4.B fix (#8): "Spikes" is the accurate caption — this is
-        # a count of state_transitions whose to_state is HYPER, i.e.
-        # how many times the user spiked into the high-arousal state.
-        # The previous "Helpful" label implied user-rated intervention
-        # quality, which the data does not capture.
+        # "Spikes" counts state_transitions whose to_state is HYPER — how
+        # many times the estimate moved into "support may help".
         transitions = report.get("state_transitions") or []
         if not isinstance(transitions, list):
             transitions = []
@@ -446,14 +444,12 @@ class RecapSheet(QWidget):
             if isinstance(t, dict) and str(t.get("to_state", "")).upper() == "HYPER"
         )
 
-        stats: list[tuple[str, str]] = []
-        stats.append(("Flow", f"{flow_pct:.0f}%"))
-        # Phase 4.B fix (#7): the schema field is ``avg_hr_bpm`` — an
-        # average over the session, not a peak. Surface that honestly.
-        if isinstance(avg_hr, (int, float)) and avg_hr is not None:
-            stats.append(("Avg HR", f"{int(round(avg_hr))} bpm"))
+        stats: list[tuple[str, str]] = [("Steady", f"{flow_pct:.0f}%")]
+        # ``avg_hr_bpm`` is an average over the session, not a peak.
+        if isinstance(avg_hr, (int, float)):
+            stats.append(("Avg pulse", f"{int(round(avg_hr))} bpm"))
         stats.append(("Breaks", str(breaks)))
-        stats.append(("Blocked", str(distractions)))
+        stats.append(("Distractions", str(distractions)))
         stats.append(("Spikes", str(spikes)))
 
         for caption, value in stats:
@@ -476,67 +472,62 @@ class RecapSheet(QWidget):
         # Below-bottom start Y for the slide-in animation.
         start_y = parent_top_left.y() + parent_geo.height() + 4
         self.move(x, start_y)
-        # Stash the resting position for the animation. We use a Python
-        # attribute because QPoint isn't a Qt property on QWidget.
         self._rest_pos = QPoint(x, rest_y)
         self._start_pos = QPoint(x, start_y)
 
+    def _retarget(self, end: QPoint, duration_ms: int) -> bool:
+        """Stop any in-flight run and animate from the current position.
+
+        Returns False when the animation system is unavailable so the
+        caller can snap instead.
+        """
+        anim = self._anim
+        if anim is None:
+            return False
+        try:
+            anim.stop()
+            anim.setDuration(duration_ms)
+            anim.setStartValue(self.pos())
+            anim.setEndValue(end)
+            anim.start()
+            return True
+        except Exception:
+            logger.debug("recap animation retarget failed", exc_info=True)
+            return False
+
     def _animate_in(self) -> None:
-        if not hasattr(self, "_rest_pos"):
+        if self._rest_pos is None:
             return
-        # Phase 4.B fix (#5): respect Accessibility → Reduce motion.
-        # Snap directly to the resting position so VOR-sensitive users
-        # don't get a slide animation. ``DURATION_NORMAL`` is replaced
-        # by ``_REDUCED_MOTION_DURATION_MS`` (0) for the bypass path.
-        if _reduced_motion_active():
+        # Respect Accessibility → Reduce motion: snap to the resting
+        # position so VOR-sensitive users don't get a slide animation.
+        if _reduced_motion_active() or not self._retarget(self._rest_pos, DURATION_NORMAL):
             try:
+                if self._anim is not None:
+                    self._anim.stop()
                 self.move(self._rest_pos)
             except Exception:
                 logger.debug("reduced-motion snap (in) failed", exc_info=True)
-            return
-        try:
-            anim = QPropertyAnimation(self, b"pos", self)
-        except Exception:
-            # Animation system unavailable (mock harness) — snap directly.
-            try:
-                self.move(self._rest_pos)
-            except Exception:
-                pass
-            return
-        anim.setDuration(DURATION_NORMAL)
-        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        anim.setStartValue(self._start_pos)
-        anim.setEndValue(self._rest_pos)
-        anim.start()
-        self._anim = anim
 
     def _animate_out(self) -> None:
-        if not hasattr(self, "_rest_pos"):
-            self.hide()
-            self._emit_dismissed()
+        if self._start_pos is None:
+            self._finish_close()
             return
-        # Phase 4.B fix (#5): reduced-motion bypass — skip the tween
-        # and hide immediately so the dashboard's stop flow can finish
-        # without an animation budget.
-        if _reduced_motion_active():
-            self.hide()
-            self._emit_dismissed()
-            return
-        try:
-            anim = QPropertyAnimation(self, b"pos", self)
-        except Exception:
-            self.hide()
-            self._emit_dismissed()
-            return
-        anim.setDuration(DURATION_NORMAL)
-        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        anim.setStartValue(self.pos())
-        anim.setEndValue(self._start_pos)
-        anim.finished.connect(self._finish_close)
-        anim.start()
-        self._anim = anim
+        # Exit is faster than entry (motion contract) and interrupts any
+        # in-flight entrance: the same animation object is retargeted from
+        # wherever the sheet currently is.
+        if _reduced_motion_active() or not self._retarget(self._start_pos, DURATION_FAST):
+            self._finish_close()
+
+    def _on_anim_finished(self) -> None:
+        if self._closing:
+            self._finish_close()
 
     def _finish_close(self) -> None:
+        try:
+            if self._anim is not None:
+                self._anim.stop()
+        except Exception:
+            pass
         self.hide()
         self._emit_dismissed()
 
@@ -552,11 +543,19 @@ class RecapSheet(QWidget):
     def _on_view_clicked(self) -> None:
         self._autohide.stop()
         # Emit the view signal BEFORE dismissing so the dashboard can
-        # switch tabs and request detail while the sheet animates away.
+        # switch tabs and open the detail while the sheet animates away.
         try:
             self.view_full_report.emit(self._session_id)
         except Exception:
             logger.debug("view_full_report.emit raised", exc_info=True)
+        self._on_close_clicked()
+
+    def _on_quit_clicked(self) -> None:
+        self._autohide.stop()
+        try:
+            self.quit_requested.emit()
+        except Exception:
+            logger.debug("quit_requested.emit raised", exc_info=True)
         self._on_close_clicked()
 
     def _on_close_clicked(self) -> None:
@@ -609,11 +608,11 @@ class RecapSheet(QWidget):
             event.accept()
             return
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            # If the View button currently holds focus, treat Enter as
-            # "view"; otherwise treat as "close".
             focused = self.focusWidget()
             if focused is self._view_btn:
                 self._on_view_clicked()
+            elif focused is self._quit_btn:
+                self._on_quit_clicked()
             else:
                 self._on_close_clicked()
             event.accept()

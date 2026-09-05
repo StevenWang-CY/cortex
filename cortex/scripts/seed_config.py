@@ -101,7 +101,7 @@ CORTEX_LLM__MODEL_DEFAULT={config.llm.model_default}
 CORTEX_LLM__MODEL_FAST={config.llm.model_fast}
 CORTEX_LLM__MODEL_DEEP={config.llm.model_deep}
 CORTEX_LLM__MAX_TOKENS={config.llm.max_tokens}
-CORTEX_LLM__TEMPERATURE={config.llm.temperature}
+CORTEX_LLM__EFFORT={config.llm.effort}
 CORTEX_LLM__TIMEOUT_SECONDS={config.llm.timeout_seconds}
 CORTEX_LLM__FALLBACK_MODE={config.llm.fallback_mode}
 

@@ -7,6 +7,7 @@ is advanced via ``datetime`` injection. No network or keychain access.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -57,7 +58,6 @@ def _make_state() -> StateEstimate:
 
 
 _VALID_PLAN_DICT: dict[str, Any] = {
-    "level": "overlay_only",
     "headline": "Fix the NameError on line 10",
     "situation_summary": "1 error in main.py",
     "primary_focus": "main.py:10",
@@ -72,6 +72,8 @@ _VALID_PLAN_DICT: dict[str, Any] = {
     "tone": "supportive",
     "suggested_actions": [],
     "causal_explanation": "1 active error pulled focus off the function.",
+    "error_analysis": None,
+    "tab_recommendations": None,
 }
 
 
@@ -79,12 +81,9 @@ def _stub_response(
     input_tokens: int = 1000,
     output_tokens: int = 500,
 ) -> MagicMock:
-    block = SimpleNamespace(
-        type="tool_use",
-        name="emit_intervention_plan",
-        input=_VALID_PLAN_DICT,
-    )
+    block = SimpleNamespace(type="text", text=json.dumps(_VALID_PLAN_DICT))
     response = MagicMock()
+    response.stop_reason = "end_turn"
     response.content = [block]
     response.usage = SimpleNamespace(
         input_tokens=input_tokens,
@@ -124,11 +123,25 @@ def _make_planner(
 
 
 # ---------------------------------------------------------------------------
-# 1. Pricing table covers all three logical model tiers
+# 1. Pricing table covers all five logical model tiers (audit D3)
 # ---------------------------------------------------------------------------
 
 
-def test_pricing_covers_sonnet_haiku_opus() -> None:
+def test_pricing_covers_every_logical_tier() -> None:
+    # Sonnet 5: $2/M in, $10/M out
+    assert usd_cost("claude-sonnet-5", input_tokens=1_000_000, output_tokens=0) == pytest.approx(
+        2.0
+    )
+    assert usd_cost("claude-sonnet-5", input_tokens=0, output_tokens=1_000_000) == pytest.approx(
+        10.0
+    )
+
+    # Opus 5: $5/M in, $25/M out
+    assert usd_cost("claude-opus-5", input_tokens=1_000_000, output_tokens=0) == pytest.approx(5.0)
+    assert usd_cost("claude-opus-5", input_tokens=0, output_tokens=1_000_000) == pytest.approx(
+        25.0
+    )
+
     # Sonnet 4.6: $3/M in, $15/M out
     sonnet = usd_cost("claude-sonnet-4-6", input_tokens=1_000_000, output_tokens=0)
     assert sonnet == pytest.approx(3.0)
@@ -145,13 +158,21 @@ def test_pricing_covers_sonnet_haiku_opus() -> None:
     )
     assert haiku_out == pytest.approx(5.0)
 
-    # Opus 4.7: $15/M in, $75/M out
+    # Opus 4.7: $5/M in, $25/M out (the old table's $15/$75 was wrong — D3)
     opus = usd_cost("claude-opus-4-7", input_tokens=1_000_000, output_tokens=0)
-    assert opus == pytest.approx(15.0)
+    assert opus == pytest.approx(5.0)
     opus_out = usd_cost(
         "claude-opus-4-7", input_tokens=0, output_tokens=1_000_000,
     )
-    assert opus_out == pytest.approx(75.0)
+    assert opus_out == pytest.approx(25.0)
+
+
+def test_cache_reads_are_discounted_and_writes_marked_up() -> None:
+    # Cache reads bill at 0.1x input; five-minute cache writes at 1.25x.
+    read = usd_cost("claude-opus-5", input_tokens=0, output_tokens=0, cache_read=1_000_000)
+    assert read == pytest.approx(0.5)
+    write = usd_cost("claude-opus-5", input_tokens=0, output_tokens=0, cache_write=1_000_000)
+    assert write == pytest.approx(6.25)
 
 
 # ---------------------------------------------------------------------------
@@ -313,14 +334,18 @@ async def test_planner_records_cost_on_success(tmp_path: Path) -> None:
     await planner.generate_intervention_plan(
         _make_context(), _make_state(), template_name="debug_error_summary",
     )
-    # debug_error_summary → deep tier → Opus 4.7
-    # 1000 * $15/M + 200 * $75/M = 0.015 + 0.015 = 0.030
+    # debug_error_summary → deep tier → Opus 5 on Bedrock Mantle
+    # 1000 * $5/M + 200 * $25/M = 0.005 + 0.005 = 0.010
     expected = usd_cost(
-        "us.anthropic.claude-opus-4-7-v1:0",
+        "anthropic.claude-opus-5",
         input_tokens=1000,
         output_tokens=200,
     )
+    assert tracker.today_total_usd() == pytest.approx(0.010)
     assert tracker.today_total_usd() == pytest.approx(expected)
+    # Token counters follow the same call (audit D15).
+    assert tracker.prompt_tokens_today() == 1000
+    assert tracker.completion_tokens_today() == 200
 
 
 # ---------------------------------------------------------------------------
@@ -391,3 +416,52 @@ def test_budget_accessors_for_gateway(tmp_path: Path) -> None:
     # Side-effect-free: repeated calls don't emit duplicate KILL logs and
     # always reflect the current spend.
     assert tracker.budget_exhausted(now=now) is True
+
+
+# ---------------------------------------------------------------------------
+# 12. Per-day token counters (audit D15)
+# ---------------------------------------------------------------------------
+
+
+def test_token_counters_accumulate_roll_over_and_persist(tmp_path: Path) -> None:
+    ledger = tmp_path / "cost_ledger.json"
+    tracker = CostTracker(ledger, warn_usd=5.0, kill_usd=20.0)
+    # Local noon today: inside the 90-day retention window the loader prunes
+    # against, and far from any midnight boundary.
+    monday = datetime.now().replace(hour=12, minute=0, second=0, microsecond=0)
+    tuesday = monday + timedelta(days=1)
+    assert tracker.prompt_tokens_today(now=monday) == 0
+    tracker.record("cid", "claude-sonnet-5", 0.01, now=monday, prompt_tokens=700, completion_tokens=80)
+    tracker.record(
+        "cid",
+        "claude-sonnet-5",
+        0.01,
+        now=monday,
+        prompt_tokens=300,
+        completion_tokens=20,
+        cancelled=True,
+    )
+    assert tracker.prompt_tokens_today(now=monday) == 1000
+    assert tracker.completion_tokens_today(now=monday) == 100
+    # Fresh bucket on the next local day.
+    assert tracker.prompt_tokens_today(now=tuesday) == 0
+    # Persisted across a restart.
+    reloaded = CostTracker(ledger, warn_usd=5.0, kill_usd=20.0)
+    assert reloaded.prompt_tokens_today(now=monday) == 1000
+    assert reloaded.completion_tokens_today(now=monday) == 100
+    # Legacy ledgers without the counters still load (additive fields).
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "days": {monday.date().isoformat(): {"total_usd": 1.0, "calls": 1, "by_cid": {}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    legacy_tracker = CostTracker(legacy, warn_usd=5.0, kill_usd=20.0)
+    assert legacy_tracker.today_total_usd(now=monday) == pytest.approx(1.0)
+    assert legacy_tracker.prompt_tokens_today(now=monday) == 0
+    with pytest.raises(ValueError):
+        tracker.record("cid", "claude-sonnet-5", 0.0, prompt_tokens=-1)

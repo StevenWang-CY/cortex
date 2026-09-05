@@ -112,6 +112,11 @@ class DaemonBridge(QObject):
     # dict so Qt's queued-connection marshalling is cheap.
     calibration_progress = Signal(dict)
     calibration_review = Signal(dict)
+    # Generic "run this on the Qt main thread" relay. Emitted from the
+    # daemon/asyncio thread with a zero-argument callable; the controller
+    # connects it to a runner. Replaces ``QTimer.singleShot(0, fn)`` from
+    # non-Qt threads, which is not thread-safe.
+    ui_task = Signal(object)
 
     # -- callbacks invoked from daemon thread ---------------------------------
     #
@@ -191,6 +196,13 @@ class DaemonBridge(QObject):
     def on_daemon_stopped(self) -> None:
         """Called when the in-process daemon's ``stop()`` future resolves."""
         self.daemon_stopped.emit()
+
+    def run_on_ui(self, fn: Callable[[], None]) -> None:
+        """Queue ``fn`` onto the Qt main thread — safe from any thread."""
+        try:
+            self.ui_task.emit(fn)
+        except Exception:
+            logger.debug("ui_task emit failed", exc_info=True)
 
     def on_session_list(self, payload: dict) -> None:
         """P0 §3.1: queue an inbound SESSION_LIST payload onto the Qt
@@ -342,8 +354,12 @@ class CortexAppController:
         self._settings: SettingsDialog | None = None
         self._onboarding: OnboardingWindow | None = None
         self._bridge = DaemonBridge()
+        self._bridge.ui_task.connect(self._run_ui_task)
         self._paused = False
         self._active_intervention_id: str | None = None
+        # Set when "Start session" arrives while a stop is still in
+        # flight; the restart runs once the old daemon reports stopped.
+        self._restart_after_stop = False
 
         # Daemon thread state
         self._daemon: Any = None  # CortexDaemon (lazy import to avoid heavy deps at module level)
@@ -383,6 +399,15 @@ class CortexAppController:
 
         logger.info("startup.stage name=qt_application")
         self._app = QApplication(sys.argv)
+        # Cortex pins the light appearance per window (mac_native); the
+        # QApplication palette must agree so text drawn from the palette
+        # never inverts under a dark system theme.
+        try:
+            app_palette = mac_native.application_palette()
+            if app_palette is not None:
+                self._app.setPalette(app_palette)
+        except Exception:
+            logger.debug("application palette apply failed", exc_info=True)
         self._app.setApplicationName("Cortex")
         self._app.setOrganizationName("Cortex")
         # Qt's offscreen backend otherwise defaults to a non-existent
@@ -541,6 +566,26 @@ class CortexAppController:
         self._onboarding.open_settings_requested.connect(self._show_settings)
         self._onboarding.run_calibration_requested.connect(self._run_calibration)
         self._onboarding.completed.connect(self._complete_onboarding)
+        # Session semantics: "End session" keeps Qt alive; "Start session"
+        # boots a fresh in-process daemon. Only the explicit quit paths
+        # (Quit Cortex button, Cmd+Q, tray) leave the app.
+        if hasattr(self._dashboard, "session_start_requested"):
+            self._dashboard.session_start_requested.connect(
+                self._on_session_start_requested,
+            )
+        if hasattr(self._dashboard, "set_session_restart_available"):
+            self._dashboard.set_session_restart_available(True)
+        if hasattr(self._dashboard, "recalibrate_requested"):
+            self._dashboard.recalibrate_requested.connect(self._run_calibration)
+        # Accessibility palette: re-render every state-coloured surface
+        # at once — no restart.
+        if hasattr(self._settings, "palette_changed"):
+            self._settings.palette_changed.connect(self._on_palette_changed)
+        # A verified extension connection completes the onboarding step.
+        if hasattr(self._connections, "connection_verified"):
+            self._connections.connection_verified.connect(
+                self._on_connection_verified,
+            )
         # P0 §3.4: route calibration progress callbacks from the runner
         # (emitted on the daemon thread) back to the onboarding card's
         # apply_calibration_progress slot. Queued connection by default —
@@ -755,9 +800,7 @@ class CortexAppController:
                 # which can be reshown without going through __init__.
                 if self._dashboard is not None:
                     mac_native.apply_unified_titlebar(self._dashboard)
-                    mac_native.apply_vibrancy(
-                        self._dashboard, material="window_background",
-                    )
+                    mac_native.apply_vibrancy(self._dashboard)
                 logger.info("_initial_show: dashboard shown successfully, visible=%s",
                             self._dashboard.isVisible() if self._dashboard else "None")
             except Exception:
@@ -853,25 +896,33 @@ class CortexAppController:
         # for WS-attached clients.
         self._install_ws_broadcast_observer()
 
+        # Bind this thread to the daemon it was started for: a later
+        # restart creates a new daemon + loop, and the old thread's
+        # teardown must not clobber the live one's handles or report a
+        # disconnect the fresh daemon does not have.
+        daemon = self._daemon
+
         def _run() -> None:
-            self._daemon_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._daemon_loop)
+            loop = asyncio.new_event_loop()
+            self._daemon_loop = loop
+            asyncio.set_event_loop(loop)
 
             async def _run_until_exit() -> None:
                 daemon_task = asyncio.create_task(
-                    self._daemon.run(),
+                    daemon.run(),
                     name="cortex-daemon-lifecycle",
                 )
                 while not daemon_task.done():
-                    if bool(getattr(self._daemon, "is_ready", False)):
+                    if bool(getattr(daemon, "is_ready", False)):
                         logger.info("startup.ready name=desktop_daemon_connection")
-                        self._bridge.connection_changed.emit(True)
+                        if self._daemon is daemon:
+                            self._bridge.connection_changed.emit(True)
                         break
                     await asyncio.sleep(0.025)
                 await daemon_task
 
             try:
-                self._daemon_loop.run_until_complete(_run_until_exit())
+                loop.run_until_complete(_run_until_exit())
             except Exception as exc:
                 logger.exception("Daemon thread crashed")
                 self._bridge.on_error(
@@ -881,10 +932,12 @@ class CortexAppController:
                     type(exc).__name__,
                 )
             finally:
-                self._daemon_loop.close()
-                self._daemon_loop = None
-            # Notify UI of disconnect
-            self._bridge.connection_changed.emit(False)
+                loop.close()
+                if self._daemon_loop is loop:
+                    self._daemon_loop = None
+            # Notify UI of disconnect — only for the daemon still in charge.
+            if self._daemon is daemon:
+                self._bridge.connection_changed.emit(False)
 
         self._daemon_thread = threading.Thread(
             target=_run,
@@ -892,6 +945,84 @@ class CortexAppController:
             daemon=True,  # Don't prevent exit if shutdown hangs
         )
         self._daemon_thread.start()
+
+    def _run_ui_task(self, fn: object) -> None:
+        """Runner for :attr:`DaemonBridge.ui_task` — always on the Qt thread."""
+        if not callable(fn):
+            return
+        try:
+            fn()
+        except Exception:
+            logger.debug("ui task raised", exc_info=True)
+
+    @Slot()
+    def _on_session_start_requested(self) -> None:
+        """Dashboard "Start session": boot a fresh in-process daemon after
+        an ended session. Defers while a stop is still in flight."""
+        if self._quitting:
+            return
+        stop_future = self._daemon_stop_future
+        if self._stopping or (stop_future is not None and not stop_future.done()):
+            logger.info("session start requested while stop in flight; deferring")
+            self._restart_after_stop = True
+            return
+        if self._daemon_loop is not None and self._daemon_loop.is_running():
+            logger.debug("session start requested but daemon already running")
+            return
+        self._restart_daemon()
+
+    def _restart_daemon(self) -> None:
+        """Drop every handle to the previous daemon and start a new one."""
+        self._outbound_subscription = None
+        self._state_subscription = None
+        self._intervention_subscription = None
+        self._daemon = None
+        try:
+            self._bridge.reset_sequence_counters()
+        except Exception:
+            logger.debug("sequence counter reset failed", exc_info=True)
+        try:
+            self._start_daemon()
+        except Exception:
+            logger.exception("daemon restart failed")
+            self._bridge.on_error(
+                "Cortex couldn't start a new session",
+                "Core services did not start. Quit and reopen Cortex if this repeats.",
+                "daemon_restart_failed",
+            )
+
+    @Slot(str)
+    def _on_palette_changed(self, _variant: str) -> None:
+        """Re-render state-coloured surfaces after a palette swap."""
+        dashboard = self._dashboard
+        if dashboard is not None and hasattr(dashboard, "apply_palette_change"):
+            try:
+                dashboard.apply_palette_change()
+            except Exception:
+                logger.debug("dashboard palette change failed", exc_info=True)
+
+    @Slot(str)
+    def _on_connection_verified(self, name: str) -> None:
+        onboarding = self._onboarding
+        if onboarding is not None and hasattr(onboarding, "mark_extensions_connected"):
+            try:
+                onboarding.mark_extensions_connected(name)
+            except Exception:
+                logger.debug("mark_extensions_connected failed", exc_info=True)
+
+    def _dismiss_overlay(self) -> None:
+        """Single overlay dismissal path: stops its timers, then hides."""
+        overlay = self._overlay
+        if overlay is None:
+            return
+        suppress = getattr(overlay, "suppress", None)
+        try:
+            if callable(suppress):
+                suppress()
+            else:
+                overlay.hide()
+        except Exception:
+            logger.debug("overlay dismiss failed", exc_info=True)
 
     def _install_ws_broadcast_observer(self) -> None:
         """Subscribe the in-process desktop to transport-neutral events."""
@@ -1285,6 +1416,10 @@ class CortexAppController:
         if self._quit_when_daemon_stops:
             self._quit_when_daemon_stops = False
             QTimer.singleShot(0, self._on_gui_quit_requested)
+            return
+        if self._restart_after_stop:
+            self._restart_after_stop = False
+            QTimer.singleShot(0, self._restart_daemon)
 
     @Slot(str, str, str)
     def _on_error_occurred(self, title: str, body: str, cid: str) -> None:
@@ -1424,9 +1559,7 @@ class CortexAppController:
                 signals = None
             if signals is None:
                 signals = []
-            # Marshal back onto the Qt thread.
-            from PySide6.QtCore import QTimer as _QTimer
-
+            # Marshal back onto the Qt thread via the bridge's queued signal.
             def _apply() -> None:
                 if self._overlay is not None and hasattr(
                     self._overlay, "apply_causal_signals"
@@ -1436,7 +1569,7 @@ class CortexAppController:
                     except Exception:
                         logger.debug("apply_causal_signals failed", exc_info=True)
 
-            _QTimer.singleShot(0, _apply)
+            self._bridge.run_on_ui(_apply)
 
         try:
             asyncio.run_coroutine_threadsafe(
@@ -1641,7 +1774,6 @@ class CortexAppController:
         """
         import concurrent.futures
 
-        from PySide6.QtCore import QTimer as _QTimer
 
         future: concurrent.futures.Future[tuple[float, bool]] = (
             concurrent.futures.Future()
@@ -1669,9 +1801,9 @@ class CortexAppController:
                 return
             future.set_result((elapsed, completed))
 
-        # QTimer.singleShot is the canonical way to schedule a callable on
-        # the Qt main thread from any thread.
-        _QTimer.singleShot(0, _on_qt_thread)
+        # Queued Qt signal — the only thread-safe way onto the Qt main
+        # thread from the asyncio thread.
+        self._bridge.run_on_ui(_on_qt_thread)
         # asyncio.wrap_future bridges the concurrent.futures.Future into
         # the asyncio loop so the caller can ``await`` it.
         return await asyncio.wrap_future(future)
@@ -1853,13 +1985,10 @@ class CortexAppController:
                         "latency_ms": None,
                         "error": "bad_result_type",
                     }
-            # Hop onto the Qt main thread via singleShot so the dialog's
+            # Hop onto the Qt main thread via the bridge so the dialog's
             # paint chain stays on the correct thread.
             try:
-                from PySide6.QtCore import QTimer as _QTimer
-
-                _QTimer.singleShot(
-                    0,
+                self._bridge.run_on_ui(
                     lambda p=payload: settings_dialog.apply_provider_test_result(p),
                 )
             except Exception:
@@ -2086,7 +2215,11 @@ class CortexAppController:
                 profile = await runner.finish(approved_by_user=True)
                 if self._daemon is None:
                     raise RuntimeError("daemon is unavailable")
-                event = self._daemon.activate_calibration_profile(
+                # The storage layer raises ``StorageError`` when its sync
+                # bridge is used on the event-loop thread; activate from a
+                # worker thread instead.
+                event = await asyncio.to_thread(
+                    self._daemon.activate_calibration_profile,
                     str(profile.profile_id),
                     expected_sha256=calibration_profile_sha256(profile),
                 )
@@ -2184,8 +2317,8 @@ class CortexAppController:
         self._paused = not self._paused
         if self._tray is not None:
             self._tray.set_paused(self._paused)
-        if self._paused and self._overlay is not None:
-            self._overlay.hide()
+        if self._paused:
+            self._dismiss_overlay()
         # P0 §3.11: route through ``set_quiet_mode`` so QUIET_MODE_STATE
         # broadcasts back to every surface (overlay capsule, popup
         # pill, VS Code status bar). The legacy local ``_paused`` flag
@@ -2220,8 +2353,7 @@ class CortexAppController:
         self._paused = True
         if self._tray is not None:
             self._tray.set_paused(True)
-        if self._overlay is not None:
-            self._overlay.hide()
+        self._dismiss_overlay()
 
     def _quit(self) -> None:
         if self._quitting:
@@ -2283,12 +2415,18 @@ class CortexAppController:
             or self._daemon_loop is None
             or not self._daemon_loop.is_running()
         ):
-            # Daemon not running — no recap to wait for; jump straight
-            # to the quit path so the user isn't stuck.
+            # Daemon not running — nothing to stop. Report "stopped" so
+            # the dashboard settles into its ended state (or completes
+            # a pending quit); ending a session must never quit the app
+            # on its own.
             logger.debug(
-                "daemon_stop_requested: no live daemon loop; quitting directly"
+                "daemon_stop_requested: no live daemon loop; reporting stopped"
             )
-            self._on_gui_quit_requested()
+            self._stopping = False
+            try:
+                self._bridge.on_daemon_stopped()
+            except Exception:
+                logger.debug("daemon_stopped fallback emit failed", exc_info=True)
             return
 
         # Fire-and-forget: the future's done-callback notifies the UI
@@ -2371,7 +2509,7 @@ class CortexAppController:
             "user_initiated_quit: arming two-phase stop via consumer tab"
         )
         try:
-            consumer._arm_stop()
+            consumer._arm_stop(quit_after=True)
         except Exception:
             logger.exception(
                 "Failed to arm two-phase stop from user-initiated quit"
@@ -2462,11 +2600,7 @@ class CortexAppController:
                     logger.info("LLM planner credentials reloaded after BYOK save")
                     # Hop back to the Qt main thread to surface the toast.
                     try:
-                        from PySide6.QtCore import QTimer
-
-                        QTimer.singleShot(
-                            0, lambda: self._show_byok_success_toast()
-                        )
+                        self._bridge.run_on_ui(self._show_byok_success_toast)
                     except Exception:
                         logger.debug(
                             "BYOK success toast scheduling failed",

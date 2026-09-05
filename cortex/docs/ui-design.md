@@ -122,14 +122,60 @@ Closing, going back, changing selected sources, or expiry must cancel any
 prepared external-context handle. A modal never animates from a nearby button;
 it is centered. Anchored popovers originate from their trigger.
 
+## Desktop shell contracts
+
+- **Appearance:** every Qt window pins the Aqua (light) appearance through
+  `mac_native.apply_vibrancy(widget, appearance="light")`, and the
+  `QApplication` palette comes from `mac_native.application_palette()`. The
+  shell never inherits the system dark theme half-way; the suggestion card is
+  the one surface that pins `"dark"` on purpose.
+- **Session semantics:** "End session" stops sensing, shows the recap, and
+  leaves Cortex open in an *ended* phase that offers "Start session" (when the
+  host can restart the daemon) and an explicit "Quit Cortex". Only explicit
+  quit routes (dashboard Quit, the recap sheet's "Quit Cortex", tray / Cmd+Q)
+  emit `gui_quit_requested`. The recap sheet's "View full report" keeps
+  Cortex open on every route and renders the report already in hand.
+- **Suggestion card:** a fixed-width (`POPUP_WIDTH`) notification anchored to
+  the top-right of the cursor's screen. It shows with
+  `WA_ShowWithoutActivating`, never calls `activateWindow`, uses only
+  Cmd-modified shortcuts, and honours Escape once the user has clicked into
+  it. The breathing pacer (`BREATHING_PACER_SIZE`) appears only for breathing
+  plans. One "Why this?" toggle reveals the full causal explanation.
+- **Truthful indicators:** connection uses the info colour, not a state
+  colour; extension dots carry text and accessible names; cost, session
+  statistics, and "cost so far today" stay hidden until real data arrives;
+  onboarding progress and "Get Started" record only steps that are really
+  done; the menu-bar status names the evidence state ("Still gathering",
+  "Not enough evidence") before naming a state.
+- **Shared components:** `components.SegmentedControl`, `Disclosure`, the
+  floating `Toast` (parented to the dashboard, positioned manually, 160 ms
+  opacity in/out, hover pauses the timer), `status_pill_qss` /
+  `status_dot_qss`, and `format_relative_age` are the single implementations.
+  Buttons use the generated `BTN_*_QSS` recipes (accent, ghost, destructive,
+  link, segment, pill), which reserve a 2 px transparent border so the
+  keyboard focus ring never shifts layout and every recipe has a `:pressed`
+  state. Cormorant is restricted to the wordmark and hero numerals
+  (`HERO_NUMERAL_QSS`).
+- **Windows, not pages:** Settings and Connections close on Escape and carry
+  no "Back" control. Settings scrolls; the weekly schedule and the Advanced
+  (debug logging) section sit behind disclosures. Connections renders every
+  outcome inline as a per-card checklist with numbered steps and re-probes on
+  show — no modal message boxes, no Terminal commands.
+- **Thread safety:** anything that must touch a widget from the daemon or a
+  worker thread goes through a queued Qt signal (`DaemonBridge.ui_task`,
+  `calibration_progress`); `QTimer.singleShot` from a non-Qt thread is not
+  allowed. Hidden windows own no running timers: the overlay's
+  `suppress()` is the single dismissal path.
+
 ## Surface-specific posture
 
 - **Desktop dashboard:** prioritize live status, signal quality, and explicit
   unavailable states. No geometry animation in data rows. Advanced diagnostics
   are visually subordinate to the consumer summary. A full-screen break always
   exposes an immediate "End early" control and Escape route. Intervention
-  footer controls must fit the production 460 px overlay width; shortcut hints
-  belong in tooltips/accessibility descriptions when visible copy would clip.
+  footer controls must fit the production `POPUP_WIDTH` (380 px) notification
+  width; shortcut hints belong in tooltips/accessibility descriptions when
+  visible copy would clip.
 - **Desktop privacy sheet:** source selection → exact preview → explicit send.
   The review step shows destination, retention caveat, expiry, byte size,
   redactions, and exact outbound prompt; changing sources burns the preview.
@@ -175,6 +221,8 @@ Reduce Motion.
 ```bash
 python -m cortex.scripts.sync_design_tokens --check
 pytest -q cortex/tests/unit/test_ui_contrast_contract.py \
+  cortex/tests/unit/test_desktop_shell_contracts.py \
+  cortex/tests/unit/test_dashboard_stop.py \
   cortex/tests/unit/test_desktop_tokens_smoke.py \
   cortex/tests/unit/test_overlay_animation.py \
   cortex/tests/unit/test_breathing_pacer_config.py \

@@ -51,11 +51,14 @@ _BEARER_PREFIX = "Bearer "
 _LEGACY_HEADER_NAME = "X-Cortex-Auth-Token"
 
 
-def _extract_token(
+def extract_token(
     authorization: str | None,
     x_cortex_auth_token: str | None,
 ) -> str | None:
     """Pull the candidate token out of either header.
+
+    Public so the rate limiter (D3) applies exactly the same header
+    contract before deciding whether a request may consume budget.
 
     ``Authorization: Bearer <token>`` is canonical. The legacy
     ``X-Cortex-Auth-Token`` header is accepted because the browser
@@ -77,6 +80,10 @@ def _extract_token(
         if candidate:
             return candidate
     return None
+
+
+# Backward-compatible private alias.
+_extract_token = extract_token
 
 
 async def require_capability_token(
@@ -138,6 +145,7 @@ async def optional_capability_token(
 
 
 __all__ = [
+    "extract_token",
     "require_capability_token",
     "optional_capability_token",
 ]

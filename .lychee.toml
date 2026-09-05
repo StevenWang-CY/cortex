@@ -13,6 +13,8 @@ exclude = [
 exclude_path = [
   "cortex/apps/browser_extension/node_modules",
   "cortex/apps/browser_extension/.plasmo",
+  "cortex/apps/vscode_extension/node_modules",
+  "cortex/apps/vscode_extension/out",
   "build",
   "dist"
 ]

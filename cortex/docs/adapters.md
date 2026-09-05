@@ -27,7 +27,7 @@ class MyAdapter:
 
     @property
     def capabilities(self) -> list[str]:
-        return ["fold_except", "scroll_to"]
+        return ["get_context"]
 
     async def execute(self, action: str, params: dict) -> AdapterResult:
         """Execute an action. Returns AdapterResult with success / reversible / error."""
@@ -56,44 +56,42 @@ Key principles:
 
 ## Existing Adapters
 
+Production adapters are context readers. None of them executes anything: the
+only executable effects in the product are the four catalogued actions of the
+intervention transaction coordinator (`open_url`, `search_error`,
+`highlight_tab`, `resume_last_active_file`), and those run through the
+manifest-bound authorization flow in `intervention_engine/transaction.py`,
+not through an adapter `execute` call.
+
 ### EditorAdapter (`context_engine/editor_adapter.py`)
 
-Communicates with the VS Code extension via WebSocket to gather:
-- Current file path
-- Visible code range (start/end lines)
-- Symbol at cursor (function/class name)
-- Diagnostics (errors, warnings)
-- Visible code content
+Receives `CONTEXT_RESPONSE` payloads from the VS Code extension and keeps the
+latest `EditorContext`:
+- current file basename and language
+- visible line range and symbol at cursor
+- diagnostics (errors, warnings), bounded
+- optional visible code excerpt, only when the user has not disabled
+  `cortex.shareEditorContent`, and only for `file` documents
 
-Actions supported:
-- `fold_except` — fold all code except specified function
-- `unfold_all` — restore all code folds
-- `scroll_to` — scroll to specific line
+The extension never reads terminal output or shell history; the
+`TerminalContext` slot in its payload is empty and the daemon treats it as
+absent.
 
 ### BrowserAdapter (`context_engine/browser_adapter.py`)
 
-Communicates with the Chrome extension via WebSocket to gather:
-- Active tab title and URL
-- Active tab content excerpt (max 2000 tokens)
-- All open tabs with type classification
-- Tab type distribution (documentation, stackoverflow, search, code_host, social, other)
-
-Actions supported:
-- `hide_tabs` — hide/group specified tabs
-- `restore_tabs` — restore hidden tabs
-- `focus_tab` — switch to a specific tab
+Receives `CONTEXT_RESPONSE` payloads from the Chrome/Edge extension:
+- active tab title, origin, and sanitized path
+- active-page excerpt (bounded, and only for origins the user has explicitly
+  allowed; never in incognito)
+- open tabs with type classification (documentation, stackoverflow, search,
+  code_host, social, other)
 
 ### TerminalAdapter (`context_engine/terminal_adapter.py`)
 
-Captures terminal context locally:
-- Last N lines of terminal output
-- Detected error messages (stack traces, compilation errors)
-- Repeated commands
-- Currently running command
-
-Actions supported:
-- `clear_history` — clear terminal history display
-- `highlight_error` — highlight error region
+A local error-block detector (Python tracebacks, JS stack traces, shell
+errors, Rust/Go panics). It has no live producer in the shipping product: the
+editor extension does not forward terminal lines, so its context is empty
+unless a developer feeds it lines in a test or a local experiment.
 
 ## Adding a New Adapter
 
@@ -134,14 +132,14 @@ class MyAppAdapter:
 
     @property
     def capabilities(self) -> list[str]:
-        return ["apply_action"]
+        return ["get_context"]
 
     async def get_context(self) -> dict:
         if self._ws_send is None or self._ws_receive is None:
             return {}
 
         try:
-            await self._ws_send(json.dumps({"type": "GET_CONTEXT", "payload": {}}))
+            await self._ws_send(json.dumps({"type": "CONTEXT_REQUEST", "payload": {}}))
             raw = await asyncio.wait_for(self._ws_receive(), timeout=2.0)
             data = json.loads(raw)
             if data.get("type") != "CONTEXT_RESPONSE":
@@ -153,16 +151,11 @@ class MyAppAdapter:
             return {}
 
     async def execute(self, action: str, params: dict) -> AdapterResult:
-        if self._ws_send is None:
-            return AdapterResult(success=False, error="adapter unavailable")
-        try:
-            await self._ws_send(json.dumps({
-                "type": "APPLY_ACTION",
-                "payload": {"action": action, **params},
-            }))
-            return AdapterResult(success=True, reversible=True)
-        except Exception as exc:
-            return AdapterResult(success=False, error=str(exc))
+        # Context adapters do not execute. Effects belong to the intervention
+        # transaction coordinator (manifest → authorization → receipt →
+        # restore); an adapter that needs an effect adds a catalogued action
+        # there instead of sending its own apply frame.
+        return AdapterResult(success=False, error="context adapters do not execute")
 
     async def health_check(self) -> bool:
         return self._available
@@ -214,41 +207,44 @@ class TestMyAppAdapter:
 
 ## Communication Protocol
 
-Adapters communicate with their corresponding extensions via the WebSocket server on port 9473. The protocol uses JSON messages:
+Adapters exchange typed frames with their extensions over the WebSocket server
+on port 9473. Every literal below is a member of the canonical `MessageType`
+catalogue (`cortex/libs/schemas/ws_message_types.py`); anything else is
+rejected at schema construction.
 
-### Request (daemon → extension)
+### Context request (daemon → extension)
 ```json
-{
-  "type": "GET_CONTEXT",
-  "payload": {}
-}
+{ "type": "CONTEXT_REQUEST", "payload": {} }
 ```
 
-### Response (extension → daemon)
+### Context response (extension → daemon)
 ```json
-{
-  "type": "CONTEXT_RESPONSE",
-  "payload": { ... }
-}
+{ "type": "CONTEXT_RESPONSE", "payload": { "...": "typed EditorContext / BrowserContext fields" } }
 ```
 
-### Legacy action (daemon → extension; experimental/disabled by default)
+### Effects (daemon → extension, only inside an authorized transaction)
 ```json
 {
-  "type": "APPLY_ACTION",
+  "type": "INTERVENTION_APPLY",
   "payload": {
-    "action": "fold_except",
-    "function_name": "handleSubmit",
-    "file_path": "src/App.tsx"
+    "intervention_id": "…",
+    "transaction_id": "…",
+    "manifest_digest": "…",
+    "actions": [ { "action_id": "…", "action_type": "highlight_tab", "target": "…" } ]
   }
 }
 ```
 
+The extension answers each action with an `INTERVENTION_RECEIPT`; the daemon
+verifies the receipt's postcondition and publishes
+`INTERVENTION_TRANSACTION_STATE`. Restores travel as `INTERVENTION_RESTORE`
+and are verified the same way.
+
 Extensions first send `AUTH` with the capability token and wait for
-`AUTH_OK`; only then may they send `IDENTIFY`. Production clients reject
-legacy apply/action traffic while in `suggest_only`. The target protocol
-uses separate PROPOSED → AUTHORIZED → APPLY message types with replay-safe
-identities.
+`AUTH_OK`; only then may they send `IDENTIFY`. Clients in `suggest_only`
+mode reject any apply traffic, and the daemon never emits `INTERVENTION_APPLY`
+without a persisted, unexpired authorization grant bound to the exact
+manifest digest.
 
 ## Privacy Requirements
 

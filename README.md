@@ -76,11 +76,13 @@
   displayed as an experimental wellness signal. Camera-derived HRV,
   respiration, LF/HF, apnea, and the former stress-integral trigger are
   unavailable until metric-specific reference-sensor validation passes.
-- **Multi-layer kill chain.** Stopping the daemon executes
-  WebSocket `SHUTDOWN` → HTTP `/shutdown` → Chrome native-messaging
-  `stop` → SIGTERM-by-port-and-name → SIGKILL survivors, with
-  bounded waits between each layer. The lifecycle invariants are documented in
-  [`AGENTS.md`](AGENTS.md) and tested on the shutdown paths.
+- **Bounded, client-safe stop chain.** Stopping the daemon executes
+  WebSocket `SHUTDOWN` → authenticated HTTP `/shutdown` → a bounded wait
+  for the daemon's own graceful shutdown (recap, receipts, database close)
+  → SIGTERM of the daemon process identified by its pidfile or listening
+  socket → SIGKILL survivors. Browser and editor processes that merely hold
+  a client socket are never signalled. The lifecycle invariants are
+  documented in [`AGENTS.md`](AGENTS.md) and tested on the shutdown paths.
 - **Hard CI gates.** Python lint/type/tests, schema and version drift,
   browser type/tests/build, VS Code compile/tests/package, regression
   replay, and dependency-policy artifacts run on changes before release.
@@ -164,8 +166,6 @@ Deep dives: [How It Works](https://github.com/StevenWang-CY/cortex/wiki/How-It-W
 
 ## Why I built this
 
-<!-- EDIT THIS PARAGRAPH — rewrite in your own voice before publishing -->
-
 Existing focus tools often ignore context. Cortex explores whether local
 signals and workspace structure can support better-timed, more specific
 suggestions without pretending that webcam measurements diagnose a mental
@@ -194,7 +194,8 @@ code audits. The version-control history is the project, not the binary.
    copy under `/Volumes/Cortex`). Use Finder **Get Info** if you need to confirm
    the installed version.
 4. Verify the checksum/attestation and open Cortex. A notarized release should not require stripping quarantine.
-5. Follow the setup wizard (Camera, Accessibility, optional BYOK, Extensions).
+5. Follow the six-step setup wizard (Camera, Accessibility, optional Claude
+   access, Calibration, Extensions, Notifications).
 
 That's it — no terminal, no Python, no Node.js required. The daemon
 runs in-process inside Cortex.app; the browser extension's

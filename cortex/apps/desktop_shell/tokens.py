@@ -22,20 +22,26 @@ BRAND_DISPLAY_FONT: Final[str] = 'Cormorant Garamond'
 BRAND_WORDMARK: Final[str] = 'Cortex'
 
 # --- Semantic palette (light + dark) ---
+# Alpha-bearing values are emitted in Qt's #AARRGGBB order.
 SEMANTIC_LIGHT: Final[dict[str, str]] = {
     "window_bg": "#ECECEC",
     "control_bg": "#FFFFFF",
     "grouped_bg": "#F2F2F7",
     "sidebar_bg": "#E5E5EA",
     "label_primary": "#1A1A1A",
-    "label_secondary": "#3C3C434C",
-    "label_tertiary": "#3C3C432E",
-    "label_quaternary": "#3C3C4318",
-    "separator": "#3C3C4326",
+    "label_secondary": "#4C3C3C43",
+    "label_tertiary": "#2E3C3C43",
+    "label_quaternary": "#183C3C43",
+    "separator": "#263C3C43",
     "danger": "#D70015",
     "success": "#30B257",
     "warning": "#D9A100",
     "info": "#0A84FF",
+    "label_inverse": "#FFFFFF",
+    "success_text": "#1B6B3C",
+    "warning_text": "#7A5600",
+    "info_text": "#005BBD",
+    "danger_text": "#B3000F",
 }
 
 SEMANTIC_DARK: Final[dict[str, str]] = {
@@ -44,14 +50,19 @@ SEMANTIC_DARK: Final[dict[str, str]] = {
     "grouped_bg": "#1C1C1E",
     "sidebar_bg": "#232326",
     "label_primary": "#FFFFFF",
-    "label_secondary": "#EBEBF599",
-    "label_tertiary": "#EBEBF58C",
-    "label_quaternary": "#EBEBF528",
-    "separator": "#5454584C",
+    "label_secondary": "#99EBEBF5",
+    "label_tertiary": "#8CEBEBF5",
+    "label_quaternary": "#28EBEBF5",
+    "separator": "#4C545458",
     "danger": "#FF453A",
     "success": "#32D74B",
     "warning": "#FFD60A",
     "info": "#0A84FF",
+    "label_inverse": "#1A1A1A",
+    "success_text": "#5FD37E",
+    "warning_text": "#E8B84A",
+    "info_text": "#5CA8FF",
+    "danger_text": "#FF6961",
 }
 
 # --- State palette mapping (FLOW/HYPER/HYPO/RECOVERY) ---
@@ -73,10 +84,10 @@ STATE_ACCENT_ROLES: Final[dict[str, str]] = {
 
 # Hex fallbacks for non-mac / pre-resolution callers.
 STATE_COLORS: Final[dict[str, str]] = {
-    "UNKNOWN": "#3C3C432E",
+    "UNKNOWN": "#2E3C3C43",
     "FLOW": "#D97757",
     "HYPER": "#D70015",
-    "HYPO": "#3C3C432E",
+    "HYPO": "#2E3C3C43",
     "RECOVERY": "#0A84FF",
 }
 
@@ -96,7 +107,7 @@ BIO_RESP: Final[str] = '#57D99E'
 BIO_BLINK: Final[str] = '#D9B457'
 
 # --- Typography ---
-FONT_SYSTEM: Final[str] = '-apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", system-ui, sans-serif'
+FONT_SYSTEM: Final[str] = '".AppleSystemUIFont", "Helvetica Neue", sans-serif'
 FONT_DISPLAY: Final[str] = '"Cormorant Garamond", ui-serif, Georgia, serif'
 FONT_MONO: Final[str] = 'Menlo, ui-monospace, "SF Mono", "JetBrains Mono", monospace'
 
@@ -168,10 +179,10 @@ HUD_HALO: Final[tuple[int, int, int, int]] = (217, 119, 87, 24)
 # Maps palette name -> {state_name: hex} for STATE_COLORS swap.
 PALETTE_VARIANTS: Final[dict[str, dict[str, str]]] = {
     "default": {
-        "UNKNOWN": "#3C3C432E",
+        "UNKNOWN": "#2E3C3C43",
         "FLOW": "#D97757",
         "HYPER": "#D70015",
-        "HYPO": "#3C3C432E",
+        "HYPO": "#2E3C3C43",
         "RECOVERY": "#0A84FF",
     },
     "deuteranopia": {
@@ -205,7 +216,11 @@ CX_TERTIARY: Final[str] = SEMANTIC_LIGHT["grouped_bg"]
 CX_TEXT: Final[str] = SEMANTIC_LIGHT["label_primary"]
 CX_TEXT_SECONDARY: Final[str] = "#5C5854"
 CX_TEXT_TERTIARY: Final[str] = "#6B6661"
-CX_TEXT_INVERSE: Final[str] = "#FFFFFF"
+CX_TEXT_INVERSE: Final[str] = SEMANTIC_LIGHT["label_inverse"]
+CX_SUCCESS_TEXT: Final[str] = SEMANTIC_LIGHT["success_text"]
+CX_WARNING_TEXT: Final[str] = SEMANTIC_LIGHT["warning_text"]
+CX_INFO_TEXT: Final[str] = SEMANTIC_LIGHT["info_text"]
+CX_DANGER_TEXT: Final[str] = SEMANTIC_LIGHT["danger_text"]
 CX_ACCENT: Final[str] = BRAND_ACCENT
 CX_ACCENT_HOVER: Final[str] = BRAND_ACCENT_HOVER
 CX_ACCENT_TEXT: Final[str] = BRAND_ACCENT_TEXT
@@ -247,35 +262,42 @@ CARD_QSS: Final[str] = (
     f"border-radius: {RADIUS_CARD}px;"
 )
 
+# Filled buttons keep a transparent 2px border at rest so the keyboard
+# focus ring never shifts layout when it appears.
+BTN_FOCUS_RING: Final[str] = f"2px solid {BRAND_ACCENT}"
+BTN_FOCUS_RING_ON_ACCENT: Final[str] = f"2px solid {SEMANTIC_LIGHT['label_primary']}"
+
 BTN_PRIMARY_QSS: Final[str] = (
     "QPushButton {"
-    f"  padding: 6px 14px;"
+    f"  padding: 4px 12px;"
     f"  border-radius: {RADIUS_BUTTON}px;"
     f"  background: {SEMANTIC_LIGHT['label_primary']};"
-    f"  color: {SEMANTIC_LIGHT['control_bg']};"
+    f"  color: {SEMANTIC_LIGHT['label_inverse']};"
     f"  font-family: {FONT_SYSTEM};"
     f"  font-size: {FS_FOOTNOTE}px;"
     f"  font-weight: {FW_SEMIBOLD};"
-    "  border: none;"
+    "  border: 2px solid transparent;"
     "}"
     "QPushButton:hover { background: #333; }"
     "QPushButton:pressed { background: #555; }"
+    f"QPushButton:focus {{ border: {BTN_FOCUS_RING}; }}"
     f"QPushButton:disabled {{ background: {SEMANTIC_LIGHT['grouped_bg']}; color: #6B6661; }}"
 )
 
 BTN_ACCENT_QSS: Final[str] = (
     "QPushButton {"
-    f"  padding: 6px 14px;"
+    f"  padding: 4px 12px;"
     f"  border-radius: {RADIUS_BUTTON}px;"
     f"  background: {BRAND_ACCENT};"
     f"  color: {SEMANTIC_LIGHT['label_primary']};"
     f"  font-family: {FONT_SYSTEM};"
     f"  font-size: {FS_FOOTNOTE}px;"
     f"  font-weight: {FW_SEMIBOLD};"
-    "  border: none;"
+    "  border: 2px solid transparent;"
     "}"
     f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"
     f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"
+    f"QPushButton:focus {{ border: {BTN_FOCUS_RING_ON_ACCENT}; }}"
     f"QPushButton:disabled {{ background: {SEMANTIC_LIGHT['grouped_bg']}; color: #6B6661; }}"
 )
 
@@ -292,7 +314,99 @@ BTN_GHOST_QSS: Final[str] = (
     "}"
     "QPushButton:hover { background: rgba(0,0,0,0.03); color: #1A1A1A; }"
     "QPushButton:pressed { background: rgba(0,0,0,0.07); color: #1A1A1A; }"
+    f"QPushButton:focus {{ border-color: {BRAND_ACCENT}; }}"
     "QPushButton:disabled { color: #827D77; border-color: rgba(0,0,0,0.08); }"
+)
+
+BTN_DESTRUCTIVE_QSS: Final[str] = (
+    "QPushButton {"
+    f"  padding: 6px 14px;"
+    f"  border-radius: {RADIUS_BUTTON}px;"
+    "  background: transparent;"
+    f"  color: {SEMANTIC_LIGHT['danger_text']};"
+    f"  font-family: {FONT_SYSTEM};"
+    f"  font-size: {FS_FOOTNOTE}px;"
+    f"  font-weight: {FW_MEDIUM};"
+    f"  border: 1px solid {SEMANTIC_LIGHT['separator']};"
+    "}"
+    "QPushButton:hover { background: rgba(215, 0, 21, 0.06); }"
+    "QPushButton:pressed { background: rgba(215, 0, 21, 0.12); }"
+    f"QPushButton:focus {{ border-color: {SEMANTIC_LIGHT['danger']}; }}"
+    "QPushButton:disabled { color: #827D77; border-color: rgba(0,0,0,0.08); }"
+)
+
+BTN_LINK_QSS: Final[str] = (
+    "QPushButton {"
+    f"  padding: 4px 12px;"
+    f"  border-radius: {RADIUS_BUTTON}px;"
+    "  background: transparent;"
+    f"  color: {BRAND_ACCENT_TEXT};"
+    f"  font-family: {FONT_SYSTEM};"
+    f"  font-size: {FS_FOOTNOTE}px;"
+    f"  font-weight: {FW_SEMIBOLD};"
+    "  border: 2px solid transparent;"
+    "}"
+    "QPushButton:hover { background: rgba(217, 119, 87, 0.10); }"
+    "QPushButton:pressed { background: rgba(217, 119, 87, 0.20); }"
+    f"QPushButton:focus {{ border: {BTN_FOCUS_RING}; }}"
+    "QPushButton:disabled { color: #827D77; }"
+)
+
+BTN_SEGMENT_QSS: Final[str] = (
+    "QPushButton {"
+    f"  padding: 4px 12px;"
+    f"  border-radius: {RADIUS_BUTTON}px;"
+    "  background: transparent;"
+    "  color: #5C5854;"
+    f"  font-family: {FONT_SYSTEM};"
+    f"  font-size: {FS_FOOTNOTE}px;"
+    f"  font-weight: {FW_MEDIUM};"
+    "  border: 2px solid transparent;"
+    "}"
+    "QPushButton:hover { color: #1A1A1A; }"
+    "QPushButton:pressed { background: rgba(0,0,0,0.05); color: #1A1A1A; }"
+    f"QPushButton:checked {{ background: {SEMANTIC_LIGHT['control_bg']}; color: #1A1A1A; font-weight: {FW_SEMIBOLD}; }}"
+    f"QPushButton:focus {{ border: {BTN_FOCUS_RING}; }}"
+)
+
+PILL_QSS: Final[str] = (
+    f"font-family: {FONT_SYSTEM};"
+    f"font-size: {FS_CAPTION}px;"
+    f"font-weight: {FW_MEDIUM};"
+    "color: #5C5854;"
+    f"background: {SEMANTIC_LIGHT['grouped_bg']};"
+    f"border-radius: {RADIUS_PILL}px;"
+    "padding: 3px 10px;"
+    "border: none;"
+)
+
+PILL_BUTTON_QSS: Final[str] = (
+    "QPushButton {"
+    f"  font-family: {FONT_SYSTEM};"
+    f"  font-size: {FS_CAPTION}px;"
+    f"  font-weight: {FW_MEDIUM};"
+    "  color: #5C5854;"
+    f"  background: {SEMANTIC_LIGHT['grouped_bg']};"
+    f"  border-radius: {RADIUS_PILL}px;"
+    "  padding: 3px 10px;"
+    "  border: 2px solid transparent;"
+    "}"
+    "QPushButton:hover { background: rgba(0,0,0,0.05); color: #1A1A1A; }"
+    "QPushButton:pressed { background: rgba(0,0,0,0.09); color: #1A1A1A; }"
+    f"QPushButton:focus {{ border: {BTN_FOCUS_RING}; }}"
+    "QPushButton:disabled { color: #827D77; }"
+)
+
+INPUT_QSS: Final[str] = (
+    "QLineEdit {"
+    f"  padding: 0 {SP4}px;"
+    f"  border: 1px solid {SEMANTIC_LIGHT['separator']};"
+    f"  border-radius: {RADIUS_BUTTON}px;"
+    f"  color: {SEMANTIC_LIGHT['label_primary']};"
+    f"  background: {SEMANTIC_LIGHT['control_bg']};"
+    f"  selection-background-color: {BRAND_ACCENT};"
+    "}"
+    f"QLineEdit:focus {{ border-color: {BRAND_ACCENT}; }}"
 )
 
 SECTION_HEADING_QSS: Final[str] = (
@@ -304,10 +418,18 @@ SECTION_HEADING_QSS: Final[str] = (
 )
 
 PAGE_TITLE_QSS: Final[str] = (
-    f"font-family: {FONT_DISPLAY};"
+    f"font-family: {FONT_SYSTEM};"
     f"font-size: {FS_TITLE}px;"
-    "font-style: italic;"
+    f"font-weight: {FW_SEMIBOLD};"
+    "color: #1A1A1A;"
+    "background: transparent;"
+)
+
+HERO_NUMERAL_QSS: Final[str] = (
+    f"font-family: {FONT_DISPLAY};"
+    f"font-size: {FS_HERO_NUMERIC}px;"
     f"font-weight: {FW_REGULAR};"
     "color: #1A1A1A;"
     "background: transparent;"
+    "border: none;"
 )

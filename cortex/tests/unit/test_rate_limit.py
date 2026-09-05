@@ -21,6 +21,7 @@ envelope on 429. These tests pin the behaviour. They each fail on
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
@@ -55,7 +56,11 @@ def _build_app(*, limits: dict[str, int] | None = None) -> tuple[FastAPI, RateLi
             super().__init__(app, **kw)
             captured["m"] = self
 
-    app.add_middleware(_CapturingMiddleware, limits=limits)
+    # D3: this harness mounts the limiter WITHOUT the capability-token
+    # dependency, so it opts out of the authenticated-only budget rule
+    # (the production wiring keeps the secure default; see
+    # ``test_rate_limit_auth_gated.py`` for that contract).
+    app.add_middleware(_CapturingMiddleware, limits=limits, authenticated_only=False)
 
     @app.post("/state/infer")
     async def _state_infer() -> dict:  # pragma: no cover - exercised by tests
@@ -155,6 +160,8 @@ def test_window_slide_frees_slots() -> None:
             kw.setdefault("limits", {"/state/infer": 2})
             kw.setdefault("window_seconds", 10.0)
             kw.setdefault("time_func", clock)
+            # D3: no auth dependency in this harness (see ``_build_app``).
+            kw.setdefault("authenticated_only", False)
             super().__init__(app, **kw)
 
     app.add_middleware(_ClockMiddleware)
@@ -179,12 +186,25 @@ def test_window_slide_frees_slots() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_cid_included_in_log_line(caplog: pytest.LogCaptureFixture) -> None:
+def test_cid_included_in_log_line(
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # Use the full ``create_app`` pipeline so the correlation middleware
     # is wired exactly as in production. The wiring contract under test
     # is: correlation wraps rate-limit, so the cid is bound by the time
     # the 429 log line is emitted.
+    #
+    # D3: in production only authenticated requests consume budget, so
+    # this test presents the capability token (the previous version
+    # relied on unauthenticated requests being counted — the defect).
+    from cortex.libs.auth.local_token import load_or_create_token
     from cortex.services.api_gateway.app import create_app, registry
+
+    token_file = tmp_path / "auth.token"
+    monkeypatch.setattr("cortex.libs.auth.local_token.auth_token_path", lambda: token_file)
+    auth = {"Authorization": f"Bearer {load_or_create_token(token_file)}"}
 
     registry.reset()
     app = create_app()
@@ -205,12 +225,13 @@ def test_cid_included_in_log_line(caplog: pytest.LogCaptureFixture) -> None:
         client.post(
             "/state/infer",
             json={"feature_vector": {}, "signal_quality": {}},
+            headers=auth,
         )
         with caplog.at_level(logging.WARNING):
             resp = client.post(
                 "/state/infer",
                 json={"feature_vector": {}, "signal_quality": {}},
-                headers={"X-Cortex-Request-ID": "cid_testabc01"},
+                headers={"X-Cortex-Request-ID": "cid_testabc01", **auth},
             )
     assert resp.status_code == 429
     # The log line uses the structured EventType value so log aggregators

@@ -148,6 +148,15 @@ class ContextPrivacyStatusResponse(DualClockModel):
     pending_previews: int = Field(default=0, ge=0, le=64)
     provider: Literal["bedrock", "vertex", "direct"]
     retention: ProviderRetentionDisclosure
+    transport_state: Literal["ready", "credentials_missing", "external_context_disabled"] = Field(
+        default="external_context_disabled",
+        description=(
+            "Why an external request can or cannot be previewed right now: the "
+            "transport is ready, external planning is configured but no provider "
+            "credential is available (fixable from Settings without a restart), "
+            "or external planning is not enabled/acknowledged."
+        ),
+    )
 
 
 class ContextPreviewConfirmationRequest(BaseModel):

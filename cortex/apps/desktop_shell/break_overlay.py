@@ -57,6 +57,7 @@ from cortex.apps.desktop_shell.a11y import (
 from cortex.apps.desktop_shell.tokens import (
     FONT_SYSTEM,
     FS_CAPTION,
+    FS_LARGE_TITLE,
     HUD_ACCENT,
     HUD_ACCENT_RING,
     HUD_BG_PRIMARY,
@@ -170,7 +171,7 @@ class _BreathingCanvas(QWidget):
 
             # Phase label in the center.
             painter.setPen(QColor(*TEXT_HUD_PRIMARY))
-            painter.setFont(mac_native.system_font(28, "medium"))
+            painter.setFont(mac_native.system_font(FS_LARGE_TITLE, "medium"))
             painter.drawText(
                 rect, Qt.AlignmentFlag.AlignCenter, self._phase_label,
             )
@@ -273,14 +274,17 @@ class BreakOverlayWindow(QWidget):
                 "QPushButton {"
                 f"  background: {_SURFACE_DIM_CSS};"
                 f"  color: {_TEXT_HUD_PRIMARY_CSS};"
-                f"  border: 1px solid {_ACCENT_RING_CSS};"
+                f"  border: 2px solid {_ACCENT_RING_CSS};"
                 f"  border-radius: {RADIUS_WINDOW}px;"
-                "  padding: 8px 18px;"
+                "  padding: 6px 14px;"
                 f"  font-family: {FONT_SYSTEM};"
                 f"  font-size: {FS_CAPTION}px;"
                 "}"
                 f"QPushButton:hover {{ background: {_SURFACE_EMPHASIS_CSS}; }}"
+                "QPushButton:pressed { background: rgba(255, 255, 255, 0.30); }"
+                f"QPushButton:focus {{ border-color: {_TEXT_HUD_PRIMARY_CSS}; }}"
             )
+            btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
             btn.clicked.connect(self._end_early)
             set_accessible_name(btn, "End breathing break")
             set_accessible_description(

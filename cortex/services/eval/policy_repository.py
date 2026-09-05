@@ -26,6 +26,13 @@ class PolicyLifecycleConflict(RuntimeError):
     """A supposedly idempotent lifecycle mutation conflicts with authority."""
 
 
+# Audit D12: a delivered proposal that is dismissed/snoozed within this many
+# milliseconds of delivery is treated as an observed interruption cost. A
+# delivery alone is not evidence of harm; the old constant ``-1.0 iff
+# delivered`` term biased every treatment arm by -0.02 under a null effect.
+IGNORED_INTERRUPTION_WINDOW_MS: int = 2_000
+
+
 @dataclass(frozen=True, slots=True)
 class FinalizationResult:
     reward: PolicyRewardRecord
@@ -56,6 +63,7 @@ def _reward_components(
 
     latest_rating: str | None = None
     latest_action: str | None = None
+    latest_action_at: int | None = None
     undo = False
     restore_failure = False
     delivery_failure = delivery is not None and delivery.get("status") == "not_delivered"
@@ -69,6 +77,8 @@ def _reward_components(
                 latest_rating = rating
         elif kind == "user_action":
             latest_action = str(payload.get("action") or "") or None
+            observed_at = observation.get("observed_at_unix_ms")
+            latest_action_at = int(observed_at) if isinstance(observed_at, int) else None
         elif kind == "undo":
             undo = True
         elif kind == "restore_failure":
@@ -112,7 +122,20 @@ def _reward_components(
             task_signal = 0.0
 
     delivered = delivery is not None and delivery.get("status") == "delivered"
-    interruption_signal = -1.0 if delivered else 0.0
+    # Audit D12: the interruption term is evidence-based. Only a delivered
+    # proposal the user rejected almost immediately (dismissed/snoozed within
+    # ``IGNORED_INTERRUPTION_WINDOW_MS`` of delivery) carries the cost; a
+    # delivery by itself scores 0 so that, under a null effect, the
+    # treatment and no-action arms receive the same reward.
+    delivered_at = delivery.get("delivered_at_unix_ms") if delivered and delivery else None
+    quick_rejection = bool(
+        delivered
+        and latest_action in {"dismissed", "snoozed"}
+        and isinstance(delivered_at, int)
+        and latest_action_at is not None
+        and 0 <= latest_action_at - delivered_at <= IGNORED_INTERRUPTION_WINDOW_MS
+    )
+    interruption_signal = -1.0 if quick_rejection else 0.0
     safety_signal = -1.0 if restore_failure else 0.0
     transport_signal = -1.0 if delivery_failure else 0.0
     reward = (
@@ -134,6 +157,11 @@ def _reward_components(
         "restore_failure": restore_failure,
         "delivery_failure": delivery_failure,
         "interruption_signal": interruption_signal,
+        # Ratings and terminal actions can only be observed when a proposal
+        # was actually presented; the no-action arm's user-feedback terms are
+        # structurally zero, never "neutral feedback". Analyses must not read
+        # the difference as an effect of those components.
+        "user_feedback_observable": delivered,
         "post_snapshot_missing": final_snapshot is None,
         "weight_user_rating": 0.45,
         "weight_user_action": 0.25,
@@ -295,7 +323,22 @@ class PolicyRepository:
 
         return await self._database.read(read)
 
-    async def mark_delivery(self, delivery: PolicyDeliveryRecord) -> None:
+    async def mark_delivery(
+        self,
+        delivery: PolicyDeliveryRecord,
+        *,
+        supersede_delivered: bool = False,
+    ) -> None:
+        """Persist the delivery result exactly once per decision.
+
+        Audit D12: the daemon records ``delivered`` at the same instant the
+        intervention transaction is marked delivered — *before* the wire
+        send — so a crash between send and bookkeeping cannot leave a
+        presented proposal recorded as undelivered. When the send then
+        reaches no surface, the daemon corrects the row to ``not_delivered``
+        with ``supersede_delivered=True``; that is the only permitted
+        rewrite, and only in that direction.
+        """
         payload = delivery.model_dump(mode="json")
         payload_json = canonical_policy_json(payload)
         digest = hashlib.sha256(payload_json.encode()).hexdigest()
@@ -313,13 +356,30 @@ class PolicyRepository:
             if selected != "no_action" and delivery.status == "not_applicable":
                 raise PolicyLifecycleConflict("active arms require a delivery result")
             existing = connection.execute(
-                "SELECT payload_sha256 FROM policy_deliveries WHERE decision_id=?",
+                "SELECT payload_sha256, delivery_status FROM policy_deliveries "
+                "WHERE decision_id=?",
                 (str(delivery.decision_id),),
             ).fetchone()
             if existing is not None:
-                if str(existing[0]) != digest:
-                    raise PolicyLifecycleConflict("delivery was already finalized differently")
-                return
+                if str(existing[0]) == digest:
+                    return
+                if (
+                    supersede_delivered
+                    and str(existing[1]) == "delivered"
+                    and delivery.status == "not_delivered"
+                ):
+                    connection.execute(
+                        "UPDATE policy_deliveries SET delivery_status=?, "
+                        "delivered_at_unix_ms=NULL, intervention_id=NULL, "
+                        "payload_json=?, payload_sha256=? WHERE decision_id=?",
+                        (delivery.status, payload_json, digest, str(delivery.decision_id)),
+                    )
+                    connection.execute(
+                        "UPDATE policy_decisions SET intervention_id=NULL WHERE decision_id=?",
+                        (str(delivery.decision_id),),
+                    )
+                    return
+                raise PolicyLifecycleConflict("delivery was already finalized differently")
             connection.execute(
                 "INSERT INTO policy_deliveries(decision_id, delivery_status, "
                 "delivered_at_unix_ms, intervention_id, payload_json, payload_sha256) "
@@ -456,8 +516,6 @@ class PolicyRepository:
         final_snapshot: dict[str, Any] | None,
         contamination: tuple[str, ...] = (),
     ) -> FinalizationResult:
-        final_json = canonical_policy_json(final_snapshot) if final_snapshot is not None else None
-        final_digest = hashlib.sha256(final_json.encode()).hexdigest() if final_json else None
         now = self._clock.unix_ms()
 
         def write(connection: sqlite3.Connection) -> FinalizationResult:
@@ -497,8 +555,41 @@ class PolicyRepository:
                     already_finalized=True,
                 )
             scheduled_close = int(window[2])
+            window_opened = int(window[1])
             if now < scheduled_close:
                 raise PolicyLifecycleConflict("outcome window has not reached its scheduled close")
+            # Audit D12: a window closed long after its scheduled close (more
+            # than one full window late — the collector was down, or the
+            # process restarted) does not have a proximal post-snapshot; it
+            # is censored rather than finalized with whatever the daemon
+            # happens to observe now. Likewise a snapshot stamped with a
+            # different process boot than the decision comes from a cold
+            # pipeline and is not comparable to the decision-time context.
+            missingness_reason: str | None = None
+            effective_snapshot = final_snapshot
+            if effective_snapshot is None:
+                missingness_reason = "post_snapshot_unavailable"
+            elif now > scheduled_close + max(1_000, scheduled_close - window_opened):
+                missingness_reason = "finalized_late"
+                effective_snapshot = None
+            else:
+                snapshot_boot = effective_snapshot.get("boot_id")
+                decision_boot = decision.get("boot_id")
+                if (
+                    isinstance(snapshot_boot, str)
+                    and isinstance(decision_boot, str)
+                    and snapshot_boot != decision_boot
+                ):
+                    missingness_reason = "post_snapshot_from_different_boot"
+                    effective_snapshot = None
+            final_json = (
+                canonical_policy_json(effective_snapshot)
+                if effective_snapshot is not None
+                else None
+            )
+            final_digest = (
+                hashlib.sha256(final_json.encode()).hexdigest() if final_json else None
+            )
 
             delivery_row = connection.execute(
                 "SELECT payload_json FROM policy_deliveries WHERE decision_id=?",
@@ -546,7 +637,7 @@ class PolicyRepository:
                 decision=decision,
                 delivery=delivery,
                 observations=observations,
-                final_snapshot=final_snapshot,
+                final_snapshot=effective_snapshot,
             )
             overlapping = connection.execute(
                 "SELECT COUNT(*) FROM policy_deliveries l "
@@ -557,7 +648,7 @@ class PolicyRepository:
             contamination_values = list(dict.fromkeys(contamination))
             if overlapping is not None and int(overlapping[0]) > 0:
                 contamination_values.append("overlapping_policy_delivery")
-            outcome_status = "finalized" if final_snapshot is not None else "censored"
+            outcome_status = "finalized" if effective_snapshot is not None else "censored"
             outcome_payload = {
                 "schema_version": "policy-outcome/2.0",
                 "decision_id": str(decision_id),
@@ -566,11 +657,9 @@ class PolicyRepository:
                 "window_opened_at_unix_ms": int(window[1]),
                 "scheduled_close_at_unix_ms": scheduled_close,
                 "finalized_at_unix_ms": now,
-                "final_snapshot": final_snapshot,
+                "final_snapshot": effective_snapshot,
                 "contamination": contamination_values,
-                "missingness_reason": (
-                    None if final_snapshot is not None else "post_snapshot_unavailable"
-                ),
+                "missingness_reason": missingness_reason,
                 "observations": observations,
             }
             outcome_json = canonical_policy_json(outcome_payload)
@@ -621,7 +710,7 @@ class PolicyRepository:
                     final_json,
                     final_digest,
                     canonical_policy_json(contamination_values),
-                    None if final_snapshot is not None else "post_snapshot_unavailable",
+                    missingness_reason,
                     str(decision_id),
                     reward_version,
                 ),

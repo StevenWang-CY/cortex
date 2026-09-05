@@ -171,3 +171,17 @@ def test_palette_variants_cover_canonical_states() -> None:
             assert palette[state] != "", (
                 f"PALETTE_VARIANTS[{variant_name!r}][{state!r}] is empty"
             )
+
+
+def test_qt_font_stack_contains_only_families_qt_can_resolve() -> None:
+    """v0.4.0: the CSS system stack (``-apple-system``, ``system-ui``, SF Pro
+    marketing names) is not resolvable by Qt, which logs "Replace uses of
+    missing font family" for every widget; the release smoke probe treats that
+    marker as fatal. The Qt output must use the platform family instead."""
+    from cortex.apps.desktop_shell import tokens
+
+    stack = tokens.FONT_SYSTEM
+    for alias in ("-apple-system", "BlinkMacSystemFont", "system-ui", "SF Pro"):
+        assert alias not in stack, f"web-only font alias {alias!r} leaked into the Qt stack"
+    assert '".AppleSystemUIFont"' in stack
+

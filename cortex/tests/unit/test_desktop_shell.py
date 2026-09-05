@@ -733,7 +733,7 @@ class TestTrayIcon:
         tray = CortexTrayIcon(self._application())
         tray.set_starting()
         assert not tray._connected
-        assert tray._state_action.text() == "State: Starting…"
+        assert tray._state_action.text() == "Status: Starting…"
 
     def test_set_paused(self):
         tray = CortexTrayIcon(self._application())
@@ -1423,12 +1423,20 @@ class _StubNotifBtn:
     def __init__(self) -> None:
         self.text = ""
         self.enabled = True
+        self.visible = True
+        self.stylesheet = ""
 
     def setText(self, t):
         self.text = t
 
     def setEnabled(self, v):
         self.enabled = v
+
+    def setVisible(self, v):
+        self.visible = v
+
+    def setStyleSheet(self, qss):
+        self.stylesheet = qss
 
 
 class TestOnboardingNotificationAuth:
@@ -1438,6 +1446,7 @@ class TestOnboardingNotificationAuth:
 
         win = OnboardingWindow.__new__(OnboardingWindow)
         win._notif_btn_ref = _StubNotifBtn()
+        win._notif_status_ref = _StubNotifBtn()
         completed: list[str] = []
         incompleted: list[str] = []
         win.mark_step_complete = lambda s: completed.append(s)
@@ -1449,15 +1458,21 @@ class TestOnboardingNotificationAuth:
         win._apply_notification_auth_result(False)
         assert "macos_notifications" not in completed
         assert "macos_notifications" in incompleted
-        assert "retry" in win._notif_btn_ref.text.lower()
+        # The button stays live for a retry; the status row says why.
+        assert "try again" in win._notif_btn_ref.text.lower()
         assert win._notif_btn_ref.enabled is True
+        assert win._notif_btn_ref.visible is True
+        assert "unavailable" in win._notif_status_ref.text.lower()
+        assert win._notif_status_ref.visible is True
 
     def test_granted_marks_complete(self):
         win, completed, incompleted = self._make_window()
         win._apply_notification_auth_result(True)
         assert "macos_notifications" in completed
-        assert "✓" in win._notif_btn_ref.text
-        assert win._notif_btn_ref.enabled is False
+        # Success is a status row, not a disabled button pretending to be one.
+        assert "enabled" in win._notif_status_ref.text.lower()
+        assert win._notif_status_ref.visible is True
+        assert win._notif_btn_ref.visible is False
 
     def test_recheck_downgrades_on_resolved_deny(self, monkeypatch):
         from cortex.libs.utils import macos_notifications as mn
@@ -1551,14 +1566,6 @@ class TestConnectionsVerify:
                 error=f"{browser} protocol probe failed",
             ),
         )
-        warnings: list[tuple[str, str]] = []
-        monkeypatch.setattr(
-            conn.QMessageBox,
-            "warning",
-            staticmethod(
-                lambda _parent, title, message: warnings.append((title, message))
-            ),
-        )
         monkeypatch.setattr(
             conn.subprocess,
             "run",
@@ -1575,8 +1582,11 @@ class TestConnectionsVerify:
                 "target_browsers": (expected_browser,),
             }
         ]
-        assert warnings
-        assert "No connection was reported as successful" in warnings[0][1]
+        # The outcome stays on the card: bridge row failed + honest note.
+        status = panel.status_for(display_name)
+        assert status["rows"]["bridge"] is False
+        assert status["tone"] == "danger"
+        assert "No connection was reported as successful" in status["note"]
 
     def test_connect_success_shows_exact_browser_restart_steps(
         self,
@@ -1623,24 +1633,20 @@ class TestConnectionsVerify:
                 args=args,
             ),
         )
-        monkeypatch.setattr(
-            conn.QMessageBox,
-            "information",
-            staticmethod(
-                lambda _parent, _title, message: messages.append(message)
-            ),
-        )
+        monkeypatch.setattr(panel, "_daemon_reachable", lambda **_kw: False)
 
         panel._connect_browser("Chrome", "chrome://extensions")
 
         assert clipboard_values == [str(extension_path)]
-        assert messages
-        assert "Cmd+Shift+G" in messages[0]
-        assert "Cmd+Q" in messages[0]
-        assert "protocol check" in messages[0]
+        status = panel.status_for("Chrome")
+        assert status["rows"]["bridge"] is True
+        assert "protocol check" in status["note"]
+        steps = " ".join(status["steps"])
+        assert "Cmd+Shift+G" in steps
+        assert "Cmd+Q" in steps
+        assert not messages
 
     def test_verify_reports_each_prerequisite(self, monkeypatch):
-        from cortex.apps.desktop_shell import connections as conn
         from cortex.scripts import install_native_host
         from types import SimpleNamespace
 
@@ -1655,21 +1661,19 @@ class TestConnectionsVerify:
             ),
         )
         monkeypatch.setattr(panel, "_daemon_reachable", lambda: False)
-        warnings: list = []
-        monkeypatch.setattr(
-            conn.QMessageBox, "warning",
-            staticmethod(lambda _parent, title, message, **kw: warnings.append((title, message))),
-        )
-        monkeypatch.setattr(
-            conn.QMessageBox, "information",
-            staticmethod(lambda *a, **kw: warnings.append(("info", a))),
-        )
+        verified: list[str] = []
+        panel.connection_verified = SimpleNamespace(emit=verified.append)
         panel._verify_browser_connection("Chrome")
-        # Honest path: a warning (not a success "information") was shown
-        # because neither prerequisite is satisfied.
-        assert warnings
-        joined = " ".join(str(x) for x in warnings)
-        assert "FAILED" in joined or "not reachable" in joined
+        # Honest path: every prerequisite is reported on the card and the
+        # panel never claims a verified connection.
+        status = panel.status_for("Chrome")
+        assert status["rows"] == {"bridge": False, "extension": False, "daemon": False}
+        assert status["tone"] == "danger"
+        steps = " ".join(status["steps"])
+        assert "Connect Chrome" in steps
+        assert "Start a session" in steps
+        assert "registered native host did not respond" in steps
+        assert verified == []
 
 
 # ===========================================================================

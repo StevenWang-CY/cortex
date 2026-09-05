@@ -142,8 +142,11 @@ def sanitize_prompt_text(value: str, *, max_len: int = 4000) -> str:
         char if char in {"\n", "\t"} or not unicodedata.category(char).startswith("C") else " "
         for char in text
     )
-    # Escape braces to avoid accidental format interpolation.
-    text = text.replace("{", "{{").replace("}", "}}")
+    # Braces are preserved verbatim: every sanitised value is passed to
+    # ``str.format`` as an *argument*, never spliced into the template, so
+    # ``{`` / ``}`` in code or titles cannot trigger interpolation. (The
+    # historical ``{{`` doubling here reached the model as doubled braces
+    # in every code snippet — audit D6.)
     # F09: defang prompt-injection markers. Replacements break the
     # exact byte pattern the model recognises as an instruction-start
     # without scrubbing the surrounding human-readable text.
@@ -232,58 +235,30 @@ intervening, referencing specific BEHAVIORAL signals the user can act on (e.g., 
 Do NOT cite raw biometric numbers (pulse, HRV, blink rate) — students already \
 know they're stressed. Focus on observable workspace behavior: tab count, switching \
 frequency, time stuck on an error, idle time, number of context switches.
-- Output ONLY valid JSON matching the schema below. No markdown, no preamble.
+- The response is a single JSON object whose shape is enforced by the API's \
+structured-output schema (output_config.format). Fill every field; use null or an \
+empty list where nothing applies. No markdown, no preamble.
 
-Output JSON schema:
-{
-  "situation_summary": "string, 1-2 sentences",
-  "primary_focus": "string, the one thing to look at",
-  "headline": "string, under 15 words",
-  "causal_explanation": "string, 1-2 sentences explaining WHY support may help, referencing specific observable workspace behavior",
-  "micro_steps": ["step 1", "step 2", "step 3"],
-  "hide_targets": [
-    "browser_tabs_except_active",
-    "terminal_lines_before_last_error_block",
-    "editor_symbols_except_current_function"
-  ],
-  "ui_plan": {
-    "dim_background": true,
-    "show_overlay": true,
-    "fold_unrelated_code": true,
-    "intervention_type": "simplified_workspace"
-  },
-  "tone": "direct",
-  "suggested_actions": [
-    {
-      "action_type": "close_tab|group_tabs|bookmark_and_close|open_url|search_error|highlight_tab|save_session|copy_to_clipboard|start_timer",
-      "tab_index": 3,
-      "target": "search query, URL to open, or session name (NOT for tab targeting)",
-      "label": "Short button label",
-      "reason": "Why this helps right now",
-      "category": "recommended|optional|informational",
-      "reversible": true,
-      "group_id": "optional grouping key",
-      "metadata": {"tab_title": "...", "search_query": "..."}
-    }
-  ],
-  "error_analysis": {
-    "error_type": "syntax|import|type|runtime|build|test|other",
-    "root_cause": "1-2 sentence root cause",
-    "suggested_fix": "concrete code fix or approach",
-    "search_query": "pre-crafted search query",
-    "relevant_doc_url": "URL if identifiable from context",
-    "failing_abstraction": "the specific function/class/module that is failing",
-    "symbol_location": "file:line location of the failing symbol",
-    "root_cause_category": "type_mismatch|null_reference|missing_import|logic_error|api_misuse|concurrency|config|other",
-    "minimal_edit": "smallest code change that fixes the issue"
-  },
-  "tab_recommendations": {
-    "tabs": [
-      {"tab_index": 0, "tab_title": "...", "action": "keep|close|group|bookmark_and_close", "reason": "...", "relevance_score": 0.9, "group_name": "optional"}
-    ],
-    "summary": "Why these recommendations"
-  }
-}
+Field guidance:
+- situation_summary: 1-2 sentences. primary_focus: the one thing to look at. \
+headline: under 15 words, naming the first micro-step.
+- causal_explanation: 1-2 sentences explaining WHY support may help, referencing \
+specific observable workspace behavior.
+- micro_steps: 1-3 strings, most impactful first. hide_targets: any of \
+"browser_tabs_except_active", "terminal_lines_before_last_error_block", \
+"editor_symbols_except_current_function".
+- ui_plan: dim_background / show_overlay / fold_unrelated_code booleans plus \
+intervention_type.
+- suggested_actions: action_type, tab_index (integer for tab actions, else null), \
+target (search query, URL to open, or session name — NOT for tab targeting), label, \
+reason, category, reversible, group_id (or null), and metadata as key/value pairs \
+(e.g. tab_title, search_query).
+- error_analysis: error_type, root_cause, suggested_fix, search_query, \
+relevant_doc_url, failing_abstraction, symbol_location, root_cause_category, \
+minimal_edit — or null when there are no errors.
+- tab_recommendations: tabs (tab_index, tab_title, action keep|close|group|\
+bookmark_and_close, reason, relevance_score 0-1, group_name or null) plus summary — \
+or null when fewer than 4 tabs are listed.
 
 IMPORTANT: The user will see your recommendations as a PROPOSAL. Sending context \
 to the model is not workspace authorization. Any eligible action is converted into \
@@ -943,7 +918,9 @@ def build_anthropic_messages(
     The Anthropic Messages API takes the system prompt as a separate
     parameter (a list of content blocks), not as a message. Cache control
     is applied to the system prompt so subsequent calls within ~5 min
-    reuse it at 10% cost.
+    reuse it at 10% cost — provided it meets the model's minimum cacheable
+    prefix (512 tokens on Opus 5, 1024 on Sonnet 5 / Sonnet 4.6, 2048 on
+    Opus 4.7, 4096 on Haiku 4.5; see ``MODEL_CAPABILITIES``).
 
     Args:
         context, state, constraints, template_name, extra_context:
@@ -981,8 +958,9 @@ def build_anthropic_messages(
             "type": "text",
             "text": SYSTEM_PROMPT,
             # Ephemeral cache: ~5 min reuse window in the Anthropic API.
-            # Saves ~90% on the 3-4k-token system prompt for back-to-back
-            # interventions.
+            # Saves ~90% on the system prompt for back-to-back
+            # interventions on models whose minimum cacheable prefix the
+            # prompt exceeds (it is shorter than Haiku 4.5's 4096 floor).
             "cache_control": {"type": "ephemeral"},
         }
     ]

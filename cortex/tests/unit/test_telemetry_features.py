@@ -468,8 +468,10 @@ class TestOtherFeatures:
             ["VS Code", "Chrome", "Terminal", "VS Code"], dt=5.0, t0=0.0,
         )
         rate = FeatureAggregator._compute_window_switch_rate(events, window_seconds=15.0)
-        # 3 switches in 15s = 12 switches/min
-        assert abs(rate - 12.0) < 1.0, f"Switch rate={rate:.1f} expected ~12"
+        # Audit D13: every focus event inside the window is a real switch
+        # (the tracker de-duplicates same-window refreshes), so 4 events in
+        # 15 s = 16 switches/min. The old ``len - 1`` under-counted by one.
+        assert abs(rate - 16.0) < 1.0, f"Switch rate={rate:.1f} expected ~16"
 
     def test_no_window_events_zero_rate(self):
         rate = FeatureAggregator._compute_window_switch_rate([], window_seconds=15.0)

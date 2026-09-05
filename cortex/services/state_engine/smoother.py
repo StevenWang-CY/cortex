@@ -34,6 +34,14 @@ from cortex.libs.schemas.temporal import EventTime
 
 logger = logging.getLogger(__name__)
 
+# Audit D3: a committed label whose own smoothed score has fallen below the
+# exit threshold used to persist indefinitely whenever no other state cleared
+# its entry threshold (e.g. HYPER at 0.2 with FLOW at 0.3). After this many
+# seconds below the exit threshold the label falls back to UNKNOWN. It must
+# exceed the RECOVERY dwell (5 s) so a genuine post-HYPER recovery still
+# commits before the fallback fires.
+EXIT_TO_UNKNOWN_DWELL_SECONDS: float = 10.0
+
 
 @dataclass
 class SmoothedScores:
@@ -92,6 +100,9 @@ class ScoreSmoother:
         self._dwell_seconds = 0.0
         self._candidate_state: UserState | None = None
         self._candidate_since = 0.0
+        # When the committed label's own score first dropped to/below the
+        # exit threshold (None while it is above). Drives the exit dwell.
+        self._exit_candidate_since: float | None = None
         self._last_update_at: float | None = None
         self._transitions: deque[StateTransition] = deque(maxlen=100)
         self._latest: StateEstimate | None = None
@@ -177,7 +188,12 @@ class ScoreSmoother:
 
         confirmed = self._apply_hysteresis(dominant_state, dominant_score, now)
         if confirmed != self._current_state:
-            self._commit_transition(confirmed, dominant_score, now, event_time)
+            self._commit_transition(
+                confirmed,
+                0.0 if confirmed == UserState.UNKNOWN else dominant_score,
+                now,
+                event_time,
+            )
         else:
             self._dwell_seconds = max(0.0, now - self._state_entered_at)
 
@@ -294,14 +310,26 @@ class ScoreSmoother:
         score: float,
         now: float,
     ) -> UserState:
+        current_score = self._get_state_score(self._current_state)
+        # Track how long the committed label has sat at/below its exit
+        # threshold. The Schmitt exit only ever mattered when a *different*
+        # state cleared its entry threshold; without an exit dwell a label
+        # could survive indefinitely on a score that no longer supports it.
+        if (
+            self._current_state == UserState.UNKNOWN
+            or current_score > self._config.estimate_exit_threshold
+        ):
+            self._exit_candidate_since = None
+        elif self._exit_candidate_since is None:
+            self._exit_candidate_since = now
+
         if dominant == UserState.UNKNOWN:
             self._candidate_state = None
-            return self._current_state
+            return self._hold_or_exit(now)
         if dominant == self._current_state:
             self._candidate_state = None
-            return self._current_state
+            return self._hold_or_exit(now)
 
-        current_score = self._get_state_score(self._current_state)
         if (
             self._current_state != UserState.UNKNOWN
             and current_score > self._config.estimate_exit_threshold
@@ -314,16 +342,24 @@ class ScoreSmoother:
             entry_threshold = min(entry_threshold, 0.5)
         if score < entry_threshold:
             self._candidate_state = None
-            return self._current_state
+            return self._hold_or_exit(now)
 
         if self._candidate_state != dominant:
             self._candidate_state = dominant
             self._candidate_since = now
-            return self._current_state
+            return self._hold_or_exit(now)
         if now - self._candidate_since < self._get_dwell_time(dominant):
-            return self._current_state
+            return self._hold_or_exit(now)
         self._candidate_state = None
         return dominant
+
+    def _hold_or_exit(self, now: float) -> UserState:
+        """Keep the committed label unless its exit dwell has elapsed."""
+        if self._current_state == UserState.UNKNOWN or self._exit_candidate_since is None:
+            return self._current_state
+        if now - self._exit_candidate_since >= EXIT_TO_UNKNOWN_DWELL_SECONDS:
+            return UserState.UNKNOWN
+        return self._current_state
 
     def _commit_transition(
         self,
@@ -365,6 +401,7 @@ class ScoreSmoother:
         self._current_state = new_state
         self._state_entered_at = now
         self._dwell_seconds = 0.0
+        self._exit_candidate_since = None
 
     def _get_state_score(self, state: UserState) -> float:
         return {
@@ -417,6 +454,7 @@ class ScoreSmoother:
         self._dwell_seconds = 0.0
         self._candidate_state = None
         self._candidate_since = 0.0
+        self._exit_candidate_since = None
         self._last_update_at = None
         self._transitions.clear()
         self._latest = None

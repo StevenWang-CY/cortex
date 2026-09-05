@@ -118,6 +118,6 @@ GitHub attestations. The tag commit must be reachable from `main`; promotion
 verifies provenance for both DMGs, both evidence bundles, and both standalone
 architecture checksum manifests.
 
-Canonical detail: [cortex/docs/architecture.md](cortex/docs/architecture.md),
-[ADRs](docs/adr/README.md), [data flow](docs/data-flow.md), and
-[implementation audit](IMPLEMENTATION.md).
+Canonical detail: [cortex/docs/architecture.md](https://github.com/StevenWang-CY/cortex/blob/main/cortex/docs/architecture.md),
+[ADRs](https://github.com/StevenWang-CY/cortex/blob/main/docs/adr/README.md), [data flow](https://github.com/StevenWang-CY/cortex/blob/main/docs/data-flow.md), and
+[implementation audit](https://github.com/StevenWang-CY/cortex/blob/main/IMPLEMENTATION.md).

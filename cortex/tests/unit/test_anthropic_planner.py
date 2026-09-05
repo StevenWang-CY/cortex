@@ -1,10 +1,11 @@
-"""AnthropicPlanner unit tests — Bedrock production LLM path.
+"""AnthropicPlanner unit tests — structured-output production LLM path.
 
 These tests exercise the planner with a stub Anthropic SDK so they run
 without network access or credentials. Covers:
 
-* Tool-use payload extraction → InterventionPlan validation
-* Model-tier routing (fast / default / deep)
+* Structured-output request shape (no tools / tool_choice / temperature)
+* Response parsing: first text block → PlanDraft → InterventionPlan
+* Model-tier routing (fast / default / deep) and template coverage
 * Retry on RateLimitError with bounded backoff
 * Circuit breaker opens after consecutive failures, serves fallback
 * Cache hit short-circuits the SDK call
@@ -13,6 +14,7 @@ without network access or credentials. Covers:
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -35,8 +37,9 @@ from cortex.services.llm_engine.anthropic_planner import (
     _TEMPLATE_TIER,
     AnthropicPlanner,
     _CircuitBreaker,
-    _extract_tool_use_input,
+    parse_plan_response,
 )
+from cortex.services.llm_engine.prompts import PROMPT_TEMPLATES
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -72,11 +75,11 @@ def _make_state() -> StateEstimate:
     )
 
 
-_VALID_PLAN_DICT: dict[str, Any] = {
-    "level": "overlay_only",
-    "headline": "Fix the NameError on line 10",
+_VALID_DRAFT: dict[str, Any] = {
     "situation_summary": "1 error in main.py",
     "primary_focus": "main.py:10",
+    "headline": "Fix the NameError on line 10",
+    "causal_explanation": "1 active error pulled focus off the function.",
     "micro_steps": ["Read the NameError", "Define x before use"],
     "hide_targets": ["editor_symbols_except_current_function"],
     "ui_plan": {
@@ -87,30 +90,32 @@ _VALID_PLAN_DICT: dict[str, Any] = {
     },
     "tone": "supportive",
     "suggested_actions": [],
-    "causal_explanation": "1 active error pulled focus off the function.",
+    "error_analysis": None,
+    "tab_recommendations": None,
 }
 
 
-def _stub_response(plan_input: dict[str, Any] | None = None) -> MagicMock:
-    """Build a fake Anthropic response with a single tool_use block."""
-    block = SimpleNamespace(
-        type="tool_use",
-        name="emit_intervention_plan",
-        input=plan_input if plan_input is not None else _VALID_PLAN_DICT,
+def _stub_response(
+    payload: dict[str, Any] | None = None,
+    *,
+    stop_reason: str = "end_turn",
+) -> SimpleNamespace:
+    """Build a fake Messages API response: one text block holding JSON."""
+    text = json.dumps(payload if payload is not None else _VALID_DRAFT)
+    return SimpleNamespace(
+        stop_reason=stop_reason,
+        content=[SimpleNamespace(type="text", text=text)],
+        usage=SimpleNamespace(
+            input_tokens=120,
+            output_tokens=80,
+            cache_read_input_tokens=0,
+            cache_creation_input_tokens=0,
+        ),
     )
-    response = MagicMock()
-    response.content = [block]
-    response.usage = SimpleNamespace(
-        input_tokens=120,
-        output_tokens=80,
-        cache_read_input_tokens=0,
-        cache_creation_input_tokens=0,
-    )
-    return response
 
 
 def _make_stub_sdk(
-    response: MagicMock | None = None,
+    response: Any | None = None,
     side_effect: Any = None,
 ) -> MagicMock:
     sdk = MagicMock()
@@ -133,7 +138,10 @@ def _make_planner(**config_kwargs: Any) -> AnthropicPlanner:
         max_concurrent_requests=2,
         **config_kwargs,
     )
-    return AnthropicPlanner(cfg, sdk=sdk, _allow_unbrokered_test_requests=True)
+    planner = AnthropicPlanner(cfg, sdk=sdk, _allow_unbrokered_test_requests=True)
+    # Skip the real jittered backoff so retry tests stay fast.
+    planner._backoff = AsyncMock(return_value=None)  # type: ignore[method-assign]  # noqa: SLF001
+    return planner
 
 
 # ---------------------------------------------------------------------------
@@ -141,16 +149,18 @@ def _make_planner(**config_kwargs: Any) -> AnthropicPlanner:
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_bedrock_inference_profile():
+def test_resolve_bedrock_mantle_id():
     assert (
-        resolve_anthropic_model_id("claude-sonnet-4-6", provider="bedrock")
-        == "us.anthropic.claude-sonnet-4-6-v1:0"
+        resolve_anthropic_model_id("claude-sonnet-5", provider="bedrock")
+        == "anthropic.claude-sonnet-5"
     )
 
 
-def test_resolve_vertex_revision():
-    assert resolve_anthropic_model_id("claude-opus-4-7", provider="vertex").startswith(
-        "claude-opus-4-7",
+def test_resolve_vertex_id():
+    assert resolve_anthropic_model_id("claude-opus-5", provider="vertex") == "claude-opus-5"
+    assert (
+        resolve_anthropic_model_id("claude-haiku-4-5", provider="vertex")
+        == "claude-haiku-4-5@20251001"
     )
 
 
@@ -162,20 +172,38 @@ def test_resolve_direct_passthrough():
 
 
 # ---------------------------------------------------------------------------
-# Tool-use extraction
+# Response parsing
 # ---------------------------------------------------------------------------
 
 
-def test_extract_tool_use_input_returns_payload():
-    response = _stub_response()
-    assert _extract_tool_use_input(response) == _VALID_PLAN_DICT
+def test_parse_plan_response_reads_first_text_block():
+    parsed = parse_plan_response(_stub_response())
+    assert parsed.plan is not None
+    assert parsed.failure_reason is None
+    assert parsed.stop_reason == "end_turn"
+    assert parsed.plan.headline == "Fix the NameError on line 10"
 
 
-def test_extract_tool_use_input_raises_when_missing():
-    response = MagicMock()
-    response.content = [SimpleNamespace(type="text", text="oops")]
-    with pytest.raises(ValueError):
-        _extract_tool_use_input(response)
+def test_parse_plan_response_without_text_block_is_invalid_and_retryable():
+    response = SimpleNamespace(
+        stop_reason="end_turn",
+        content=[SimpleNamespace(type="tool_use", name="x", input={})],
+        usage=None,
+    )
+    parsed = parse_plan_response(response)
+    assert parsed.plan is None
+    assert parsed.failure_reason == "invalid_response"
+    assert parsed.retryable is True
+
+
+def test_parse_plan_response_rejects_non_json_and_non_object():
+    for text in ("not json", "[1, 2]", "42"):
+        response = SimpleNamespace(
+            stop_reason="end_turn",
+            content=[SimpleNamespace(type="text", text=text)],
+            usage=None,
+        )
+        assert parse_plan_response(response).failure_reason == "invalid_response"
 
 
 # ---------------------------------------------------------------------------
@@ -193,14 +221,21 @@ async def test_generate_plan_success_round_trip():
     )
     assert isinstance(plan, InterventionPlan)
     assert plan.level == "overlay_only"
+    assert plan.metadata["source"] == "llm"
     planner._sdk.messages.create.assert_awaited_once()
     call_kwargs = planner._sdk.messages.create.await_args.kwargs
-    assert call_kwargs["model"] == "us.anthropic.claude-opus-4-7-v1:0"
-    assert call_kwargs["tool_choice"]["name"] == "emit_intervention_plan"
+    # debug_error_summary → deep tier → Opus 5 on Bedrock Mantle.
+    assert call_kwargs["model"] == "anthropic.claude-opus-5"
+    assert call_kwargs["max_tokens"] == 8192
+    assert call_kwargs["output_config"]["format"]["type"] == "json_schema"
+    assert call_kwargs["output_config"]["effort"] == "medium"
+    for forbidden in ("tools", "tool_choice", "temperature", "top_p", "top_k", "thinking"):
+        assert forbidden not in call_kwargs
+    assert call_kwargs["system"][0]["cache_control"] == {"type": "ephemeral"}
 
 
 @pytest.mark.asyncio
-async def test_template_tier_routes_to_fast_model():
+async def test_template_tier_routes_to_fast_model_without_effort():
     planner = _make_planner()
     await planner.generate_intervention_plan(
         _make_context(),
@@ -208,21 +243,37 @@ async def test_template_tier_routes_to_fast_model():
         template_name="calm_overlay_writer",
     )
     call_kwargs = planner._sdk.messages.create.await_args.kwargs
-    assert call_kwargs["model"] == "us.anthropic.claude-haiku-4-5-v1:0"
+    assert call_kwargs["model"] == "anthropic.claude-haiku-4-5"
+    assert "effort" not in call_kwargs["output_config"]
 
 
-def test_known_templates_all_have_a_tier():
-    # Defensive: any new template added to prompts.py without an entry
-    # here will silently fall to "default" — this test fails fast on
-    # missing routing entries for the templates we expect.
-    expected = {
-        "calm_overlay_writer",
-        "browser_tab_reduction",
-        "micro_step_planner",
-        "code_focus_reduction",
-        "debug_error_summary",
-    }
-    assert expected.issubset(set(_TEMPLATE_TIER.keys()))
+@pytest.mark.asyncio
+async def test_template_tier_override_wins():
+    planner = _make_planner(template_tier_overrides={"calm_overlay_writer": "deep"})
+    await planner.generate_intervention_plan(
+        _make_context(),
+        _make_state(),
+        template_name="calm_overlay_writer",
+    )
+    call_kwargs = planner._sdk.messages.create.await_args.kwargs
+    assert call_kwargs["model"] == "anthropic.claude-opus-5"
+
+
+def test_template_tier_map_covers_exactly_the_prompt_templates():
+    # D12: the map used to name three non-existent templates and omit five
+    # real ones. Both key sets must be identical so no template silently
+    # falls to the default tier.
+    assert set(_TEMPLATE_TIER) == set(PROMPT_TEMPLATES)
+    assert _TEMPLATE_TIER["deep_bottleneck_diagnosis"] == "deep"
+    assert _TEMPLATE_TIER["recovery_reinforcer"] == "fast"
+    assert _TEMPLATE_TIER["re_engage_planner"] == "default"
+
+
+def test_model_for_template_uses_tier_routing():
+    planner = _make_planner()
+    assert planner.model_for_template("debug_error_summary") == "anthropic.claude-opus-5"
+    assert planner.model_for_template("browser_tab_reduction") == "anthropic.claude-haiku-4-5"
+    assert planner.model_for_template(None) == "anthropic.claude-sonnet-5"
 
 
 # ---------------------------------------------------------------------------
@@ -230,33 +281,31 @@ def test_known_templates_all_have_a_tier():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_retries_on_rate_limit_then_succeeds():
-    rate_err = RateLimitError(
+def _rate_limit_error() -> RateLimitError:
+    return RateLimitError(
         "throttled",
         response=MagicMock(status_code=429, headers={}),
         body=None,
     )
-    success = _stub_response()
+
+
+@pytest.mark.asyncio
+async def test_retries_on_rate_limit_then_succeeds():
     sdk = MagicMock()
     sdk.messages = MagicMock()
-    sdk.messages.create = AsyncMock(side_effect=[rate_err, success])
+    sdk.messages.create = AsyncMock(side_effect=[_rate_limit_error(), _stub_response()])
     planner = _make_planner(_sdk=sdk)
     plan = await planner.generate_intervention_plan(
         _make_context(), _make_state(), template_name="micro_step_planner",
     )
     assert plan.level == "overlay_only"
+    assert plan.metadata["source"] == "llm"
     assert sdk.messages.create.await_count == 2
 
 
 @pytest.mark.asyncio
 async def test_exhausted_retries_return_fallback_plan():
-    rate_err = RateLimitError(
-        "throttled",
-        response=MagicMock(status_code=429, headers={}),
-        body=None,
-    )
-    sdk = _make_stub_sdk(side_effect=rate_err)
+    sdk = _make_stub_sdk(side_effect=_rate_limit_error())
     planner = _make_planner(_sdk=sdk)
     plan = await planner.generate_intervention_plan(
         _make_context(), _make_state(), template_name="micro_step_planner",
@@ -265,7 +314,8 @@ async def test_exhausted_retries_return_fallback_plan():
     # supportive tone.
     assert plan.level == "overlay_only"
     assert plan.tone == "supportive"
-    assert sdk.messages.create.await_count == 3
+    assert plan.metadata["fallback_reason"] == "retries_exhausted"
+    assert sdk.messages.create.await_count == planner._config.planner_attempts == 3
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +335,14 @@ def test_circuit_breaker_opens_and_recovers():
     assert cb.allow(now=100.0)
 
 
+def test_circuit_breaker_trip_opens_immediately():
+    cb = _CircuitBreaker(threshold=5, window_seconds=60.0, open_seconds=10.0)
+    cb.trip(now=1.0)
+    assert cb.is_open
+    assert not cb.allow(now=2.0)
+    assert cb.allow(now=11.5)
+
+
 @pytest.mark.asyncio
 async def test_open_circuit_serves_fallback_without_calling_sdk():
     import time as _time
@@ -299,7 +357,28 @@ async def test_open_circuit_serves_fallback_without_calling_sdk():
         _make_context(), _make_state(), template_name="micro_step_planner",
     )
     assert plan.level == "overlay_only"
+    assert plan.metadata["fallback_reason"] == "circuit_open"
     sdk.messages.create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_breakers_are_per_tier():
+    import time as _time
+
+    sdk = _make_stub_sdk()
+    planner = _make_planner(_sdk=sdk)
+    planner._circuits["deep"]._opened_at = _time.monotonic()  # noqa: SLF001
+    deep = await planner.generate_intervention_plan(
+        _make_context(), _make_state(), template_name="debug_error_summary",
+    )
+    assert deep.metadata["fallback_reason"] == "circuit_open"
+    assert deep.metadata["tier"] == "deep"
+    sdk.messages.create.assert_not_awaited()
+    fast = await planner.generate_intervention_plan(
+        _make_context(), _make_state(), template_name="calm_overlay_writer",
+    )
+    assert fast.metadata["source"] == "llm"
+    sdk.messages.create.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -324,30 +403,32 @@ async def test_cache_hit_short_circuits_sdk_call():
 
 
 # ---------------------------------------------------------------------------
-# Invalid tool input
+# Invalid payloads
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_invalid_tool_input_triggers_retry_then_fallback():
-    bad = _stub_response(plan_input={"this": "is not a plan"})
+async def test_invalid_payload_triggers_retry_then_fallback():
+    bad = _stub_response(payload={"this": "is not a plan"})
     sdk = _make_stub_sdk(response=bad)
     planner = _make_planner(_sdk=sdk)
     plan = await planner.generate_intervention_plan(
         _make_context(), _make_state(), template_name="micro_step_planner",
     )
-    # Invalid tool inputs exhaust retries and fall back to the
-    # deterministic plan, which is always level=overlay_only.
+    # Invalid payloads exhaust retries and fall back to the deterministic
+    # plan, which is always level=overlay_only.
     assert plan.level == "overlay_only"
+    assert plan.metadata["fallback_reason"] == "invalid_response"
+    assert sdk.messages.create.await_count == 3
 
 
 # ---------------------------------------------------------------------------
-# Fatal API error
+# Non-retryable API errors
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_fatal_api_status_error_does_not_retry():
+async def test_bad_request_is_not_retried():
     fatal = APIStatusError(
         "bad request",
         response=MagicMock(status_code=400, headers={}),
@@ -358,6 +439,14 @@ async def test_fatal_api_status_error_does_not_retry():
     plan = await planner.generate_intervention_plan(
         _make_context(), _make_state(), template_name="micro_step_planner",
     )
-    # APIStatusError is in the same retryable bucket; we just bound to 3.
     assert plan.level == "overlay_only"
-    assert sdk.messages.create.await_count <= 3
+    assert plan.metadata["fallback_reason"] == "bad_request"
+    assert plan.metadata["http_status"] == 400
+    assert sdk.messages.create.await_count == 1
+
+
+def test_worst_case_seconds_matches_config():
+    planner = _make_planner()
+    assert planner.worst_case_seconds == planner._config.planner_worst_case_seconds
+    # 3 attempts × 2 s per-attempt timeout + capped backoff (2 s + 3 s).
+    assert planner.worst_case_seconds == pytest.approx(3 * 2.0 + 5.0)

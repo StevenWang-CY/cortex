@@ -396,7 +396,7 @@ class CostResponse(DualClockModel):
     or when no LLM client is registered):
     - ``prompt_tokens``: best-effort prompt-token counter for today.
     - ``completion_tokens``: best-effort completion-token counter for today.
-    - ``model``: active model id (e.g. ``claude-sonnet-4-5``).
+    - ``model``: active model id (e.g. ``claude-sonnet-5``).
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -438,7 +438,7 @@ class CostResponse(DualClockModel):
     model: str | None = Field(
         None,
         description=(
-            "Active model id (e.g. ``claude-sonnet-4-5``). ``None`` "
+            "Active model id (e.g. ``claude-sonnet-5``). ``None`` "
             "when no LLM client is registered."
         ),
     )
@@ -484,6 +484,24 @@ class TestProviderResult(BaseModel):
 # ─── StateUpdatePayload (STATE_UPDATE payload) ────────────────────────
 
 
+class PulseReadinessReason(BaseModel):
+    """Why the pulse window is not publishable yet (v0.4.0, audit S10).
+
+    Mirrors one ``ReadinessReason`` from the capture window diagnostics so a
+    client can replace a permanent "Reading your pulse…" with the real
+    blocker: still filling, too many unusable frames (and why), motion,
+    or a gap the window cannot bridge.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    code: str = Field(..., min_length=1, max_length=64)
+    message: str = Field(..., min_length=1, max_length=240)
+    observed: float | None = None
+    required: float | None = None
+    missing_reason: str | None = Field(None, max_length=64)
+
+
 class CaptureStatus(BaseModel):
     """P0 §3 (audit Debt-1 closure): capture-channel status sub-payload.
 
@@ -525,6 +543,13 @@ class CaptureStatus(BaseModel):
             "Latest capture-loop sequence number; surfaced for debug "
             "overlays that need to detect dropped frames. None when the "
             "producer does not stamp a sequence."
+        ),
+    )
+    pulse_unavailable: PulseReadinessReason | None = Field(
+        None,
+        description=(
+            "The first gate the pulse window failed, or None when the "
+            "window is publishable or no window has been prepared yet."
         ),
     )
 

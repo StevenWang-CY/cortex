@@ -15,15 +15,25 @@ import { CortexPanelProvider } from "./panel-provider";
 import { PANEL_STATE_LABELS } from "./design-tokens";
 import { EditorTransactionAdapter } from "./editor-transaction-adapter";
 
+const DEFAULT_DAEMON_URL = "ws://127.0.0.1:9473";
+
 let wsClient: CortexWSClient | undefined;
 let contextProvider: ContextProvider | undefined;
 let foldController: FoldController | undefined;
 let editorTransactionAdapter: EditorTransactionAdapter | undefined;
 let panelProvider: CortexPanelProvider | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
+/** Last connection state applied to the status bar (survives re-creation). */
+let statusBarConnected = false;
 type ExecutionMode = "suggest_only" | "authorized" | "research_autonomous";
 let currentExecutionMode: ExecutionMode = "suggest_only";
 let editorTransactionChain: Promise<void> = Promise.resolve();
+
+// A6: toast de-dup keyed by intervention_id. The daemon rebroadcasts the
+// same INTERVENTION_TRIGGER after every MICRO_STEP_TOGGLED; without this
+// each checkbox click re-raised the "Cortex: <headline>" toast.
+let lastOverlayToastInterventionId: string | null = null;
+let lastOsNotifInterventionId: string | null = null;
 
 function enqueueEditorTransaction(operation: () => Promise<void>): void {
     // Node's EventEmitter does not await async message listeners. Serialize
@@ -45,12 +55,56 @@ function handleLegacyBreakRecommendation(payload: unknown): void {
     const reason = typeof p.reason === "string"
         ? p.reason
         : "You've reached your preferred focus interval.";
-    void vscode.window.showInformationMessage(
+    void Promise.resolve(vscode.window.showInformationMessage(
         `Cortex · ${reason}`,
         "Open Cortex",
-    ).then((choice) => {
+    )).then((choice) => {
         if (choice === "Open Cortex") panelProvider?.showPanel();
-    });
+    }).catch(() => undefined);
+}
+
+/**
+ * A13: MORNING_BRIEFING → one notification.
+ *
+ * ``showInformationMessage`` only honours ``detail`` for modal dialogs,
+ * so the action items are inlined into the message itself. Every field
+ * is validated: ``action_items`` that is not an array (the previous code
+ * threw on ``.map``) degrades to the "left off at" hint.
+ */
+function handleMorningBriefing(payload: unknown): void {
+    const p = typeof payload === "object" && payload !== null
+        ? (payload as Record<string, unknown>)
+        : {};
+    const summary = typeof p.summary === "string" && p.summary.trim().length > 0
+        ? p.summary.trim()
+        : "Welcome back!";
+    const items = Array.isArray(p.action_items)
+        ? p.action_items
+            .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+            .map((item) => item.trim())
+        : [];
+    const leftOff = typeof p.left_off_at === "string" ? p.left_off_at.trim() : "";
+
+    let message = `Morning briefing: ${summary}`;
+    if (items.length > 0) {
+        const shown = items
+            .slice(0, 3)
+            .map((item, i) => `${i + 1}. ${item}`)
+            .join("  ");
+        const more = items.length > 3 ? ` (+${items.length - 3} more)` : "";
+        message += ` — ${shown}${more}`;
+    } else if (leftOff.length > 0) {
+        message += ` — You left off at ${leftOff}`;
+    }
+
+    void Promise.resolve(vscode.window.showInformationMessage(
+        message,
+        "Show Details",
+    )).then((choice) => {
+        if (choice === "Show Details" && panelProvider) {
+            panelProvider.showMorningBriefing(p);
+        }
+    }).catch(() => undefined);
 }
 
 function parseExecutionMode(value: unknown): ExecutionMode {
@@ -87,29 +141,76 @@ function _logDebug(message: string): void {
 }
 
 /**
- * Extension activation — called once on startup.
+ * Paint the status bar item for a connection state.
+ *
+ * A14: clicking the item reveals the panel while connected (it used to
+ * be a no-op ``cortex.connect``) and connects while disconnected.
+ * ``initial`` renders the pre-first-attempt look without the warning
+ * background.
  */
-export async function activate(context: vscode.ExtensionContext): Promise<void> {
-    editorTransactionChain = Promise.resolve();
-    const config = vscode.workspace.getConfiguration("cortex");
-    const daemonUrl = config.get<string>("daemonUrl", "ws://127.0.0.1:9473");
+function applyStatusBarConnection(connected: boolean, initial = false): void {
+    statusBarConnected = connected;
+    if (!statusBarItem) return;
+    if (connected) {
+        statusBarItem.text = "$(pulse) Cortex";
+        statusBarItem.tooltip = "Cortex — Connected";
+        statusBarItem.backgroundColor = undefined;
+        statusBarItem.command = "cortex.showPanel";
+        return;
+    }
+    statusBarItem.text = initial ? "$(pulse) Cortex" : "$(debug-disconnect) Cortex";
+    statusBarItem.tooltip = "Cortex — Disconnected";
+    statusBarItem.backgroundColor = initial
+        ? undefined
+        : new vscode.ThemeColor("statusBarItem.warningBackground");
+    statusBarItem.command = "cortex.connect";
+}
 
-    // --- Status bar ---
-    if (config.get<boolean>("showStatusBar", true)) {
+/**
+ * A14: create or dispose the status bar item to match
+ * ``cortex.showStatusBar`` (applied live, no reload required).
+ */
+function ensureStatusBar(context: vscode.ExtensionContext): void {
+    const show = vscode.workspace
+        .getConfiguration("cortex")
+        .get<boolean>("showStatusBar", true);
+    if (show && !statusBarItem) {
         statusBarItem = vscode.window.createStatusBarItem(
             vscode.StatusBarAlignment.Right,
             100,
         );
-        statusBarItem.text = "$(pulse) Cortex";
-        statusBarItem.tooltip = "Cortex — Disconnected";
-        statusBarItem.command = "cortex.connect";
+        applyStatusBarConnection(statusBarConnected, !statusBarConnected);
         statusBarItem.show();
         context.subscriptions.push(statusBarItem);
+    } else if (!show && statusBarItem) {
+        statusBarItem.dispose();
+        statusBarItem = undefined;
     }
+}
+
+/**
+ * Extension activation — called once on startup.
+ */
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
+    editorTransactionChain = Promise.resolve();
+    lastOverlayToastInterventionId = null;
+    lastOsNotifInterventionId = null;
+    statusBarConnected = false;
+    const config = vscode.workspace.getConfiguration("cortex");
+    const daemonUrl = config.get<string>("daemonUrl", DEFAULT_DAEMON_URL);
+
+    // --- Status bar ---
+    ensureStatusBar(context);
 
     // --- Services ---
-    contextProvider = new ContextProvider();
-    foldController = new FoldController();
+    const services = {
+        contextProvider: new ContextProvider(),
+        foldController: new FoldController(),
+    };
+    contextProvider = services.contextProvider;
+    foldController = services.foldController;
+    // A10: the document-change subscription is released with the extension.
+    context.subscriptions.push(services.contextProvider);
 
     // --- WebSocket client ---
     const instanceKey = "cortex.clientInstanceId.v1";
@@ -125,53 +226,47 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // restarts, so complete the durable write before opening the socket.
         await context.globalState.update(instanceKey, clientInstanceId);
     }
-    wsClient = new CortexWSClient(daemonUrl, clientInstanceId);
+    const client = new CortexWSClient(daemonUrl, clientInstanceId);
+    wsClient = client;
     editorTransactionAdapter = new EditorTransactionAdapter(
         context.globalState,
-        wsClient.clientBootId,
+        client.clientBootId,
         (batch) => wsClient?.sendInterventionReceipt(batch),
         workspaceMutationAllowed,
         clientInstanceId,
     );
 
-    wsClient.onStateUpdate((payload) => {
+    client.onStateUpdate((payload) => {
         updateStatusBar(payload);
     });
 
-    wsClient.onInterventionTrigger((payload) => {
+    client.onInterventionTrigger((payload) => {
         handleIntervention(payload);
     });
 
-    wsClient.onConnectionChange((connected) => {
+    client.onConnectionChange((connected) => {
         if (connected) {
             void editorTransactionAdapter?.flushPendingReceipts();
         }
-        if (statusBarItem) {
-            if (connected) {
-                statusBarItem.text = "$(pulse) Cortex";
-                statusBarItem.tooltip = "Cortex — Connected";
-                statusBarItem.backgroundColor = undefined;
-            } else {
-                statusBarItem.text = "$(debug-disconnect) Cortex";
-                statusBarItem.tooltip = "Cortex — Disconnected";
-                statusBarItem.backgroundColor = new vscode.ThemeColor(
-                    "statusBarItem.warningBackground",
-                );
-            }
-        }
+        applyStatusBarConnection(connected);
     });
 
-    wsClient.onRestore((payload) => {
+    client.onRestore((payload) => {
         // Legacy restore frames close presentation only. Exact commands are
         // validated against the durable editor journal and emit typed
         // receipts; neither path calls unfoldAll or steals editor focus.
         enqueueEditorTransaction(async () => {
             await editorTransactionAdapter?.handleRestore(payload);
-            panelProvider?.clearIntervention();
+            // A14: only clear the panel if the restore targets the
+            // intervention currently on screen.
+            const restoreId = typeof payload.intervention_id === "string"
+                ? payload.intervention_id
+                : undefined;
+            panelProvider?.clearIntervention(restoreId);
         });
     });
 
-    wsClient.onMessage((msg) => {
+    client.onMessage((msg) => {
         if (msg.type === "INTERVENTION_APPLY") {
             enqueueEditorTransaction(async () => {
                 await editorTransactionAdapter?.handleApply(msg.payload);
@@ -183,16 +278,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
     });
 
-    wsClient.onSettingsSync((payload) => {
+    client.onSettingsSync((payload) => {
         currentExecutionMode = parseExecutionMode(payload.execution_mode);
-        const quietMode = Boolean(payload.quiet_mode);
-        if (statusBarItem && quietMode) {
+        if (!statusBarItem) return;
+        // A14: the quiet-mode tooltip must clear again on quiet_mode:false.
+        if (payload.quiet_mode === true) {
             statusBarItem.tooltip = "Cortex — Quiet mode enabled";
+        } else if (payload.quiet_mode === false) {
+            statusBarItem.tooltip = statusBarConnected
+                ? "Cortex — Connected"
+                : "Cortex — Disconnected";
         }
     });
 
     // --- P0 §3.11: QUIET_MODE_STATE — surface mode in status bar ---
-    wsClient.onMessage((msg) => {
+    client.onMessage((msg) => {
         if (msg.type !== 'QUIET_MODE_STATE') return;
         const payload = msg.payload as Record<string, unknown> | undefined;
         if (!statusBarItem || !payload) return;
@@ -231,7 +331,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     osNotifPulseTimeout = undefined;
     let lastOsNotifShownHeadline = "";
     let lastOsNotifShownAt = 0;
-    wsClient.onMessage((msg) => {
+    client.onMessage((msg) => {
         if (msg.type !== 'INTERVENTION_TRIGGER') return;
         const payload = msg.payload as Record<string, unknown> | undefined;
         if (!payload || payload.desktop_not_focused !== true) return;
@@ -249,23 +349,29 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             }
             osNotifPulseTimeout = undefined;
         }, 5000);
-        // De-dup the toast: same headline within 10s collapses to the
-        // original popup (the user hasn't dismissed it yet).
+        const interventionId = String(payload.intervention_id || '');
+        // A6: de-dup by intervention_id (the daemon echoes the same
+        // trigger after every micro-step toggle). Payloads without an id
+        // fall back to the headline/10s rule.
         const now = Date.now();
+        if (interventionId && interventionId === lastOsNotifInterventionId) {
+            return;
+        }
         if (
-            headline === lastOsNotifShownHeadline
+            !interventionId
+            && headline === lastOsNotifShownHeadline
             && now - lastOsNotifShownAt < 10_000
         ) {
             return;
         }
+        lastOsNotifInterventionId = interventionId || null;
         lastOsNotifShownHeadline = headline;
         lastOsNotifShownAt = now;
-        const interventionId = String(payload.intervention_id || '');
-        vscode.window.showInformationMessage(
+        void Promise.resolve(vscode.window.showInformationMessage(
             `Cortex · ${headline}`,
             'Open Dashboard',
             'Snooze',
-        ).then((choice) => {
+        )).then((choice) => {
             if (choice === 'Open Dashboard') {
                 panelProvider?.showPanel();
             } else if (choice === 'Snooze') {
@@ -279,11 +385,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 }
                 wsClient.sendSnoozeRequest(interventionId, 15);
             }
-        });
+        }).catch(() => undefined);
     });
 
     // --- P0 §3.9: WHY_DETAIL response → forward to panel ---
-    wsClient.onMessage((msg) => {
+    client.onMessage((msg) => {
         if (msg.type === 'WHY_DETAIL') {
             const payload = msg.payload as Record<string, unknown> | undefined;
             if (panelProvider && payload) {
@@ -293,36 +399,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     });
 
     // Compatibility-only: reject unsupported HRV/stress-derived claims.
-    wsClient.onMessage((msg) => {
+    client.onMessage((msg) => {
         if (msg.type === 'BREAK_RECOMMENDATION') {
             handleLegacyBreakRecommendation(msg.payload);
         }
     });
 
     // --- v2.0: MORNING_BRIEFING via generic handler ---
-    wsClient.onMessage((msg) => {
+    client.onMessage((msg) => {
         if (msg.type === 'MORNING_BRIEFING') {
-            const summary = msg.payload?.summary || 'Welcome back!';
-            const items = msg.payload?.action_items || [];
-            const leftOff = msg.payload?.left_off_at || '';
-            const detail = (items as string[]).length > 0
-                ? (items as string[]).map((item: string, i: number) => `${i + 1}. ${item}`).join('\n')
-                : leftOff as string;
-            vscode.window.showInformationMessage(
-                `Morning briefing: ${summary}`,
-                { modal: false, detail },
-                'Show Details',
-            ).then(choice => {
-                if (choice === 'Show Details' && panelProvider) {
-                    panelProvider.showMorningBriefing(msg.payload);
-                }
-            });
+            handleMorningBriefing(msg.payload);
         }
     });
 
     // Legacy EXECUTE_ACTION is never editor authority. The exact equivalent
     // arrives only as a manifest-bound INTERVENTION_APPLY above.
-    wsClient.onMessage((msg) => {
+    client.onMessage((msg) => {
         if (msg.type !== 'EXECUTE_ACTION') return;
         _logDebug("Rejected legacy EXECUTE_ACTION without exact authorization");
     });
@@ -332,46 +424,69 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // command runs even if generic-handler registration order ever
     // changes; the prior implementation depended on onMessage being
     // bound before the first daemon-pushed throttle frame.
-    wsClient.onCopilotThrottle((_payload) => {
+    client.onCopilotThrottle((_payload) => {
         _logDebug("Rejected COPILOT_THROTTLE without exact authorization");
     });
 
     // --- Panel provider ---
-    panelProvider = new CortexPanelProvider(context.extensionUri, wsClient);
+    const panel = new CortexPanelProvider(context.extensionUri, client);
+    panelProvider = panel;
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider(
             "cortex.interventionPanel",
-            panelProvider,
+            panel,
         ),
+        // A10: releases the view/config subscriptions the panel owns.
+        panel,
+    );
+
+    // --- Settings applied live (A14) ---
+    context.subscriptions.push(
+        vscode.workspace.onDidChangeConfiguration((event) => {
+            if (event.affectsConfiguration("cortex.showStatusBar")) {
+                ensureStatusBar(context);
+            }
+            if (event.affectsConfiguration("cortex.daemonUrl")) {
+                const url = vscode.workspace
+                    .getConfiguration("cortex")
+                    .get<string>("daemonUrl", DEFAULT_DAEMON_URL);
+                wsClient?.setUrl(url);
+            }
+        }),
     );
 
     // --- Register commands ---
     context.subscriptions.push(
         vscode.commands.registerCommand("cortex.getActiveFile", () => {
-            return contextProvider!.getActiveFile();
+            return contextProvider?.getActiveFile() ?? null;
         }),
 
         vscode.commands.registerCommand("cortex.getDiagnostics", () => {
-            return contextProvider!.getDiagnostics();
+            return contextProvider?.getDiagnostics() ?? [];
         }),
 
         vscode.commands.registerCommand("cortex.getSymbolAtCursor", () => {
-            return contextProvider!.getSymbolAtCursor();
+            return contextProvider?.getSymbolAtCursor() ?? Promise.resolve(null);
         }),
 
         vscode.commands.registerCommand(
             "cortex.foldExcept",
-            (startLine: number, endLine: number) => {
-                return foldController!.foldExcept(startLine, endLine);
+            (startLine: unknown, endLine: unknown) => {
+                // A9: FoldController validates the range and refuses
+                // palette invocations (no arguments) without touching folds.
+                return foldController?.foldExcept(
+                    startLine as number,
+                    endLine as number,
+                ) ?? Promise.resolve(false);
             },
         ),
 
         vscode.commands.registerCommand("cortex.unfoldAll", () => {
-            return foldController!.unfoldAll();
+            return foldController?.unfoldAll() ?? Promise.resolve(false);
         }),
 
         vscode.commands.registerCommand("cortex.restoreFoldState", () => {
-            return foldController!.restoreFoldState();
+            return foldController?.restoreFoldState() ?? Promise.resolve(false);
         }),
 
         vscode.commands.registerCommand("cortex.showPanel", () => {
@@ -387,36 +502,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }),
     );
 
-    // v2.0: Copilot throttle commands
-    context.subscriptions.push(
-        vscode.commands.registerCommand('cortex.disableInlineSuggestions', async () => {
-            const config = vscode.workspace.getConfiguration();
-            await config.update('editor.inlineSuggest.enabled', false, vscode.ConfigurationTarget.Global);
-            // Also try to disable GitHub Copilot if available
-            try {
-                await config.update('github.copilot.enable', { '*': false }, vscode.ConfigurationTarget.Global);
-            } catch {
-                // Copilot not installed
-            }
-        }),
-        vscode.commands.registerCommand('cortex.enableInlineSuggestions', async () => {
-            const config = vscode.workspace.getConfiguration();
-            await config.update('editor.inlineSuggest.enabled', true, vscode.ConfigurationTarget.Global);
-            try {
-                await config.update('github.copilot.enable', { '*': true }, vscode.ConfigurationTarget.Global);
-            } catch {
-                // Copilot not installed
-            }
-        }),
-    );
-
     // --- Auto-connect ---
     if (config.get<boolean>("autoConnect", true)) {
-        wsClient.connect();
+        client.connect();
     }
 
     // --- Handle CONTEXT_REQUEST from daemon ---
-    wsClient.onContextRequest(async () => {
+    client.onContextRequest(async () => {
         if (!contextProvider) {
             return {};
         }
@@ -439,10 +531,15 @@ export function deactivate(): void {
     }
     wsClient?.disconnect();
     wsClient = undefined;
+    // A10: release the subscriptions the providers own. They are also in
+    // context.subscriptions; both paths are idempotent.
+    contextProvider?.dispose();
     contextProvider = undefined;
     foldController = undefined;
     editorTransactionAdapter = undefined;
+    panelProvider?.dispose();
     panelProvider = undefined;
+    statusBarItem = undefined;
     // F9: dispose the shared OutputChannel.
     outputChannel?.dispose();
     outputChannel = undefined;
@@ -491,12 +588,12 @@ function updateStatusBar(payload: Record<string, unknown>): void {
         ? `Cortex — ${label} (${confPct}% evidence strength; ${coveragePct}% coverage)`
         : `Cortex — ${label}. No actionable estimate.`;
 
-    // Color coding
+    // Colour coding. VS Code only honours warning/error backgrounds on
+    // status bar items; HYPER ("support may help") is the one state that
+    // warrants the warning tint. HYPO ("quiet activity") is informational
+    // and is distinguished by its icon only — it must not look like an
+    // alert (UX polish).
     if (state === "HYPER") {
-        statusBarItem.backgroundColor = new vscode.ThemeColor(
-            "statusBarItem.warningBackground",
-        );
-    } else if (state === "HYPO") {
         statusBarItem.backgroundColor = new vscode.ThemeColor(
             "statusBarItem.warningBackground",
         );
@@ -514,27 +611,36 @@ function handleIntervention(payload: Record<string, unknown>): void {
     // from this handler, including for legacy payloads that request it.
     currentExecutionMode = parseExecutionMode(payload.execution_mode);
 
-    // Show panel with intervention content
+    // Show panel with intervention content. A6: the provider patches a
+    // same-id rebroadcast in place instead of rebuilding the webview.
     panelProvider?.showIntervention(payload);
 
     // Show notification for overlay_only
     const level = payload.level as string | undefined;
     const headline = payload.headline as string | undefined;
+    const interventionId = typeof payload.intervention_id === "string"
+        ? payload.intervention_id
+        : "";
     if (level === "overlay_only" && headline) {
-        vscode.window.showInformationMessage(
+        // A6: one toast per intervention id.
+        if (interventionId && interventionId === lastOverlayToastInterventionId) {
+            return;
+        }
+        lastOverlayToastInterventionId = interventionId || null;
+        void Promise.resolve(vscode.window.showInformationMessage(
             `Cortex: ${headline}`,
             "View Details",
             "Dismiss",
-        ).then((action) => {
+        )).then((action) => {
             if (action === "View Details") {
                 panelProvider?.showPanel();
             } else if (action === "Dismiss") {
                 wsClient?.sendUserAction(
                     "dismissed",
-                    payload.intervention_id as string,
+                    interventionId,
                 );
             }
-        });
+        }).catch(() => undefined);
     }
 }
 
@@ -555,4 +661,15 @@ export function _handleInterventionForTest(
 /** Test seam for the compatibility sink for unvalidated physiology claims. */
 export function _handleLegacyBreakRecommendationForTest(payload: unknown): void {
     handleLegacyBreakRecommendation(payload);
+}
+
+/** Test seam for the MORNING_BRIEFING notification (A13). */
+export function _handleMorningBriefingForTest(payload: unknown): void {
+    handleMorningBriefing(payload);
+}
+
+/** Test seam: forget the last toasted intervention ids (A6 de-dup). */
+export function _resetToastDedupForTest(): void {
+    lastOverlayToastInterventionId = null;
+    lastOsNotifInterventionId = null;
 }

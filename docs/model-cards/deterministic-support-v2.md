@@ -65,17 +65,31 @@ Production behavior inputs:
 | keypress rate | keypresses/min | 15 s | flow-like, under-engaged |
 | keystroke interval variance | ms² | 15 s | support-likely, flow-like |
 | correction rate | corrections/100 keys | 15 s | support-likely, flow-like |
-| inactivity | seconds | 15 s observation exposure | under-engaged and flow activity gate |
-| tab-switch rate | switches/min | 60 s | all three stateless hypotheses |
-| re-read scroll bursts | bursts/min | 60 s | support-likely, flow-like |
+| inactivity | seconds | since the last input event, bounded by observed exposure | under-engaged and flow activity gate |
+| tab-switch rate | switches/min | 15 s | all three stateless hypotheses |
+| re-read scroll bursts | bursts/min | 15 s | support-likely, flow-like |
 | focus-transition thrashing | ratio | 60 s | support-likely, flow-like |
 
 The aggregator publishes observation counts. Mouse statistics require at least
 two mouse observations; typing-interval variance requires at least two typing
 keypresses; correction rate requires at least one typing key. A connected
 stream containing zero events is an observed zero for rates, not a fabricated
-measurement. On collector startup, no-event inactivity begins at zero and is
-capped by actual observation exposure rather than machine uptime.
+measurement.
+
+Inactivity is the elapsed time since the most recent input event of any kind,
+taken from the input hooks' last-input marker rather than from the 15 s
+sliding event window (which by construction can never witness more than 15 s
+of silence). It is bounded only by actual observation exposure: on collector
+startup, no-event inactivity begins at zero and grows with exposure rather
+than machine uptime. This is what makes the 30 s under-engaged floor, the
+flow-like "recent activity" gate (inactivity ≤ 30 s), and the zombie-reading
+detector reachable.
+
+Per-minute rates (tab switches, re-read scroll bursts) are computed over the
+same 15 s window as every other input feature and are stamped with that
+window; the focus-transition graph keeps its own 60 s window. Every focus
+event inside the window is a real transition (the tracker de-duplicates
+same-window refreshes), so a window holding *n* events reports *n* switches.
 
 Diagnostic-only inputs are explicitly excluded from every production rule:
 
@@ -127,7 +141,8 @@ Important compound gates are:
   coverage;
 - support-likely and flow-like require at least three observed inputs;
 - under-engaged requires at least two inputs, inactivity above the 30-second
-  transform floor, and a corroborating channel;
+  transform floor (40 s of observed silence yields a positive under-engaged
+  score), and a corroborating channel;
 - flow-like additionally requires inactivity no greater than 30 seconds and
   affirmative mouse, click, or typing activity; stable zero streams cannot
   imply flow-like activity;
@@ -140,7 +155,15 @@ Important compound gates are:
 thresholds, monotonic elapsed time, and state-specific dwell. Regressed replay
 timestamps are clamped and cannot create negative dwell. `recovering` can only
 appear after a confirmed support-likely episode begins to subside; it is never
-scored from a mixed single frame.
+scored from a mixed single frame. A committed label whose own smoothed score
+stays at or below the exit threshold for 10 s without any other state clearing
+its entry threshold falls back to `UNKNOWN` (exit dwell) instead of persisting
+indefinitely.
+
+The intervention policy measures dwell as the time the support-likely
+confidence has been *above the trigger gate*, bounded by the label's own
+dwell; a confidence spike that has only just crossed the gate cannot borrow
+dwell from a long sub-threshold label.
 
 An insufficient or warming evaluation forces `UNKNOWN` and clears candidates.
 The UI receives explicit `status`, `evidence_coverage`, contributions,
@@ -181,6 +204,18 @@ status/abstention rate, coverage distribution, feature missingness by reason,
 rule version, intervention proposal/authorization/outcome, and rollback events.
 It must not record raw frames or keystrokes. Monitoring must be stratified by
 supported device/input configurations where consent and sample size permit.
+
+## Implementation notes (2026-09)
+
+- Inactivity provenance fixed (last-input marker, exposure-bounded; audit D1).
+  The feature's documented meaning ("time since last input event") is
+  unchanged, so no feature-schema or model version increment was taken; the
+  under-engaged rule, previously unreachable, is now live.
+- `mouse_variance_baseline` is floored at 1.0 in every transform (audit D2).
+- Tab-switch and scroll-back rates are stamped with their true 15 s window
+  and switches are no longer under-counted by one per window (audit D13).
+- The legacy physiology/posture composites were deleted from the scorer
+  (audit D17); only the behaviour transforms above remain.
 
 ## Change and rollback policy
 

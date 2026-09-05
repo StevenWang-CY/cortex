@@ -9,9 +9,11 @@ user before anyone notices.
 This module ships the missing telemetry + safety rail:
 
 1. ``CostTracker.record`` writes a per-call ``LLM_COST`` log line
-   (cid, model, USD estimate, cancelled flag, per-cid attribution),
-   atomically appends to a per-day rolling ledger on disk, and exposes
-   the ledger for the dashboard banner.
+   (cid, model, USD estimate, token counts, cancelled flag, per-cid
+   attribution), atomically appends to a per-day rolling ledger on disk
+   (USD, call count, prompt/completion token counters), and exposes the
+   ledger for the dashboard banner. Orphaned (cancelled-caller) calls
+   are recorded through the same path once their response lands.
 2. ``CostTracker.check_budget`` returns ``OK``/``WARN``/``KILL``. The
    planner consults this before every SDK call and short-circuits to
    the deterministic fallback plan when ``KILL`` fires, stamping
@@ -271,11 +273,21 @@ class CostTracker:
     def _day(self, key: str) -> dict[str, Any]:
         entry = self._days.get(key)
         if entry is None:
-            entry = {"total_usd": 0.0, "calls": 0, "by_cid": {}}
+            entry = {
+                "total_usd": 0.0,
+                "calls": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "by_cid": {},
+            }
             self._days[key] = entry
-        # Defensive coercion: if a manually-edited ledger lost a sub-field.
+        # Defensive coercion: if a manually-edited ledger lost a sub-field,
+        # or the ledger predates the token counters (additive fields only,
+        # so the schema version is unchanged).
         entry.setdefault("total_usd", 0.0)
         entry.setdefault("calls", 0)
+        entry.setdefault("prompt_tokens", 0)
+        entry.setdefault("completion_tokens", 0)
         entry.setdefault("by_cid", {})
         return entry
 
@@ -287,14 +299,24 @@ class CostTracker:
         *,
         cancelled: bool = False,
         now: datetime | None = None,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
     ) -> None:
-        """Append a single LLM call's cost to today's bucket.
+        """Append a single LLM call's cost and token counts to today's bucket.
 
-        Emits an ``LLM_COST`` structured log line for the aggregator;
-        the on-disk ledger is the durable form for cross-restart spend.
+        ``prompt_tokens`` counts every billed input token (uncached +
+        cache reads + cache writes); ``completion_tokens`` the output
+        tokens. Emits an ``LLM_COST`` structured log line for the
+        aggregator; the on-disk ledger is the durable form for
+        cross-restart spend.
         """
         if usd < 0:
             raise ValueError(f"usd must be non-negative; got {usd!r}")
+        if prompt_tokens < 0 or completion_tokens < 0:
+            raise ValueError(
+                "token counts must be non-negative; got "
+                f"prompt={prompt_tokens!r} completion={completion_tokens!r}"
+            )
         cid_key = cid or "-"
         moment = now if now is not None else utc_datetime(self._clock)
         today = _today_iso(moment)
@@ -302,6 +324,8 @@ class CostTracker:
             day = self._day(today)
             day["total_usd"] = float(day["total_usd"]) + float(usd)
             day["calls"] = int(day["calls"]) + 1
+            day["prompt_tokens"] = int(day["prompt_tokens"]) + int(prompt_tokens)
+            day["completion_tokens"] = int(day["completion_tokens"]) + int(completion_tokens)
             by_cid = day["by_cid"]
             if cid_key not in by_cid:
                 by_cid[cid_key] = {"total_usd": 0.0, "calls": 0}
@@ -317,11 +341,14 @@ class CostTracker:
             self._days = _prune_old(self._days, today=_local_date(moment))
             self._flush()
         logger.info(
-            "%s cid=%s model=%s usd=%.6f cancelled=%s day_total=%.6f",
+            "%s cid=%s model=%s usd=%.6f tokens_in=%d tokens_out=%d cancelled=%s "
+            "day_total=%.6f",
             EventType.LLM_COST.value,
             cid_key,
             model,
             usd,
+            prompt_tokens,
+            completion_tokens,
             cancelled,
             self.today_total_usd(now=moment),
         )
@@ -362,6 +389,27 @@ class CostTracker:
         with self._lock:
             entry = self._days.get(today)
             return float(entry["total_usd"]) if entry else 0.0
+
+    def _today_int(self, key: str, now: datetime | None) -> int:
+        today = _today_iso(now if now is not None else utc_datetime(self._clock))
+        with self._lock:
+            entry = self._days.get(today)
+            if not entry:
+                return 0
+            value = entry.get(key, 0)
+            return int(value) if isinstance(value, (int, float)) else 0
+
+    def prompt_tokens_today(self, *, now: datetime | None = None) -> int:
+        """Billed input tokens (uncached + cache read/write) for the local day.
+
+        Probed by :func:`probe_token_totals` for the ``CostResponse``
+        ``prompt_tokens`` field on both the HTTP and WS cost surfaces.
+        """
+        return self._today_int("prompt_tokens", now)
+
+    def completion_tokens_today(self, *, now: datetime | None = None) -> int:
+        """Output tokens for the local day (see :meth:`prompt_tokens_today`)."""
+        return self._today_int("completion_tokens", now)
 
     def per_cid_today(
         self,
@@ -461,10 +509,12 @@ def _probe_int_attr(obj: Any, names: tuple[str, ...]) -> int | None:
 def probe_token_totals(tracker: Any) -> tuple[int | None, int | None]:
     """Best-effort (prompt_tokens, completion_tokens) for today.
 
-    Returns ``(None, None)`` when the tracker exposes no token counters
-    (the current ``CostTracker`` does not), so both CostResponse surfaces
-    report the same value. Kept as a free function so the HTTP route and
-    the WS daemon path share one implementation.
+    :class:`CostTracker` exposes ``prompt_tokens_today`` /
+    ``completion_tokens_today`` (zero-arg callables), so the production
+    tracker yields real per-day counters. Returns ``(None, None)`` for a
+    tracker without counters so both CostResponse surfaces report the same
+    value. Kept as a free function so the HTTP route and the WS daemon
+    path share one implementation.
     """
     if tracker is None:
         return (None, None)

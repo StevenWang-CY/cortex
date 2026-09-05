@@ -96,7 +96,6 @@ def test_consumer_tab_setstylesheet_called_once_under_identical_updates(
     _patch_count_calls(consumer._state_label, "setStyleSheet", counter)
     _patch_count_calls(consumer._state_label, "setText", counter)
     _patch_count_calls(consumer._bpm_label, "setText", counter)
-    _patch_count_calls(consumer._hrv_label, "setText", counter)
     _patch_count_calls(consumer._blk_label, "setText", counter)
 
     for _ in range(20):

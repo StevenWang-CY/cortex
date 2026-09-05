@@ -20,6 +20,7 @@ These tests verify:
 
 from __future__ import annotations
 
+import json
 import os
 from types import SimpleNamespace
 from typing import Any
@@ -72,7 +73,6 @@ def _make_state() -> StateEstimate:
 
 
 _VALID_PLAN_DICT: dict[str, Any] = {
-    "level": "overlay_only",
     "headline": "Fix the NameError on line 10",
     "situation_summary": "1 error in main.py",
     "primary_focus": "main.py:10",
@@ -87,16 +87,15 @@ _VALID_PLAN_DICT: dict[str, Any] = {
     "tone": "supportive",
     "suggested_actions": [],
     "causal_explanation": "1 active error pulled focus off the function.",
+    "error_analysis": None,
+    "tab_recommendations": None,
 }
 
 
 def _stub_response() -> MagicMock:
-    block = SimpleNamespace(
-        type="tool_use",
-        name="emit_intervention_plan",
-        input=_VALID_PLAN_DICT,
-    )
+    block = SimpleNamespace(type="text", text=json.dumps(_VALID_PLAN_DICT))
     response = MagicMock()
+    response.stop_reason = "end_turn"
     response.content = [block]
     response.usage = SimpleNamespace(
         input_tokens=100,

@@ -382,3 +382,73 @@ def enforce_chronotype_retention(
             cutoff.isoformat(),
         )
     return deleted
+
+
+# ─── F36 / D6: session storage size budget ───────────────────────────
+#
+# One session leaves up to three files under ``storage/sessions``:
+# ``session_<id>.json`` (the report), ``session_<id>.jsonl`` (the raw
+# telemetry, by far the largest) and ``session_<id>.md`` (a human digest).
+# The daemon's budget helper only summed ``.json`` files, so the budget
+# never bounded real disk usage. This variant counts every session
+# artefact that grows with session length and evicts oldest-first across
+# all of them. ``runtime_daemon.enforce_session_storage_budget`` should
+# delegate here (patch note for the runtime owner).
+
+SESSION_BUDGET_SUFFIXES: frozenset[str] = frozenset({".json", ".jsonl"})
+
+
+def enforce_session_storage_budget(
+    sessions_dir: Path,
+    *,
+    incoming_bytes: int,
+    max_total_size_mb: int,
+    suffixes: frozenset[str] = SESSION_BUDGET_SUFFIXES,
+) -> int:
+    """Evict oldest session files until ``incoming_bytes`` fits the budget.
+
+    Returns the number of files evicted. ``max_total_size_mb == 0`` evicts
+    every existing session file before each write (the strict-bound
+    sentinel used by tests); a negative budget disables eviction. A
+    missing directory is a no-op.
+    """
+    if max_total_size_mb < 0:
+        return 0
+    if not sessions_dir.exists() or not sessions_dir.is_dir():
+        return 0
+
+    budget_bytes = max_total_size_mb * 1024 * 1024
+    entries: list[tuple[float, int, Path]] = []
+    for candidate in sessions_dir.iterdir():
+        if not candidate.is_file() or candidate.suffix not in suffixes:
+            continue
+        try:
+            stat = candidate.stat()
+        except OSError:
+            continue
+        entries.append((stat.st_mtime, stat.st_size, candidate))
+
+    total = sum(size for _mtime, size, _path in entries)
+    if total + incoming_bytes <= budget_bytes:
+        return 0
+
+    entries.sort(key=lambda entry: entry[0])
+    evicted = 0
+    for _mtime, size, path in entries:
+        if total + incoming_bytes <= budget_bytes:
+            break
+        try:
+            path.unlink()
+            total -= size
+            evicted += 1
+        except OSError:
+            logger.warning("session storage budget: could not evict %s", path, exc_info=True)
+    if evicted > 0:
+        logger.info(
+            "session storage budget: evicted %d file(s) to make room for a %d-byte "
+            "write (cap=%d MB)",
+            evicted,
+            incoming_bytes,
+            max_total_size_mb,
+        )
+    return evicted

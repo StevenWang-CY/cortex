@@ -49,9 +49,14 @@ as untrusted proposal data.
 Presentation is side-effect free. If optional mutation is enabled, the flow is:
 
 ```text
-PROPOSED → PRESENTED → AUTHORIZED → APPLYING → APPLIED
-         → VERIFIED → RESTORING → RESTORED
+PROPOSED → DELIVERED → AUTHORIZED → APPLYING → APPLIED | PARTIAL | FAILED
+                                              → RESTORING → RESTORED | RESTORE_FAILED
+                                                                     → ABANDONED
 ```
+
+Verification is per receipt rather than a lifecycle state: an action counts
+as applied only when the bound client returns a receipt whose postcondition
+fingerprint the daemon can check.
 
 Authority binds the exact manifest digest, effect capability, target, consent
 revision, expiry, and one-time nonce. Each effect returns a minimal typed
@@ -66,6 +71,6 @@ synchronization stores intervention and policy lifecycles atomically. On
 restart Cortex reconciles unresolved intent/receipts before claiming success.
 Redis/in-memory and legacy JSON are compatibility or diagnostic surfaces only.
 
-Detailed evidence: [model card](docs/model-cards/deterministic-support-v2.md),
-[architecture](cortex/docs/architecture.md), [data flow](docs/data-flow.md), and
-[limitations](docs/limitations.md).
+Detailed evidence: [model card](https://github.com/StevenWang-CY/cortex/blob/main/docs/model-cards/deterministic-support-v2.md),
+[architecture](https://github.com/StevenWang-CY/cortex/blob/main/cortex/docs/architecture.md), [data flow](https://github.com/StevenWang-CY/cortex/blob/main/docs/data-flow.md), and
+[limitations](https://github.com/StevenWang-CY/cortex/blob/main/docs/limitations.md).

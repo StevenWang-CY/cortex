@@ -1,14 +1,20 @@
-"""Desktop shell onboarding — 4-step first-run wizard (macOS-native refactor).
+"""Desktop shell onboarding — 6-step first-run wizard (macOS-native refactor).
 
 Visual layer adopts:
 
-* Native popover vibrancy material under the window (via mac_native)
-* Horizontal progress strip showing all 4 steps at once
+* Pinned light appearance under the window (via mac_native)
+* Horizontal progress strip showing all 6 steps at once; a step's dot
+  flips to "done" the moment that step is really finished (a permission
+  actually granted, a token saved, a step explicitly skipped)
 * Sentence-case section headings, SF system fonts
 * Terracotta number badges + Cormorant Garamond brand wordmark preserved
 * Native ``AVCaptureDevice.requestAccessForMediaType_`` for camera grant
   (already in cortex/libs/utils/platform.py) and the standard
   ``AXIsProcessTrustedWithOptions`` for accessibility
+
+"Get Started" never pretends: it persists only the steps that are
+actually done and tells the user which ones are still open. Escape
+closes the window.
 
 Public API (Signals + ``onboarding_marker_path``) preserved byte-identical.
 
@@ -62,24 +68,30 @@ from cortex.apps.desktop_shell.a11y import (
     set_accessible_description,
     set_accessible_name,
 )
-from cortex.apps.desktop_shell.components import wrap_capped
+from cortex.apps.desktop_shell.components import status_pill_qss, wrap_capped
 from cortex.apps.desktop_shell.tokens import (
     BRAND_ACCENT,
     BRAND_ACCENT_DIM,
-    BRAND_ACCENT_HOVER,
-    BRAND_ACCENT_PRESSED,
     BRAND_ACCENT_TEXT,
     BRAND_DISPLAY_FONT,
+    BTN_ACCENT_QSS,
+    BTN_LINK_QSS,
+    CARD_QSS,
+    CX_BG,
+    CX_BG_SECONDARY,
+    CX_BORDER_DEFAULT,
+    CX_SURFACE,
+    CX_TEXT,
     CX_TEXT_SECONDARY,
     CX_TEXT_TERTIARY,
     FS_BODY,
     FS_CAPTION,
     FS_FOOTNOTE,
-    FS_TITLE,
     FW_REGULAR,
+    INPUT_QSS,
+    PAGE_TITLE_QSS,
     RADIUS_BUTTON,
     RADIUS_CARD,
-    SEMANTIC_LIGHT,
     SP2,
     SP3,
     SP4,
@@ -130,8 +142,10 @@ _WHY_COPY: dict[str, str] = {
         "system-wide events, not just our own window."
     ),
     "llm_backend": (
-        "Your Bedrock token stays in the macOS Keychain. Cortex reads "
-        "it once at launch and never persists it elsewhere."
+        "With Claude access, suggestions are written for the exact page "
+        "and task in front of you. Your Bedrock token stays in the macOS "
+        "Keychain; Cortex reads it once at launch and never persists it "
+        "elsewhere. Without it, Cortex uses its built-in offline suggestions."
     ),
     "calibration": (
         "Calibration records quality-gated rest and representative-work "
@@ -272,17 +286,15 @@ class OnboardingState:
         """True only when every step in :data:`ONBOARDING_STEPS` is done."""
         return set(ONBOARDING_STEPS).issubset(self.completed_steps)
 
-_WINDOW_BG = SEMANTIC_LIGHT["window_bg"]
-_CONTROL_BG = SEMANTIC_LIGHT["control_bg"]
-_GROUPED_BG = SEMANTIC_LIGHT["grouped_bg"]
-_LABEL = SEMANTIC_LIGHT["label_primary"]
-# WCAG-AA-passing label tints from the token registry — was carrying a
-# private sub-AA copy that drifted from the dashboard's audit-F55 fix.
-_LABEL_SECONDARY = CX_TEXT_SECONDARY
-_LABEL_TERTIARY = CX_TEXT_TERTIARY
-_SEPARATOR = SEMANTIC_LIGHT["separator"]
-_SUCCESS = SEMANTIC_LIGHT["success"]
-_SUCCESS_DIM = "rgba(48, 178, 87, 0.10)"
+_STEP_INDEX: dict[str, int] = {step: i for i, step in enumerate(ONBOARDING_STEPS)}
+_STEP_TITLES: dict[str, str] = {
+    "camera": "Camera",
+    "accessibility": "Accessibility",
+    "llm_backend": "Claude access",
+    "calibration": "Calibration",
+    "extensions": "Extensions",
+    "macos_notifications": "Notifications",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -430,18 +442,10 @@ class _StatusPill(QLabel):
     def set_ok(self, ok: bool) -> None:
         if ok:
             self.setText(f"✓ {self._label}")
-            self.setStyleSheet(
-                f"color: {_SUCCESS}; background: {_SUCCESS_DIM};"
-                f" border: none; border-radius: {RADIUS_BUTTON}px;"
-                "  padding: 2px 10px;"
-            )
+            self.setStyleSheet(status_pill_qss("success"))
         else:
             self.setText(f"○ {self._label}")
-            self.setStyleSheet(
-                f"color: {_LABEL_TERTIARY}; background: rgba(0,0,0,0.04);"
-                f" border: none; border-radius: {RADIUS_BUTTON}px;"
-                "  padding: 2px 10px;"
-            )
+            self.setStyleSheet(status_pill_qss("neutral"))
 
 
 class _ECGTrace(QWidget):
@@ -459,7 +463,7 @@ class _ECGTrace(QWidget):
         self.setMinimumHeight(80)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(
-            f"background: {_GROUPED_BG}; border-radius: {RADIUS_CARD}px;"
+            f"background: {CX_BG_SECONDARY}; border-radius: {RADIUS_CARD}px;"
         )
 
     def push_sample(self, value: float) -> None:
@@ -485,7 +489,7 @@ class _ECGTrace(QWidget):
 
         if not self._samples or len(self._samples) < 2:
             # Flat baseline
-            pen = QPen(QColor(_LABEL_TERTIARY))
+            pen = QPen(QColor(CX_TEXT_TERTIARY))
             pen.setWidthF(1.0)
             painter.setPen(pen)
             mid = h // 2
@@ -529,14 +533,19 @@ class _ECGTrace(QWidget):
 # ---------------------------------------------------------------------------
 
 class _ProgressStrip(QWidget):
-    """Horizontal step indicator: 4 numbered dots, the current one
-    rendered as the terracotta brand accent."""
+    """Horizontal step indicator: numbered dots, the current one rendered
+    as the terracotta brand accent, finished ones as a check on the
+    accent tint. The strip only reflects real completion — the window
+    feeds it from the persisted ``OnboardingState``."""
 
     def __init__(self, count: int, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._count = count
         self._current = 0
+        self._completed: set[int] = set()
         self._dots: list[QLabel] = []
+        self._bars: list[QFrame] = []
+        set_accessible_name(self, "Setup progress")
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         # SP2 = 8 — matches the 4pt grid for inter-dot spacing.
@@ -552,7 +561,8 @@ class _ProgressStrip(QWidget):
                 bar = QFrame()
                 bar.setFixedHeight(1)
                 bar.setMinimumWidth(20)
-                bar.setStyleSheet(f"background: {_SEPARATOR};")
+                bar.setStyleSheet(f"background: {CX_BORDER_DEFAULT};")
+                self._bars.append(bar)
                 layout.addWidget(bar, stretch=1)
         self._restyle()
 
@@ -560,23 +570,44 @@ class _ProgressStrip(QWidget):
         self._current = max(0, min(index, self._count - 1))
         self._restyle()
 
+    def set_completed(self, indices: set[int] | frozenset[int]) -> None:
+        self._completed = {i for i in indices if 0 <= i < self._count}
+        self._restyle()
+
+    def completed_indices(self) -> frozenset[int]:
+        return frozenset(self._completed)
+
+    def current_index(self) -> int:
+        return self._current
+
     def _restyle(self) -> None:
         for i, dot in enumerate(self._dots):
-            if i == self._current:
-                dot.setStyleSheet(
-                    f"background: {BRAND_ACCENT};"
-                    f" color: {_LABEL}; border-radius: 11px;"
-                )
-            elif i < self._current:
+            if i in self._completed:
+                dot.setText("✓")
                 dot.setStyleSheet(
                     f"background: {BRAND_ACCENT_DIM};"
                     f" color: {BRAND_ACCENT_TEXT}; border-radius: 11px;"
                 )
-            else:
+                set_accessible_name(dot, f"Step {i + 1} of {self._count} — done")
+            elif i == self._current:
+                dot.setText(str(i + 1))
                 dot.setStyleSheet(
-                    f"background: {_GROUPED_BG};"
-                    f" color: {_LABEL_TERTIARY}; border-radius: 11px;"
+                    f"background: {BRAND_ACCENT};"
+                    f" color: {CX_TEXT}; border-radius: 11px;"
                 )
+                set_accessible_name(dot, f"Step {i + 1} of {self._count} — current")
+            else:
+                dot.setText(str(i + 1))
+                dot.setStyleSheet(
+                    f"background: {CX_BG_SECONDARY};"
+                    f" color: {CX_TEXT_TERTIARY}; border-radius: 11px;"
+                )
+                set_accessible_name(dot, f"Step {i + 1} of {self._count} — not started")
+        for i, bar in enumerate(self._bars):
+            done = i in self._completed
+            bar.setStyleSheet(
+                f"background: {BRAND_ACCENT if done else CX_BORDER_DEFAULT};"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -609,7 +640,7 @@ class OnboardingWindow(QWidget):
         # description and hint paragraphs).
         self.setMinimumSize(600, 720)
         self.resize(640, 820)
-        self.setStyleSheet(f"background: {_WINDOW_BG}; color: {_LABEL};")
+        self.setStyleSheet(f"background: {CX_BG}; color: {CX_TEXT};")
         # F49: durable per-step completion record. Loaded from disk so
         # a re-entry into the wizard does not lose prior progress.
         self._onboarding_state = OnboardingState.load()
@@ -627,7 +658,24 @@ class OnboardingWindow(QWidget):
             self._camera_permission_was_granted = check_camera_permission()
         except Exception:
             self._camera_permission_was_granted = False
+        # Honest completion tracking for the steps that have no OS-level
+        # signal of their own: Claude access and extensions count as
+        # done when a token is present / a connection verified, or when
+        # the user explicitly skips them.
+        self._llm_skipped = "llm_backend" in self._onboarding_state.completed_steps
+        self._llm_key_present = False
+        self._extensions_skipped = "extensions" in self._onboarding_state.completed_steps
+        self._extensions_verified = False
+        self._permission_marks: dict[str, bool] = {}
         self._build_ui()
+        self._sync_permission_step("camera", self._camera_permission_was_granted)
+        try:
+            self._sync_permission_step(
+                "accessibility", check_accessibility_permission(),
+            )
+        except Exception:
+            pass
+        self._refresh_progress()
 
         # Permissions are granted in System Settings out-of-process — there's
         # no callback path back into the app. Poll every 1.5s while the
@@ -645,13 +693,78 @@ class OnboardingWindow(QWidget):
             if cam and not self._camera_permission_was_granted:
                 self.camera_permission_granted.emit()
             self._camera_permission_was_granted = cam
+            self._sync_permission_step("camera", cam)
         except Exception:
             pass
         try:
             acc = check_accessibility_permission()
             getattr(self._accessibility_step, "_cortex_set_state", lambda _b: None)(acc)
+            self._sync_permission_step("accessibility", acc)
         except Exception:
             pass
+
+    def _sync_permission_step(self, step: str, granted: bool) -> None:
+        """Mirror a real OS grant into the persisted step state — only on
+        transitions, so the log stream sees one USER_ACTION per change."""
+        marks = self.__dict__.setdefault("_permission_marks", {})
+        if marks.get(step) is granted:
+            return
+        marks[step] = granted
+        if granted:
+            self.mark_step_complete(step)
+        else:
+            self.mark_step_incomplete(step)
+
+    def _refresh_progress(self) -> None:
+        """Feed the progress strip and the finish note from the persisted
+        state: a dot is "done" only when that step really is."""
+        state = getattr(self, "_onboarding_state", None)
+        if state is None:
+            return
+        done = {
+            _STEP_INDEX[step]
+            for step in state.completed_steps
+            if step in _STEP_INDEX
+        }
+        current = next(
+            (i for i in range(len(ONBOARDING_STEPS)) if i not in done),
+            len(ONBOARDING_STEPS) - 1,
+        )
+        strip = getattr(self, "_progress", None)
+        if strip is not None:
+            try:
+                strip.set_completed(done)
+                strip.set_current(current)
+            except Exception:
+                logger.debug("progress strip refresh failed", exc_info=True)
+        note = getattr(self, "_finish_note", None)
+        if note is not None:
+            open_steps = [
+                _STEP_TITLES.get(step, step)
+                for step in ONBOARDING_STEPS
+                if step not in state.completed_steps
+            ]
+            try:
+                if open_steps:
+                    note.setText(
+                        "Not finished: " + ", ".join(open_steps)
+                        + ". You can do these later from Settings."
+                    )
+                else:
+                    note.setText("Everything is set up.")
+            except Exception:
+                pass
+
+    def keyPressEvent(self, event: object) -> None:  # noqa: D401 - Qt override
+        key = getattr(event, "key", lambda: None)()
+        if key == Qt.Key.Key_Escape:
+            self.close()
+            try:
+                event.accept()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            return
+        super().keyPressEvent(event)
 
     # -- Native chrome ---------------------------------------------------
 
@@ -673,7 +786,7 @@ class OnboardingWindow(QWidget):
             self._positioned_once = True
         try:
             mac_native.apply_unified_titlebar(self)
-            mac_native.apply_vibrancy(self, material="popover")
+            mac_native.apply_vibrancy(self)
         except Exception:
             pass
         # Resume permission polling whenever the wizard becomes visible.
@@ -720,7 +833,7 @@ class OnboardingWindow(QWidget):
         content = QWidget()
         content.setObjectName("CortexOnboardingContent")
         content.setStyleSheet(
-            f"#CortexOnboardingContent {{ background: {_WINDOW_BG}; }}"
+            f"#CortexOnboardingContent {{ background: {CX_BG}; }}"
         )
         layout = QVBoxLayout(content)
         layout.setContentsMargins(SP8, SP8, SP8, SP8)
@@ -729,7 +842,10 @@ class OnboardingWindow(QWidget):
         if QScrollArea is not None:
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
-            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            try:
+                scroll.setFrameShape(QFrame.Shape.NoFrame)
+            except AttributeError:  # pragma: no cover - stub harness
+                pass
             scroll.setStyleSheet(
                 "QScrollArea { border: none; background: transparent; }"
                 "QScrollBar:vertical { background: transparent; width: 8px; }"
@@ -759,17 +875,16 @@ class OnboardingWindow(QWidget):
         layout.addSpacing(SP2)
 
         title = QLabel("Welcome to Cortex")
-        title.setFont(mac_native.system_font(FS_TITLE, "bold"))
-        title.setStyleSheet(f"color: {_LABEL}; background: transparent;")
+        title.setStyleSheet(PAGE_TITLE_QSS)
         layout.addWidget(title)
 
         subtitle = QLabel(
-            "Grant permissions, choose your LLM backend, and connect your "
-            "browser and editor. This only takes a minute."
+            "Grant permissions, choose Claude access, and connect your "
+            "browser and editor. Skip anything you want to do later."
         )
         subtitle.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
         subtitle.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
         wrap_capped(subtitle, 340)
         layout.addWidget(subtitle)
@@ -827,7 +942,7 @@ class OnboardingWindow(QWidget):
         )
         hint.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         hint.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; border: none;"
+            f"color: {CX_TEXT_SECONDARY}; border: none;"
         )
         wrap_capped(hint, 340)
         ext_layout.addWidget(hint)
@@ -836,16 +951,7 @@ class OnboardingWindow(QWidget):
         connect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         connect_btn.setMinimumHeight(34)
         connect_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
-        connect_btn.setStyleSheet(
-            "QPushButton {"
-            "  padding: 6px 16px;"
-            f"  border-radius: {RADIUS_BUTTON}px;"
-            f"  background: {BRAND_ACCENT};"
-            f"  color: {_LABEL}; border: none;"
-            "}"
-            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"
-            f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"
-        )
+        connect_btn.setStyleSheet(BTN_ACCENT_QSS)
         connect_btn.clicked.connect(self.extensions_requested.emit)
         # P1-20: log USER_ACTION so the extension-connect step is traceable.
         connect_btn.clicked.connect(
@@ -857,7 +963,33 @@ class OnboardingWindow(QWidget):
             "Install the Cortex browser and editor extensions.",
         )
         self._connect_btn_ref = connect_btn
-        ext_layout.addWidget(connect_btn)
+        ext_row = QHBoxLayout()
+        ext_row.addWidget(connect_btn)
+        ext_row.addStretch()
+        skip_ext_btn = QPushButton("Skip — connect later")
+        skip_ext_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        skip_ext_btn.setFont(mac_native.system_font(FS_CAPTION, "regular"))
+        skip_ext_btn.setStyleSheet(BTN_LINK_QSS)
+        skip_ext_btn.clicked.connect(self._on_skip_extensions)
+        set_accessible_name(skip_ext_btn, "Skip connecting extensions")
+        set_accessible_description(
+            skip_ext_btn,
+            "Skip for now. You can connect extensions later from the menu bar.",
+        )
+        self._skip_extensions_btn = skip_ext_btn
+        ext_row.addWidget(skip_ext_btn)
+        ext_layout.addLayout(ext_row)
+        self._ext_status = QLabel("")
+        self._ext_status.setFont(mac_native.system_font(FS_CAPTION, "medium"))
+        self._ext_status.setStyleSheet(status_pill_qss("neutral"))
+        self._ext_status.setVisible(False)
+        set_accessible_name(self._ext_status, "Extensions step status")
+        ext_status_row = QHBoxLayout()
+        ext_status_row.addWidget(self._ext_status)
+        ext_status_row.addStretch()
+        ext_layout.addLayout(ext_status_row)
+        if self._extensions_skipped:
+            self._render_extensions_status("Skipped — connect later from the menu bar", "neutral")
         layout.addWidget(ext_frame)
 
         # ── Step 6: macOS Notifications (P0 §3.12) ───────────────────
@@ -876,24 +1008,25 @@ class OnboardingWindow(QWidget):
         notif_hint.setWordWrap(True)
         notif_hint.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         notif_hint.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; border: none;"
+            f"color: {CX_TEXT_SECONDARY}; border: none;"
         )
         notif_layout.addWidget(notif_hint)
+
+        notif_row = QHBoxLayout()
+        notif_status = QLabel("")
+        notif_status.setFont(mac_native.system_font(FS_CAPTION, "medium"))
+        notif_status.setStyleSheet(status_pill_qss("neutral"))
+        notif_status.setVisible(False)
+        set_accessible_name(notif_status, "macOS notifications status")
+        self._notif_status_ref = notif_status
+        notif_row.addWidget(notif_status)
+        notif_row.addStretch()
 
         notif_btn = QPushButton("Enable notifications")
         notif_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         notif_btn.setMinimumHeight(34)
         notif_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
-        notif_btn.setStyleSheet(
-            "QPushButton {"
-            "  padding: 6px 16px;"
-            f"  border-radius: {RADIUS_BUTTON}px;"
-            f"  background: {BRAND_ACCENT};"
-            f"  color: {_LABEL}; border: none;"
-            "}"
-            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"
-            f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"
-        )
+        notif_btn.setStyleSheet(BTN_ACCENT_QSS)
         notif_btn.clicked.connect(self._on_request_notifications)
         set_accessible_name(notif_btn, "Enable macOS notifications")
         set_accessible_description(
@@ -901,12 +1034,26 @@ class OnboardingWindow(QWidget):
             "Triggers the macOS notification permission prompt.",
         )
         self._notif_btn_ref = notif_btn
-        notif_layout.addWidget(notif_btn)
+        notif_row.addWidget(notif_btn)
+        notif_layout.addLayout(notif_row)
+        if "macos_notifications" in self._onboarding_state.completed_steps:
+            self._render_notification_status(
+                "Notifications enabled", "success", show_button=False,
+            )
         layout.addWidget(notif_frame)
 
         layout.addStretch()
 
         # ── Finish bar ────────────────────────────────────────────────
+        self._finish_note = QLabel("")
+        self._finish_note.setFont(mac_native.system_font(FS_CAPTION, "regular"))
+        self._finish_note.setStyleSheet(
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
+        )
+        wrap_capped(self._finish_note, 340)
+        set_accessible_name(self._finish_note, "Setup steps still open")
+        layout.addWidget(self._finish_note)
+
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         finish_btn = QPushButton("Get Started")
@@ -914,21 +1061,15 @@ class OnboardingWindow(QWidget):
         finish_btn.setMinimumHeight(38)
         finish_btn.setMinimumWidth(140)
         finish_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
-        finish_btn.setStyleSheet(
-            "QPushButton {"
-            "  padding: 8px 24px;"
-            f"  border-radius: {RADIUS_BUTTON}px;"
-            f"  background: {_LABEL};"
-            "  color: #FFF; border: none;"
-            "}"
-            "QPushButton:hover { background: #333; }"
-        )
+        finish_btn.setStyleSheet(BTN_ACCENT_QSS)
         finish_btn.clicked.connect(self._on_finish)
-        set_accessible_name(finish_btn, "Finish onboarding")
+        set_accessible_name(finish_btn, "Get started")
         set_accessible_description(
             finish_btn,
-            "Mark every onboarding step complete and start Cortex.",
+            "Start using Cortex. Steps you have not finished stay open and "
+            "can be completed later from Settings.",
         )
+        self._finish_btn_ref = finish_btn
         btn_row.addWidget(finish_btn)
         layout.addLayout(btn_row)
 
@@ -943,8 +1084,12 @@ class OnboardingWindow(QWidget):
                 getattr(self, "_region_combo", None),
                 getattr(self, "_key_input", None),
                 getattr(self, "_save_key_btn", None),
+                getattr(self, "_skip_llm_btn", None),
                 getattr(self, "_begin_calibration_btn", None),
+                getattr(self, "_skip_calibration_btn", None),
                 connect_btn,
+                skip_ext_btn,
+                notif_btn,
                 finish_btn,
             )
             if w is not None
@@ -1007,24 +1152,90 @@ class OnboardingWindow(QWidget):
 
     def _apply_notification_auth_result(self, granted: bool) -> None:
         """Reflect the resolved notification-authorization state in the
-        wizard: mark the step complete + show the success affordance when
-        granted, or reflect denied/unavailable and leave it incomplete."""
+        wizard: mark the step complete and show a status row when
+        granted, or reflect denied/unavailable, leave it incomplete, and
+        keep the button live for a retry."""
         if granted:
             self.mark_step_complete("macos_notifications")
-            if hasattr(self, "_notif_btn_ref"):
-                try:
-                    self._notif_btn_ref.setText("Notifications enabled ✓")
-                    self._notif_btn_ref.setEnabled(False)
-                except Exception:
-                    pass
+            self._render_notification_status(
+                "Notifications enabled", "success", show_button=False,
+            )
         else:
             self.mark_step_incomplete("macos_notifications")
+            self._render_notification_status(
+                "Notifications unavailable", "warning", show_button=True,
+            )
             if hasattr(self, "_notif_btn_ref"):
                 try:
-                    self._notif_btn_ref.setText("Notifications unavailable — retry")
+                    self._notif_btn_ref.setText("Try again")
                     self._notif_btn_ref.setEnabled(True)
                 except Exception:
                     pass
+
+    def _render_notification_status(
+        self, text: str, tone: str, *, show_button: bool,
+    ) -> None:
+        status = getattr(self, "_notif_status_ref", None)
+        if status is not None:
+            try:
+                status.setText(text)
+                status.setStyleSheet(status_pill_qss(tone))
+                status.setVisible(True)
+            except Exception:
+                pass
+        btn = getattr(self, "_notif_btn_ref", None)
+        if btn is not None:
+            try:
+                btn.setVisible(show_button)
+                btn.setEnabled(show_button)
+            except Exception:
+                pass
+
+    def _render_extensions_status(self, text: str, tone: str) -> None:
+        status = getattr(self, "_ext_status", None)
+        if status is None:
+            return
+        try:
+            status.setText(text)
+            status.setStyleSheet(status_pill_qss(tone))
+            status.setVisible(bool(text))
+        except Exception:
+            pass
+
+    def _on_skip_extensions(self) -> None:
+        """User chose to connect extensions later — an explicit choice,
+        so the step counts as done and the strip says so."""
+        self._extensions_skipped = True
+        self.mark_step_complete("extensions")
+        self._render_extensions_status(
+            "Skipped — connect later from the menu bar", "neutral",
+        )
+
+    def mark_extensions_connected(self, name: str = "") -> None:
+        """Hook for the Connections panel: a verified extension connection
+        completes the step for real."""
+        self._extensions_verified = True
+        self.mark_step_complete("extensions")
+        label = f"{name} connected" if name else "Extension connected"
+        self._render_extensions_status(label, "success")
+
+    def _on_skip_llm(self) -> None:
+        """Claude access is optional: skipping is a real decision and
+        completes the step. Cortex uses its offline suggestions."""
+        self._llm_skipped = True
+        self.mark_step_complete("llm_backend")
+        self._render_llm_status("Skipped — using offline suggestions", "neutral")
+
+    def _render_llm_status(self, text: str, tone: str) -> None:
+        status = getattr(self, "_llm_status", None)
+        if status is None:
+            return
+        try:
+            status.setText(text)
+            status.setStyleSheet(status_pill_qss(tone))
+            status.setVisible(bool(text))
+        except Exception:
+            pass
 
     def _recheck_notification_auth(self) -> None:
         """Deferred reconciliation of the async macOS auth prompt result.
@@ -1049,19 +1260,41 @@ class OnboardingWindow(QWidget):
             self._apply_notification_auth_result(False)
 
     def _on_finish(self) -> None:
-        """Click handler for the Get Started button. Persists every step
-        as complete BEFORE re-emitting ``completed`` so a crash between
-        the click and the daemon-launch path does not lose progress."""
-        for step in ONBOARDING_STEPS:
-            try:
-                self._onboarding_state.mark_complete(step)
-            except OSError:
-                # Atomic write failed (disk full, read-only filesystem).
-                # Log but don't block the user from finishing onboarding.
-                logger.warning(
-                    "Failed to persist onboarding step %s", step,
-                    exc_info=True,
-                )
+        """Click handler for the Get Started button.
+
+        Persists only the steps that are actually done — a permission
+        the OS reports as granted, a token saved or explicitly skipped,
+        extensions verified or explicitly skipped, calibration and
+        notifications as their own affordances recorded them — then emits
+        ``completed``. Never blocks the user; open steps are listed in
+        the finish note and stay available from Settings.
+        """
+        try:
+            cam = check_camera_permission()
+        except Exception:
+            cam = False
+        try:
+            acc = check_accessibility_permission()
+        except Exception:
+            acc = False
+        self._sync_permission_step("camera", cam)
+        self._sync_permission_step("accessibility", acc)
+        if (self._llm_skipped or self._llm_key_present) and (
+            "llm_backend" not in self._onboarding_state.completed_steps
+        ):
+            self.mark_step_complete("llm_backend")
+        if (self._extensions_skipped or self._extensions_verified) and (
+            "extensions" not in self._onboarding_state.completed_steps
+        ):
+            self.mark_step_complete("extensions")
+        open_steps = [
+            step for step in ONBOARDING_STEPS
+            if step not in self._onboarding_state.completed_steps
+        ]
+        self._log_onboarding_action(
+            "finish", open_steps=",".join(open_steps) or "none",
+        )
+        self._refresh_progress()
         self.completed.emit()
 
     def mark_step_complete(self, step: str) -> None:
@@ -1079,6 +1312,7 @@ class OnboardingWindow(QWidget):
         # P1-20: emit a USER_ACTION event with the wizard correlation id
         # so every per-step completion is traceable in the log stream.
         self._log_onboarding_action(f"{step}_complete", step=step)
+        self._refresh_progress()
 
     def mark_step_incomplete(self, step: str) -> None:
         """Inverse of :meth:`mark_step_complete` — used when the user
@@ -1090,6 +1324,7 @@ class OnboardingWindow(QWidget):
                 "Failed to mark onboarding step %s incomplete", step,
                 exc_info=True,
             )
+        self._refresh_progress()
 
     def _log_onboarding_action(self, action: str, **extra: object) -> None:
         """P1-20: emit a structured USER_ACTION log line for an onboarding
@@ -1133,13 +1368,7 @@ class OnboardingWindow(QWidget):
         # in Qt and would otherwise pick up the white background +
         # border, scrambling text rendering).
         frame.setObjectName("CortexOnbStep")
-        frame.setStyleSheet(
-            "QFrame#CortexOnbStep {"
-            f"  background: {_CONTROL_BG};"
-            f"  border: 0.5px solid {_SEPARATOR};"
-            f"  border-radius: {RADIUS_CARD}px;"
-            "}"
-        )
+        frame.setStyleSheet(f"QFrame#CortexOnbStep {{ {CARD_QSS} }}")
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(SP4, SP4, SP4, SP4)
         layout.setSpacing(SP3)
@@ -1160,7 +1389,7 @@ class OnboardingWindow(QWidget):
         heading = QLabel(title)
         heading.setFont(mac_native.system_font(FS_BODY, "semibold"))
         heading.setStyleSheet(
-            f"color: {_LABEL}; border: none; background: transparent;"
+            f"color: {CX_TEXT}; border: none; background: transparent;"
         )
         header.addWidget(heading)
         header.addStretch()
@@ -1174,16 +1403,7 @@ class OnboardingWindow(QWidget):
             why_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             why_btn.setCheckable(True)
             why_btn.setFont(mac_native.system_font(FS_CAPTION, "medium"))
-            why_btn.setStyleSheet(
-                "QPushButton {"
-                "  padding: 2px 8px;"
-                f"  border-radius: {RADIUS_BUTTON}px;"
-                "  background: transparent;"
-                f"  color: {BRAND_ACCENT_TEXT};"
-                "  border: none;"
-                "}"
-                f"QPushButton:hover {{ color: {BRAND_ACCENT_TEXT}; background: {BRAND_ACCENT_DIM}; }}"
-            )
+            why_btn.setStyleSheet(BTN_LINK_QSS)
             set_accessible_name(why_btn, f"Why Cortex needs {title}")
             set_accessible_description(
                 why_btn,
@@ -1196,7 +1416,7 @@ class OnboardingWindow(QWidget):
             why_body.setWordWrap(True)
             why_body.setFont(mac_native.system_font(FS_CAPTION, "regular"))
             why_body.setStyleSheet(
-                f"color: {_LABEL_SECONDARY}; border: none; background: transparent;"
+                f"color: {CX_TEXT_SECONDARY}; border: none; background: transparent;"
             )
             why_body.setVisible(False)
             set_accessible_name(why_body, f"{title} rationale")
@@ -1243,7 +1463,7 @@ class OnboardingWindow(QWidget):
         desc.setWordWrap(True)
         desc.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         desc.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; border: none;"
+            f"color: {CX_TEXT_SECONDARY}; border: none;"
         )
         layout.addWidget(desc)
 
@@ -1280,18 +1500,9 @@ class OnboardingWindow(QWidget):
 
         btn = QPushButton(btn_text)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setMinimumHeight(28)
-        btn.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
-        btn.setStyleSheet(
-            "QPushButton {"
-            "  padding: 4px 12px;"
-            f"  border-radius: {RADIUS_BUTTON}px;"
-            f"  background: {BRAND_ACCENT};"
-            f"  color: {_LABEL}; border: none;"
-            "}"
-            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"
-            f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"
-        )
+        btn.setMinimumHeight(30)
+        btn.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
+        btn.setStyleSheet(BTN_ACCENT_QSS)
         if callable(action):
             btn.clicked.connect(action)
         set_accessible_name(btn, f"{title} — {btn_text}")
@@ -1303,19 +1514,11 @@ class OnboardingWindow(QWidget):
         def _set_state(is_granted: bool) -> None:
             if is_granted:
                 status.setText("Granted")
-                status.setStyleSheet(
-                    f"color: {_SUCCESS}; background: {_SUCCESS_DIM};"
-                    f" border: none; border-radius: {RADIUS_BUTTON}px;"
-                    "  padding: 3px 8px;"
-                )
+                status.setStyleSheet(status_pill_qss("success"))
                 btn.setVisible(False)
             else:
                 status.setText("Not granted")
-                status.setStyleSheet(
-                    f"color: {_LABEL_TERTIARY}; background: rgba(0,0,0,0.04);"
-                    f" border: none; border-radius: {RADIUS_BUTTON}px;"
-                    "  padding: 3px 8px;"
-                )
+                status.setStyleSheet(status_pill_qss("neutral"))
                 btn.setVisible(True)
 
         _set_state(bool(granted))
@@ -1355,7 +1558,7 @@ class OnboardingWindow(QWidget):
         )
         desc.setWordWrap(True)
         desc.setFont(mac_native.system_font(FS_CAPTION, "regular"))
-        desc.setStyleSheet(f"color: {_LABEL_SECONDARY}; border: none;")
+        desc.setStyleSheet(f"color: {CX_TEXT_SECONDARY}; border: none;")
         self._cal_description = desc
         layout.addWidget(desc)
 
@@ -1384,7 +1587,7 @@ class OnboardingWindow(QWidget):
         )
         self._cal_numerics.setFont(mac_native.system_font(FS_CAPTION, "medium"))
         self._cal_numerics.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; border: none; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; border: none; background: transparent;"
         )
         layout.addWidget(self._cal_numerics)
 
@@ -1396,7 +1599,7 @@ class OnboardingWindow(QWidget):
         self._cal_progress_bar.setFixedHeight(4)
         self._cal_progress_bar.setStyleSheet(
             "QProgressBar {"
-            f"  background: {_GROUPED_BG};"
+            f"  background: {CX_BG_SECONDARY};"
             "  border: none;"
             "  border-radius: 2px;"
             "}"
@@ -1413,17 +1616,7 @@ class OnboardingWindow(QWidget):
         begin_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         begin_btn.setMinimumHeight(32)
         begin_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
-        begin_btn.setStyleSheet(
-            "QPushButton {"
-            "  padding: 6px 20px;"
-            f"  border-radius: {RADIUS_BUTTON}px;"
-            f"  background: {BRAND_ACCENT};"
-            f"  color: {_LABEL}; border: none;"
-            "}"
-            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"
-            f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"
-            "QPushButton:disabled { background: rgba(0,0,0,0.10); color: rgba(0,0,0,0.30); }"
-        )
+        begin_btn.setStyleSheet(BTN_ACCENT_QSS)
         begin_btn.clicked.connect(self._on_begin_calibration)
         set_accessible_name(begin_btn, "Begin calibration")
         set_accessible_description(
@@ -1437,15 +1630,7 @@ class OnboardingWindow(QWidget):
         skip_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         skip_btn.setFlat(True)
         skip_btn.setFont(mac_native.system_font(FS_CAPTION, "regular"))
-        skip_btn.setStyleSheet(
-            "QPushButton {"
-            "  background: transparent; border: none;"
-            f"  color: {_LABEL_TERTIARY};"
-            "  text-decoration: underline;"
-            "  padding: 4px 8px;"
-            "}"
-            f"QPushButton:hover {{ color: {_LABEL_SECONDARY}; }}"
-        )
+        skip_btn.setStyleSheet(BTN_LINK_QSS)
         skip_btn.clicked.connect(self._on_skip_calibration)
         set_accessible_name(skip_btn, "Skip calibration")
         set_accessible_description(
@@ -1460,11 +1645,7 @@ class OnboardingWindow(QWidget):
         # Success label — hidden until completion.
         self._cal_success_label = QLabel("✓ Measured profile saved and applied")
         self._cal_success_label.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
-        self._cal_success_label.setStyleSheet(
-            f"color: {_SUCCESS}; background: {_SUCCESS_DIM};"
-            f" border: none; border-radius: {RADIUS_BUTTON}px;"
-            "  padding: 4px 10px;"
-        )
+        self._cal_success_label.setStyleSheet(status_pill_qss("success"))
         self._cal_success_label.setVisible(False)
         layout.addWidget(self._cal_success_label)
 
@@ -1590,17 +1771,18 @@ class OnboardingWindow(QWidget):
                 pass
 
     def _make_llm_step(self) -> QFrame:
-        frame = self._make_section("3", "AWS Bedrock bearer token", step_id="llm_backend")
+        frame = self._make_section("3", "Claude access (optional)", step_id="llm_backend")
         layout = frame.layout()
 
         desc = QLabel(
-            "Cortex calls Anthropic Claude via AWS Bedrock. Paste your "
+            "Cortex calls Anthropic Claude via AWS Bedrock to write "
+            "suggestions for the exact task in front of you. Paste your "
             "long-lived bearer token below — it's stored only in the macOS "
             "Keychain and never written to disk."
         )
         desc.setWordWrap(True)
         desc.setFont(mac_native.system_font(FS_CAPTION, "regular"))
-        desc.setStyleSheet(f"color: {_LABEL_SECONDARY}; border: none;")
+        desc.setStyleSheet(f"color: {CX_TEXT_SECONDARY}; border: none;")
         layout.addWidget(desc)
 
         config = get_config()
@@ -1616,12 +1798,13 @@ class OnboardingWindow(QWidget):
         region_combo.setMinimumHeight(30)
         region_combo.setStyleSheet(
             "QComboBox {"
-            f"  color: {_LABEL};"
-            f"  background: {_CONTROL_BG};"
-            f"  border: 0.5px solid {_SEPARATOR};"
+            f"  color: {CX_TEXT};"
+            f"  background: {CX_SURFACE};"
+            f"  border: 1px solid {CX_BORDER_DEFAULT};"
             f"  border-radius: {RADIUS_BUTTON}px;"
             "  padding: 6px 12px;"
             "}"
+            f"QComboBox:focus {{ border-color: {BRAND_ACCENT}; }}"
         )
         self._region_combo = region_combo
         layout.addWidget(region_combo)
@@ -1633,32 +1816,14 @@ class OnboardingWindow(QWidget):
         self._key_input.setEchoMode(QLineEdit.EchoMode.Password)
         self._key_input.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
         self._key_input.setMinimumHeight(32)
-        self._key_input.setStyleSheet(
-            "QLineEdit {"
-            f"  color: {_LABEL};"
-            f"  background: {_CONTROL_BG};"
-            f"  border: 0.5px solid {_SEPARATOR};"
-            f"  border-radius: {RADIUS_BUTTON}px;"
-            "  padding: 6px 12px;"
-            "}"
-            f"QLineEdit:focus {{ border: 1.5px solid {BRAND_ACCENT}; }}"
-        )
+        self._key_input.setStyleSheet(INPUT_QSS)
         key_row.addWidget(self._key_input)
 
         save_key_btn = QPushButton("Save")
         save_key_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         save_key_btn.setMinimumHeight(32)
         save_key_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
-        save_key_btn.setStyleSheet(
-            "QPushButton {"
-            "  padding: 6px 16px;"
-            f"  border-radius: {RADIUS_BUTTON}px;"
-            f"  background: {BRAND_ACCENT};"
-            f"  color: {_LABEL}; border: none;"
-            "}"
-            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"
-            f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"
-        )
+        save_key_btn.setStyleSheet(BTN_ACCENT_QSS)
         save_key_btn.clicked.connect(self._save_api_key)
         set_accessible_name(save_key_btn, "Save Bedrock bearer token")
         set_accessible_description(
@@ -1688,23 +1853,45 @@ class OnboardingWindow(QWidget):
         except Exception:
             pass
 
+        self._llm_key_present = has_key
+
+        status_row = QHBoxLayout()
+        self._llm_status = QLabel("")
+        self._llm_status.setFont(mac_native.system_font(FS_CAPTION, "medium"))
+        self._llm_status.setStyleSheet(status_pill_qss("neutral"))
+        self._llm_status.setVisible(False)
+        set_accessible_name(self._llm_status, "Claude access status")
+        status_row.addWidget(self._llm_status)
+        status_row.addStretch()
+
+        skip_btn = QPushButton("Skip — Cortex will use offline suggestions")
+        skip_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        skip_btn.setFont(mac_native.system_font(FS_CAPTION, "regular"))
+        skip_btn.setStyleSheet(BTN_LINK_QSS)
+        skip_btn.clicked.connect(self._on_skip_llm)
+        set_accessible_name(skip_btn, "Skip Claude access")
+        set_accessible_description(
+            skip_btn,
+            "Continue without a token. Cortex uses its built-in offline "
+            "suggestions; you can add a token later in Settings.",
+        )
+        self._skip_llm_btn = skip_btn
+        status_row.addWidget(skip_btn)
+        layout.addLayout(status_row)
+
         if has_key:
-            saved_label = QLabel("Bedrock bearer token found in Keychain")
-            saved_label.setFont(mac_native.system_font(FS_CAPTION, "regular"))
-            saved_label.setStyleSheet(
-                f"color: {_SUCCESS}; border: none;"
-            )
-            layout.addWidget(saved_label)
+            self._render_llm_status("Token found in Keychain", "success")
+        elif self._llm_skipped:
+            self._render_llm_status("Skipped — using offline suggestions", "neutral")
 
         hint = QLabel(
-            "Cortex calls Claude via AWS Bedrock inference profiles  ·  "
-            "Stored in macOS Keychain (service: cortex.bedrock)  ·  "
-            "Without a token, the daemon falls back to rule-based plans."
+            "Stored in the macOS Keychain (service: cortex.bedrock). "
+            "Region and token can be changed later in Settings."
         )
         hint.setWordWrap(True)
         hint.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         hint.setStyleSheet(
-            f"color: {_LABEL_TERTIARY}; border: none;"
+            f"color: {CX_TEXT_SECONDARY}; border: none;"
         )
         layout.addWidget(hint)
 
@@ -1762,12 +1949,11 @@ class OnboardingWindow(QWidget):
                 logger.debug("byok_token_saved emit failed", exc_info=True)
             # P1-20: emit USER_ACTION so the BYOK-save step is traceable.
             self._log_onboarding_action("byok_save", provider="bedrock")
+            self._llm_key_present = True
             self.mark_step_complete("llm_backend")
-            QMessageBox.information(
-                self,
-                "Saved",
-                "Bedrock bearer token saved to macOS Keychain. "
-                "Cortex will use it for the next intervention.",
+            self._render_llm_status(
+                "Token saved to Keychain — Cortex will use it for the next suggestion",
+                "success",
             )
             self._key_input.clear()
         except Exception as e:

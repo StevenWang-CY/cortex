@@ -4,7 +4,7 @@
 
 `CortexConfig` is the runtime source of truth. YAML uses dotted paths below; environment overrides use the corresponding `CORTEX_…` name and double underscores. Secrets are deliberately not fields on `CortexConfig`.
 
-This reference contains **203 runtime settings**.
+This reference contains **194 runtime settings**.
 
 | YAML path | Environment variable | Type | Default | Constraints | Description |
 | --- | --- | --- | --- | --- | --- |
@@ -20,11 +20,11 @@ This reference contains **203 runtime settings**.
 | `llm.privacy.max_pending_previews` | `CORTEX_LLM__PRIVACY__MAX_PENDING_PREVIEWS` | `int` | `16` | ≥ 1; ≤ 64 | — |
 | `llm.privacy.provider_retention_mode` | `CORTEX_LLM__PRIVACY__PROVIDER_RETENTION_MODE` | `Literal[unverified, provider_default, zero_data_retention_contract]` | `"unverified"` | — | — |
 | `llm.use_keychain` | `CORTEX_LLM__USE_KEYCHAIN` | `bool` | `true` | — | — |
-| `llm.model_default` | `CORTEX_LLM__MODEL_DEFAULT` | `Literal[claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5]` | `"claude-sonnet-4-6"` | — | — |
-| `llm.model_fast` | `CORTEX_LLM__MODEL_FAST` | `Literal[claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5]` | `"claude-haiku-4-5"` | — | — |
-| `llm.model_deep` | `CORTEX_LLM__MODEL_DEEP` | `Literal[claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5]` | `"claude-opus-4-7"` | — | — |
-| `llm.max_tokens` | `CORTEX_LLM__MAX_TOKENS` | `int` | `1024` | — | — |
-| `llm.temperature` | `CORTEX_LLM__TEMPERATURE` | `float` | `0.3` | — | — |
+| `llm.model_default` | `CORTEX_LLM__MODEL_DEFAULT` | `Literal[claude-opus-5, claude-sonnet-5, claude-haiku-4-5, claude-opus-4-7, claude-sonnet-4-6]` | `"claude-sonnet-5"` | — | — |
+| `llm.model_fast` | `CORTEX_LLM__MODEL_FAST` | `Literal[claude-opus-5, claude-sonnet-5, claude-haiku-4-5, claude-opus-4-7, claude-sonnet-4-6]` | `"claude-haiku-4-5"` | — | — |
+| `llm.model_deep` | `CORTEX_LLM__MODEL_DEEP` | `Literal[claude-opus-5, claude-sonnet-5, claude-haiku-4-5, claude-opus-4-7, claude-sonnet-4-6]` | `"claude-opus-5"` | — | — |
+| `llm.max_tokens` | `CORTEX_LLM__MAX_TOKENS` | `int` | `8192` | ≥ 1024 | — |
+| `llm.effort` | `CORTEX_LLM__EFFORT` | `Literal[low, medium, high, xhigh, max]` | `"medium"` | — | — |
 | `llm.timeout_seconds` | `CORTEX_LLM__TIMEOUT_SECONDS` | `float` | `30.0` | — | — |
 | `llm.cache_ttl_seconds` | `CORTEX_LLM__CACHE_TTL_SECONDS` | `int` | `60` | ≥ 0; ≤ 60 | — |
 | `llm.template_tier_overrides` | `CORTEX_LLM__TEMPLATE_TIER_OVERRIDES` | `dict[str, Literal[fast, default, deep]]` | `{}` | — | — |
@@ -56,17 +56,8 @@ This reference contains **203 runtime settings**.
 | `state.hypo_dwell_seconds` | `CORTEX_STATE__HYPO_DWELL_SECONDS` | `int` | `60` | — | — |
 | `state.flow_dwell_seconds` | `CORTEX_STATE__FLOW_DWELL_SECONDS` | `int` | `120` | — | — |
 | `state.ema_alpha` | `CORTEX_STATE__EMA_ALPHA` | `float` | `0.3` | — | — |
-| `state.weights.pulse_elevation` | `CORTEX_STATE__WEIGHTS__PULSE_ELEVATION` | `float` | `0.2` | — | — |
-| `state.weights.hrv_drop` | `CORTEX_STATE__WEIGHTS__HRV_DROP` | `float` | `0.15` | — | — |
-| `state.weights.blink_suppression` | `CORTEX_STATE__WEIGHTS__BLINK_SUPPRESSION` | `float` | `0.12` | — | — |
-| `state.weights.posture_collapse` | `CORTEX_STATE__WEIGHTS__POSTURE_COLLAPSE` | `float` | `0.08` | — | — |
-| `state.weights.mouse_thrashing` | `CORTEX_STATE__WEIGHTS__MOUSE_THRASHING` | `float` | `0.15` | — | — |
-| `state.weights.window_switching` | `CORTEX_STATE__WEIGHTS__WINDOW_SWITCHING` | `float` | `0.15` | — | — |
-| `state.weights.workspace_complexity` | `CORTEX_STATE__WEIGHTS__WORKSPACE_COMPLEXITY` | `float` | `0.15` | — | — |
 | `intervention.execution_mode` | `CORTEX_INTERVENTION__EXECUTION_MODE` | `Literal[suggest_only, authorized, research_autonomous]` | `"suggest_only"` | — | — |
 | `intervention.overlay_threshold` | `CORTEX_INTERVENTION__OVERLAY_THRESHOLD` | `float` | `0.7` | — | — |
-| `intervention.simplified_threshold` | `CORTEX_INTERVENTION__SIMPLIFIED_THRESHOLD` | `float` | `0.85` | — | — |
-| `intervention.guided_threshold` | `CORTEX_INTERVENTION__GUIDED_THRESHOLD` | `float` | `0.95` | — | — |
 | `intervention.complexity_threshold` | `CORTEX_INTERVENTION__COMPLEXITY_THRESHOLD` | `float` | `0.6` | — | — |
 | `intervention.cooldown_seconds` | `CORTEX_INTERVENTION__COOLDOWN_SECONDS` | `int` | `60` | — | — |
 | `intervention.intervention_dismiss_cooldown_ms` | `CORTEX_INTERVENTION__INTERVENTION_DISMISS_COOLDOWN_MS` | `int` | `1800000` | — | — |
@@ -84,7 +75,7 @@ This reference contains **203 runtime settings**.
 | `intervention.receptivity_work_hours_start` | `CORTEX_INTERVENTION__RECEPTIVITY_WORK_HOURS_START` | `int` | `7` | — | — |
 | `intervention.receptivity_work_hours_end` | `CORTEX_INTERVENTION__RECEPTIVITY_WORK_HOURS_END` | `int` | `22` | — | — |
 | `intervention.adaptive_threshold_enabled` | `CORTEX_INTERVENTION__ADAPTIVE_THRESHOLD_ENABLED` | `bool` | `true` | — | — |
-| `intervention.adaptive_threshold_min` | `CORTEX_INTERVENTION__ADAPTIVE_THRESHOLD_MIN` | `float` | `0.75` | — | — |
+| `intervention.adaptive_threshold_min` | `CORTEX_INTERVENTION__ADAPTIVE_THRESHOLD_MIN` | `float` | `0.6` | — | — |
 | `intervention.adaptive_threshold_max` | `CORTEX_INTERVENTION__ADAPTIVE_THRESHOLD_MAX` | `float` | `0.95` | — | — |
 | `intervention.dismissal_model_enabled` | `CORTEX_INTERVENTION__DISMISSAL_MODEL_ENABLED` | `bool` | `true` | — | — |
 | `intervention.dismissal_model_threshold` | `CORTEX_INTERVENTION__DISMISSAL_MODEL_THRESHOLD` | `float` | `0.6` | — | — |
@@ -169,7 +160,7 @@ This reference contains **203 runtime settings**.
 | `storage.sqlite_busy_timeout_ms` | `CORTEX_STORAGE__SQLITE_BUSY_TIMEOUT_MS` | `int` | `5000` | ≥ 1; ≤ 60000 | — |
 | `storage.backup_retention_count` | `CORTEX_STORAGE__BACKUP_RETENTION_COUNT` | `int` | `3` | ≥ 1; ≤ 20 | — |
 | `storage.analytics_queue_capacity` | `CORTEX_STORAGE__ANALYTICS_QUEUE_CAPACITY` | `int` | `256` | ≥ 16; ≤ 16384 | — |
-| `storage.session_retention_days` | `CORTEX_STORAGE__SESSION_RETENTION_DAYS` | `int` | `7` | — | — |
+| `storage.session_retention_days` | `CORTEX_STORAGE__SESSION_RETENTION_DAYS` | `int` | `180` | — | — |
 | `storage.feature_retention_days` | `CORTEX_STORAGE__FEATURE_RETENTION_DAYS` | `int` | `7` | — | — |
 | `storage.error_retention_days` | `CORTEX_STORAGE__ERROR_RETENTION_DAYS` | `int` | `90` | — | — |
 | `storage.max_total_size_mb` | `CORTEX_STORAGE__MAX_TOTAL_SIZE_MB` | `int` | `500` | — | — |

@@ -2,9 +2,9 @@
 # These values can be overridden by environment variables or .env file
 
 llm:
-  # v0.2.1: Anthropic SDK transport. AWS Bedrock is the production path;
-  # AsyncAnthropic (direct) and AsyncAnthropicVertex are escape hatches
-  # selected by ANTHROPIC_PROVIDER / config.llm.provider.
+  # Anthropic SDK transport. AWS Bedrock (Mantle Messages endpoint, bearer
+  # token from Keychain) is the production path; AsyncAnthropic (direct) and
+  # AsyncAnthropicVertex are escape hatches selected by config.llm.provider.
   provider: bedrock
   # Safe by default: local deterministic planning, with no model network call.
   # External planning additionally requires the current disclosure revision
@@ -22,11 +22,15 @@ llm:
     keychain_service: cortex.bedrock
     keychain_account: bearer_token
   use_keychain: true
-  model_default: claude-sonnet-4-6
+  model_default: claude-sonnet-5
   model_fast: claude-haiku-4-5
-  model_deep: claude-opus-4-7
-  max_tokens: 1024
-  temperature: 0.3
+  model_deep: claude-opus-5
+  # Structured-output plans (per-tab triage for up to 30 tabs + error
+  # analysis) need headroom; Opus 5 / Sonnet 5 also spend part of this
+  # budget on adaptive thinking. Sampling params are never sent.
+  max_tokens: 8192
+  # output_config.effort for models that accept it (omitted for Haiku 4.5).
+  effort: medium
   timeout_seconds: 30.0
   cache_ttl_seconds: 60
   fallback_mode: rule_based
@@ -66,14 +70,6 @@ state:
   ema_alpha: 0.3
 
   # Overwhelm score weights (should sum to 1.0)
-  weights:
-    pulse_elevation: 0.20
-    hrv_drop: 0.15
-    blink_suppression: 0.12
-    posture_collapse: 0.08
-    mouse_thrashing: 0.15
-    window_switching: 0.15
-    workspace_complexity: 0.15
 
 intervention:
   # Safety boundary: proposals are presentation-only until an exact
@@ -83,8 +79,6 @@ intervention:
 
   # Confidence thresholds for intervention levels
   overlay_threshold: 0.70
-  simplified_threshold: 0.85
-  guided_threshold: 0.95
 
   # Workspace complexity threshold to trigger
   complexity_threshold: 0.6
@@ -106,7 +100,7 @@ intervention:
   receptivity_work_hours_start: 7
   receptivity_work_hours_end: 22
   adaptive_threshold_enabled: true
-  adaptive_threshold_min: 0.75
+  adaptive_threshold_min: 0.60
   adaptive_threshold_max: 0.95
   dismissal_model_enabled: true
   dismissal_model_threshold: 0.6
@@ -207,7 +201,7 @@ storage:
   sqlite_busy_timeout_ms: 5000
   backup_retention_count: 3
   analytics_queue_capacity: 256
-  session_retention_days: 7
+  session_retention_days: 180
   feature_retention_days: 7
   error_retention_days: 90
 

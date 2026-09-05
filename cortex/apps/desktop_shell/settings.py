@@ -1,8 +1,8 @@
-"""Desktop Shell — Settings Dialog (macOS-native refactor).
+"""Desktop Shell — Settings window (macOS-native refactor).
 
-Settings panel for Cortex configuration. Visual layer adopts:
+Settings for Cortex configuration. Visual layer adopts:
 
-* Sentence-case section headings (HIG) — was previously SHOUTING + letter-spaced
+* Sentence-case section headings (HIG) from the shared token recipes
 * SF system fonts via :func:`mac_native.system_font`
 * Hairline-bordered inset cards (no Material drop shadows)
 * Brand-accent (terracotta) only on the sensitivity slider handle and the
@@ -10,8 +10,13 @@ Settings panel for Cortex configuration. Visual layer adopts:
 * Native window chrome via :func:`mac_native.apply_unified_titlebar` +
   :func:`mac_native.apply_vibrancy`
 
-Public API preserved verbatim: ``settings_changed(dict)`` Signal,
-``back_requested()`` Signal, ``get_settings``, ``_apply_settings``,
+The ten cards scroll inside a ``QScrollArea``; Close / Apply stay pinned
+below it. Rarely used controls (weekly schedule, debug logging) sit behind
+disclosures. Escape closes the window; it is a window, not a page, so there
+is no "Back".
+
+Public API preserved: ``settings_changed(dict)`` Signal, ``back_requested()``
+Signal (emitted on close), ``get_settings``, ``_apply_settings``,
 ``apply_payload``, QSettings persistence under ``("Cortex", "Desktop")``.
 """
 
@@ -32,6 +37,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QVBoxLayout,
@@ -44,24 +50,34 @@ from cortex.apps.desktop_shell.a11y import (
     set_accessible_description,
     set_accessible_name,
 )
-from cortex.apps.desktop_shell.components import install_elide, wrap_capped
+from cortex.apps.desktop_shell.components import (
+    Disclosure,
+    format_relative_age,
+    install_elide,
+    status_pill_qss,
+    wrap_capped,
+)
 from cortex.apps.desktop_shell.context_privacy_dialog import ContextPrivacyDialog
 from cortex.apps.desktop_shell.tokens import (
     BRAND_ACCENT,
     BRAND_ACCENT_HOVER,
-    BRAND_ACCENT_PRESSED,
     BRAND_ACCENT_TEXT,
-    BRAND_DISPLAY_FONT,
+    BTN_ACCENT_QSS,
+    BTN_GHOST_QSS,
+    BTN_LINK_QSS,
+    CARD_QSS,
+    CX_BG,
+    CX_BG_SECONDARY,
+    CX_BORDER_DEFAULT,
+    CX_SURFACE,
+    CX_TEXT,
     CX_TEXT_SECONDARY,
     CX_TEXT_TERTIARY,
     FS_CAPTION,
     FS_FOOTNOTE,
-    FS_TITLE,
-    FW_REGULAR,
-    FW_SEMIBOLD,
+    PAGE_TITLE_QSS,
     RADIUS_BUTTON,
-    RADIUS_CARD,
-    SEMANTIC_LIGHT,
+    SECTION_HEADING_QSS,
     SP2,
     SP3,
     SP4,
@@ -70,16 +86,6 @@ from cortex.apps.desktop_shell.tokens import (
 )
 
 logger = logging.getLogger(__name__)
-
-_WINDOW_BG = SEMANTIC_LIGHT["window_bg"]
-_CONTROL_BG = SEMANTIC_LIGHT["control_bg"]
-_GROUPED_BG = SEMANTIC_LIGHT["grouped_bg"]
-_LABEL = SEMANTIC_LIGHT["label_primary"]
-# WCAG-AA-passing label tints from the token registry — was carrying a
-# private sub-AA copy that drifted from the dashboard's audit-F55 fix.
-_LABEL_SECONDARY = CX_TEXT_SECONDARY
-_LABEL_TERTIARY = CX_TEXT_TERTIARY
-_SEPARATOR = SEMANTIC_LIGHT["separator"]
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +96,7 @@ _SEPARATOR = SEMANTIC_LIGHT["separator"]
 _CHECKBOX_QSS = (
     "QCheckBox {"
     f"  font-size: {FS_FOOTNOTE}px;"
-    f"  color: {_LABEL};"
+    f"  color: {CX_TEXT};"
     "  spacing: 8px;"
     "  background: transparent;"
     "}"
@@ -99,19 +105,20 @@ _CHECKBOX_QSS = (
 _COMBO_QSS = (
     "QComboBox {"
     f"  font-size: {FS_FOOTNOTE}px;"
-    f"  color: {_LABEL};"
-    f"  background: {_CONTROL_BG};"
-    f"  border: 0.5px solid {_SEPARATOR};"
+    f"  color: {CX_TEXT};"
+    f"  background: {CX_SURFACE};"
+    f"  border: 1px solid {CX_BORDER_DEFAULT};"
     f"  border-radius: {RADIUS_BUTTON}px;"
     "  padding: 6px 12px;"
     "}"
-    f"QComboBox:hover {{ border-color: rgba(0,0,0,0.20); }}"
+    "QComboBox:hover { border-color: rgba(0,0,0,0.20); }"
+    f"QComboBox:focus {{ border-color: {BRAND_ACCENT}; }}"
     "QComboBox::drop-down { border: none; width: 22px; }"
     "QComboBox QAbstractItemView {"
-    f"  background: {_CONTROL_BG};"
-    f"  border: 0.5px solid {_SEPARATOR};"
+    f"  background: {CX_SURFACE};"
+    f"  border: 0.5px solid {CX_BORDER_DEFAULT};"
     f"  border-radius: {RADIUS_BUTTON}px;"
-    f"  color: {_LABEL};"
+    f"  color: {CX_TEXT};"
     "  padding: 4px 0;"
     "  outline: none;"
     "}"
@@ -121,7 +128,7 @@ _COMBO_QSS = (
     "}"
     "QComboBox QAbstractItemView::item:selected {"
     f"  background: rgba(217, 119, 87, 0.12);"
-    f"  color: {_LABEL};"
+    f"  color: {CX_TEXT};"
     "}"
     "QComboBox QAbstractItemView::item:hover {"
     f"  background: rgba(217, 119, 87, 0.08);"
@@ -129,18 +136,19 @@ _COMBO_QSS = (
 )
 
 _SPINBOX_QSS = (
-    "QSpinBox {"
+    "QSpinBox, QDoubleSpinBox {"
     f"  font-size: {FS_FOOTNOTE}px;"
-    f"  color: {_LABEL};"
-    f"  background: {_CONTROL_BG};"
-    f"  border: 0.5px solid {_SEPARATOR};"
+    f"  color: {CX_TEXT};"
+    f"  background: {CX_SURFACE};"
+    f"  border: 1px solid {CX_BORDER_DEFAULT};"
     f"  border-radius: {RADIUS_BUTTON}px;"
     "  padding: 4px 10px;"
     "}"
+    f"QSpinBox:focus, QDoubleSpinBox:focus {{ border-color: {BRAND_ACCENT}; }}"
 )
 
 _SLIDER_QSS = (
-    f"QSlider::groove:horizontal {{ background: {_GROUPED_BG};"
+    f"QSlider::groove:horizontal {{ background: {CX_BG_SECONDARY};"
     " height: 6px; border-radius: 3px; }"
     f"QSlider::handle:horizontal {{ background: {BRAND_ACCENT};"
     " width: 18px; height: 18px; margin: -6px 0; border-radius: 9px;"
@@ -148,24 +156,22 @@ _SLIDER_QSS = (
     " }"
     f"QSlider::handle:horizontal:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
     f"QSlider::handle:horizontal:pressed {{ background: {BRAND_ACCENT_HOVER}; }}"
+    f"QSlider:focus::handle:horizontal {{ border: 2px solid {CX_TEXT}; }}"
     f"QSlider::sub-page:horizontal {{ background: {BRAND_ACCENT};"
     " border-radius: 3px; }"
 )
 
-_PAGE_TITLE_QSS = (
-    f"font-family: {BRAND_DISPLAY_FONT}, ui-serif, Georgia, serif;"
-    f"font-size: {FS_TITLE}px;"
-    "font-style: italic;"
-    f"font-weight: {FW_REGULAR};"
-    f"color: {_LABEL};"
-    "background: transparent;"
-)
+_PAGE_TITLE_QSS = PAGE_TITLE_QSS
+_SECTION_HEADING_QSS = SECTION_HEADING_QSS
 
-_SECTION_HEADING_QSS = (
-    f"font-size: {FS_FOOTNOTE}px;"
-    f"font-weight: {FW_SEMIBOLD};"
-    f"color: {_LABEL_SECONDARY};"
-    "background: transparent;"
+_SCROLL_QSS = (
+    "QScrollArea { border: none; background: transparent; }"
+    "QScrollBar:vertical { background: transparent; width: 8px; }"
+    "QScrollBar::handle:vertical {"
+    "  background: rgba(0,0,0,0.18); border-radius: 4px; min-height: 24px;"
+    "}"
+    "QScrollBar::handle:vertical:hover { background: rgba(0,0,0,0.32); }"
+    "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
 )
 
 
@@ -189,25 +195,11 @@ def _active_calibration_measured_at() -> float | None:
 
 
 def _format_relative_time(mtime: float, now: float | None = None) -> str:
-    """Human-readable "N days ago" / "2 hours ago" formatter — matches
-    the dashboard's freshness pill so the two surfaces stay consistent."""
+    """Human-readable "N days ago" / "2 hours ago" via the shared formatter."""
     if mtime <= 0:
         return "never"
     current = now if now is not None else time.time()
-    delta = max(0.0, current - mtime)
-    minute = 60.0
-    hour = 60.0 * minute
-    day = 24.0 * hour
-    if delta < minute:
-        return "just now"
-    if delta < hour:
-        n = int(delta // minute)
-        return f"{n} minute ago" if n == 1 else f"{n} minutes ago"
-    if delta < day:
-        n = int(delta // hour)
-        return f"{n} hour ago" if n == 1 else f"{n} hours ago"
-    n = int(delta // day)
-    return f"{n} day ago" if n == 1 else f"{n} days ago"
+    return format_relative_age(current - mtime)
 
 
 def _format_baseline_freshness_label(path: Path | None = None) -> str:
@@ -273,8 +265,13 @@ class SettingsDialog(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Cortex — Settings")
-        self.setMinimumSize(440, 580)
-        self.setStyleSheet(f"background: {_WINDOW_BG}; color: {_LABEL};")
+        self.setMinimumSize(440, 520)
+        self.resize(480, 640)
+        self.setStyleSheet(f"background: {CX_BG}; color: {CX_TEXT};")
+        set_accessible_name(self, "Cortex settings")
+        set_accessible_description(
+            self, "Cortex settings window. Escape closes it; Apply saves changes.",
+        )
         # E.2: QSettings persistence — Cortex/Desktop. Default values come
         # from the widget initializers in _build_ui; we restore over the
         # top once the UI is built.
@@ -320,7 +317,7 @@ class SettingsDialog(QWidget):
         super().showEvent(event)
         try:
             mac_native.apply_unified_titlebar(self)
-            mac_native.apply_vibrancy(self, material="window_background")
+            mac_native.apply_vibrancy(self)
         except Exception:
             logger.debug("native chrome application failed", exc_info=True)
         # Resume + force-refresh the permission poll whenever the dialog
@@ -350,30 +347,46 @@ class SettingsDialog(QWidget):
             logger.debug("permission poll stop failed", exc_info=True)
         super().hideEvent(event)
 
+    def keyPressEvent(self, event: object) -> None:  # noqa: D401 - Qt override
+        # Escape closes the window (it is a window, not a page).
+        key = getattr(event, "key", lambda: None)()
+        if key == Qt.Key.Key_Escape:
+            self._on_back()
+            try:
+                event.accept()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            return
+        super().keyPressEvent(event)
+
     def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
+        # Two tiers: the window hosts a scroll area (all cards) and a pinned
+        # Close / Apply row beneath it, so the actions never scroll away.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        content = QWidget()
+        content.setObjectName("CortexSettingsContent")
+        content.setStyleSheet(f"#CortexSettingsContent {{ background: {CX_BG}; }}")
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(SP6, SP5, SP6, SP6)
         layout.setSpacing(SP5)
 
-        # ── Header (back link + page title) ──────────────────────────
-        header = QHBoxLayout()
-        back_btn = QPushButton("←  Back")
-        back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        back_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
-        back_btn.setStyleSheet(
-            "QPushButton {"
-            f"  color: {_LABEL_SECONDARY};"
-            "  background: transparent; border: none; padding: 4px 0;"
-            "}"
-            f"QPushButton:hover {{ color: {_LABEL}; }}"
-        )
-        back_btn.clicked.connect(self._on_back)
-        header.addWidget(back_btn)
-        header.addStretch()
-        layout.addLayout(header)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        try:
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+        except AttributeError:  # pragma: no cover - stub harness
+            pass
+        scroll.setStyleSheet(_SCROLL_QSS)
+        scroll.setWidget(content)
+        self._scroll_area = scroll
+        outer.addWidget(scroll, stretch=1)
 
         title = QLabel("Settings")
         title.setStyleSheet(_PAGE_TITLE_QSS)
+        set_accessible_name(title, "Settings")
         layout.addWidget(title)
 
         # ── Sensing ──────────────────────────────────────────────────
@@ -429,7 +442,7 @@ class SettingsDialog(QWidget):
             mac_native.system_font(FS_CAPTION, "regular")
         )
         self._baseline_freshness_label.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent; border: none;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent; border: none;"
         )
         install_elide(self._baseline_freshness_label)
         recal_row.addWidget(self._baseline_freshness_label)
@@ -439,18 +452,13 @@ class SettingsDialog(QWidget):
         self._recalibrate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._recalibrate_btn.setMinimumHeight(28)
         self._recalibrate_btn.setFont(
-            mac_native.system_font(FS_CAPTION, "semibold")
+            mac_native.system_font(FS_FOOTNOTE, "medium")
         )
-        self._recalibrate_btn.setStyleSheet(
-            "QPushButton {"
-            "  padding: 4px 14px;"
-            f"  border-radius: {RADIUS_BUTTON}px;"
-            f"  background: {BRAND_ACCENT};"
-            f"  color: {_LABEL}; border: none;"
-            "}"
-            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"
-            f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"
-        )
+        self._recalibrate_btn.setStyleSheet(BTN_GHOST_QSS)
+        try:
+            self._recalibrate_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        except Exception:
+            pass
         self._recalibrate_btn.clicked.connect(self.recalibrate_requested.emit)
         set_accessible_name(self._recalibrate_btn, "Recalibrate measured profile")
         set_accessible_description(
@@ -481,7 +489,7 @@ class SettingsDialog(QWidget):
         sens_row = QHBoxLayout()
         sens_label = QLabel("Sensitivity")
         sens_label.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
-        sens_label.setStyleSheet(f"color: {_LABEL}; background: transparent;")
+        sens_label.setStyleSheet(f"color: {CX_TEXT}; background: transparent;")
         sens_row.addWidget(sens_label)
         sens_row.addStretch()
 
@@ -508,19 +516,19 @@ class SettingsDialog(QWidget):
         sens_desc = QLabel("1 = fewer interventions  ·  5 = intervene earlier")
         sens_desc.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         sens_desc.setStyleSheet(
-            f"color: {_LABEL_TERTIARY}; background: transparent;"
+            f"color: {CX_TEXT_TERTIARY}; background: transparent;"
         )
         int_inner.addWidget(sens_desc)
 
         div = QFrame()
         div.setFixedHeight(1)
-        div.setStyleSheet(f"background: {_SEPARATOR};")
+        div.setStyleSheet(f"background: {CX_BORDER_DEFAULT};")
         int_inner.addWidget(div)
 
         cd_row = QHBoxLayout()
         cd_label = QLabel("Cooldown")
         cd_label.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
-        cd_label.setStyleSheet(f"color: {_LABEL}; background: transparent;")
+        cd_label.setStyleSheet(f"color: {CX_TEXT}; background: transparent;")
         cd_row.addWidget(cd_label)
         cd_row.addStretch()
         self._cooldown_spin = QSpinBox()
@@ -541,7 +549,7 @@ class SettingsDialog(QWidget):
         qd_label = QLabel("Quiet duration")
         qd_label.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
         qd_label.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
         qd_row.addWidget(qd_label)
         qd_row.addStretch()
@@ -581,7 +589,7 @@ class SettingsDialog(QWidget):
         )
         fp_help.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         fp_help.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
         wrap_capped(fp_help, 340)
         fp_inner.addWidget(fp_help)
@@ -589,7 +597,7 @@ class SettingsDialog(QWidget):
         preset_row = QHBoxLayout()
         preset_label = QLabel("Blocklist preset")
         preset_label.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
-        preset_label.setStyleSheet(f"color: {_LABEL}; background: transparent;")
+        preset_label.setStyleSheet(f"color: {CX_TEXT}; background: transparent;")
         preset_row.addWidget(preset_label)
         preset_row.addStretch()
         self._distraction_preset = QComboBox()
@@ -607,7 +615,7 @@ class SettingsDialog(QWidget):
         custom_label = QLabel("Custom domains (one per line)")
         custom_label.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         custom_label.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
         fp_inner.addWidget(custom_label)
 
@@ -621,10 +629,10 @@ class SettingsDialog(QWidget):
         self._distraction_custom_domains.setMaximumHeight(90)
         self._distraction_custom_domains.setStyleSheet(
             "QPlainTextEdit {"
-            f"  background: {_CONTROL_BG};"
-            f"  border: 0.5px solid {_SEPARATOR};"
+            f"  background: {CX_SURFACE};"
+            f"  border: 0.5px solid {CX_BORDER_DEFAULT};"
             f"  border-radius: {RADIUS_BUTTON}px;"
-            f"  color: {_LABEL};"
+            f"  color: {CX_TEXT};"
             "  padding: 6px;"
             "}"
         )
@@ -656,7 +664,7 @@ class SettingsDialog(QWidget):
         )
         notif_help.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         notif_help.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
         wrap_capped(notif_help, 340)
         notif_inner.addWidget(notif_help)
@@ -697,43 +705,32 @@ class SettingsDialog(QWidget):
         self._provider_status_pill.setFont(
             mac_native.system_font(FS_CAPTION, "regular"),
         )
-        self._provider_status_pill.setStyleSheet(
-            "QLabel {"
-            "  padding: 2px 10px;"
-            f"  border-radius: {RADIUS_BUTTON}px;"
-            f"  color: {_LABEL_SECONDARY};"
-            f"  background: {_GROUPED_BG};"
-            "}"
-        )
+        self._provider_status_pill.setStyleSheet(status_pill_qss("neutral"))
+        set_accessible_name(self._provider_status_pill, "LLM provider status")
         provider_row.addWidget(self._provider_status_pill, stretch=1)
         self._test_provider_btn = QPushButton("Test connection")
         self._test_provider_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._test_provider_btn.setFont(
-            mac_native.system_font(FS_CAPTION, "medium"),
+            mac_native.system_font(FS_FOOTNOTE, "medium"),
         )
-        self._test_provider_btn.setStyleSheet(
-            "QPushButton {"
-            "  padding: 4px 10px;"
-            f"  border-radius: {RADIUS_BUTTON}px;"
-            "  background: transparent;"
-            f"  color: {_LABEL};"
-            f"  border: 0.5px solid {_SEPARATOR};"
-            "}"
-            "QPushButton:hover { background: rgba(0,0,0,0.03); }"
-        )
+        self._test_provider_btn.setStyleSheet(BTN_GHOST_QSS)
+        try:
+            self._test_provider_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        except Exception:
+            pass
         self._test_provider_btn.clicked.connect(self._on_test_provider_clicked)
         provider_row.addWidget(self._test_provider_btn)
         llm_inner.addLayout(provider_row)
 
         llm_divider = QFrame()
         llm_divider.setFixedHeight(1)
-        llm_divider.setStyleSheet(f"background: {_SEPARATOR};")
+        llm_divider.setStyleSheet(f"background: {CX_BORDER_DEFAULT};")
         llm_inner.addWidget(llm_divider)
 
         planner_label = QLabel("Planning privacy")
         planner_label.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
         planner_label.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
         llm_inner.addWidget(planner_label)
 
@@ -762,7 +759,7 @@ class SettingsDialog(QWidget):
             mac_native.system_font(FS_CAPTION, "regular")
         )
         self._llm_privacy_help.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
         llm_inner.addWidget(self._llm_privacy_help)
 
@@ -780,7 +777,7 @@ class SettingsDialog(QWidget):
             mac_native.system_font(FS_CAPTION, "regular")
         )
         self._privacy_summary.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
         privacy_action_row.addWidget(self._privacy_summary, stretch=1)
         self._review_context_btn = QPushButton("Review request…")
@@ -788,16 +785,11 @@ class SettingsDialog(QWidget):
         self._review_context_btn.setFont(
             mac_native.system_font(FS_CAPTION, "medium")
         )
-        self._review_context_btn.setStyleSheet(
-            "QPushButton {"
-            "  padding: 4px 10px;"
-            f"  border-radius: {RADIUS_BUTTON}px;"
-            "  background: transparent;"
-            f"  color: {BRAND_ACCENT_TEXT};"
-            f"  border: 0.5px solid {_SEPARATOR};"
-            "}"
-            "QPushButton:hover { background: rgba(217,119,87,0.08); }"
-        )
+        self._review_context_btn.setStyleSheet(BTN_LINK_QSS)
+        try:
+            self._review_context_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        except Exception:
+            pass
         self._review_context_btn.clicked.connect(self._open_context_privacy_dialog)
         privacy_action_row.addWidget(self._review_context_btn)
         llm_inner.addLayout(privacy_action_row)
@@ -819,7 +811,7 @@ class SettingsDialog(QWidget):
         cap_row = QHBoxLayout()
         cap_label = QLabel("Daily LLM cap")
         cap_label.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
-        cap_label.setStyleSheet(f"color: {_LABEL}; background: transparent;")
+        cap_label.setStyleSheet(f"color: {CX_TEXT}; background: transparent;")
         cap_row.addWidget(cap_label)
         cap_row.addStretch()
         self._budget_daily_spin = QDoubleSpinBox()
@@ -829,17 +821,23 @@ class SettingsDialog(QWidget):
         self._budget_daily_spin.setValue(1.50)
         self._budget_daily_spin.setSuffix(" USD")
         self._budget_daily_spin.setMinimumWidth(96)
+        self._budget_daily_spin.setStyleSheet(_SPINBOX_QSS)
         cap_row.addWidget(self._budget_daily_spin)
         budget_inner.addLayout(cap_row)
 
-        self._budget_today_label = QLabel("Cost so far today: pending…")
+        # Rendered only once the daemon reports real spend
+        # (``apply_cost_response``); a permanent "pending…" is a placeholder
+        # pretending to be data.
+        self._budget_today_label = QLabel("")
         self._budget_today_label.setFont(
             mac_native.system_font(FS_CAPTION, "regular"),
         )
         self._budget_today_label.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
         wrap_capped(self._budget_today_label, 320)
+        self._budget_today_label.setVisible(False)
+        set_accessible_name(self._budget_today_label, "LLM cost so far today")
         budget_inner.addWidget(self._budget_today_label)
 
         budget_help = QLabel(
@@ -849,7 +847,7 @@ class SettingsDialog(QWidget):
         budget_help.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         budget_help.setWordWrap(True)
         budget_help.setStyleSheet(
-            f"color: {_LABEL_TERTIARY}; background: transparent;"
+            f"color: {CX_TEXT_TERTIARY}; background: transparent;"
         )
         budget_inner.addWidget(budget_help)
 
@@ -867,7 +865,7 @@ class SettingsDialog(QWidget):
         palette_row = QHBoxLayout()
         palette_label = QLabel("Color palette")
         palette_label.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
-        palette_label.setStyleSheet(f"color: {_LABEL}; background: transparent;")
+        palette_label.setStyleSheet(f"color: {CX_TEXT}; background: transparent;")
         palette_row.addWidget(palette_label)
         palette_row.addStretch()
         self._palette_combo = QComboBox()
@@ -888,20 +886,18 @@ class SettingsDialog(QWidget):
 
         a11y_help = QLabel(
             "Swap the state palette to a color-blind-safe variant. "
-            "Restart Cortex to apply the new colors everywhere."
+            "Cortex applies it to the status dot, support scores, the "
+            "menu-bar icon, and the suggestion card on their next update."
         )
         a11y_help.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         a11y_help.setWordWrap(True)
         a11y_help.setStyleSheet(
-            f"color: {_LABEL_TERTIARY}; background: transparent;"
+            f"color: {CX_TEXT_TERTIARY}; background: transparent;"
         )
         a11y_inner.addWidget(a11y_help)
         layout.addWidget(a11y_card)
 
-        # ── Weekly schedule (P0 §3.20) ───────────────────────────────
-        sched_label = QLabel("Weekly schedule")
-        sched_label.setStyleSheet(_SECTION_HEADING_QSS)
-        layout.addWidget(sched_label)
+        # ── Weekly schedule (P0 §3.20) — behind a disclosure ─────────
         sched_card = self._make_card()
         sched_inner = QVBoxLayout(sched_card)
         sched_inner.setContentsMargins(SP4, SP4, SP4, SP4)
@@ -925,7 +921,7 @@ class SettingsDialog(QWidget):
             lab = QLabel(slot.title())
             lab.setFont(mac_native.system_font(FS_CAPTION, "medium"))
             lab.setStyleSheet(
-                f"color: {_LABEL_SECONDARY}; background: transparent;"
+                f"color: {CX_TEXT_SECONDARY}; background: transparent;"
             )
             header_row.addWidget(lab, stretch=1)
         sched_inner.addLayout(header_row)
@@ -934,7 +930,7 @@ class SettingsDialog(QWidget):
             day_label = QLabel(day[:3].title())
             day_label.setFont(mac_native.system_font(FS_CAPTION, "regular"))
             day_label.setStyleSheet(
-                f"color: {_LABEL}; background: transparent;"
+                f"color: {CX_TEXT}; background: transparent;"
             )
             row.addWidget(day_label, stretch=1)
             combos: list[QComboBox] = []
@@ -946,7 +942,10 @@ class SettingsDialog(QWidget):
                 row.addWidget(cb, stretch=1)
             self._schedule_combos[day] = combos
             sched_inner.addLayout(row)
-        layout.addWidget(sched_card)
+        self._schedule_disclosure = Disclosure(
+            "Weekly schedule", sched_card, expanded=False,
+        )
+        layout.addWidget(self._schedule_disclosure)
 
         # ── Security ────────────────────────────────────────────────
         # Audit Debt-2 Commit 5: the capability token gates every
@@ -967,16 +966,11 @@ class SettingsDialog(QWidget):
         rotate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         rotate_btn.setMinimumHeight(32)
         rotate_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
-        rotate_btn.setStyleSheet(
-            "QPushButton {"
-            f"  padding: 6px 14px;"
-            f"  border-radius: {RADIUS_BUTTON}px;"
-            "  background: transparent;"
-            f"  color: {_LABEL};"
-            f"  border: 0.5px solid {_SEPARATOR};"
-            "}"
-            "QPushButton:hover { background: rgba(0,0,0,0.03); }"
-        )
+        rotate_btn.setStyleSheet(BTN_GHOST_QSS)
+        try:
+            rotate_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        except Exception:
+            pass
         set_accessible_name(rotate_btn, "Rotate authentication token")
         set_accessible_description(
             rotate_btn,
@@ -994,7 +988,7 @@ class SettingsDialog(QWidget):
         sec_hint.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         sec_hint.setWordWrap(True)
         sec_hint.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
         sec_inner.addWidget(sec_hint)
 
@@ -1005,37 +999,51 @@ class SettingsDialog(QWidget):
         )
         self._rotate_token_status.setWordWrap(True)
         self._rotate_token_status.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
         sec_inner.addWidget(self._rotate_token_status)
 
         layout.addWidget(sec_card)
 
-        # ── Debug ────────────────────────────────────────────────────
-        debug_label = QLabel("Debug")
-        debug_label.setStyleSheet(_SECTION_HEADING_QSS)
-        layout.addWidget(debug_label)
-
+        # ── Advanced (debug logging) — behind a disclosure ───────────
         debug_card = self._make_card()
         debug_inner = QVBoxLayout(debug_card)
         debug_inner.setContentsMargins(SP4, SP4, SP4, SP4)
         debug_inner.setSpacing(SP2)
 
-        self._debug_capture = QCheckBox("Capture debug")
-        self._debug_rppg = QCheckBox("rPPG debug")
-        self._debug_state = QCheckBox("State debug")
-        self._debug_llm = QCheckBox("LLM debug")
+        debug_help = QLabel(
+            "Verbose logging for support. Leave these off unless asked."
+        )
+        debug_help.setFont(mac_native.system_font(FS_CAPTION, "regular"))
+        debug_help.setStyleSheet(
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
+        )
+        wrap_capped(debug_help, 340)
+        debug_inner.addWidget(debug_help)
+
+        self._debug_capture = QCheckBox("Capture debug logging")
+        self._debug_rppg = QCheckBox("rPPG debug logging")
+        self._debug_state = QCheckBox("State engine debug logging")
+        self._debug_llm = QCheckBox("LLM debug logging")
 
         for cb in (self._debug_capture, self._debug_rppg, self._debug_state, self._debug_llm):
             cb.setStyleSheet(_CHECKBOX_QSS)
             debug_inner.addWidget(cb)
 
-        layout.addWidget(debug_card)
-
-        # ── Actions (HIG: bottom-right, Cancel/Close left of Apply) ──
+        self._advanced_disclosure = Disclosure("Advanced", debug_card, expanded=False)
+        layout.addWidget(self._advanced_disclosure)
         layout.addStretch()
 
-        btn_row = QHBoxLayout()
+        # ── Actions (HIG: bottom-right, Close left of Apply) ─────────
+        # Pinned under the scroll area so they never scroll out of reach.
+        actions = QWidget()
+        actions.setObjectName("CortexSettingsActions")
+        actions.setStyleSheet(
+            f"#CortexSettingsActions {{ background: {CX_BG};"
+            f" border-top: 1px solid {CX_BORDER_DEFAULT}; }}"
+        )
+        btn_row = QHBoxLayout(actions)
+        btn_row.setContentsMargins(SP6, SP3, SP6, SP4)
         btn_row.setSpacing(SP3)
         btn_row.addStretch()
 
@@ -1043,50 +1051,27 @@ class SettingsDialog(QWidget):
         close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         close_btn.setMinimumHeight(32)
         close_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
-        close_btn.setStyleSheet(
-            "QPushButton {"
-            f"  padding: 6px 14px;"
-            f"  border-radius: {RADIUS_BUTTON}px;"
-            "  background: transparent;"
-            f"  color: {_LABEL_SECONDARY};"
-            f"  border: 0.5px solid {_SEPARATOR};"
-            "}"
-            "QPushButton:hover { background: rgba(0,0,0,0.03); color: " + _LABEL + "; }"
-        )
-        close_btn.clicked.connect(self.hide)
+        close_btn.setStyleSheet(BTN_GHOST_QSS)
+        close_btn.clicked.connect(self._on_back)
         btn_row.addWidget(close_btn)
 
         apply_btn = QPushButton("Apply")
         apply_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         apply_btn.setMinimumHeight(32)
         apply_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
-        # HIG default action: filled with the brand accent. macOS' own default
-        # action would use NSColor.controlAccentColor; we override with our
-        # terracotta to keep the brand mark.
-        apply_btn.setStyleSheet(
-            "QPushButton {"
-            f"  padding: 6px 16px;"
-            f"  border-radius: {RADIUS_BUTTON}px;"
-            f"  background: {BRAND_ACCENT};"
-            f"  color: {_LABEL};"
-            "  border: none;"
-            "}"
-            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"
-            f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"
-        )
+        # HIG default action: filled with the brand accent.
+        apply_btn.setStyleSheet(BTN_ACCENT_QSS)
         apply_btn.clicked.connect(self._apply_settings)
         # F04: keep a handle on the Apply button so _apply_settings can
         # disable it while an apply is in-flight (visual coalescing of
         # double-clicks; the mutex below is the correctness guarantee).
         self._apply_btn = apply_btn
         btn_row.addWidget(apply_btn)
-
-        layout.addLayout(btn_row)
+        outer.addWidget(actions)
 
         # audit-w2 (F55 carry-over): accessible names + tab order. Without
         # these, VoiceOver announces every control as "checkbox" / "button"
         # and the focus ring skips around the panel unpredictably.
-        set_accessible_name(back_btn, "Back to dashboard")
         set_accessible_name(self._webcam_enabled, "Enable webcam")
         set_accessible_description(
             self._webcam_enabled,
@@ -1129,7 +1114,6 @@ class SettingsDialog(QWidget):
         # Phase-3 / Audit-1.2 F5: include the new P0 §3.10 / §3.12
         # controls in the tab order so keyboard users can reach them.
         chain_tab_order(
-            back_btn,
             self._webcam_enabled,
             self._input_telemetry_enabled,
             self._interventions_enabled,
@@ -1145,6 +1129,11 @@ class SettingsDialog(QWidget):
             self._llm_privacy_mode,
             self._external_context_ack,
             self._review_context_btn,
+            self._budget_daily_spin,
+            self._palette_combo,
+            self._schedule_disclosure._header,
+            self._rotate_token_btn,
+            self._advanced_disclosure._header,
             self._debug_capture,
             self._debug_rppg,
             self._debug_state,
@@ -1177,13 +1166,7 @@ class SettingsDialog(QWidget):
     def _make_card(self) -> QFrame:
         card = QFrame()
         card.setObjectName("CortexSettingsCard")
-        card.setStyleSheet(
-            "QFrame#CortexSettingsCard {"
-            f"  background: {_CONTROL_BG};"
-            f"  border: 0.5px solid {_SEPARATOR};"
-            f"  border-radius: {RADIUS_CARD}px;"
-            "}"
-        )
+        card.setStyleSheet(f"QFrame#CortexSettingsCard {{ {CARD_QSS} }}")
         return card
 
     def _make_permission_row(
@@ -1603,12 +1586,11 @@ class SettingsDialog(QWidget):
         return f"QSettings status={status!r}"
 
     def _on_palette_changed(self, index: int) -> None:
-        """P0 §3.25: persist + activate the chosen palette variant.
+        """P0 §3.25: activate the chosen palette variant immediately.
 
-        We update the runtime palette immediately so future state-colour
-        lookups respect the choice; existing widgets keep their pre-swap
-        colour until next paint, hence the QMessageBox suggesting a
-        restart for a fully consistent swap.
+        The runtime palette flips at once; ``palette_changed`` lets the
+        host re-render every state-coloured surface (dashboard dot and
+        score bars, tray tint, suggestion card) without a restart.
         """
         try:
             value = self._palette_combo.itemData(index) or "default"
@@ -1623,15 +1605,6 @@ class SettingsDialog(QWidget):
             self.palette_changed.emit(str(value))
         except Exception:
             pass
-        if value != "default":
-            try:
-                QMessageBox.information(
-                    self,
-                    "Restart to apply",
-                    "Restart Cortex to apply the new color palette everywhere.",
-                )
-            except Exception:
-                logger.debug("palette restart dialog failed", exc_info=True)
 
     def _on_llm_backend_changed(self, index: int) -> None:
         """The explicit offline backend cannot be paired with external mode."""
@@ -1732,14 +1705,7 @@ class SettingsDialog(QWidget):
         provider = llm_modes[idx] if 0 <= idx < len(llm_modes) else "bedrock"
         try:
             self._provider_status_pill.setText("Testing…")
-            self._provider_status_pill.setStyleSheet(
-                "QLabel {"
-                "  padding: 2px 10px;"
-                f"  border-radius: {RADIUS_BUTTON}px;"
-                f"  color: {_LABEL};"
-                f"  background: {_GROUPED_BG};"
-                "}"
-            )
+            self._provider_status_pill.setStyleSheet(status_pill_qss("info"))
         except Exception:
             pass
         try:
@@ -1773,20 +1739,13 @@ class SettingsDialog(QWidget):
                 text = f"{nice} ✓ {int(latency)} ms"
             else:
                 text = f"{nice} ✓"
-            color = SEMANTIC_LIGHT["success"]
+            tone = "success"
         else:
             text = f"{nice} ✗ {error[:40]}" if error else f"{nice} ✗"
-            color = SEMANTIC_LIGHT["danger"]
+            tone = "danger"
         try:
             self._provider_status_pill.setText(text)
-            self._provider_status_pill.setStyleSheet(
-                "QLabel {"
-                "  padding: 2px 10px;"
-                f"  border-radius: {RADIUS_BUTTON}px;"
-                f"  color: {color};"
-                f"  background: {_GROUPED_BG};"
-                "}"
-            )
+            self._provider_status_pill.setStyleSheet(status_pill_qss(tone))
         except Exception:
             logger.warning("provider pill update failed", exc_info=True)
             self._show_apply_error(
@@ -1823,6 +1782,7 @@ class SettingsDialog(QWidget):
             line = f"Cost so far today: ${cost:.2f}"
         try:
             self._budget_today_label.setText(line)
+            self._budget_today_label.setVisible(True)
         except Exception:
             logger.warning("budget label update failed", exc_info=True)
             self._show_apply_error(

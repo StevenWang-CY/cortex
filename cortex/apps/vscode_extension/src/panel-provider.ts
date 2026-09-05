@@ -7,11 +7,34 @@
  * - 4-7-8 breathing pacer animation
  * - Dismiss button
  * - Connection status and current state
+ *
+ * Security/lifecycle contract (audit A2/A6/A7/A8/A10/A11/A12):
+ * - Every render carries a nonce-based Content-Security-Policy; there
+ *   are no inline event handlers and daemon-provided JSON is escaped
+ *   before it is embedded in the nonce script.
+ * - A rebroadcast of the *same* intervention (daemon echo after
+ *   MICRO_STEP_TOGGLED) patches the micro-steps via postMessage instead
+ *   of rebuilding the DOM, so the pacer, "Why this?" state and rating
+ *   survive.
+ * - The WHY_DETAIL promise is always consumed; loading/timeout/error
+ *   copy is rendered instead of leaving an empty panel.
+ * - The view reference is dropped on ``onDidDispose``; every
+ *   subscription is disposable through ``dispose()``.
+ * - Colours come from VS Code theme variables; terracotta is reserved
+ *   for the card border and the breathing pacer.
+ * - ``workbench.reduceMotion`` is honoured alongside the OS preference.
  */
 
 import * as vscode from "vscode";
-import { CortexWSClient } from "./ws-client";
-import { PANEL_STATE_HEX_LIGHT, PANEL_STATE_LABELS } from "./design-tokens";
+import { randomBytes } from "crypto";
+import { CortexWSClient, WhyDetailTimeoutError } from "./ws-client";
+import { PANEL_STATE_LABELS } from "./design-tokens";
+
+type StepStatus = "pending" | "done" | "skipped";
+interface StepRow {
+    text: string;
+    status: StepStatus;
+}
 
 /**
  * Webview provider for the Cortex intervention side panel.
@@ -19,16 +42,25 @@ import { PANEL_STATE_HEX_LIGHT, PANEL_STATE_LABELS } from "./design-tokens";
  * Registered as "cortex.interventionPanel" in the activity bar.
  * Renders LLM-generated intervention content with a calming UI.
  */
-export class CortexPanelProvider implements vscode.WebviewViewProvider {
+export class CortexPanelProvider
+    implements vscode.WebviewViewProvider, vscode.Disposable
+{
     private _view: vscode.WebviewView | undefined;
     private _extensionUri: vscode.Uri;
     private _wsClient: CortexWSClient;
     private _currentPayload: Record<string, unknown> | null = null;
     private _currentState: Record<string, unknown> = {};
+    private readonly _disposables: vscode.Disposable[] = [];
+    private _viewDisposables: vscode.Disposable[] = [];
+    /** intervention_id of the WHY_DETAIL request currently awaiting a reply. */
+    private _whyDetailInFlight: string | null = null;
+    /** A12: mirror of ``workbench.reduceMotion === "on"``. */
+    private _reduceMotion = false;
 
     constructor(extensionUri: vscode.Uri, wsClient: CortexWSClient) {
         this._extensionUri = extensionUri;
         this._wsClient = wsClient;
+        this._reduceMotion = CortexPanelProvider._readReduceMotion();
 
         // D.1: STATE_UPDATE fires every 500ms. A full HTML rebuild here
         // resets the breathing-pacer canvas's animation start time on
@@ -69,6 +101,37 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
                 console.error("[CortexPanel] onConnectionChange handler threw:", err);
             }
         });
+
+        // A12: follow ``workbench.reduceMotion`` live. The initial value
+        // is baked into the HTML (``data-reduce-motion``); changes are
+        // pushed into the running webview so the pacer can stop or
+        // resume without a rebuild.
+        try {
+            this._disposables.push(
+                vscode.workspace.onDidChangeConfiguration((event) => {
+                    if (!event.affectsConfiguration("workbench.reduceMotion")) {
+                        return;
+                    }
+                    this._reduceMotion = CortexPanelProvider._readReduceMotion();
+                    this._postMotionPreference();
+                }),
+            );
+        } catch {
+            // Stubbed host without configuration events (tests).
+        }
+    }
+
+    /** A8/A10: drop the view and every subscription this provider owns. */
+    dispose(): void {
+        this._disposeViewSubscriptions();
+        for (const d of this._disposables.splice(0)) {
+            try {
+                d.dispose();
+            } catch {
+                // already disposed
+            }
+        }
+        this._view = undefined;
     }
 
     /**
@@ -79,6 +142,7 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
         _context: vscode.WebviewViewResolveContext,
         _token: vscode.CancellationToken,
     ): void {
+        this._disposeViewSubscriptions();
         this._view = webviewView;
 
         webviewView.webview.options = {
@@ -89,22 +153,62 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
         // Handle messages from webview
         // P0-4: wrap so a throw inside _handleWebviewMessage (bad message
         // shape, null intervention_id, etc.) cannot kill the subscription.
-        webviewView.webview.onDidReceiveMessage((message) => {
-            try {
-                this._handleWebviewMessage(message);
-            } catch (err) {
-                console.error("[CortexPanel] onDidReceiveMessage handler threw:", err);
-            }
-        });
+        this._track(
+            webviewView.webview.onDidReceiveMessage((message) => {
+                try {
+                    this._handleWebviewMessage(message);
+                } catch (err) {
+                    console.error("[CortexPanel] onDidReceiveMessage handler threw:", err);
+                }
+            }),
+        );
+
+        // A8: once VS Code disposes the view (hidden without
+        // retainContextWhenHidden, sidebar closed, extension host
+        // reload) ``show()`` and the ``html`` setter throw. Forget the
+        // reference so later showIntervention/showPanel calls become
+        // no-ops until the view is resolved again.
+        this._track(
+            webviewView.onDidDispose(() => {
+                if (this._view === webviewView) {
+                    this._view = undefined;
+                }
+                this._disposeViewSubscriptions();
+            }),
+        );
 
         this._updatePanel();
     }
 
+    /** intervention_id of the intervention currently on screen, if any. */
+    get currentInterventionId(): string | null {
+        const id = this._currentPayload?.intervention_id;
+        return typeof id === "string" && id.length > 0 ? id : null;
+    }
+
     /**
      * Show an intervention in the panel.
+     *
+     * A6: when the daemon rebroadcasts the intervention that is already
+     * displayed (it does so after every MICRO_STEP_TOGGLED so peer
+     * surfaces converge) only the micro-step rows are patched in place.
+     * A full rebuild would restart the pacer, collapse "Why this?",
+     * drop a pending rating and re-reveal the panel.
      */
     showIntervention(payload: Record<string, unknown>): void {
+        const incomingId = typeof payload.intervention_id === "string"
+            ? payload.intervention_id
+            : null;
+        const sameIntervention =
+            incomingId !== null && incomingId === this.currentInterventionId;
         this._currentPayload = payload;
+
+        if (sameIntervention && this._view) {
+            this._postMicroSteps();
+            return;
+        }
+
+        this._whyDetailInFlight = null;
         this._updatePanel();
 
         // Ensure panel is visible
@@ -115,45 +219,137 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
      * Focus/reveal the side panel.
      */
     showPanel(): void {
-        if (this._view) {
+        if (!this._view) return;
+        try {
             this._view.show(true);
+        } catch {
+            // View disposed between the null-check and the call.
         }
     }
 
     public showMorningBriefing(payload: Record<string, unknown>): void {
-        if (this._view) {
-            this._view.webview.postMessage({
-                type: 'morningBriefing',
-                payload,
-            });
-        }
+        this.showPanel();
+        this._post({
+            type: "morningBriefing",
+            payload,
+        });
     }
 
     /**
      * P0 §3.9: route a WHY_DETAIL response into the webview so the
-     * "Why?" drilldown panel can render the structured causal signals.
+     * "Why this?" drilldown can render the structured causal signals.
+     *
+     * A7: ``payload.error`` (e.g. ``handler_not_registered``) is honoured
+     * and rendered as an error state rather than as "no signals".
      */
     public applyWhyDetail(payload: Record<string, unknown>): void {
-        if (!this._view) return;
-        try {
-            this._view.webview.postMessage({
-                type: 'whyDetail',
-                payload,
-            });
-        } catch {
-            // webview may be tearing down
-        }
+        this._whyDetailInFlight = null;
+        const error = typeof payload.error === "string" && payload.error.length > 0
+            ? payload.error
+            : null;
+        this._post({
+            type: "whyDetail",
+            status: error ? "error" : "ok",
+            error,
+            payload,
+        });
     }
 
     /**
      * Clear the current intervention display.
+     *
+     * A14: when ``interventionId`` is given (INTERVENTION_RESTORE carries
+     * one) the panel is only cleared if that is the intervention on
+     * screen — a late restore for a previous intervention must not wipe
+     * a newer one.
      */
-    clearIntervention(): void {
+    clearIntervention(interventionId?: string): void {
+        if (interventionId && this._currentPayload) {
+            const currentId = this.currentInterventionId;
+            if (currentId && currentId !== interventionId) {
+                return;
+            }
+        }
         this._currentPayload = null;
+        this._whyDetailInFlight = null;
         this._updatePanel();
     }
 
     // --- Internal ---
+
+    private _track(disposable: vscode.Disposable | undefined): void {
+        if (disposable && typeof disposable.dispose === "function") {
+            this._viewDisposables.push(disposable);
+        }
+    }
+
+    private _disposeViewSubscriptions(): void {
+        for (const d of this._viewDisposables.splice(0)) {
+            try {
+                d.dispose();
+            } catch {
+                // already disposed
+            }
+        }
+    }
+
+    private static _readReduceMotion(): boolean {
+        try {
+            return vscode.workspace
+                .getConfiguration("workbench")
+                .get<string>("reduceMotion", "auto") === "on";
+        } catch {
+            return false;
+        }
+    }
+
+    /** postMessage that tolerates a webview mid-teardown. */
+    private _post(message: Record<string, unknown>): boolean {
+        if (!this._view) return false;
+        try {
+            void this._view.webview.postMessage(message);
+            return true;
+        } catch {
+            // postMessage can throw briefly during webview teardown
+            return false;
+        }
+    }
+
+    private _postMotionPreference(): void {
+        this._post({ type: "motion", reduce: this._reduceMotion });
+    }
+
+    private _postMicroSteps(): void {
+        if (!this._currentPayload) return;
+        this._post({
+            type: "microSteps",
+            steps: CortexPanelProvider._normalizeSteps(this._currentPayload.micro_steps),
+        });
+    }
+
+    /**
+     * P0 §3.6: micro_steps may carry either the legacy ``string[]`` shape
+     * OR the ``{text, status, …}[]`` shape. Coerce both into a uniform
+     * ``{text, status}`` list so the strikethrough styling reflects
+     * daemon-authoritative state.
+     */
+    private static _normalizeSteps(raw: unknown): StepRow[] {
+        const stepsRaw = Array.isArray(raw) ? raw : [];
+        const steps: StepRow[] = [];
+        for (const entry of stepsRaw) {
+            if (typeof entry === "string" && entry.length > 0) {
+                steps.push({ text: entry, status: "pending" });
+            } else if (entry && typeof entry === "object") {
+                const e = entry as Record<string, unknown>;
+                const text = typeof e.text === "string" ? e.text : "";
+                const rawStatus = typeof e.status === "string" ? e.status : "pending";
+                const status: StepStatus =
+                    rawStatus === "done" || rawStatus === "skipped" ? rawStatus : "pending";
+                if (text.length > 0) steps.push({ text, status });
+            }
+        }
+        return steps;
+    }
 
     private _handleWebviewMessage(message: Record<string, unknown>): void {
         const command = String(message.command || "");
@@ -195,11 +391,35 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             }
 
             case "whyDetailRequest": {
-                // P0 §3.9: forward the "Why?" expansion to the daemon.
+                // P0 §3.9: forward the "Why this?" expansion to the daemon.
                 if (!this._currentPayload) break;
                 const interventionId = this._currentPayload.intervention_id as string;
                 if (!interventionId) break;
-                this._wsClient.sendWhyDetailRequest(interventionId);
+                this._whyDetailInFlight = interventionId;
+                this._post({ type: "whyDetail", status: "loading" });
+                // A7: the promise rejects with WhyDetailTimeoutError after
+                // 5 s; consuming it here avoids an unhandled rejection and
+                // lets the panel show timeout copy instead of staying empty.
+                Promise.resolve(this._wsClient.sendWhyDetailRequest(interventionId))
+                    .then((payload) => {
+                        if (payload && typeof payload === "object") {
+                            this.applyWhyDetail(payload);
+                        }
+                    })
+                    .catch((err: unknown) => {
+                        // The generic WHY_DETAIL listener in extension.ts
+                        // may already have delivered a reply that lacked a
+                        // correlation id (older daemons); only report when
+                        // nothing arrived at all.
+                        if (this._whyDetailInFlight !== interventionId) return;
+                        this._whyDetailInFlight = null;
+                        const timedOut = err instanceof WhyDetailTimeoutError;
+                        this._post({
+                            type: "whyDetail",
+                            status: "error",
+                            error: timedOut ? "timeout" : "request_failed",
+                        });
+                    });
                 break;
             }
 
@@ -229,7 +449,7 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
                 const stepIndex = Number(message.step_index);
                 const rawStatus = String(message.new_status || "");
                 if (!Number.isFinite(stepIndex) || stepIndex < 0) break;
-                const newStatus: "pending" | "done" | "skipped" =
+                const newStatus: StepStatus =
                     rawStatus === "done" || rawStatus === "skipped" || rawStatus === "pending"
                         ? rawStatus
                         : "pending";
@@ -268,7 +488,7 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             // (a) Daemon offline.
             return '<div class="daemon-offline" data-testid="cx-state-offline">'
                 + 'Cortex daemon offline. '
-                + '<button id="reconnect-btn" type="button">Reconnect</button>'
+                + '<button id="reconnect-btn" type="button" class="reconnect-btn">Reconnect</button>'
                 + '</div>';
         }
         const hasState = Object.keys(this._currentState).length > 0;
@@ -307,18 +527,31 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             ? "Not enough evidence"
             : PANEL_STATE_LABELS[stateStr] ?? "Status unavailable";
         const confidence = state.confidence as number | undefined;
-        try {
-            this._view.webview.postMessage({
-                type: "state",
-                state: stateStr,
-                label,
-                status: state.status,
-                color: PANEL_STATE_HEX_LIGHT[stateStr] ?? "#888",
-                confidence: confidence ?? 0,
-            });
-        } catch {
-            // postMessage can throw briefly during webview teardown
-        }
+        this._view.webview.postMessage({
+            type: "state",
+            state: stateStr,
+            label,
+            status: state.status,
+            confidence: confidence ?? 0,
+        });
+    }
+
+    /**
+     * A2: JSON that is safe to embed inside a ``<script>`` body.
+     * ``JSON.stringify`` does not escape ``</script>``; a daemon (or a
+     * poisoned LLM output) could otherwise close the nonce script and
+     * open a new one — the CSP would block it, but the panel would be
+     * blank. ``<``, ``>``, ``&`` and the JS line terminators U+2028/2029
+     * are emitted as ``\uXXXX`` escapes, which JSON/JS decode back to
+     * the original characters.
+     */
+    static safeJsonForScript(value: unknown): string {
+        return JSON.stringify(value ?? null)
+            .replace(/</g, "\\u003c")
+            .replace(/>/g, "\\u003e")
+            .replace(/&/g, "\\u0026")
+            .replace(/\u2028/g, "\\u2028")
+            .replace(/\u2029/g, "\\u2029");
     }
 
     /**
@@ -328,6 +561,7 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
      * and current state display.
      */
     private _getWebviewContent(): string {
+        const nonce = randomBytes(16).toString("base64");
         const state = this._currentState;
         const payload = this._currentPayload;
 
@@ -341,13 +575,11 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
         const confidence = state.confidence as number | undefined;
         const confPct =
             confidence !== undefined ? Math.round(confidence * 100) : 0;
-
-        // State color — sourced from emitted design tokens so palette edits in
-        // libs/design/tokens.yaml flow through after a sync_design_tokens.py run.
-        const stateColor = PANEL_STATE_HEX_LIGHT[stateStr] ?? "#888";
+        const stateAttr = this._escapeHtml(String(stateStr));
 
         // Build intervention section
         let interventionHtml = "";
+        let initialSignalsJson = "[]";
         if (payload) {
             const headline = this._escapeHtml(
                 (payload.headline as string) ?? "Take a moment",
@@ -358,38 +590,16 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             const focus = this._escapeHtml(
                 (payload.primary_focus as string) ?? "",
             );
-            // P0 §3.6: micro_steps may carry either the legacy ``string[]``
-            // shape OR the new ``{text, status, …}[]`` shape. Coerce both
-            // into a uniform ``{text, status}`` tuple list so the
-            // strikethrough styling reflects daemon-authoritative state.
-            const stepsRaw = Array.isArray(payload.micro_steps) ? payload.micro_steps : [];
-            type StepRow = { text: string; status: "pending" | "done" | "skipped" };
-            const steps: StepRow[] = [];
-            for (const entry of stepsRaw) {
-                if (typeof entry === "string" && entry.length > 0) {
-                    steps.push({ text: entry, status: "pending" });
-                } else if (entry && typeof entry === "object") {
-                    const e = entry as Record<string, unknown>;
-                    const text = typeof e.text === "string" ? e.text : "";
-                    const rawStatus = typeof e.status === "string" ? e.status : "pending";
-                    const status: "pending" | "done" | "skipped" =
-                        rawStatus === "done" || rawStatus === "skipped" ? rawStatus : "pending";
-                    if (text.length > 0) steps.push({ text, status });
-                }
-            }
+            const steps = CortexPanelProvider._normalizeSteps(payload.micro_steps);
 
             let stepsHtml = "";
             for (let i = 0; i < steps.length; i++) {
                 const step = this._escapeHtml(steps[i].text);
                 const isDone = steps[i].status === "done";
-                const checkedAttr = isDone ? " checked" : "";
-                const struckStyle = isDone
-                    ? ' style="text-decoration: line-through; opacity: 0.7;"'
-                    : "";
                 stepsHtml += `
                     <label class="step">
-                        <input type="checkbox" id="step-${i}" data-step-index="${i}"${checkedAttr} />
-                        <span${struckStyle}>${step}</span>
+                        <input type="checkbox" id="step-${i}" data-step-index="${i}"${isDone ? " checked" : ""} />
+                        <span class="step-text${isDone ? " is-done" : ""}" data-step-index="${i}">${step}</span>
                     </label>`;
             }
 
@@ -403,28 +613,27 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             const causalSignalsRaw = Array.isArray(payload.causal_signals)
                 ? (payload.causal_signals as Record<string, unknown>[])
                 : [];
-            const causalSignalsJson = JSON.stringify(causalSignalsRaw);
+            initialSignalsJson = CortexPanelProvider.safeJsonForScript(causalSignalsRaw);
 
             interventionHtml = `
                 <div class="intervention">
                     <h2 class="headline">${headline}</h2>
                     <p class="summary">${summary}</p>
-                    <div class="causal" style="font-size:11px;color:#71717a;margin-top:6px;cursor:pointer;" onclick="this.querySelector('.causal-body').style.display = this.querySelector('.causal-body').style.display === 'none' ? 'block' : 'none'">
-                        <span style="font-weight:500;">Why this?</span> ›
-                        <div class="causal-body" style="display:none;margin-top:4px;line-height:1.5;">${causalExplanation}</div>
-                    </div>
-                    <!-- P0 §3.9: structured rationale drilldown. The
-                         "Why?" link expands the panel; when no
-                         signals were attached the panel issues a
-                         WHY_DETAIL_REQUEST to populate them on demand. -->
+                    <!-- UX: one "Why this?" affordance. Expands the free-text
+                         rationale (when the trigger carried one) and the
+                         structured signal rows; issues a WHY_DETAIL_REQUEST
+                         on first open when no signals were attached. -->
                     <div class="why-block">
-                        <button id="why-toggle" type="button" class="why-toggle">Why?</button>
-                        <div id="why-panel" class="why-panel" style="display:none;"></div>
+                        <button id="why-toggle" type="button" class="why-toggle" aria-expanded="false" aria-controls="why-panel">Why this?</button>
+                        <div id="why-panel" class="why-panel" hidden>
+                            ${causalExplanation ? `<p class="why-explanation">${causalExplanation}</p>` : ""}
+                            <div id="why-signals" class="why-signals" aria-live="polite"></div>
+                        </div>
                     </div>
                     <div class="focus">
                         <strong>Focus:</strong> ${focus}
                     </div>
-                    <div class="steps">
+                    <div class="steps" id="steps">
                         ${stepsHtml}
                     </div>
                     <div class="pacer" id="pacer" role="group" aria-label="Breathing guide">
@@ -437,48 +646,54 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
                         <button id="thumbs-up" type="button" class="rating-btn" aria-label="Mark helpful">👍</button>
                         <button id="thumbs-down" type="button" class="rating-btn" aria-label="Mark unhelpful">👎</button>
                     </div>
-                    <input id="rating-text" type="text" maxlength="200" placeholder="What would have helped? (Enter to send, Esc to skip)" class="rating-text" style="display:none;" />
-                    <button class="dismiss-btn" id="dismiss-btn">Dismiss</button>
-                </div>
-                <script>
-                    window.__CORTEX_INITIAL_CAUSAL_SIGNALS__ = ${causalSignalsJson};
-                </script>`;
+                    <input id="rating-text" type="text" maxlength="200" placeholder="What would have helped? (Enter to send, Esc to skip)" aria-label="What would have helped?" class="rating-text" hidden />
+                    <button class="dismiss-btn" id="dismiss-btn" type="button">Dismiss</button>
+                </div>`;
         }
 
         return `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <style>
-        /* VS Code theme variables provide the editor-matched chrome; only
-         * the Cortex brand accent (terracotta) is fixed across all themes.
-         * The terracotta lives on the intervention card's left border, the
-         * focus headline, and the breathing-pacer rings — the same brand
-         * mark as the desktop shell + browser extension. */
+        /* A11: every colour is a VS Code theme variable so the panel
+         * reads correctly on light, dark and high-contrast themes. The
+         * Cortex brand accent (terracotta) is the only fixed colour and
+         * is used exclusively on the intervention card's left border and
+         * the breathing-pacer rings — never for text. */
         :root {
             --cx-bg: var(--vscode-editor-background, #1e1e1e);
             --cx-card: var(--vscode-editorWidget-background,
                         var(--vscode-sideBar-background, #252526));
             --cx-text: var(--vscode-editor-foreground, #e6e6e6);
-            --cx-text-secondary: var(--vscode-descriptionForeground,
-                                  rgba(204, 204, 204, 0.7));
-            --cx-text-tertiary: var(--vscode-disabledForeground,
-                                 rgba(204, 204, 204, 0.45));
-            --cx-separator: var(--vscode-widget-border, rgba(128, 128, 128, 0.18));
+            --cx-text-secondary: var(--vscode-descriptionForeground, #9d9d9d);
+            --cx-text-tertiary: var(--vscode-disabledForeground, #8b8b8b);
+            --cx-separator: var(--vscode-editorWidget-border,
+                              var(--vscode-widget-border, #3c3c3c));
             --cx-focus-ring: var(--vscode-focusBorder, #007fd4);
-            --cx-accent: #D97757;          /* brand — preserved */
+            --cx-link: var(--vscode-textLink-foreground, #3794ff);
+            --cx-warn: var(--vscode-editorWarning-foreground, #cca700);
+            --cx-button-bg: var(--vscode-button-background, #0e639c);
+            --cx-button-fg: var(--vscode-button-foreground, #f4f4f4);
+            --cx-button-hover: var(--vscode-button-hoverBackground, #1177bb);
+            --cx-button2-bg: var(--vscode-button-secondaryBackground, #3a3d41);
+            --cx-button2-fg: var(--vscode-button-secondaryForeground, #f4f4f4);
+            --cx-button2-hover: var(--vscode-button-secondaryHoverBackground, #45494e);
+            --cx-input-bg: var(--vscode-input-background, #3c3c3c);
+            --cx-input-fg: var(--vscode-input-foreground, #cccccc);
+            --cx-input-border: var(--vscode-input-border, var(--cx-separator));
+            --cx-accent: #D97757;          /* brand — border + pacer only */
             --cx-accent-strong: #E08E6F;
-            --cx-dismiss-bg: var(--vscode-button-secondaryBackground,
-                              rgba(255, 255, 255, 0.06));
-            --cx-dismiss-bg-hover: var(--vscode-button-secondaryHoverBackground,
-                                    rgba(255, 255, 255, 0.12));
             /* 5-step modular scale matching cortex/libs/design/tokens.yaml */
             --fs-caption: 11px;
             --fs-footnote: 13px;
             --fs-body: 15px;
             --fs-title: 22px;
         }
+
+        [hidden] { display: none !important; }
 
         body {
             margin: 0;
@@ -496,16 +711,28 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             gap: 8px;
             padding: 8px 12px;
             background: var(--cx-card);
-            border: 0.5px solid var(--cx-separator);
+            border: 1px solid var(--cx-separator);
             border-radius: 8px;
             margin-bottom: 12px;
         }
 
+        /* Theme-aware state dots. UNKNOWN is an outlined ring so it stays
+           visible on both light and dark backgrounds. */
         .state-dot {
             width: 10px;
             height: 10px;
             border-radius: 50%;
+            box-sizing: border-box;
+            background: var(--cx-text-tertiary);
         }
+        .state-dot[data-state="UNKNOWN"] {
+            background: transparent;
+            border: 2px solid var(--cx-text-tertiary);
+        }
+        .state-dot[data-state="FLOW"] { background: var(--cx-accent); }
+        .state-dot[data-state="HYPER"] { background: var(--cx-warn); }
+        .state-dot[data-state="HYPO"] { background: var(--cx-text-secondary); }
+        .state-dot[data-state="RECOVERY"] { background: var(--cx-link); }
 
         .state-label {
             font-weight: 600;
@@ -521,10 +748,8 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             background: var(--cx-card);
             border-radius: 10px;
             padding: 16px;
+            border: 1px solid var(--cx-separator);
             border-left: 3px solid var(--cx-accent);
-            border-top: 0.5px solid var(--cx-separator);
-            border-right: 0.5px solid var(--cx-separator);
-            border-bottom: 0.5px solid var(--cx-separator);
         }
 
         .headline {
@@ -541,15 +766,15 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
         }
 
         .focus {
-            color: var(--cx-accent);
+            color: var(--cx-text);
             margin-bottom: 12px;
             font-size: var(--fs-footnote);
             font-weight: 600;
         }
 
-        .causal {
-            font-size: var(--fs-caption) !important;
-            color: var(--cx-text-tertiary) !important;
+        .focus strong {
+            font-weight: 500;
+            color: var(--cx-text-secondary);
         }
 
         .steps {
@@ -566,11 +791,16 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
 
         .step input[type="checkbox"] {
             margin-top: 2px;
-            accent-color: var(--cx-accent);
+            accent-color: var(--cx-button-bg);
         }
 
-        .step span {
+        .step-text {
             line-height: 1.45;
+        }
+
+        .step-text.is-done {
+            text-decoration: line-through;
+            opacity: 0.7;
         }
 
         .pacer {
@@ -598,10 +828,10 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             display: block;
             width: 100%;
             padding: 8px;
-            border: 0.5px solid var(--cx-separator);
+            border: 1px solid var(--cx-separator);
             border-radius: 6px;
-            background: var(--cx-dismiss-bg);
-            color: var(--cx-text);
+            background: var(--cx-button2-bg);
+            color: var(--cx-button2-fg);
             cursor: pointer;
             font-size: var(--fs-footnote);
             font-weight: 500;
@@ -610,7 +840,8 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
                 transform 120ms cubic-bezier(.23, 1, .32, 1);
         }
 
-        button:focus-visible {
+        button:focus-visible,
+        input:focus-visible {
             outline: 2px solid var(--cx-focus-ring);
             outline-offset: 1px;
         }
@@ -627,21 +858,21 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             text-align: center;
             padding: 20px 12px;
             color: var(--cx-text-secondary);
-            font-size: var(--fs-caption);
+            font-size: var(--fs-footnote);
         }
 
-        .daemon-offline button {
+        .reconnect-btn {
             display: inline-block;
             margin-left: 6px;
-            padding: 4px 12px;
+            padding: 5px 14px;
             border-radius: 5px;
-            background: var(--cx-accent);
-            color: white;
+            background: var(--cx-button-bg);
+            color: var(--cx-button-fg);
             border: none;
             cursor: pointer;
-            font-size: var(--fs-caption);
+            font-size: var(--fs-footnote);
             font-weight: 600;
-            transition: filter 120ms cubic-bezier(.23, 1, .32, 1),
+            transition: background-color 120ms cubic-bezier(.23, 1, .32, 1),
                 transform 120ms cubic-bezier(.23, 1, .32, 1);
         }
 
@@ -650,7 +881,7 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             text-align: center;
             padding: 20px 12px;
             color: var(--cx-text-secondary);
-            font-size: var(--fs-caption);
+            font-size: var(--fs-footnote);
         }
 
         /* Subtle CSS-only pulsing dot spinner — no external assets. */
@@ -670,6 +901,18 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             50%       { opacity: 1.0; transform: scale(1.15); }
         }
 
+        /* Morning briefing card (rendered on demand via postMessage). */
+        .briefing {
+            background: var(--cx-card);
+            border: 1px solid var(--cx-separator);
+            border-radius: 8px;
+            padding: 12px 14px;
+            margin-bottom: 12px;
+        }
+        .briefing-title { font-weight: 600; margin-bottom: 4px; }
+        .briefing ol { margin: 6px 0 0; padding-left: 20px; }
+        .briefing p { margin: 4px 0; color: var(--cx-text-secondary); }
+
         /* P0 §3.8: rating row */
         .rating-row {
             display: flex;
@@ -679,9 +922,9 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
         }
 
         .rating-btn {
-            background: rgba(255, 255, 255, 0.06);
-            color: var(--cx-text);
-            border: 0.5px solid var(--cx-separator);
+            background: var(--cx-button2-bg);
+            color: var(--cx-button2-fg);
+            border: 1px solid var(--cx-separator);
             border-radius: 6px;
             padding: 4px 12px;
             font-size: 14px;
@@ -691,26 +934,30 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
                 transform 120ms cubic-bezier(.23, 1, .32, 1);
         }
 
-        .rating-btn.selected { background: var(--cx-accent); color: white; }
+        .rating-btn.selected {
+            background: var(--cx-button-bg);
+            color: var(--cx-button-fg);
+            border-color: transparent;
+        }
 
         .rating-text {
             width: 100%;
             margin-top: 6px;
             padding: 6px 10px;
-            background: rgba(255, 255, 255, 0.04);
-            color: var(--cx-text);
-            border: 1px solid rgba(217, 119, 87, 0.40);
+            background: var(--cx-input-bg);
+            color: var(--cx-input-fg);
+            border: 1px solid var(--cx-input-border);
             border-radius: 5px;
             box-sizing: border-box;
-            font-size: var(--fs-caption);
+            font-size: var(--fs-footnote);
         }
 
-        /* P0 §3.9: Why? drilldown */
+        /* P0 §3.9: Why this? drilldown */
         .why-block { margin: 6px 0; }
 
         .why-toggle {
             background: none;
-            color: var(--cx-text-secondary);
+            color: var(--cx-link);
             border: none;
             padding: 2px 0;
             font-size: var(--fs-caption);
@@ -720,15 +967,61 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
                 transform 120ms cubic-bezier(.23, 1, .32, 1);
         }
 
+        .why-panel {
+            margin-top: 4px;
+            padding: 6px 10px;
+            border-radius: 6px;
+            background: var(--cx-card);
+            border: 1px solid var(--cx-separator);
+        }
+
+        .why-explanation {
+            margin: 0 0 6px;
+            font-size: var(--fs-caption);
+            line-height: 1.5;
+            color: var(--cx-text-secondary);
+        }
+
+        .why-signals {
+            font-size: var(--fs-caption);
+            color: var(--cx-text-secondary);
+        }
+
+        .why-retry {
+            margin-left: 8px;
+            padding: 2px 8px;
+            border-radius: 4px;
+            border: 1px solid var(--cx-separator);
+            background: var(--cx-button2-bg);
+            color: var(--cx-button2-fg);
+            font-size: var(--fs-caption);
+            cursor: pointer;
+        }
+
+        .why-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 3px 0;
+            font-size: var(--fs-caption);
+        }
+
+        .why-name { font-weight: 600; min-width: 96px; color: var(--cx-text); }
+        .why-value { flex: 1; color: var(--cx-text-secondary); }
+        .why-spark { width: 60px; height: 24px; }
+        .why-delta-down { color: var(--cx-warn); font-weight: 600; }
+        .why-delta-up { color: var(--cx-link); font-weight: 600; }
+
         .dismiss-btn:active,
-        .daemon-offline button:active,
+        .reconnect-btn:active,
         .rating-btn:active,
         .why-toggle:active { transform: scale(.97); }
 
         @media (hover: hover) and (pointer: fine) {
-            .dismiss-btn:hover { background: var(--cx-dismiss-bg-hover); }
-            .daemon-offline button:hover { filter: brightness(1.08); }
-            .rating-btn:hover { background: rgba(255, 255, 255, 0.12); }
+            .dismiss-btn:hover { background: var(--cx-button2-hover); }
+            .reconnect-btn:hover { background: var(--cx-button-hover); }
+            .rating-btn:hover { background: var(--cx-button2-hover); }
+            .rating-btn.selected:hover { background: var(--cx-button-hover); }
             .why-toggle:hover { color: var(--cx-text); }
         }
 
@@ -741,142 +1034,140 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
                     background-color 160ms cubic-bezier(.23, 1, .32, 1);
             }
             .dismiss-btn,
-            .daemon-offline button,
+            .reconnect-btn,
             .rating-btn,
-            .why-toggle { transition-property: background-color, border-color, color, filter; }
+            .why-toggle { transition-property: background-color, border-color, color; }
             .dismiss-btn:active,
-            .daemon-offline button:active,
+            .reconnect-btn:active,
             .rating-btn:active,
             .why-toggle:active { transform: none; }
         }
 
-        .why-panel {
-            margin-top: 4px;
-            padding: 6px 10px;
-            border-radius: 6px;
-            background: rgba(255, 255, 255, 0.03);
+        body[data-reduce-motion="true"] .cx-spinner {
+            animation: none;
+            opacity: .75;
+            transform: none;
         }
-
-        .why-row {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            padding: 3px 0;
-            font-size: var(--fs-caption);
-        }
-
-        .why-name { font-weight: 600; min-width: 96px; }
-        .why-value { flex: 1; color: var(--cx-text-secondary); }
-        .why-spark { width: 60px; height: 24px; }
-        .why-delta-down { color: #E47A6E; font-weight: 600; }
-        .why-delta-up { color: var(--cx-accent); font-weight: 600; }
     </style>
 </head>
-<body>
+<body data-reduce-motion="${this._reduceMotion ? "true" : "false"}">
     <div class="state-bar">
-        <div class="state-dot" id="cx-state-dot" style="background: ${stateColor};"></div>
+        <div class="state-dot" id="cx-state-dot" data-state="${stateAttr}"></div>
         <span class="state-label" id="cx-state-label">${stateLabel}</span>
         <span class="state-conf" id="cx-state-conf">${ready ? `Evidence ${confPct}%` : "No estimate"}</span>
     </div>
 
+    <div id="cx-briefing" class="briefing" hidden></div>
+
     ${interventionHtml || this._getEmptyStateHtml()}
 
-    <script>
+    <script nonce="${nonce}">
         const vscode = acquireVsCodeApi();
+        // A2: escaped server-side (see safeJsonForScript) so a closing script tag
+        // inside a signal name cannot terminate this script element.
+        const INITIAL_CAUSAL_SIGNALS = ${initialSignalsJson};
+        // A12: host-side workbench.reduceMotion mirror; updated by
+        // {type:'motion'} messages.
+        let hostReduceMotion = document.body.dataset.reduceMotion === 'true';
+        let syncPacerFn = null;
 
-        // D.1: receive STATE_UPDATE diffs from the host and patch the DOM
-        // in place. The host posts {type:'state',state,color,confidence}
-        // every ~500ms; full HTML rebuild only happens on intervention
-        // show/clear so the breathing pacer keeps its animation state.
-        window.addEventListener('message', (event) => {
-            const msg = event.data || {};
-            if (msg.type === 'state') {
-                const label = document.getElementById('cx-state-label');
-                const dot = document.getElementById('cx-state-dot');
-                const conf = document.getElementById('cx-state-conf');
-                if (label) label.textContent = msg.label || msg.state;
-                if (dot) dot.style.background = msg.color;
-                if (conf) {
-                    const pct = Math.round((Number(msg.confidence) || 0) * 100);
-                    conf.textContent = msg.status === 'estimated'
-                        ? 'Evidence ' + pct + '%'
-                        : 'No estimate';
-                }
+        // ---- Morning briefing (on demand) ----
+        function renderBriefing(p) {
+            const el = document.getElementById('cx-briefing');
+            if (!el || !p || typeof p !== 'object') return;
+            el.innerHTML = '';
+            const title = document.createElement('div');
+            title.className = 'briefing-title';
+            title.textContent = 'Morning briefing';
+            el.appendChild(title);
+            if (p.summary) {
+                const s = document.createElement('p');
+                s.textContent = String(p.summary);
+                el.appendChild(s);
             }
-        });
-
-        // Dismiss button
-        const dismissBtn = document.getElementById('dismiss-btn');
-        if (dismissBtn) {
-            dismissBtn.addEventListener('click', () => {
-                vscode.postMessage({ command: 'dismiss' });
-            });
-        }
-
-        // P1 (audit Phase 4d, Task B): reconnect button on the
-        // daemon-offline empty state. Asks the host to call
-        // 'CortexWSClient.connect()' via a dedicated command rather
-        // than via the activity-bar palette command, so the panel can
-        // recover without leaving the webview.
-        const reconnectBtn = document.getElementById('reconnect-btn');
-        if (reconnectBtn) {
-            reconnectBtn.addEventListener('click', () => {
-                vscode.postMessage({ command: 'reconnect' });
-            });
-        }
-
-        // P0 §3.8: rating buttons
-        const thumbsUpBtn = document.getElementById('thumbs-up');
-        const thumbsDownBtn = document.getElementById('thumbs-down');
-        const ratingTextEl = document.getElementById('rating-text');
-        if (thumbsUpBtn) {
-            thumbsUpBtn.addEventListener('click', () => {
-                thumbsUpBtn.classList.add('selected');
-                if (thumbsDownBtn) thumbsDownBtn.classList.remove('selected');
-                vscode.postMessage({ command: 'userRating', rating: 'thumbs_up' });
-            });
-        }
-        if (thumbsDownBtn) {
-            thumbsDownBtn.addEventListener('click', () => {
-                thumbsDownBtn.classList.add('selected');
-                if (thumbsUpBtn) thumbsUpBtn.classList.remove('selected');
-                vscode.postMessage({ command: 'userRating', rating: 'thumbs_down' });
-                if (ratingTextEl) {
-                    ratingTextEl.style.display = 'block';
-                    ratingTextEl.focus();
+            const items = Array.isArray(p.action_items) ? p.action_items : [];
+            if (items.length > 0) {
+                const ol = document.createElement('ol');
+                for (const item of items) {
+                    const li = document.createElement('li');
+                    li.textContent = String(item);
+                    ol.appendChild(li);
                 }
-            });
-        }
-        if (ratingTextEl) {
-            ratingTextEl.addEventListener('keydown', (ev) => {
-                if (ev.key === 'Enter') {
-                    const text = (ratingTextEl.value || '').trim();
-                    if (text) {
-                        vscode.postMessage({
-                            command: 'userRating',
-                            rating: 'thumbs_down',
-                            context: text.slice(0, 200),
-                        });
-                    }
-                    ratingTextEl.value = '';
-                    ratingTextEl.style.display = 'none';
-                } else if (ev.key === 'Escape') {
-                    ratingTextEl.value = '';
-                    ratingTextEl.style.display = 'none';
-                }
-            });
+                el.appendChild(ol);
+            }
+            if (p.left_off_at) {
+                const l = document.createElement('p');
+                l.textContent = 'You left off at ' + String(p.left_off_at);
+                el.appendChild(l);
+            }
+            el.hidden = false;
         }
 
-        // P0 §3.9: Why? toggle + drilldown render
+        // ---- Why this? drilldown (P0 §3.9 / A7) ----
         const whyToggle = document.getElementById('why-toggle');
         const whyPanel = document.getElementById('why-panel');
+        const whySignals = document.getElementById('why-signals');
         let whyOpen = false;
+        let whyLoaded = false;
+        let whyLoading = false;
+        const WHY_ERROR_COPY = {
+            timeout: 'The explanation took too long to arrive.',
+            handler_not_registered: 'Explanations are not available from this Cortex build.',
+            request_failed: 'Could not load the explanation.'
+        };
+
+        function setWhyStatus(text) {
+            if (!whySignals) return;
+            whySignals.innerHTML = '';
+            whySignals.textContent = text;
+        }
+
+        function openWhy() {
+            whyOpen = true;
+            if (whyPanel) whyPanel.hidden = false;
+            if (whyToggle) {
+                whyToggle.textContent = 'Hide why';
+                whyToggle.setAttribute('aria-expanded', 'true');
+            }
+        }
+
+        function closeWhy() {
+            whyOpen = false;
+            if (whyPanel) whyPanel.hidden = true;
+            if (whyToggle) {
+                whyToggle.textContent = 'Why this?';
+                whyToggle.setAttribute('aria-expanded', 'false');
+            }
+        }
+
+        function requestWhyDetail() {
+            if (whyLoaded || whyLoading) return;
+            whyLoading = true;
+            setWhyStatus('Gathering signals…');
+            vscode.postMessage({ command: 'whyDetailRequest' });
+        }
+
+        function showWhyError(code) {
+            if (!whySignals) return;
+            whySignals.innerHTML = '';
+            const text = document.createElement('span');
+            text.textContent = WHY_ERROR_COPY[code] || WHY_ERROR_COPY.request_failed;
+            whySignals.appendChild(text);
+            if (code !== 'handler_not_registered') {
+                const retry = document.createElement('button');
+                retry.type = 'button';
+                retry.className = 'why-retry';
+                retry.textContent = 'Retry';
+                retry.addEventListener('click', requestWhyDetail);
+                whySignals.appendChild(retry);
+            }
+        }
 
         function renderCausalSignals(signals) {
-            if (!whyPanel) return;
-            whyPanel.innerHTML = '';
+            if (!whySignals) return;
+            whySignals.innerHTML = '';
             if (!Array.isArray(signals) || signals.length === 0) {
-                whyPanel.textContent = 'No structured signals available.';
+                whySignals.textContent = 'No structured signals available.';
                 return;
             }
             for (const sig of signals) {
@@ -896,7 +1187,7 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
                 }
                 valEl.textContent = vtext;
                 row.appendChild(valEl);
-                // sparkline
+                // sparkline — terracotta is a graphic accent here, not text
                 const canvas = document.createElement('canvas');
                 canvas.className = 'why-spark';
                 canvas.width = 60;
@@ -929,61 +1220,160 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
                     pill.textContent = arrow + Math.abs(delta).toFixed(0) + '%';
                     row.appendChild(pill);
                 }
-                whyPanel.appendChild(row);
+                whySignals.appendChild(row);
             }
         }
 
+        function applyWhyDetail(m) {
+            if (m.status === 'loading') {
+                whyLoading = true;
+                setWhyStatus('Gathering signals…');
+                return;
+            }
+            whyLoading = false;
+            if (m.status === 'error' || m.error) {
+                whyLoaded = false;
+                showWhyError(String(m.error || 'request_failed'));
+                openWhy();
+                return;
+            }
+            const sigs = (m.payload && m.payload.causal_signals) || [];
+            renderCausalSignals(sigs);
+            whyLoaded = true;
+            openWhy();
+        }
+
         // Initial signals shipped with the trigger payload (if any).
-        try {
-            renderCausalSignals(window.__CORTEX_INITIAL_CAUSAL_SIGNALS__ || []);
-        } catch { /* empty payload */ }
+        if (Array.isArray(INITIAL_CAUSAL_SIGNALS) && INITIAL_CAUSAL_SIGNALS.length > 0) {
+            renderCausalSignals(INITIAL_CAUSAL_SIGNALS);
+            whyLoaded = true;
+        }
 
         if (whyToggle) {
             whyToggle.addEventListener('click', () => {
-                whyOpen = !whyOpen;
-                if (whyPanel) whyPanel.style.display = whyOpen ? 'block' : 'none';
-                whyToggle.textContent = whyOpen ? 'Hide why' : 'Why?';
-                // If we have no signals cached, ask the daemon for them.
-                if (whyOpen && whyPanel && whyPanel.children.length === 0) {
-                    vscode.postMessage({ command: 'whyDetailRequest' });
+                if (whyOpen) {
+                    closeWhy();
+                    return;
+                }
+                openWhy();
+                requestWhyDetail();
+            });
+        }
+
+        // ---- Rating (P0 §3.8) ----
+        // Exactly one USER_RATING per 👎 selection: the click only opens
+        // the comment field; Enter/Esc (or Dismiss) sends the rating once,
+        // with or without the comment.
+        const thumbsUpBtn = document.getElementById('thumbs-up');
+        const thumbsDownBtn = document.getElementById('thumbs-down');
+        const ratingTextEl = document.getElementById('rating-text');
+        let downPending = false;
+
+        function sendRating(rating, context) {
+            const msg = { command: 'userRating', rating: rating };
+            const text = (context || '').trim();
+            if (text) msg.context = text.slice(0, 200);
+            vscode.postMessage(msg);
+        }
+
+        function hideRatingText() {
+            if (!ratingTextEl) return;
+            ratingTextEl.value = '';
+            ratingTextEl.hidden = true;
+        }
+
+        function finishThumbsDown(context) {
+            if (!downPending) return;
+            downPending = false;
+            const text = context !== undefined
+                ? context
+                : (ratingTextEl ? ratingTextEl.value : '');
+            hideRatingText();
+            sendRating('thumbs_down', text);
+        }
+
+        if (thumbsUpBtn) {
+            thumbsUpBtn.addEventListener('click', () => {
+                if (thumbsUpBtn.classList.contains('selected')) return;
+                thumbsUpBtn.classList.add('selected');
+                if (thumbsDownBtn) thumbsDownBtn.classList.remove('selected');
+                downPending = false;
+                hideRatingText();
+                sendRating('thumbs_up');
+            });
+        }
+        if (thumbsDownBtn) {
+            thumbsDownBtn.addEventListener('click', () => {
+                if (thumbsDownBtn.classList.contains('selected')) return;
+                thumbsDownBtn.classList.add('selected');
+                if (thumbsUpBtn) thumbsUpBtn.classList.remove('selected');
+                downPending = true;
+                if (ratingTextEl) {
+                    ratingTextEl.hidden = false;
+                    ratingTextEl.focus();
+                } else {
+                    finishThumbsDown('');
+                }
+            });
+        }
+        if (ratingTextEl) {
+            ratingTextEl.addEventListener('keydown', (ev) => {
+                if (ev.key === 'Enter') {
+                    ev.preventDefault();
+                    finishThumbsDown();
+                } else if (ev.key === 'Escape') {
+                    finishThumbsDown('');
                 }
             });
         }
 
-        window.addEventListener('message', (event) => {
-            const m = event.data || {};
-            if (m.type === 'whyDetail') {
-                const sigs = (m.payload && m.payload.causal_signals) || [];
-                renderCausalSignals(sigs);
-                if (whyPanel) whyPanel.style.display = 'block';
-                whyOpen = true;
-                if (whyToggle) whyToggle.textContent = 'Hide why';
-                return;
-            }
-        });
+        // ---- Dismiss ----
+        const dismissBtn = document.getElementById('dismiss-btn');
+        if (dismissBtn) {
+            dismissBtn.addEventListener('click', () => {
+                finishThumbsDown();
+                vscode.postMessage({ command: 'dismiss' });
+            });
+        }
 
-        // P0 §3.6: micro-step checkbox toggle. Each click posts a
-        // 'microStepToggled' message to the extension, which forwards
-        // it as MICRO_STEP_TOGGLED via the WS client. The daemon
-        // rebroadcasts INTERVENTION_TRIGGER so the strikethrough state
-        // converges across every connected surface.
+        // P1 (audit Phase 4d, Task B): reconnect button on the
+        // daemon-offline empty state. Asks the host to call
+        // 'CortexWSClient.connect()' via a dedicated command rather
+        // than via the activity-bar palette command, so the panel can
+        // recover without leaving the webview.
+        const reconnectBtn = document.getElementById('reconnect-btn');
+        if (reconnectBtn) {
+            reconnectBtn.addEventListener('click', () => {
+                vscode.postMessage({ command: 'reconnect' });
+            });
+        }
+
+        // ---- Micro-steps (P0 §3.6 / A6) ----
+        function applyMicroSteps(steps) {
+            if (!Array.isArray(steps)) return;
+            steps.forEach((s, i) => {
+                const cb = document.getElementById('step-' + i);
+                const span = document.querySelector('.step-text[data-step-index="' + i + '"]');
+                const done = Boolean(s && s.status === 'done');
+                if (cb) cb.checked = done;
+                if (span) {
+                    span.classList.toggle('is-done', done);
+                    if (s && typeof s.text === 'string' && s.text) span.textContent = s.text;
+                }
+            });
+        }
+
         document.querySelectorAll('.step input').forEach(cb => {
             cb.addEventListener('change', (ev) => {
                 const target = ev.target;
                 const index = parseInt(target.getAttribute('data-step-index') || '-1', 10);
                 if (!Number.isFinite(index) || index < 0) return;
                 const newStatus = target.checked ? 'done' : 'pending';
-                // Optimistic local strikethrough — daemon will reconcile.
-                const span = target.parentElement && target.parentElement.querySelector('span');
-                if (span) {
-                    if (newStatus === 'done') {
-                        span.style.textDecoration = 'line-through';
-                        span.style.opacity = '0.7';
-                    } else {
-                        span.style.textDecoration = 'none';
-                        span.style.opacity = '1';
-                    }
-                }
+                // Optimistic local strikethrough — daemon will reconcile
+                // via a same-id INTERVENTION_TRIGGER that the host turns
+                // into a {type:'microSteps'} patch.
+                const span = target.parentElement && target.parentElement.querySelector('.step-text');
+                if (span) span.classList.toggle('is-done', newStatus === 'done');
                 vscode.postMessage({
                     command: 'microStepToggled',
                     step_index: index,
@@ -992,7 +1382,48 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             });
         });
 
-        // 4-7-8 Breathing Pacer
+        // ---- Host → webview messages ----
+        // D.1: receive STATE_UPDATE diffs from the host and patch the DOM
+        // in place. The host posts {type:'state',state,label,confidence}
+        // every ~500ms; full HTML rebuild only happens on intervention
+        // show/clear so the breathing pacer keeps its animation state.
+        window.addEventListener('message', (event) => {
+            const msg = event.data || {};
+            switch (msg.type) {
+                case 'state': {
+                    const label = document.getElementById('cx-state-label');
+                    const dot = document.getElementById('cx-state-dot');
+                    const conf = document.getElementById('cx-state-conf');
+                    if (label) label.textContent = msg.label || msg.state;
+                    if (dot) dot.dataset.state = String(msg.state || 'UNKNOWN');
+                    if (conf) {
+                        const pct = Math.round((Number(msg.confidence) || 0) * 100);
+                        conf.textContent = msg.status === 'estimated'
+                            ? 'Evidence ' + pct + '%'
+                            : 'No estimate';
+                    }
+                    break;
+                }
+                case 'motion':
+                    hostReduceMotion = Boolean(msg.reduce);
+                    document.body.dataset.reduceMotion = hostReduceMotion ? 'true' : 'false';
+                    if (syncPacerFn) syncPacerFn();
+                    break;
+                case 'microSteps':
+                    applyMicroSteps(msg.steps);
+                    break;
+                case 'whyDetail':
+                    applyWhyDetail(msg);
+                    break;
+                case 'morningBriefing':
+                    renderBriefing(msg.payload);
+                    break;
+                default:
+                    break;
+            }
+        });
+
+        // ---- 4-7-8 Breathing Pacer ----
         const canvas = document.getElementById('pacer-canvas');
         const labelEl = document.getElementById('pacer-label');
         const timerEl = document.getElementById('pacer-timer');
@@ -1034,8 +1465,12 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
                 timerEl.textContent = '';
             }
 
+            function motionReduced() {
+                return reducedPacerMotion.matches || hostReduceMotion;
+            }
+
             function shouldRunPacer() {
-                return !reducedPacerMotion.matches
+                return !motionReduced()
                     && document.visibilityState === 'visible';
             }
 
@@ -1084,13 +1519,14 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
 
             function syncPacer() {
                 stopPacer();
-                if (reducedPacerMotion.matches) {
+                if (motionReduced()) {
                     renderStaticPacer();
                 } else if (document.visibilityState === 'visible') {
                     startPacer();
                 }
             }
 
+            syncPacerFn = syncPacer;
             reducedPacerMotion.addEventListener('change', syncPacer);
             document.addEventListener('visibilitychange', syncPacer);
             syncPacer();

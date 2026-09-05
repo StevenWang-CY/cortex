@@ -105,8 +105,16 @@ class SessionReportGenerator:
         self._start_time = datetime.now(UTC)
 
     def record_state(self, state: str, timestamp: float) -> None:
-        """Record a state transition."""
+        """Record the current state label at ``timestamp``.
+
+        Called on every 2 Hz state tick. Time is always accumulated into
+        the running label's duration, but a :class:`StateTransition` is
+        appended only when the label actually changes (audit D13: the old
+        per-tick append produced ~57k FLOW→FLOW entries per 8 h session
+        that were re-serialised on every 90 s checkpoint).
+        """
         now = timestamp
+        unchanged = self._current_state == state
         if self._current_state is not None:
             # P0 Pipeline B: clamp negative dt to defend against NTP
             # backjumps (system clock leaping backwards while the daemon
@@ -146,11 +154,12 @@ class SessionReportGenerator:
             if self._current_state == "FLOW":
                 self._hourly_flow[hour] += dt
 
-            self._state_transitions.append(StateTransition(
-                from_state=self._current_state,
-                to_state=state,
-                timestamp=datetime.fromtimestamp(now, tz=UTC),
-            ))
+            if not unchanged:
+                self._state_transitions.append(StateTransition(
+                    from_state=self._current_state,
+                    to_state=state,
+                    timestamp=datetime.fromtimestamp(now, tz=UTC),
+                ))
 
         # Track flow streaks
         if state == "FLOW" and self._current_state != "FLOW":

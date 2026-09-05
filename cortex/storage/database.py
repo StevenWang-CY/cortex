@@ -42,6 +42,12 @@ T = TypeVar("T")
 MINIMUM_SQLITE_VERSION = (3, 37, 0)
 CURRENT_SCHEMA_VERSION = 2
 CORTEX_APPLICATION_ID = 0x43545831  # ASCII-ish "CTX1", positive signed int.
+# D6: in-code fallback for session aggregate/report retention when the
+# caller does not thread ``StorageConfig.session_retention_days`` through.
+# Sessions feed the History tab and trends; the size budget
+# (``max_total_size_mb``) bounds disk growth, so time-based expiry can be
+# generous. Keep in sync with the ``settings.py`` default (patch note).
+DEFAULT_SESSION_RETENTION_DAYS = 180
 
 
 class StorageError(RuntimeError):
@@ -419,6 +425,22 @@ class SQLiteDatabase:
         self._verify_migration_checksums_sync(connection)
 
     def _verify_migration_checksums_sync(self, connection: sqlite3.Connection) -> None:
+        """Cross-check the applied-migration ledger against the packaged SQL.
+
+        D5: a ledger row whose ``source_sha256`` differs from the packaged
+        file of the same version used to raise ``StorageCorruptionError``
+        — so any whitespace or comment edit to a shipped ``.sql`` bricked
+        every existing install at startup, even though the schema those
+        installs carry is exactly the one the edited file still produces.
+        The applied schema is already in place and was verified by
+        ``quick_check``/``integrity_check``; a packaging difference is
+        therefore logged as a compatibility warning. What still fails
+        closed: a ledger that does not line up with ``user_version`` (a
+        real inconsistency) and a ``user_version`` newer than this build
+        knows (``_verify_identity_sync``). The packaged files themselves
+        are pinned by ``test_packaged_migration_checksums_are_pinned`` so
+        an accidental edit is caught in CI instead of in users' installs.
+        """
         rows = connection.execute(
             "SELECT version, name, source_sha256 FROM schema_migrations ORDER BY version"
         ).fetchall()
@@ -428,10 +450,23 @@ class SQLiteDatabase:
             )
         for row in rows:
             version = int(row["version"])
+            if version > CURRENT_SCHEMA_VERSION:
+                raise StorageCompatibilityError(
+                    f"schema migration ledger lists version {version}, newer than "
+                    f"supported schema {CURRENT_SCHEMA_VERSION}; refusing a down-migration"
+                )
             name, _source, expected_sha = self._read_migration(version)
             if row["name"] != name or row["source_sha256"] != expected_sha:
-                raise StorageCorruptionError(
-                    f"packaged migration checksum mismatch for schema {version}"
+                logger.warning(
+                    "Packaged migration %s for schema %d differs from the applied "
+                    "ledger row (applied name=%s sha256=%s, packaged sha256=%s); the "
+                    "applied schema is already in place, treating this as a "
+                    "packaging compatibility notice rather than corruption",
+                    name,
+                    version,
+                    row["name"],
+                    row["source_sha256"],
+                    expected_sha,
                 )
 
     def _require_connection(self) -> sqlite3.Connection:
@@ -509,14 +544,38 @@ class SQLiteDatabase:
 
         return await self._submit_raw(invoke, critical=True)
 
+    @staticmethod
+    def _reject_event_loop_thread(method: str) -> None:
+        """D9: refuse to block a running asyncio loop with SQLite work.
+
+        ``asyncio.get_running_loop`` only succeeds on the thread that is
+        running a loop, so a caller dispatched through
+        ``asyncio.to_thread`` (or any plain worker thread) passes while a
+        coroutine calling the sync bridge directly is rejected instead of
+        silently freezing every WS client, HTTP request and capture tick
+        for the duration of the call (up to the busy timeout).
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        raise StorageError(
+            f"SQLiteDatabase.{method} was called from a thread running an asyncio "
+            "event loop; it would block the loop for the duration of the SQLite "
+            "call. Use the async API (read/transaction) or run the caller with "
+            "asyncio.to_thread()."
+        )
+
     def call_sync(self, operation: Callable[[sqlite3.Connection], T]) -> T:
         """Run a callback synchronously after async startup.
 
         This narrow bridge exists for legacy synchronous calibration readers.
         It never opens a second connection. New application services should
-        use :meth:`read` or :meth:`transaction`.
+        use :meth:`read` or :meth:`transaction`. It must never be invoked
+        from the event-loop thread (D9) — see :meth:`_reject_event_loop_thread`.
         """
 
+        self._reject_event_loop_thread("call_sync")
         if self._closed:
             raise StorageError("call_sync requires an open database")
         if not self._started:
@@ -527,7 +586,12 @@ class SQLiteDatabase:
         return future.result(timeout=max(5.0, self._busy_timeout_ms / 1_000 + 1.0))
 
     def transaction_sync(self, operation: Callable[[sqlite3.Connection], T]) -> T:
-        """Synchronous compatibility bridge with atomic commit semantics."""
+        """Synchronous compatibility bridge with atomic commit semantics.
+
+        Same event-loop-thread guard as :meth:`call_sync` (D9).
+        """
+
+        self._reject_event_loop_thread("transaction_sync")
 
         def invoke(connection: sqlite3.Connection) -> T:
             try:
@@ -727,12 +791,33 @@ class SQLiteDatabase:
 
                 await self._submit_raw(close_sync, critical=True)
             self._closed = True
-            self._executor.shutdown(wait=True, cancel_futures=False)
+            # D9: ``ThreadPoolExecutor.shutdown(wait=True)`` joins the
+            # worker thread. Joining on the event loop stalled every
+            # other coroutine for as long as the worker took to drain
+            # (a queued VACUUM or integrity_check can be seconds), so the
+            # join runs off-loop and is bounded; a worker that does not
+            # exit in time is abandoned to process exit rather than
+            # holding the shutdown chain hostage.
+            join_timeout = max(5.0, self._busy_timeout_ms / 1_000 + 1.0)
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self._executor.shutdown, wait=True, cancel_futures=False
+                    ),
+                    timeout=join_timeout,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "SQLite worker thread did not exit within %.1fs; abandoning the "
+                    "join so shutdown can proceed",
+                    join_timeout,
+                )
 
 
 __all__ = [
     "CORTEX_APPLICATION_ID",
     "CURRENT_SCHEMA_VERSION",
+    "DEFAULT_SESSION_RETENTION_DAYS",
     "MINIMUM_SQLITE_VERSION",
     "SQLiteDatabase",
     "StorageBusyError",

@@ -6,6 +6,19 @@
  * - cortex.getDiagnostics: all errors/warnings for current file
  * - cortex.getSymbolAtCursor: current function/class/symbol name
  * - gatherFullContext(): combines all three for CONTEXT_RESPONSE
+ *
+ * Privacy contract (docs/data-flow.md, "Editor" row):
+ * - Only ``file`` documents are described. ``untitled`` documents are
+ *   included only when ``cortex.shareUntitledDocuments`` is on. Output
+ *   panels, settings editors, diff views, git/virtual documents and
+ *   every other scheme are never shared (A16).
+ * - ``cortex.shareEditorContent`` (default on) gates the visible-code
+ *   excerpt. When off, only path, visible range, symbol and diagnostics
+ *   are shared.
+ * - Terminal content is never collected. The former terminal-capture
+ *   path depended on a proposed API the extension never declared and
+ *   would have shipped raw terminal lines + command history; it has
+ *   been removed entirely (A3).
  */
 
 import * as vscode from "vscode";
@@ -27,9 +40,6 @@ interface ActiveFileInfo {
     visible_code: string;
 }
 
-/**
- * Provides VS Code editor context to the Cortex daemon.
- */
 /** A short description of a recent edit. */
 interface RecentEdit {
     file_path: string;
@@ -38,82 +48,71 @@ interface RecentEdit {
     kind: "insert" | "delete" | "replace";
 }
 
-export class ContextProvider {
-    private _terminalLines: string[] = [];
-    private _commandHistory: string[] = [];
+/**
+ * Provides VS Code editor context to the Cortex daemon.
+ */
+export class ContextProvider implements vscode.Disposable {
     // D.7: maintain a small ring of recent edits so the LLM can see
     // where the user is actively working without needing a full git diff.
     private _recentEdits: RecentEdit[] = [];
     private static readonly _RECENT_EDIT_CAPACITY = 25;
+    private readonly _disposables: vscode.Disposable[] = [];
 
     constructor() {
         // Watch text-document changes — describe each change in a small,
         // privacy-preserving way (no content, only file/line/length).
         try {
-            vscode.workspace.onDidChangeTextDocument((event) => {
-                if (event.document.uri.scheme !== "file") {
-                    return;
-                }
-                const filePath = event.document.uri.fsPath;
-                for (const change of event.contentChanges) {
-                    const insertedLength = change.text.length;
-                    const replacedLength =
-                        change.rangeOffset + change.rangeLength - change.rangeOffset;
-                    let kind: RecentEdit["kind"];
-                    if (insertedLength > 0 && change.rangeLength > 0) {
-                        kind = "replace";
-                    } else if (insertedLength > 0) {
-                        kind = "insert";
-                    } else {
-                        kind = "delete";
+            this._disposables.push(
+                vscode.workspace.onDidChangeTextDocument((event) => {
+                    if (!this._isShareableScheme(event.document.uri.scheme)) {
+                        return;
                     }
-                    this._recentEdits.push({
-                        file_path: filePath,
-                        line: change.range.start.line + 1,
-                        length: Math.max(insertedLength, replacedLength),
-                        kind,
-                    });
-                    if (this._recentEdits.length > ContextProvider._RECENT_EDIT_CAPACITY) {
-                        this._recentEdits.shift();
+                    const filePath = event.document.uri.fsPath;
+                    for (const change of event.contentChanges) {
+                        const insertedLength = change.text.length;
+                        const replacedLength = change.rangeLength;
+                        let kind: RecentEdit["kind"];
+                        if (insertedLength > 0 && change.rangeLength > 0) {
+                            kind = "replace";
+                        } else if (insertedLength > 0) {
+                            kind = "insert";
+                        } else {
+                            kind = "delete";
+                        }
+                        this._recentEdits.push({
+                            file_path: filePath,
+                            line: change.range.start.line + 1,
+                            length: Math.max(insertedLength, replacedLength),
+                            kind,
+                        });
+                        if (this._recentEdits.length > ContextProvider._RECENT_EDIT_CAPACITY) {
+                            this._recentEdits.shift();
+                        }
                     }
-                }
-            });
+                }),
+            );
         } catch {
             // Subscription may fail in test harnesses with stubbed vscode API.
         }
+    }
 
-        const windowAny = vscode.window as typeof vscode.window & {
-            onDidWriteTerminalData?: (
-                listener: (event: { data: string; terminal: vscode.Terminal }) => void,
-            ) => vscode.Disposable;
-        };
-
-        if (typeof windowAny.onDidWriteTerminalData === "function") {
-            windowAny.onDidWriteTerminalData((event) => {
-                const chunks = event.data
-                    .split(/\r?\n/)
-                    .map((line) => line.trimEnd())
-                    .filter((line) => line.length > 0);
-                for (const chunk of chunks) {
-                    this._terminalLines.push(chunk);
-                    if (this._terminalLines.length > 200) {
-                        this._terminalLines.shift();
-                    }
-                    if (/^\s*(\$|>|%|#)\s+/.test(chunk)) {
-                        this._commandHistory.push(chunk.replace(/^\s*(\$|>|%|#)\s+/, ""));
-                        if (this._commandHistory.length > 50) {
-                            this._commandHistory.shift();
-                        }
-                    }
-                }
-            });
+    /** A10: release the document-change subscription. */
+    dispose(): void {
+        for (const d of this._disposables.splice(0)) {
+            try {
+                d.dispose();
+            } catch {
+                // already disposed
+            }
         }
     }
 
     /**
      * Get active file path and visible range.
      *
-     * Corresponds to the cortex.getActiveFile command.
+     * Corresponds to the cortex.getActiveFile command. Returns ``null``
+     * when there is no active editor or its document scheme is not
+     * shareable (A16).
      */
     getActiveFile(): ActiveFileInfo | null {
         const editor = vscode.window.activeTextEditor;
@@ -122,6 +121,9 @@ export class ContextProvider {
         }
 
         const doc = editor.document;
+        if (!this._isShareableScheme(doc.uri.scheme)) {
+            return null;
+        }
         const visibleRanges = editor.visibleRanges;
 
         // Use first visible range
@@ -132,16 +134,19 @@ export class ContextProvider {
             endLine = visibleRanges[0].end.line + 1;
         }
 
-        // Extract visible code (limit to 2000 tokens ≈ 8000 chars)
-        const visibleText = doc.getText(
-            new vscode.Range(
-                Math.max(0, startLine - 1),
-                0,
-                Math.min(doc.lineCount, endLine),
-                0,
-            ),
-        );
-        const visibleCode = visibleText.substring(0, 8000);
+        let visibleCode = "";
+        if (this._shareEditorContent()) {
+            // Extract visible code (limit to 2000 tokens ≈ 8000 chars)
+            const visibleText = doc.getText(
+                new vscode.Range(
+                    Math.max(0, startLine - 1),
+                    0,
+                    Math.min(doc.lineCount, endLine),
+                    0,
+                ),
+            );
+            visibleCode = visibleText.substring(0, 8000);
+        }
 
         return {
             file_path: doc.uri.fsPath,
@@ -158,6 +163,9 @@ export class ContextProvider {
     getDiagnostics(): CortexDiagnostic[] {
         const editor = vscode.window.activeTextEditor;
         if (!editor) {
+            return [];
+        }
+        if (!this._isShareableScheme(editor.document.uri.scheme)) {
             return [];
         }
 
@@ -215,6 +223,9 @@ export class ContextProvider {
         if (!editor) {
             return null;
         }
+        if (!this._isShareableScheme(editor.document.uri.scheme)) {
+            return null;
+        }
 
         const position = editor.selection.active;
 
@@ -240,7 +251,9 @@ export class ContextProvider {
      * Gather complete editor context for a CONTEXT_RESPONSE.
      *
      * Combines getActiveFile, getDiagnostics, and getSymbolAtCursor
-     * into a single payload matching the EditorContext schema.
+     * into a single payload matching the EditorContext schema. No
+     * ``terminal_context`` is ever produced (A3); the daemon schema
+     * treats it as optional.
      */
     async gatherFullContext(): Promise<Record<string, unknown>> {
         const activeFile = this.getActiveFile();
@@ -265,32 +278,27 @@ export class ContextProvider {
 
         return {
             editor_context: editorContext,
-            terminal_context: this.getTerminalContext(),
-        };
-    }
-
-    getTerminalContext(): Record<string, unknown> {
-        const lines = this._terminalLines.slice(-50);
-        const detectedErrors = lines.filter((line) =>
-            /(error:|failed|traceback|exception|command not found|permission denied)/i.test(line),
-        );
-        const repeatedCommands = Array.from(
-            new Set(
-                this._commandHistory.filter(
-                    (command, index, all) => all.indexOf(command) !== index,
-                ),
-            ),
-        );
-
-        return {
-            last_n_lines: lines,
-            detected_errors: detectedErrors.slice(-10),
-            repeated_commands: repeatedCommands,
-            running_command: vscode.window.activeTerminal?.name ?? null,
         };
     }
 
     // --- Internal helpers ---
+
+    /** A16: ``file`` always; ``untitled`` only by explicit opt-in. */
+    private _isShareableScheme(scheme: string): boolean {
+        if (scheme === "file") return true;
+        if (scheme === "untitled") {
+            return this._config().get<boolean>("shareUntitledDocuments", false) === true;
+        }
+        return false;
+    }
+
+    private _shareEditorContent(): boolean {
+        return this._config().get<boolean>("shareEditorContent", true) !== false;
+    }
+
+    private _config(): vscode.WorkspaceConfiguration {
+        return vscode.workspace.getConfiguration("cortex");
+    }
 
     /**
      * Find the most specific (deepest) document symbol containing a position.

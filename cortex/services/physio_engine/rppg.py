@@ -23,6 +23,15 @@ from enum import StrEnum
 import numpy as np
 from numpy.typing import NDArray
 
+from cortex.libs.signal.filters import bandpass_filter
+
+# CHROM band-pass applied to the chrominance signals *before* the alpha
+# tuning (de Haan & Jeanne 2013, Sec. III-C: alpha = sigma(Xf)/sigma(Yf) on
+# the band-passed Xf, Yf).  The paper's band is 40-240 BPM (0.67-4 Hz).
+CHROM_BANDPASS_LOW_HZ = 0.67
+CHROM_BANDPASS_HIGH_HZ = 4.0
+_CHROM_BANDPASS_ORDER = 3
+
 
 class RPPGAlgorithm(StrEnum):
     """Available rPPG extraction algorithms."""
@@ -150,9 +159,44 @@ def _pos_single_window(rgb_window: NDArray[np.float64]) -> NDArray[np.float64]:
     return np.asarray(bvp, dtype=np.float64)
 
 
+def _chrom_bandpass(
+    signal: NDArray[np.float64],
+    *,
+    fs: float,
+    low_hz: float,
+    high_hz: float,
+) -> NDArray[np.float64]:
+    """Band-pass one chrominance signal; fall back to mean removal when the
+    window is too short or the band is not representable at ``fs``.
+
+    The fallback keeps CHROM total on tiny inputs (the registry contract) but
+    is *not* the published algorithm; every production window (>= 8 s at
+    >= 10 fps) takes the filtered path.
+    """
+
+    centred = np.asarray(signal, dtype=np.float64) - float(np.mean(signal))
+    if fs <= 0 or not np.isfinite(fs):
+        return centred
+    high = min(float(high_hz), 0.45 * float(fs))
+    if low_hz <= 0 or low_hz >= high:
+        return centred
+    try:
+        return bandpass_filter(
+            centred,
+            low_hz=float(low_hz),
+            high_hz=high,
+            fs=float(fs),
+            order=_CHROM_BANDPASS_ORDER,
+        )
+    except ValueError:
+        return centred
+
+
 def extract_bvp_chrom(
     rgb_window: NDArray[np.float64],
     fs: float = 30.0,
+    low_hz: float = CHROM_BANDPASS_LOW_HZ,
+    high_hz: float = CHROM_BANDPASS_HIGH_HZ,
 ) -> NDArray[np.float64]:
     """
     CHROM (Chrominance-Based) rPPG algorithm.
@@ -161,14 +205,20 @@ def extract_bvp_chrom(
     Cortex makes no comparative subgroup-performance claim until the
     subject-disjoint validation protocol is complete.
 
-    Steps:
+    Steps (de Haan & Jeanne 2013):
     1. Temporally normalize each channel
     2. Compute chrominance signals Xs and Ys
-    3. Combine using standard deviation ratio
+    3. Band-pass both to Xf and Yf
+    4. Combine as S = Xf - alpha * Yf with alpha = sigma(Xf) / sigma(Yf)
+
+    Earlier revisions computed alpha on the unfiltered Xs/Ys, which lets
+    out-of-band illumination drift dominate the standard-deviation ratio.
 
     Args:
         rgb_window: RGB traces, shape (N, 3) with [R, G, B] columns.
         fs: Sampling frequency in Hz.
+        low_hz: Lower edge of the internal chrominance band-pass.
+        high_hz: Upper edge of the internal chrominance band-pass.
 
     Returns:
         BVP signal of shape (N,).
@@ -192,18 +242,22 @@ def extract_bvp_chrom(
     xs = 3.0 * r_n - 2.0 * g_n
     ys = 1.5 * r_n + g_n - 1.5 * b_n
 
-    # Combine using standard deviation ratio
-    std_xs = np.std(xs)
-    std_ys = np.std(ys)
+    # Band-pass before tuning alpha (Xf, Yf in the paper).
+    xf = _chrom_bandpass(xs, fs=fs, low_hz=low_hz, high_hz=high_hz)
+    yf = _chrom_bandpass(ys, fs=fs, low_hz=low_hz, high_hz=high_hz)
 
-    if std_ys < 1e-10:
-        bvp = xs
+    # Combine using the standard deviation ratio of the *filtered* signals
+    std_xf = np.std(xf)
+    std_yf = np.std(yf)
+
+    if std_yf < 1e-10:
+        bvp = xf
     else:
-        alpha = std_xs / std_ys
-        bvp = xs - alpha * ys
+        alpha = std_xf / std_yf
+        bvp = xf - alpha * yf
 
     # Zero-mean
-    bvp -= np.mean(bvp)
+    bvp = bvp - np.mean(bvp)
 
     return np.asarray(bvp, dtype=np.float64)
 

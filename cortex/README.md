@@ -122,7 +122,7 @@ The planner can describe tab organization, error investigation, micro-steps,
 or other workspace changes. Descriptions are not commands. In the shipping
 default:
 
-- receiving `INTERVENTION_TRIGGER`, `INTERVENTION_PROPOSED`,
+- receiving `INTERVENTION_TRIGGER`, `INTERVENTION_PROMPT`,
   `BREAK_RECOMMENDATION`, `PRE_BREAK_WARNING`, or `BREATHING_OVERLAY` cannot
   close/hide/group tabs, fold editors, disable suggestions, or mutate files;
 - a consent downgrade is non-executable;

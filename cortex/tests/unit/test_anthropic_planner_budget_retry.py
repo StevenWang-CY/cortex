@@ -16,6 +16,7 @@ can tell apart "killed at call start" from "killed mid-retry".
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -129,7 +130,7 @@ async def test_kill_switch_fires_mid_retry_after_budget_crossed(
     async def fast_sleep(_seconds: float) -> None:
         tracker.record(
             "cid_test",
-            "us.anthropic.claude-sonnet-4-6-v1:0",
+            "anthropic.claude-sonnet-5",
             25.0,  # over the $20 kill ceiling
             cancelled=False,
         )
@@ -171,10 +172,8 @@ async def test_first_attempt_unchanged_when_budget_ok(
         if call_count["n"] == 1:
             raise _rate_limit_error()
         block = SimpleNamespace(
-            type="tool_use",
-            name="emit_intervention_plan",
-            input={
-                "level": "overlay_only",
+            type="text",
+            text=json.dumps({
                 "headline": "Fix the NameError on line 10",
                 "situation_summary": "1 error in main.py",
                 "primary_focus": "main.py:10",
@@ -189,9 +188,12 @@ async def test_first_attempt_unchanged_when_budget_ok(
                 "tone": "supportive",
                 "suggested_actions": [],
                 "causal_explanation": "1 error pulled focus off the function.",
-            },
+                "error_analysis": None,
+                "tab_recommendations": None,
+            }),
         )
         return SimpleNamespace(
+            stop_reason="end_turn",
             content=[block],
             usage=SimpleNamespace(
                 input_tokens=10,
@@ -243,10 +245,8 @@ async def test_planner_without_cost_tracker_skips_recheck(
         if call_count["n"] == 1:
             raise _rate_limit_error()
         block = SimpleNamespace(
-            type="tool_use",
-            name="emit_intervention_plan",
-            input={
-                "level": "overlay_only",
+            type="text",
+            text=json.dumps({
                 "headline": "Fix the NameError on line 10",
                 "situation_summary": "1 error in main.py",
                 "primary_focus": "main.py:10",
@@ -261,9 +261,12 @@ async def test_planner_without_cost_tracker_skips_recheck(
                 "tone": "supportive",
                 "suggested_actions": [],
                 "causal_explanation": "1 error pulled focus off the function.",
-            },
+                "error_analysis": None,
+                "tab_recommendations": None,
+            }),
         )
         return SimpleNamespace(
+            stop_reason="end_turn",
             content=[block],
             usage=SimpleNamespace(
                 input_tokens=10,

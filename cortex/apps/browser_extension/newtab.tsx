@@ -1,17 +1,20 @@
 /**
  * Cortex Pulse Room — New Tab Page
  *
- * Renders your heartbeat as light. A single point of light in darkness
- * that pulses at your actual heart rate. Pulse history ripples outward.
- * ECG-style trace at the bottom.
+ * Renders your heartbeat as light. A single point of light that pulses at
+ * your actual heart rate; pulse history ripples outward.
  *
  * Inspired by Rafael Lozano-Hemmer's Pulse Room installation.
  */
 
 import React, { useEffect, useRef, useState } from "react";
 import "./page-reset.css";
-import { CX, STATE_COLORS_RGB, CX_KEYFRAMES } from "./design-tokens";
+import { CX, STATE_COLORS_RGB, STATE_LABELS, CX_KEYFRAMES } from "./design-tokens";
 import { newCorrelationId } from "./lib/correlation";
+import { LAUNCH_FAILED_STATUS } from "./lib/popup-view-model";
+
+/** Storage key shared with the popup's "Use the browser's default new tab". */
+export const NEWTAB_DISABLED_KEY = "cortex_newtab_disabled";
 
 // P2-9: debug flag for newtab page — silences console output in production.
 const CORTEX_DEBUG: boolean = (() => {
@@ -38,9 +41,6 @@ function nt_sendWithCid(
     if (CORTEX_DEBUG) {
         console.debug(`cortex.newtab.send cid=${correlation_id} type=${String(msg.type)}`);
     }
-    // Phase 4d Task B: lastError sweep — wrap raw sendMessage so the
-    // callback drops cleanly when the SW is mid-eviction. The polling
-    // callsites further down also inspect lastError themselves.
     try {
         chrome.runtime.sendMessage(enriched, (response) => {
             const lastErr = (chrome as unknown as {
@@ -87,6 +87,104 @@ interface RecentActivity {
     related_tabs: string[];
 }
 
+/** Translucent material that resolves in both appearances. */
+const GLASS_BACKGROUND = "color-mix(in srgb, var(--cx-control-bg) 65%, transparent)";
+
+function headlinePrefix(state: string): string {
+    switch (state) {
+        case "FLOW":
+            return "Steady with ";
+        case "HYPER":
+            return "Supported by ";
+        case "RECOVERY":
+            return "Settling with ";
+        default:
+            return "Resting with ";
+    }
+}
+
+/**
+ * Minimal page shown when the user chose the browser's default new tab.
+ * A ``chrome://`` page cannot be the target of a plain link from an
+ * extension page, so the button asks the tabs API to navigate.
+ */
+function DefaultNewTabNotice({ onRestore }: { onRestore: () => void }): React.ReactElement {
+    const [hint, setHint] = useState("");
+    const openDefault = () => {
+        try {
+            chrome.tabs.update({ url: "chrome://new-tab-page" }, () => {
+                const lastErr = (chrome as unknown as {
+                    runtime?: { lastError?: { message?: string } };
+                }).runtime?.lastError;
+                if (lastErr) setHint("Open a new tab from the browser’s menu to use its default page.");
+            });
+        } catch {
+            setHint("Open a new tab from the browser’s menu to use its default page.");
+        }
+    };
+    return (
+        <main
+            data-testid="newtab-default-notice"
+            style={{
+                minHeight: "100vh",
+                display: "flex",
+                flexDirection: "column",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 12,
+                background: CX.bg,
+                color: CX.text,
+                fontFamily: CX.font,
+                padding: 24,
+                textAlign: "center",
+            }}
+        >
+            <div style={{ fontFamily: CX.fontBrand, fontStyle: "italic", fontSize: 28 }}>Cortex.</div>
+            <p style={{ margin: 0, fontSize: 14, color: CX.textSecondary }}>
+                The Pulse Room is off for new tabs.
+            </p>
+            <button
+                type="button"
+                onClick={openDefault}
+                data-testid="newtab-open-default"
+                style={{
+                    marginTop: 8,
+                    padding: "10px 20px",
+                    borderRadius: CX.radiusFull,
+                    border: `1px solid ${CX.borderEmphasis}`,
+                    background: CX.surface,
+                    color: CX.text,
+                    fontSize: 13,
+                    fontWeight: 500,
+                    fontFamily: CX.font,
+                    cursor: "pointer",
+                }}
+            >
+                Open Chrome’s default new tab
+            </button>
+            {hint && <p role="status" style={{ margin: 0, fontSize: 12, color: CX.textTertiary }}>{hint}</p>}
+            <button
+                type="button"
+                onClick={onRestore}
+                data-testid="newtab-restore"
+                style={{
+                    background: "none",
+                    border: "none",
+                    padding: 4,
+                    color: CX.accentText,
+                    fontSize: 12,
+                    fontFamily: CX.font,
+                    cursor: "pointer",
+                    textDecoration: "underline",
+                    textUnderlineOffset: 2,
+                }}
+            >
+                Turn the Pulse Room back on
+            </button>
+        </main>
+    );
+}
+
 function PulseRoom(): React.ReactElement {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const stateRef = useRef({
@@ -102,19 +200,19 @@ function PulseRoom(): React.ReactElement {
         rings: [] as Ring[],
         breathPhase: 0,
         traceHistory: [] as number[],
+        glowColor: "",
     });
     const canvasBackgroundRef = useRef<string>(CX.light.window_bg);
 
     const [displayHR, setDisplayHR] = useState(0);
     const [displayConnected, setDisplayConnected] = useState(false);
+    const [displayState, setDisplayState] = useState("");
+    const [newtabDisabled, setNewtabDisabled] = useState<boolean | null>(null);
     // Resolve before the first paint/effect pass so a reduced-motion user
     // never briefly schedules the ordinary canvas loop during hydration.
     const [reducedMotion, setReducedMotion] = useState(
         () => window.matchMedia("(prefers-reduced-motion: reduce)").matches,
     );
-    // P2-7: pacer phase label for the aria-live accessibility region.
-    // Derived from pulsePhase so screen readers can announce the
-    // current breathing cue without coupling to canvas internals.
     const [pacerPhase, setPacerPhase] = useState<"inhale" | "hold" | "exhale">("inhale");
 
     // Launch controls
@@ -125,7 +223,35 @@ function PulseRoom(): React.ReactElement {
     const [activities, setActivities] = useState<RecentActivity[]>([]);
     const [showActivities, setShowActivities] = useState(false);
 
-    // Inject fonts + keyframes
+    // Honour the popup's "use the browser's default new tab" choice.
+    useEffect(() => {
+        let active = true;
+        try {
+            chrome.storage.local.get(NEWTAB_DISABLED_KEY, (result) => {
+                if (active) setNewtabDisabled(result?.[NEWTAB_DISABLED_KEY] === true);
+            });
+        } catch {
+            setNewtabDisabled(false);
+        }
+        const onChanged = (
+            changes: Record<string, { newValue?: unknown }>,
+            area: string,
+        ) => {
+            if (area !== "local" || !changes[NEWTAB_DISABLED_KEY]) return;
+            setNewtabDisabled(changes[NEWTAB_DISABLED_KEY].newValue === true);
+        };
+        try {
+            chrome.storage.onChanged.addListener(onChanged);
+        } catch { /* storage events unavailable */ }
+        return () => {
+            active = false;
+            try {
+                chrome.storage.onChanged.removeListener(onChanged);
+            } catch { /* ignore */ }
+        };
+    }, []);
+
+    // Inject keyframes + interaction states
     useEffect(() => {
         const id = "cortex-newtab-styles";
         if (document.getElementById(id)) { return; }
@@ -169,7 +295,7 @@ function PulseRoom(): React.ReactElement {
             @media (hover: hover) and (pointer: fine) {
                 .cortex-resume-card:hover {
                     transform: translateY(-4px);
-                    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.08), inset 0 0 0 1px rgba(255,255,255,0.8) !important;
+                    box-shadow: ${CX.shadowFloat}, inset 0 0 0 1px var(--cx-border-emphasis) !important;
                 }
             }
             .cortex-resume-list {
@@ -245,6 +371,7 @@ function PulseRoom(): React.ReactElement {
                     setDisplayConnected(response.connected);
                     if (response.state) {
                         stateRef.current.state = response.state.state || "";
+                        setDisplayState(response.state.state || "");
                         stateRef.current.confidence = response.state.confidence || 0;
                         const bio = response.state.biometrics;
                         if (bio?.heart_rate) {
@@ -266,6 +393,7 @@ function PulseRoom(): React.ReactElement {
             if (message.type === "STATE_UPDATE" && message.payload) {
                 const payload = message.payload as Record<string, unknown>;
                 stateRef.current.state = (payload.state as string) || "";
+                setDisplayState((payload.state as string) || "");
                 stateRef.current.confidence = (payload.confidence as number) || 0;
                 stateRef.current.connected = true;
                 setDisplayConnected(true);
@@ -297,18 +425,19 @@ function PulseRoom(): React.ReactElement {
         } catch { /* extension context lost */ }
     }, []);
 
-    // Canvas animation loop + Logo Interaction
+    // Canvas animation loop + logo interaction
     const logoRef = useRef<HTMLDivElement>(null);
-    const auraRef = useRef<HTMLDivElement>(null);
-    // P2-7: track last-announced pacer phase to avoid flooding the
-    // aria-live region with identical strings every rAF tick.
+    const glowRef = useRef<HTMLDivElement>(null);
     const lastPacerPhaseRef = useRef<"inhale" | "hold" | "exhale">("inhale");
 
     useEffect(() => {
         if (reducedMotion) {
             animRef.current.rings = [];
             if (logoRef.current) logoRef.current.style.transform = "scale(1)";
-            if (auraRef.current) auraRef.current.style.filter = "none";
+            if (glowRef.current) {
+                glowRef.current.style.opacity = "0.35";
+                glowRef.current.style.transform = "scale(1)";
+            }
             return;
         }
 
@@ -326,7 +455,7 @@ function PulseRoom(): React.ReactElement {
             canvas.width = window.innerWidth * dpr;
             canvas.height = window.innerHeight * dpr;
             ctx!.scale(dpr, dpr);
-            // Fill immediately on resize to prevent white flash
+            // Fill immediately on resize to prevent a flash of the page ground
             ctx!.fillStyle = canvasBackgroundRef.current;
             ctx!.fillRect(0, 0, window.innerWidth, window.innerHeight);
         }
@@ -348,12 +477,11 @@ function PulseRoom(): React.ReactElement {
             const col = STATE_COLORS_RGB[sr.state] || STATE_COLORS_RGB.FLOW;
             const isHyper = sr.state === "HYPER";
 
-            // --- Background Paint ---
             ctx.clearRect(0, 0, w, h);
             ctx.fillStyle = canvasBackgroundRef.current;
             ctx.fillRect(0, 0, w, h);
 
-            // Beat timing computing based on heartbeat
+            // Beat timing computed from the heartbeat
             if (sr.heartRate > 0) {
                 const timeSinceBeat = now - anim.lastBeatTime;
                 anim.pulsePhase = Math.min(timeSinceBeat / anim.beatInterval, 1);
@@ -361,13 +489,12 @@ function PulseRoom(): React.ReactElement {
                 if (timeSinceBeat >= anim.beatInterval) {
                     anim.lastBeatTime = now;
                     anim.pulsePhase = 0;
-                    // Spawn delicate ripple ring
                     if (!isHyper || anim.rings.length % 2 === 0) {
                         anim.rings.push({
                             born: now,
-                            radius: 30, // Start tightly behind logo
+                            radius: 30,
                             maxRadius: 250 + Math.random() * 100,
-                            opacity: 1.0, 
+                            opacity: 1.0,
                         });
                     }
                 }
@@ -376,11 +503,7 @@ function PulseRoom(): React.ReactElement {
                 anim.pulsePhase = (Math.sin(now / 1500) * 0.5 + 0.5);
             }
 
-            // P2-7: derive the pacer phase for the aria-live region.
-            // 4-7-8 pattern mapped onto pulsePhase [0..1]:
-            //   [0, 0.33)  → inhale   (first third)
-            //   [0.33, 0.5) → hold    (short plateau)
-            //   [0.5, 1]   → exhale   (latter half)
+            // Pacer phase for the aria-live region (4-7-8 mapped onto [0..1]).
             {
                 const p = anim.pulsePhase;
                 const derived: "inhale" | "hold" | "exhale" =
@@ -397,7 +520,6 @@ function PulseRoom(): React.ReactElement {
                 if (age > 4) return false;
 
                 ring.radius = ring.maxRadius * (1 - Math.exp(-age * 1.2));
-                // Extremely faint, delicate lines
                 const fadeAlpha = Math.max(0, 0.4 * (1 - age / 4));
 
                 ctx.beginPath();
@@ -405,17 +527,16 @@ function PulseRoom(): React.ReactElement {
                 ctx.strokeStyle = `rgba(${col.r}, ${col.g}, ${col.b}, ${fadeAlpha})`;
                 ctx.lineWidth = 1;
                 ctx.stroke();
-                // Add second faint ring for detail
                 ctx.beginPath();
                 ctx.arc(cx, cy, ring.radius * 0.8, 0, Math.PI * 2);
                 ctx.strokeStyle = `rgba(${col.r}, ${col.g}, ${col.b}, ${fadeAlpha * 0.3})`;
                 ctx.lineWidth = 0.5;
                 ctx.stroke();
-                
+
                 return true;
             });
 
-            // --- Drive the SVG DOM Elements ---
+            // --- Drive the DOM elements: transform and opacity only ---
             const systole = sr.heartRate > 0
                 ? (anim.pulsePhase < 0.15
                     ? Math.sin((anim.pulsePhase / 0.15) * (Math.PI / 2))
@@ -425,16 +546,21 @@ function PulseRoom(): React.ReactElement {
             const dampened = isHyper ? systole * 0.6 : systole;
 
             if (logoRef.current) {
-                // Core heartbeat scaling — delicate and elegant
                 const scale = 1 + dampened * 0.08;
                 logoRef.current.style.transform = `scale(${scale})`;
             }
 
-            if (auraRef.current) {
-                // Glowing drop-shadow "breath" around the logo
-                const glowSize = 20 + dampened * 60;
-                const glowAlpha = 0.05 + dampened * 0.15;
-                auraRef.current.style.filter = `drop-shadow(0px 0px ${glowSize}px rgba(${col.r}, ${col.g}, ${col.b}, ${glowAlpha}))`;
+            if (glowRef.current) {
+                // The glow is pre-rendered once as a blurred radial layer; the
+                // beat only retargets its opacity and scale (compositor-only).
+                const glowColor = `rgb(${col.r}, ${col.g}, ${col.b})`;
+                if (anim.glowColor !== glowColor) {
+                    anim.glowColor = glowColor;
+                    glowRef.current.style.background =
+                        `radial-gradient(circle, rgba(${col.r}, ${col.g}, ${col.b}, 0.55) 0%, rgba(${col.r}, ${col.g}, ${col.b}, 0) 70%)`;
+                }
+                glowRef.current.style.opacity = String(0.25 + dampened * 0.75);
+                glowRef.current.style.transform = `scale(${1 + dampened * 0.6})`;
             }
 
             rafId = requestAnimationFrame(draw);
@@ -473,18 +599,32 @@ function PulseRoom(): React.ReactElement {
         setLaunching(true);
         setLaunchError("");
         nt_sendWithCid({ type: "LAUNCH_CORTEX" }, (raw: unknown) => {
-            const resp = raw as { ok?: boolean; status?: string; error?: string } | undefined;
+            const resp = raw as { ok?: boolean; status?: string } | undefined;
             setLaunching(false);
             if (resp?.ok && resp.status === "camera_enabled") {
                 // Connected — state updates will flow via polling
             } else {
-                setLaunchError(`${resp?.status || "no_response"}: ${resp?.error || "unknown"}`);
+                setLaunchError(LAUNCH_FAILED_STATUS);
                 setTimeout(() => setLaunchError(""), 15000);
             }
         });
     }
 
-    const col = STATE_COLORS_RGB[displayConnected ? stateRef.current.state : ""] || STATE_COLORS_RGB.FLOW;
+    if (newtabDisabled === true) {
+        return (
+            <DefaultNewTabNotice
+                onRestore={() => {
+                    try {
+                        chrome.storage.local.set({ [NEWTAB_DISABLED_KEY]: false });
+                    } catch { /* storage unavailable */ }
+                    setNewtabDisabled(false);
+                }}
+            />
+        );
+    }
+
+    const col = STATE_COLORS_RGB[displayConnected ? displayState : ""] || STATE_COLORS_RGB.FLOW;
+    const stateLabel = STATE_LABELS[displayState] ?? STATE_LABELS.UNKNOWN;
 
     return (
         <div
@@ -498,12 +638,11 @@ function PulseRoom(): React.ReactElement {
             }}
         >
             {/*
-              CLAUDE.md rule 19 / F.2: Plasmo's tabs/* pages have a
-              default white <body>. The imported page-reset.css fires
-              on first paint of the React tree but the user can still
-              see a white flash before the stylesheet attaches. Inject
-              an inline <style> tag as the first child so the rule is
-              applied during HTML parse, before React mounts.
+              CLAUDE.md rule 19: Plasmo's new-tab override page has a white
+              <body> by default. The imported page-reset.css attaches with
+              the React tree, so an inline <style> is emitted as the first
+              child to paint the token ground during HTML parse, before React
+              mounts; the canvas fillRect on resize is the third layer.
             */}
             <style
                 dangerouslySetInnerHTML={{
@@ -513,9 +652,6 @@ function PulseRoom(): React.ReactElement {
                         ";margin:0;padding:0}",
                 }}
             />
-            {/* P2-7: role + aria-label satisfy WCAG SC 1.1.1 for the canvas
-                visualisation. The aria-live region announces the breathing
-                pacer phase transitions to screen reader users. */}
             <canvas
                 ref={canvasRef}
                 role="img"
@@ -547,7 +683,7 @@ function PulseRoom(): React.ReactElement {
                 }} />
             )}
 
-            {/* Premium Editorial Centerpiece & Breathing SVG Logo */}
+            {/* Centerpiece & breathing logo */}
             <div
                 style={{
                     position: "absolute",
@@ -564,24 +700,35 @@ function PulseRoom(): React.ReactElement {
                     justifyContent: "center",
                     textAlign: "center",
                 }}>
-                {/* The Breathing Logo */}
-                <div 
-                    ref={auraRef}
-                    style={{
-                        marginBottom: 40,
-                        transition: reducedMotion ? "none" : "filter 0.05s linear",
-                    }}
-                >
-                    <div 
+                <div style={{ position: "relative", marginBottom: 40 }}>
+                    {/* Pre-rendered glow: blurred once, animated via opacity/scale only */}
+                    <div
+                        ref={glowRef}
+                        aria-hidden="true"
+                        data-testid="pulse-glow"
+                        style={{
+                            position: "absolute",
+                            inset: -60,
+                            borderRadius: "50%",
+                            filter: "blur(24px)",
+                            opacity: 0.25,
+                            transform: "scale(1)",
+                            transformOrigin: "center center",
+                            willChange: "opacity, transform",
+                            pointerEvents: "none",
+                            background: `radial-gradient(circle, rgba(${col.r}, ${col.g}, ${col.b}, 0.55) 0%, rgba(${col.r}, ${col.g}, ${col.b}, 0) 70%)`,
+                        }}
+                    />
+                    <div
                         ref={logoRef}
                         style={{
+                            position: "relative",
                             color: displayConnected ? `rgb(${col.r}, ${col.g}, ${col.b})` : CX.textSecondary,
                             willChange: "transform",
                             transformOrigin: "center center",
-                            transition: reducedMotion ? "none" : "transform 0.05s linear",
                         }}
                     >
-                        <svg width="100" height="100" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <svg width="100" height="100" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
                             <path d="M 51.8 12.2 A 28 28 0 1 0 51.8 51.8" fill="none" stroke={CX.text} strokeWidth="6" strokeLinecap="round" />
                             <path d="M 12 32 L 22 32 L 27 15 L 37 49 L 42 32 L 60 32" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
                             <circle cx="60" cy="32" r="3" fill="currentColor" />
@@ -600,41 +747,45 @@ function PulseRoom(): React.ReactElement {
                 }}>
                     {displayConnected ? (
                         <>
-                            {stateRef.current.state === "FLOW" ? "Deep Work with " :
-                             stateRef.current.state === "HYPER" ? "Elevated with " :
-                             stateRef.current.state === "RECOVERY" ? "Recovery with " : "Resting with "}
+                            {headlinePrefix(displayState)}
                             <span style={{ fontFamily: CX.fontBrand, fontStyle: "italic", fontWeight: 500, paddingLeft: 4, letterSpacing: "0.02em" }}>Cortex.</span>
                         </>
                     ) : (
                         <span style={{ fontFamily: CX.fontBrand, fontStyle: "italic", fontWeight: 500, letterSpacing: "0.02em" }}>Cortex.</span>
                     )}
                 </h1>
-                
+
                 {displayConnected ? (
-                    <div style={{
-                        fontFamily: CX.mono,
-                        fontSize: 13,
-                        color: CX.textTertiary,
-                        textTransform: "uppercase",
-                        letterSpacing: "0.15em",
-                        userSelect: "none",
-                    }}>
-                        {displayHR > 0 ? `${displayHR} BPM \u00b7 ${stateRef.current.state} STATE` : "CALIBRATING BIOFEEDBACK"}
+                    <div
+                        data-testid="newtab-state-line"
+                        style={{
+                            fontFamily: CX.font,
+                            fontSize: 14,
+                            color: CX.textSecondary,
+                            letterSpacing: "0.01em",
+                            userSelect: "none",
+                        }}
+                    >
+                        {displayHR > 0 ? `${displayHR} bpm · ${stateLabel}` : "Reading your pulse…"}
                     </div>
                 ) : (
                     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 16 }}>
-                        <div style={{ fontSize: 13, color: CX.textTertiary, fontFamily: CX.mono, letterSpacing: "0.15em", userSelect: "none" }}>
-                            VISUAL ENGINE OFFLINE
+                        <div
+                            data-testid="newtab-state-line"
+                            style={{ fontSize: 14, color: CX.textSecondary, fontFamily: CX.font, userSelect: "none" }}
+                        >
+                            Cortex is resting
                         </div>
-                            <button
-                                className="cortex-launch-button cortex-translucent-material"
+                        <button
+                            className="cortex-launch-button cortex-translucent-material"
                             onClick={handleLaunch}
                             disabled={launching}
+                            aria-busy={launching || undefined}
                             style={{
                                 padding: "12px 36px",
-                                border: `1px solid rgba(0,0,0,0.08)`,
+                                border: "1px solid var(--cx-border-emphasis)",
                                 borderRadius: CX.radiusFull,
-                                background: "rgba(255, 255, 255, 0.6)",
+                                background: GLASS_BACKGROUND,
                                 backdropFilter: "blur(20px)",
                                 WebkitBackdropFilter: "blur(20px)",
                                 color: CX.text,
@@ -643,14 +794,14 @@ function PulseRoom(): React.ReactElement {
                                 fontFamily: CX.font,
                                 cursor: launching ? "default" : "pointer",
                                 opacity: launching ? 0.6 : 1,
-                                boxShadow: "0 4px 12px rgba(0,0,0,0.03)",
+                                boxShadow: CX.shadowFloat,
                                 letterSpacing: 0.5,
                             }}
                         >
-                            {launching ? "Starting\u2026" : "Start Cortex"}
+                            {launching ? "Starting…" : "Open Cortex"}
                         </button>
                         {launchError && (
-                            <div style={{ fontSize: 11, color: CX.textTertiary, fontFamily: CX.mono, maxWidth: 300, lineHeight: 1.5 }}>
+                            <div role="status" style={{ fontSize: 12, color: CX.textSecondary, fontFamily: CX.font, maxWidth: 300, lineHeight: 1.5 }}>
                                 {launchError}
                             </div>
                         )}
@@ -659,7 +810,7 @@ function PulseRoom(): React.ReactElement {
                 </div>
             </div>
 
-            {/* Resume cards — Glassmorphic Artifacts */}
+            {/* Resume cards — translucent material over the pulse field */}
             {showActivities && activities.length > 0 && (
                 <div
                     className="cortex-resume-list"
@@ -691,10 +842,10 @@ function PulseRoom(): React.ReactElement {
                                         width: "100%",
                                         padding: 16,
                                         borderRadius: 20,
-                                        background: "rgba(255, 255, 255, 0.65)",
+                                        background: GLASS_BACKGROUND,
                                         backdropFilter: "blur(24px)",
                                         WebkitBackdropFilter: "blur(24px)",
-                                        boxShadow: "0 8px 32px rgba(0, 0, 0, 0.05), inset 0 0 0 1px rgba(255,255,255,0.6)",
+                                        boxShadow: `${CX.shadowFloat}, inset 0 0 0 1px var(--cx-border-subtle)`,
                                         cursor: "pointer",
                                         animationDelay: `${index * 50}ms`,
                                     }}
@@ -711,13 +862,13 @@ function PulseRoom(): React.ReactElement {
                                         marginBottom: 10,
                                         letterSpacing: "-0.01em",
                                     }}>{a.title}</div>
-                                    {/* Progress bar — 3px, sleek */}
-                                    <div style={{ height: 3, borderRadius: 1.5, background: "rgba(0,0,0,0.06)", marginBottom: 10, overflow: "hidden" }}>
+                                    {/* Progress bar — 3px */}
+                                    <div style={{ height: 3, borderRadius: 1.5, background: "var(--cx-border-emphasis)", marginBottom: 10, overflow: "hidden" }}>
                                         <div style={{ height: "100%", borderRadius: 1.5, background: CX.accent, width: `${pct}%` }} />
                                     </div>
                                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                                        <span style={{ fontSize: 10, color: CX.textTertiary, fontFamily: CX.mono, letterSpacing: "0.05em" }}>{posLabel}</span>
-                                        <span style={{ fontSize: 10, fontWeight: 600, color: CX.textSecondary, letterSpacing: "0.08em", textTransform: "uppercase" }}>Resume &rarr;</span>
+                                        <span style={{ fontSize: 11, color: CX.textTertiary, fontFamily: CX.mono, letterSpacing: "0.05em" }}>{posLabel}</span>
+                                        <span style={{ fontSize: 11, fontWeight: 600, color: CX.textSecondary, letterSpacing: "0.08em", textTransform: "uppercase" }}>Resume &rarr;</span>
                                     </div>
                                 </a>
                             </div>
@@ -734,7 +885,6 @@ function PulseRoom(): React.ReactElement {
                     right: 32,
                     fontSize: 11,
                     color: CX.textTertiary,
-                    opacity: 0.4,
                     fontFamily: CX.fontSerif,
                     letterSpacing: "0.05em",
                     userSelect: "none",
@@ -757,7 +907,7 @@ function formatActivityPosition(pos: Record<string, unknown>): string {
         case "scroll":
             return `${Math.round(pos.scroll_pct as number)}% read`;
         case "code_problem":
-            return `${pos.stage} \u00b7 ${pos.wrong_answer_count} WA`;
+            return `${pos.stage} · ${pos.wrong_answer_count} WA`;
         case "notebook":
             return `cell ${(pos.cell_index as number) + 1}`;
         case "pdf":

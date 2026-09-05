@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from uuid import UUID
@@ -165,7 +166,11 @@ async def test_direct_and_websocket_activation_emit_identical_domain_event(
 
     try:
         with patch("cortex.services.runtime_daemon.uuid4", return_value=_EVENT_ID):
-            direct_event = direct.activate_calibration_profile(
+            # D9: the SQLite sync bridge refuses event-loop callers, so the
+            # direct activation runs on a worker thread here exactly as the
+            # desktop controller must dispatch it.
+            direct_event = await asyncio.to_thread(
+                direct.activate_calibration_profile,
                 str(profile.profile_id),
                 expected_sha256=calibration_profile_sha256(profile),
             )

@@ -2,20 +2,38 @@
 State Engine — Trigger Policy
 
 Determines when interventions should be triggered based on state
-estimates, signal quality, cooldown periods, and dismissal tracking.
+estimates, evidence coverage, receptivity, cooldown periods, and
+dismissal tracking. Every number below is the ``InterventionConfig`` /
+``StateConfig`` default; the code reads the config, never these literals.
 
-Trigger conditions (all must be met):
-1. State is HYPER
-2. Confidence > 0.85
-3. Workspace complexity > 0.7
-4. Signal quality acceptable
-5. Cooldown period elapsed (60s since last intervention)
-6. Not in quiet mode (3 dismissals in 5 min → progressive quiet: 15/30/60 min)
-7. Dwell time met (15s in HYPER state — sustained overwhelm, not transient spikes)
+Shared interruption gate (applies to *every* proposal surface — the
+standard policy path, zombie-reading / rabbit-hole specials, LeetCode
+matrix actions — via :meth:`TriggerPolicy.check_interruption_gate`):
+1. Receptivity: no active microphone/call, no fullscreen app, no typing
+   burst (>= 10 s), inside work hours (07:00–22:00 local)
+2. Not in quiet mode (3 dismissals in 5 min → progressive quiet:
+   30/60/120 min) and not in a weekly-schedule ``quiet``/``off`` slot
+3. Cooldown elapsed (60 s since the last recorded intervention)
+4. Hourly cap not reached (6 interventions in the trailing hour)
+
+HYPER trigger conditions (all must be met, after the shared gate):
+1. Estimate status is ``estimated`` with evidence coverage >= 0.45
+2. Confidence >= effective threshold (``overlay_threshold`` 0.70 plus
+   active dismissal bumps and the bounded adaptive offset)
+3. Workspace complexity >= ``complexity_threshold`` (0.6) when known
+4. Dwell: the confidence has been *above the gate* for
+   ``hyper_dwell_seconds`` (30 s), bounded by the label's own dwell —
+   label age alone is not enough (a spike that only just crossed the
+   gate cannot borrow dwell from a long sub-threshold HYPER label)
+5. The dismissal model is not in a time-boxed, visible pause
 
 Adaptive behavior:
-- Each dismissal raises trigger threshold by +0.05 for 1 hour
-- 3 dismissals within 5 minutes → progressive quiet mode (15→30→60 min)
+- Each dismissal raises the trigger threshold by +0.05 for 1 hour
+- 3 dismissals within 5 minutes → progressive quiet mode (30→60→120 min)
+- When the online dismissal model predicts a likely dismissal
+  (>= 10 outcomes, p > 0.6) proposals pause for a stated, escalating
+  window; when the pause ends one probe proposal is allowed so the
+  user's response can retrain the model. Weights decay on every pause.
 """
 
 from __future__ import annotations
@@ -26,7 +44,7 @@ import threading
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -72,6 +90,15 @@ _DISMISSAL_FLUSH_EVERY_SECONDS: float = 30.0
 
 # F26: persisted quiet-mode-history record version.
 QUIET_MODE_HISTORY_VERSION: int = 2
+
+# Audit D8: the dismissal model no longer blocks indefinitely. Each pause
+# lasts ``quiet_mode_minutes × level`` (level escalates per consecutive pause
+# up to this multiplier) and the model weights decay by this factor on every
+# pause so a stale prediction cannot outlive the user's changed behaviour.
+DISMISSAL_PAUSE_MAX_LEVEL: int = 4
+DISMISSAL_PAUSE_WEIGHT_DECAY: float = 0.5
+# Minimum labelled outcomes before the dismissal model may pause proposals.
+DISMISSAL_MODEL_MIN_OUTCOMES: int = 10
 
 
 def _default_dismissal_model_path() -> Path:
@@ -126,6 +153,27 @@ class TriggerDecision:
     context_complexity: float | None = None
     receptivity_blocked: bool = False
     dismissal_probability: float | None = None
+    # Audit D8: wall-clock expiry of a visible dismissal-model pause
+    # (``None`` when no pause is active). UI surfaces render the resume
+    # time; ``reason`` carries the same information as prose.
+    paused_until_unix_ms: int | None = None
+
+
+@dataclass(frozen=True)
+class InterruptionGateDecision:
+    """Verdict of the shared interruption gate (audit D5).
+
+    Every proposal surface — the standard policy path, the zombie-reading
+    and rabbit-hole specials, and the LeetCode matrix — must pass this
+    gate before it may interrupt the user. ``evaluate`` applies it
+    internally; other surfaces call :meth:`TriggerPolicy.check_interruption_gate`.
+    """
+
+    allowed: bool
+    reason: str
+    cooldown_remaining: float
+    quiet_mode_active: bool
+    receptivity_blocked: bool = False
 
 
 class TriggerPolicy:
@@ -271,6 +319,22 @@ class TriggerPolicy:
         # dict means "no schedule armed" and every slot is implicitly
         # ``on``.
         self._weekly_schedule: dict[str, list[str]] = {}
+
+        # Audit D3: time-above-gate tracker. ``_gate_above_since`` is the
+        # policy-clock instant at which the HYPER confidence last crossed
+        # the effective threshold and has stayed there since; it resets
+        # whenever the confidence drops below the gate, the label leaves
+        # HYPER, or the estimate stops being ``estimated``. The dwell gate
+        # reads ``min(label dwell, now - _gate_above_since)`` so label age
+        # alone can never satisfy it.
+        self._gate_above_since: float | None = None
+        self._gate_prev_hyper: bool = False
+
+        # Audit D8: visible, time-boxed dismissal-model pause state.
+        self._dismissal_pause_until: float = 0.0
+        self._dismissal_pause_level: int = 0
+        self._dismissal_probe_pending: bool = False
+        self._dismissal_pause_dismissals: int = 0
 
     # ──────────────────────────────────────────────────────────────────
     # P0 §3.20: weekly schedule
@@ -438,14 +502,14 @@ class TriggerPolicy:
         # Compute effective threshold (base + dismissal bumps + adaptive feedback).
         effective_threshold = self._compute_effective_threshold(now)
         confidence = estimate.confidence
+        # Audit D3: advance the above-gate tracker on every observation,
+        # including ones a later gate rejects, so the dwell accrues while
+        # cooldown / quiet mode / receptivity hold the proposal back.
+        self._track_gate_dwell(estimate, effective_threshold, now)
         cooldown_remaining = max(
             0.0, self._last_intervention_time + self._config.cooldown_seconds - now
         )
-        quiet_active = (
-            self.is_quiet_mode
-            if current_time is None
-            else now < self._quiet_mode_until
-        )
+        quiet_active = self._quiet_active_at(now, synthetic=current_time is not None)
 
         # Evidence eligibility precedes every interruption/receptivity gate.
         # UNKNOWN, warm-up, and insufficient-evidence frames are observable
@@ -474,130 +538,26 @@ class TriggerPolicy:
                 context_complexity=context_complexity,
             )
 
-        # F25: drop intervention timestamps that fell out of the
-        # trailing-hour window so the count below reflects only the
-        # last 3600 s. ``deque`` is bounded by ``maxlen``, but we still
-        # prune by time to keep the window sharp.
-        self._prune_intervention_window(now)
-        recent_intervention_count = len(self._intervention_timestamps)
-        rate_limit_cap = int(getattr(
-            self._config, "max_interventions_per_hour", 6,
-        ))
-
-        # Receptivity gate (don't interrupt high-friction moments).
-        if self._config.receptivity_enforced:
-            if self._config.receptivity_block_if_mic_active and mic_active:
-                return TriggerDecision(
-                    should_trigger=False,
-                    reason="Receptivity gate: microphone/call active",
-                    confidence=confidence,
-                    cooldown_remaining=cooldown_remaining,
-                    quiet_mode_active=quiet_active,
-                    effective_threshold=effective_threshold,
-                    context_complexity=context_complexity,
-                    receptivity_blocked=True,
-                )
-            if self._config.receptivity_block_fullscreen and fullscreen_active:
-                return TriggerDecision(
-                    should_trigger=False,
-                    reason="Receptivity gate: fullscreen active",
-                    confidence=confidence,
-                    cooldown_remaining=cooldown_remaining,
-                    quiet_mode_active=quiet_active,
-                    effective_threshold=effective_threshold,
-                    context_complexity=context_complexity,
-                    receptivity_blocked=True,
-                )
-            if typing_burst_seconds >= self._config.receptivity_typing_burst_seconds:
-                return TriggerDecision(
-                    should_trigger=False,
-                    reason="Receptivity gate: active typing burst",
-                    confidence=confidence,
-                    cooldown_remaining=cooldown_remaining,
-                    quiet_mode_active=quiet_active,
-                    effective_threshold=effective_threshold,
-                    context_complexity=context_complexity,
-                    receptivity_blocked=True,
-                )
-            if not within_work_hours:
-                return TriggerDecision(
-                    should_trigger=False,
-                    reason="Receptivity gate: outside configured work hours",
-                    confidence=confidence,
-                    cooldown_remaining=cooldown_remaining,
-                    quiet_mode_active=quiet_active,
-                    effective_threshold=effective_threshold,
-                    context_complexity=context_complexity,
-                    receptivity_blocked=True,
-                )
-
-        # Check quiet mode
-        if quiet_active:
+        # Audit D5: one shared interruption gate (receptivity, quiet mode,
+        # weekly schedule, cooldown, hourly cap) for every proposal surface.
+        gate = self._interruption_gate(
+            now,
+            synthetic_time=current_time is not None,
+            mic_active=mic_active,
+            fullscreen_active=fullscreen_active,
+            typing_burst_seconds=typing_burst_seconds,
+            within_work_hours=within_work_hours,
+        )
+        if not gate.allowed:
             return TriggerDecision(
                 should_trigger=False,
-                reason="Quiet mode active",
+                reason=gate.reason,
                 confidence=confidence,
-                cooldown_remaining=cooldown_remaining,
-                quiet_mode_active=True,
+                cooldown_remaining=gate.cooldown_remaining,
+                quiet_mode_active=gate.quiet_mode_active,
                 effective_threshold=effective_threshold,
                 context_complexity=context_complexity,
-            )
-
-        # P0 §3.20: weekly schedule. ``off`` slots block every
-        # intervention outright; ``quiet`` slots are honoured by upstream
-        # PREVIEW-only callers (the receptivity gate already passed). A
-        # ``None`` slot (no schedule armed) preserves legacy behaviour.
-        #
-        # P1: the schedule slot lookup MUST use wall-clock day-of-week /
-        # hour, NOT ``current_time``. ``current_time`` is the monotonic
-        # cooldown clock (a monotonic instant); feeding it
-        # into ``datetime.fromtimestamp`` yields a garbage weekday/hour
-        # (monotonic epoch is process-boot-relative, not UNIX wall time)
-        # and mis-gates the weekly schedule. Pass no ``when`` so the
-        # lookup resolves against the injected local wall clock,
-        # decoupled from the cooldown clock.
-        slot_value = self.lookup_schedule_slot()
-        if slot_value == "off":
-            return TriggerDecision(
-                should_trigger=False,
-                reason="weekly_schedule_off",
-                confidence=confidence,
-                cooldown_remaining=cooldown_remaining,
-                quiet_mode_active=False,
-                effective_threshold=effective_threshold,
-                context_complexity=context_complexity,
-            )
-
-        # Check cooldown
-        if cooldown_remaining > 0:
-            return TriggerDecision(
-                should_trigger=False,
-                reason=f"Cooldown active ({cooldown_remaining:.0f}s remaining)",
-                confidence=confidence,
-                cooldown_remaining=cooldown_remaining,
-                quiet_mode_active=False,
-                effective_threshold=effective_threshold,
-                context_complexity=context_complexity,
-            )
-
-        # F25 (audit): hourly cap. A session sustaining more than
-        # ``max_interventions_per_hour`` triggers in the trailing hour
-        # is almost certainly oscillating, not in genuine sustained
-        # overwhelm. This gate is independent of the dismissal-driven
-        # quiet-mode (F26): it protects users who never dismiss but
-        # whose biometrics flutter at the threshold.
-        if rate_limit_cap > 0 and recent_intervention_count >= rate_limit_cap:
-            return TriggerDecision(
-                should_trigger=False,
-                reason=(
-                    f"Hourly intervention cap reached "
-                    f"({recent_intervention_count}/{rate_limit_cap} in last hour)"
-                ),
-                confidence=confidence,
-                cooldown_remaining=cooldown_remaining,
-                quiet_mode_active=False,
-                effective_threshold=effective_threshold,
-                context_complexity=context_complexity,
+                receptivity_blocked=gate.receptivity_blocked,
             )
 
         # ------------------------------------------------------------------
@@ -631,8 +591,8 @@ class TriggerPolicy:
             "RECOVERY": self._check_recovery_gates,
             "FLOW": self._reject_flow_state,
         }
-        gate = STATE_GATES.get(estimate.state, self._reject_flow_state)
-        return gate(
+        state_gate = STATE_GATES.get(estimate.state, self._reject_flow_state)
+        return state_gate(
             estimate,
             now=now,
             effective_threshold=effective_threshold,
@@ -643,6 +603,308 @@ class TriggerPolicy:
             hr_delta_pct=hr_delta_pct,
             enable_hypo_recovery_interventions=enable_hypo_recovery_interventions,
         )
+
+    # ------------------------------------------------------------------
+    # Audit D5: shared interruption gate.
+    # ------------------------------------------------------------------
+
+    def check_interruption_gate(
+        self,
+        *,
+        current_time: float | None = None,
+        mic_active: bool = False,
+        fullscreen_active: bool = False,
+        typing_burst_seconds: float = 0.0,
+        within_work_hours: bool = True,
+    ) -> InterruptionGateDecision:
+        """Shared gate for surfaces that bypass :meth:`evaluate`.
+
+        Zombie-reading, rabbit-hole, and LeetCode proposals decide *what*
+        to propose on their own detectors, but *whether the user may be
+        interrupted at all* is policy-owned: receptivity, quiet mode, the
+        weekly schedule, the cooldown, and the hourly cap apply uniformly.
+        Callers that present a proposal must then call
+        :meth:`record_intervention` so the cooldown/cap see it.
+        """
+        now = monotonic_seconds(self._clock) if current_time is None else current_time
+        return self._interruption_gate(
+            now,
+            synthetic_time=current_time is not None,
+            mic_active=mic_active,
+            fullscreen_active=fullscreen_active,
+            typing_burst_seconds=typing_burst_seconds,
+            within_work_hours=within_work_hours,
+        )
+
+    def _quiet_active_at(self, now: float, *, synthetic: bool) -> bool:
+        # A synthetic ``current_time`` (tests / replay) compares against the
+        # policy-clock expiry; the live path honours the bounded deadline
+        # that survives wall-clock rollback.
+        if synthetic:
+            return now < self._quiet_mode_until
+        return self.is_quiet_mode
+
+    def _interruption_gate(
+        self,
+        now: float,
+        *,
+        synthetic_time: bool,
+        mic_active: bool,
+        fullscreen_active: bool,
+        typing_burst_seconds: float,
+        within_work_hours: bool,
+    ) -> InterruptionGateDecision:
+        cooldown_remaining = max(
+            0.0, self._last_intervention_time + self._config.cooldown_seconds - now
+        )
+        quiet_active = self._quiet_active_at(now, synthetic=synthetic_time)
+
+        # F25: drop intervention timestamps that fell out of the
+        # trailing-hour window so the count below reflects only the
+        # last 3600 s. ``deque`` is bounded by ``maxlen``, but we still
+        # prune by time to keep the window sharp.
+        self._prune_intervention_window(now)
+        recent_intervention_count = len(self._intervention_timestamps)
+        rate_limit_cap = int(getattr(
+            self._config, "max_interventions_per_hour", 6,
+        ))
+
+        def blocked(
+            reason: str,
+            *,
+            quiet: bool = False,
+            receptivity: bool = False,
+        ) -> InterruptionGateDecision:
+            return InterruptionGateDecision(
+                allowed=False,
+                reason=reason,
+                cooldown_remaining=cooldown_remaining,
+                quiet_mode_active=quiet,
+                receptivity_blocked=receptivity,
+            )
+
+        # Receptivity gate (don't interrupt high-friction moments).
+        if self._config.receptivity_enforced:
+            if self._config.receptivity_block_if_mic_active and mic_active:
+                return blocked(
+                    "Receptivity gate: microphone/call active",
+                    quiet=quiet_active,
+                    receptivity=True,
+                )
+            if self._config.receptivity_block_fullscreen and fullscreen_active:
+                return blocked(
+                    "Receptivity gate: fullscreen active",
+                    quiet=quiet_active,
+                    receptivity=True,
+                )
+            if typing_burst_seconds >= self._config.receptivity_typing_burst_seconds:
+                return blocked(
+                    "Receptivity gate: active typing burst",
+                    quiet=quiet_active,
+                    receptivity=True,
+                )
+            if not within_work_hours:
+                return blocked(
+                    "Receptivity gate: outside configured work hours",
+                    quiet=quiet_active,
+                    receptivity=True,
+                )
+
+        # Check quiet mode
+        if quiet_active:
+            return blocked("Quiet mode active", quiet=True)
+
+        # P0 §3.20: weekly schedule. ``off`` slots block every
+        # intervention outright; ``quiet`` slots (audit D10) suppress
+        # interruptions exactly like quiet mode while sensing continues.
+        # A ``None`` slot (no schedule armed) preserves legacy behaviour.
+        #
+        # P1: the schedule slot lookup MUST use wall-clock day-of-week /
+        # hour, NOT ``now``. ``now`` is the monotonic cooldown clock;
+        # feeding it into ``datetime.fromtimestamp`` yields a garbage
+        # weekday/hour and mis-gates the weekly schedule. Pass no ``when``
+        # so the lookup resolves against the injected local wall clock,
+        # decoupled from the cooldown clock.
+        slot_value = self.lookup_schedule_slot()
+        if slot_value == "off":
+            return blocked("weekly_schedule_off")
+        if slot_value == "quiet":
+            return blocked("weekly_schedule_quiet", quiet=True)
+
+        # Check cooldown
+        if cooldown_remaining > 0:
+            return blocked(f"Cooldown active ({cooldown_remaining:.0f}s remaining)")
+
+        # F25 (audit): hourly cap. A session sustaining more than
+        # ``max_interventions_per_hour`` triggers in the trailing hour
+        # is almost certainly oscillating, not in genuine sustained
+        # overwhelm. This gate is independent of the dismissal-driven
+        # quiet-mode (F26): it protects users who never dismiss but
+        # whose biometrics flutter at the threshold.
+        if rate_limit_cap > 0 and recent_intervention_count >= rate_limit_cap:
+            return blocked(
+                f"Hourly intervention cap reached "
+                f"({recent_intervention_count}/{rate_limit_cap} in last hour)"
+            )
+
+        return InterruptionGateDecision(
+            allowed=True,
+            reason="interruption_gate_open",
+            cooldown_remaining=0.0,
+            quiet_mode_active=False,
+        )
+
+    # ------------------------------------------------------------------
+    # Audit D3: time-above-gate dwell.
+    # ------------------------------------------------------------------
+
+    def observe(
+        self,
+        estimate: StateEstimate,
+        *,
+        current_time: float | None = None,
+    ) -> None:
+        """Feed an estimate to the dwell trackers without evaluating gates.
+
+        The daemon calls this on ticks where no proposal can be made (no
+        workspace context yet) so the above-gate tracker never has an
+        unobserved gap that a later first observation would have to
+        credit from label age.
+        """
+        now = monotonic_seconds(self._clock) if current_time is None else current_time
+        self._record_hyper_transition(estimate.is_overwhelmed, now)
+        self._track_gate_dwell(estimate, self._compute_effective_threshold(now), now)
+
+    def _track_gate_dwell(
+        self,
+        estimate: StateEstimate,
+        threshold: float,
+        now: float,
+    ) -> None:
+        hyper_now = estimate.state == "HYPER" and estimate.status == "estimated"
+        above = hyper_now and estimate.confidence >= threshold
+        if not above:
+            self._gate_above_since = None
+        elif self._gate_above_since is None:
+            if self._gate_prev_hyper:
+                # The label was HYPER on the previous observation but the
+                # confidence was below the gate: the dwell starts now. This
+                # is the audit D3 case — a spike cannot borrow dwell from a
+                # sub-gate HYPER label.
+                self._gate_above_since = now
+            else:
+                # First observation of this HYPER episode. The policy has
+                # no evidence about the confidence history before it began
+                # observing, so it credits at most the label's own dwell;
+                # from here on only observed above-gate time counts.
+                self._gate_above_since = now - max(0.0, float(estimate.dwell_seconds))
+        self._gate_prev_hyper = hyper_now
+
+    def hyper_eligible(
+        self,
+        estimate: StateEstimate,
+        *,
+        current_time: float | None = None,
+    ) -> bool:
+        """Side-effect-free HYPER eligibility (evidence, confidence, dwell).
+
+        The daemon uses this to log a research *availability* decision point
+        (``eligible=True, available=False``) when the shared interruption gate
+        blocked an otherwise eligible estimate (audit D10). It never starts a
+        dismissal pause or consumes a probe.
+        """
+        now = monotonic_seconds(self._clock) if current_time is None else current_time
+        if estimate.state != "HYPER" or estimate.status != "estimated":
+            return False
+        if estimate.evidence_coverage < 0.45:
+            return False
+        threshold = self._compute_effective_threshold(now)
+        if estimate.confidence < threshold:
+            return False
+        dwell_required = self._hyper_dwell_seconds
+        if self._is_oscillating(now):
+            multiplier = float(getattr(self._config, "oscillation_dwell_multiplier", 2.0))
+            if multiplier > 1.0:
+                dwell_required *= multiplier
+        effective_dwell = min(float(estimate.dwell_seconds), self._seconds_above_gate(now))
+        return effective_dwell >= dwell_required
+
+    def _seconds_above_gate(self, now: float) -> float:
+        if self._gate_above_since is None:
+            return 0.0
+        return max(0.0, now - self._gate_above_since)
+
+    # ------------------------------------------------------------------
+    # Audit D8: visible, time-boxed dismissal-model pause.
+    # ------------------------------------------------------------------
+
+    @property
+    def dismissal_pause_active(self) -> bool:
+        return self._dismissal_pause_until > monotonic_seconds(self._clock)
+
+    def _pause_resume_unix_ms(self, now: float) -> int:
+        remaining = max(0.0, self._dismissal_pause_until - now)
+        return int(self._clock.unix_ms() + remaining * 1_000.0)
+
+    def _pause_reason(self, now: float, dismiss_prob: float) -> str:
+        resume_at = (
+            utc_datetime(self._clock).astimezone()
+            + timedelta(seconds=max(0.0, self._dismissal_pause_until - now))
+        )
+        return (
+            f"Paused after {self._dismissal_pause_dismissals} dismissals "
+            f"(predicted dismissal probability {dismiss_prob:.2f}); "
+            f"proposals resume at {resume_at.strftime('%H:%M')}"
+        )
+
+    def _dismissal_pause_verdict(self, now: float, dismiss_prob: float) -> str | None:
+        """Return a blocking reason, or ``None`` when a proposal may proceed.
+
+        State machine (no ``reset()`` required to recover):
+
+        * no pause → start one (escalating length, weights decayed) and
+          block with a reason that names the resume time;
+        * pause running → block with the same visible reason;
+        * pause expired → allow exactly one *probe* proposal so the user's
+          response can retrain the model. The probe is consumed by
+          :meth:`record_intervention`; an approval resets the escalation.
+        """
+        if self._dismissal_pause_until > now:
+            return self._pause_reason(now, dismiss_prob)
+        if self._dismissal_pause_until > 0.0:
+            # The pause just expired: arm the probe.
+            self._dismissal_pause_until = 0.0
+            self._dismissal_probe_pending = True
+        if self._dismissal_probe_pending:
+            return None
+        self._dismissal_pause_level = min(
+            self._dismissal_pause_level + 1, DISMISSAL_PAUSE_MAX_LEVEL
+        )
+        duration = (
+            max(1, int(self._config.quiet_mode_minutes)) * 60.0 * self._dismissal_pause_level
+        )
+        self._dismissal_pause_until = now + duration
+        self._dismissal_pause_dismissals = self._dismissals_total
+        self._decay_dismissal_model()
+        logger.info(
+            "Dismissal model paused proposals for %.0f min (level %d, p=%.2f)",
+            duration / 60.0,
+            self._dismissal_pause_level,
+            dismiss_prob,
+        )
+        return self._pause_reason(now, dismiss_prob)
+
+    def _decay_dismissal_model(self) -> None:
+        """Shrink the logistic weights toward the neutral prior (audit D8)."""
+        with self._dismissal_persist_lock:
+            self._dismissal_model_weights = tuple(  # type: ignore[assignment]
+                float(w * DISMISSAL_PAUSE_WEIGHT_DECAY) for w in self._dismissal_model_weights
+            )
+            snapshot = self._dismissal_model_weights
+            outcomes_snapshot = self._dismissal_outcomes
+            self._dismissal_updates_since_flush = 0
+            self._dismissal_last_flush_at = monotonic_seconds(self._clock)
+        self._persist_dismissal_model(snapshot, outcomes_snapshot)
 
     # ------------------------------------------------------------------
     # State-arm gates (P0 §3.5).
@@ -731,10 +993,18 @@ class TriggerPolicy:
             ))
             if multiplier > 1.0:
                 dwell_required *= multiplier
-        if estimate.dwell_seconds < dwell_required:
+        # Audit D3: the dwell that counts is the time the confidence has
+        # been above the trigger gate, bounded by the label's own dwell.
+        effective_dwell = min(
+            float(estimate.dwell_seconds), self._seconds_above_gate(now)
+        )
+        if effective_dwell < dwell_required:
             return TriggerDecision(
                 should_trigger=False,
-                reason=f"Dwell time {estimate.dwell_seconds:.1f}s < {dwell_required:.0f}s required",
+                reason=(
+                    f"Dwell time above gate {effective_dwell:.1f}s "
+                    f"< {dwell_required:.0f}s required"
+                ),
                 confidence=confidence,
                 cooldown_remaining=0.0,
                 quiet_mode_active=False,
@@ -744,19 +1014,22 @@ class TriggerPolicy:
 
         if (
             self._config.dismissal_model_enabled
-            and self._dismissal_outcomes >= 10
+            and self._dismissal_outcomes >= DISMISSAL_MODEL_MIN_OUTCOMES
             and dismiss_prob > self._config.dismissal_model_threshold
         ):
-            return TriggerDecision(
-                should_trigger=False,
-                reason=f"Predicted dismissal probability too high ({dismiss_prob:.2f})",
-                confidence=confidence,
-                cooldown_remaining=0.0,
-                quiet_mode_active=False,
-                effective_threshold=effective_threshold,
-                context_complexity=context_complexity,
-                dismissal_probability=dismiss_prob,
-            )
+            pause_reason = self._dismissal_pause_verdict(now, dismiss_prob)
+            if pause_reason is not None:
+                return TriggerDecision(
+                    should_trigger=False,
+                    reason=pause_reason,
+                    confidence=confidence,
+                    cooldown_remaining=0.0,
+                    quiet_mode_active=False,
+                    effective_threshold=effective_threshold,
+                    context_complexity=context_complexity,
+                    dismissal_probability=dismiss_prob,
+                    paused_until_unix_ms=self._pause_resume_unix_ms(now),
+                )
 
         # All conditions met — trigger intervention
         return TriggerDecision(
@@ -979,6 +1252,8 @@ class TriggerPolicy:
         # The deque is bounded by ``maxlen``; pruning by time happens
         # in evaluate().
         self._intervention_timestamps.append(now)
+        # Audit D8: a presented proposal consumes the post-pause probe.
+        self._dismissal_probe_pending = False
         logger.info(f"Intervention #{self._intervention_count} triggered")
 
     # ------------------------------------------------------------------
@@ -1116,6 +1391,11 @@ class TriggerPolicy:
             self._dismissals_total += 1
         else:
             self._approvals_total += 1
+            # Audit D8: an approval is the recovery signal — clear any
+            # pause escalation so the next pause (if ever) starts short.
+            self._dismissal_pause_level = 0
+            self._dismissal_pause_until = 0.0
+            self._dismissal_probe_pending = False
 
         # F27: a fallback-origin outcome is real user behaviour that the
         # quiet-mode counter and adaptive threshold should reflect, but
@@ -1461,25 +1741,36 @@ class TriggerPolicy:
         """
         Compute the effective trigger threshold.
 
-        Base threshold (0.85) + active dismissal bumps.
+        ``overlay_threshold`` (the configured base, 0.70 by default) plus
+        the active time-boxed dismissal bumps plus the bounded adaptive
+        feedback offset.
+
+        Audit D4: ``adaptive_threshold_min`` / ``_max`` bound how far the
+        *adaptive* terms may move the threshold; they never override the
+        configured base. A base below the adaptive floor (settings slider
+        at 0.55, ``overlay_threshold=0.70`` vs. the 0.75 floor) is honoured
+        as-is instead of being silently clipped upward.
+
+        Audit D8: a dismissal contributes either its active time-boxed
+        bump or its long-run feedback increment, never both at once.
         """
-        base = self._config.overlay_threshold
+        base = float(self._config.overlay_threshold)
 
         # Add active threshold bumps
-        total_bump = sum(
+        active_bumps = [
             bump for bump, expiry in self._threshold_bumps
             if expiry > now
-        )
+        ]
+        total_bump = sum(active_bumps)
 
         threshold = base + total_bump
         if self._config.adaptive_threshold_enabled:
-            feedback_offset = (self._dismissals_total - self._approvals_total) * 0.01
+            long_run_dismissals = max(0, self._dismissals_total - len(active_bumps))
+            feedback_offset = (long_run_dismissals - self._approvals_total) * 0.01
             threshold += float(np.clip(feedback_offset, -0.10, 0.10))
-            threshold = float(np.clip(
-                threshold,
-                self._config.adaptive_threshold_min,
-                self._config.adaptive_threshold_max,
-            ))
+            floor = min(base, float(self._config.adaptive_threshold_min))
+            ceiling = max(base, float(self._config.adaptive_threshold_max))
+            threshold = float(np.clip(threshold, floor, ceiling))
         # Cap at reasonable maximum
         return min(0.99, threshold)
 
@@ -1516,6 +1807,12 @@ class TriggerPolicy:
         self._dismissals_total = 0
         self._approvals_total = 0
         self._dismissal_model_weights = (0.0, 0.0, 0.0)
+        self._dismissal_pause_until = 0.0
+        self._dismissal_pause_level = 0
+        self._dismissal_probe_pending = False
+        self._dismissal_pause_dismissals = 0
+        self._gate_above_since = None
+        self._gate_prev_hyper = False
         # F21: also clear the persisted record so a subsequent restart
         # does not re-hydrate the model we just wiped.
         try:

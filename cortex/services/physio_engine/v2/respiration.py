@@ -14,7 +14,6 @@ from numpy.typing import NDArray
 from scipy.signal import detrend, hilbert, welch
 
 from cortex.libs.schemas.physiology import (
-    EstimateUncertainty,
     EvidenceStatus,
     PhysiologyMetric,
     SignalAlgorithmIdentity,
@@ -26,6 +25,7 @@ from cortex.services.physio_engine.v2.provenance import (
     code_sha256,
     configuration_sha256,
 )
+from cortex.services.physio_engine.v2.uncertainty import heuristic_interval
 
 
 @dataclass(frozen=True)
@@ -310,10 +310,11 @@ class RespirationFusionV2:
                     status=EvidenceStatus.EXPERIMENTAL,
                     quality=float(min(item.quality for item in usable.values())),
                     algorithm=self._identities["fusion"],
-                    uncertainty=EstimateUncertainty(
+                    # Deterministic heuristic bound (disagreement and spectral
+                    # resolution), not a statistical interval; see uncertainty.py.
+                    uncertainty=heuristic_interval(
                         lower=max(0.0, rate - half_width),
                         upper=rate + half_width,
-                        confidence_level=0.95,
                         method="channel-agreement-and-spectral-resolution-bound",
                     ),
                     window_start_mono_ns=start_ns,
@@ -351,10 +352,11 @@ class RespirationFusionV2:
             status=EvidenceStatus.EXPERIMENTAL,
             quality=estimate.quality,
             algorithm=self._identities[name],
-            uncertainty=EstimateUncertainty(
+            # Deterministic heuristic bound (spectral resolution), not a
+            # statistical interval; see uncertainty.py.
+            uncertainty=heuristic_interval(
                 lower=max(0.0, estimate.rate_bpm - half_width),
                 upper=estimate.rate_bpm + half_width,
-                confidence_level=0.95,
                 method="spectral-resolution-bound",
             ),
             window_start_mono_ns=start_ns,

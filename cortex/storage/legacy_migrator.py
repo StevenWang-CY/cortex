@@ -19,7 +19,11 @@ from cortex.libs.schemas.session_report import SessionReport
 from cortex.services.capture_service.calibration_store import (
     calibration_profile_sha256,
 )
-from cortex.storage.database import SQLiteDatabase, StorageCorruptionError
+from cortex.storage.database import (
+    DEFAULT_SESSION_RETENTION_DAYS,
+    SQLiteDatabase,
+    StorageCorruptionError,
+)
 from cortex.storage.intervention_store import _atomic_copy_bytes
 
 _ZERO_BOOT_ID = UUID("00000000-0000-0000-0000-000000000000")
@@ -60,7 +64,10 @@ class LegacyDataMigrator:
         *,
         storage_root: str | Path,
         clock: Clock | None = None,
-        session_retention_days: int = 7,
+        # D6: the daemon threads ``StorageConfig.session_retention_days``
+        # through; the fallback matches the in-code default so a caller
+        # that omits it does not silently expire aggregates after a week.
+        session_retention_days: int = DEFAULT_SESSION_RETENTION_DAYS,
     ) -> None:
         self._database = database
         self._root = Path(storage_root).expanduser().resolve()

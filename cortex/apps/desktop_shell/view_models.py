@@ -35,6 +35,51 @@ class ConsumerStateViewModel:
     connected_surfaces: frozenset[str]
 
 
+_PULSE_MISSING_REASON_COPY: dict[str, str] = {
+    "no_face": "Stay in view for a pulse reading",
+    "low_light": "Too dark for a pulse reading — add some light",
+    "saturated": "Too bright for a pulse reading — reduce glare",
+    "motion": "Hold still for a pulse reading",
+    "occluded": "Face partly covered — clear the camera's view",
+    "camera_warmup": "Camera warming up…",
+    "frame_dropped": "Camera frames are dropping — close other camera apps",
+    "permission": "Camera permission needed for a pulse reading",
+    "source_disconnected": "Camera disconnected",
+}
+
+
+def pulse_unavailable_copy(reason: Any) -> str:
+    """Turn a ``PulseReadinessReason`` payload into calm consumer copy.
+
+    v0.4.0 (audit S10): the daemon now says *why* a pulse is unavailable; a
+    permanent "Reading your pulse…" was a lie whenever the window could never
+    become ready (low light, frequent face loss, sub-sampled capture).
+    """
+
+    default = "Reading your pulse…"
+    if not isinstance(reason, Mapping):
+        return default
+    code = str(reason.get("code") or "")
+    missing = str(reason.get("missing_reason") or "").lower()
+    if code == "filling":
+        observed = _number(reason.get("observed"))
+        required = _number(reason.get("required"))
+        if observed is not None and required and required > 0:
+            return f"Reading your pulse… {min(observed, required):.0f} of {required:.0f} s"
+        return default
+    if code in {"no_observations", "duplicate_timestamps", "too_few_valid_samples"}:
+        return default if code != "no_observations" else "Waiting for the camera…"
+    if code == "motion_fraction_above_cap":
+        return _PULSE_MISSING_REASON_COPY["motion"]
+    if missing in _PULSE_MISSING_REASON_COPY:
+        return _PULSE_MISSING_REASON_COPY[missing]
+    if code == "gap_too_long":
+        return _PULSE_MISSING_REASON_COPY["no_face"]
+    if code == "valid_fraction_below_gate":
+        return "Not enough usable frames yet — stay in view with steady light"
+    return default
+
+
 def consumer_state_view(payload: Mapping[str, Any]) -> ConsumerStateViewModel:
     capture = _mapping(payload.get("capture"))
     store = _mapping(payload.get("store"))
@@ -71,7 +116,7 @@ def consumer_state_view(payload: Mapping[str, Any]) -> ConsumerStateViewModel:
         elif not bool(capture.get("face_detected", True)):
             bio_status = "Looking for your face…"
         else:
-            bio_status = "Reading your pulse…"
+            bio_status = pulse_unavailable_copy(capture.get("pulse_unavailable"))
     else:
         bio_status = None
 

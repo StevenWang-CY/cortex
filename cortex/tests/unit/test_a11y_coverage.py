@@ -88,8 +88,9 @@ def test_connections_panel_accessibility(qapp):
         for widget in panel._tab_order_chain:
             name = widget.accessibleName()
             assert name, f"{widget!r} has no accessibleName"
-        # Back button is first.
-        assert panel._tab_order_chain[0].accessibleName() == "Back to dashboard"
+        # The window has no "Back" (Escape closes it); the first stop is
+        # the first browser's Connect action.
+        assert panel._tab_order_chain[0].accessibleName().startswith("Connect ")
     finally:
         panel.deleteLater()
 

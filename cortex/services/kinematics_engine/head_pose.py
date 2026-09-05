@@ -12,8 +12,21 @@ import cv2
 import numpy as np
 from numpy.typing import NDArray
 
+from cortex.libs.signal.angles import circular_mean_deg, wrapped_angle_delta
+
+__all__ = [
+    "HeadPoseEstimator",
+    "HeadPoseResult",
+    "circular_mean_deg",
+    "wrapped_angle_delta",
+]
+
 logger = logging.getLogger(__name__)
 
+# Generic 3D face model in the *anthropometric* convention used by most
+# published tables: x right, y up, z toward the camera (millimetres).
+# Order: nose tip, chin, left eye outer corner, right eye outer corner,
+# left mouth corner, right mouth corner.
 _MODEL_POINTS_3D = np.array(
     [
         [0.0, 0.0, 0.0],
@@ -25,6 +38,14 @@ _MODEL_POINTS_3D = np.array(
     ],
     dtype=np.float64,
 )
+# OpenCV camera coordinates are x right, y *down*, z *away* from the camera,
+# i.e. the model above rotated by 180 degrees about x.  Solving PnP against
+# the un-rotated table made a frontal face resolve to R = Rx(180 deg), so
+# pitch sat at +/-180 deg and wrapped through the neutral pose.  Solving
+# against the camera-convention model makes a frontal face (0, 0, 0) and
+# head flexion (looking down: forehead toward the camera, chin tucked)
+# a positive pitch.
+_MODEL_POINTS_3D_CAMERA = _MODEL_POINTS_3D * np.array([1.0, -1.0, -1.0])
 _PNP_LANDMARK_INDICES = [1, 152, 33, 263, 61, 291]
 
 
@@ -163,7 +184,7 @@ class HeadPoseEstimator:
         image_points: NDArray[np.float64],
     ) -> tuple[float, float, float]:
         success, rotation_vec, _translation_vec = cv2.solvePnP(
-            _MODEL_POINTS_3D,
+            _MODEL_POINTS_3D_CAMERA,
             image_points,
             self._camera_matrix,
             self._dist_coeffs,
@@ -197,7 +218,7 @@ class HeadPoseEstimator:
 
     @staticmethod
     def _wrapped_delta(current: float, previous: float) -> float:
-        return (current - previous + 180.0) % 360.0 - 180.0
+        return wrapped_angle_delta(current, previous)
 
     def _prune(self, now: float) -> None:
         cutoff = now - self._history_seconds

@@ -19,7 +19,16 @@ class PhysiologyEngineV2:
         config: RPPGSignalConfig,
         *,
         registry: RPPGBackendRegistry | None = None,
+        max_motion_face_widths_per_second: float | None = None,
     ) -> None:
+        """Build the pulse and respiration pipelines for one fixed backend.
+
+        ``max_motion_face_widths_per_second`` is the window-mean facial
+        translation speed above which a pulse window is not published; pass
+        ``CaptureConfig.max_motion_face_widths_per_second`` so the window gate
+        agrees with the per-frame motion gate.  ``None`` keeps the pulse
+        pipeline default.
+        """
         if config.dynamic_backend_selection:
             raise BackendValidationError(
                 "dynamic rPPG backend selection has no held-out validation artifact; "
@@ -30,6 +39,11 @@ class PhysiologyEngineV2:
             config.backend,
             expected_implementation_sha256=config.backend_expected_sha256,
         )
+        pulse_kwargs: dict[str, float] = {}
+        if max_motion_face_widths_per_second is not None:
+            pulse_kwargs["max_motion_face_widths_per_second"] = float(
+                max_motion_face_widths_per_second
+            )
         self.pulse = PulsePipelineV2(
             backend,
             low_hz=config.bandpass_low,
@@ -39,6 +53,7 @@ class PhysiologyEngineV2:
             experimental_hrv_enabled=config.experimental_hrv_enabled,
             hrv_min_window_seconds=float(config.hrv_min_window_seconds),
             hrv_min_valid_ibi=config.hrv_min_valid_ibi,
+            **pulse_kwargs,
         )
         self.respiration = RespirationFusionV2(
             backend,

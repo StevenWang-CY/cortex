@@ -221,13 +221,27 @@ class TestValidateInterventionPlan(unittest.TestCase):
         assert plan.level == "simplified_workspace"
         assert plan.is_valid
 
-    def test_normalization_adds_defaults(self):
-        """Missing optional fields should get defaults."""
-        data = {"level": "overlay_only"}
+    def test_missing_required_fields_are_not_fabricated(self):
+        """Audit D9: the required narrative fields are never invented, so a
+        bare ``{"level": ...}`` (or ``{}``) must fail validation instead of
+        becoming a live plan with placeholder text."""
+        assert validate_intervention_plan({"level": "overlay_only"}) is None
+        assert validate_intervention_plan({}) is None
+
+    def test_normalization_adds_optional_defaults(self):
+        """Only optional presentation fields get defaults."""
+        data = {
+            "level": "overlay_only",
+            "situation_summary": "Test",
+            "headline": "Test",
+            "primary_focus": "Test",
+            "micro_steps": ["step"],
+        }
         plan = validate_intervention_plan(data)
         assert plan is not None
-        assert plan.headline == "Focus on the current task"
-        assert len(plan.micro_steps) >= 1
+        assert plan.tone == "direct"
+        assert plan.hide_targets == []
+        assert plan.ui_plan.intervention_type == "overlay_only"
 
     def test_normalization_clamps_steps(self):
         """More than 3 steps should be clamped to 3."""
@@ -255,11 +269,9 @@ class TestValidateInterventionPlan(unittest.TestCase):
         assert plan.level == "guided_mode"
 
     def test_wrong_schema_returns_none(self):
-        """Data with no usable fields should still get normalized and succeed."""
+        """Data with no usable fields fails validation (audit D9)."""
         data = {"action": "simplify", "message": "hi"}
-        plan = validate_intervention_plan(data)
-        # Normalization adds defaults, so this should succeed
-        assert plan is not None
+        assert validate_intervention_plan(data) is None
 
     def test_parse_and_validate_end_to_end(self):
         plan = parse_and_validate(VALID_PLAN_JSON)
@@ -267,7 +279,10 @@ class TestValidateInterventionPlan(unittest.TestCase):
         assert plan.level == "simplified_workspace"
 
     def test_parse_and_validate_malformed(self):
-        raw = '{"level": "overlay_only", "headline": "Test"'  # missing brace
+        raw = (
+            '{"level": "overlay_only", "headline": "Test", '
+            '"situation_summary": "S", "primary_focus": "P", "micro_steps": ["a"]'
+        )  # missing closing brace
         plan = parse_and_validate(raw)
         assert plan is not None
         assert plan.level == "overlay_only"

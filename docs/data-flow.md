@@ -1,6 +1,6 @@
 # Data flow and deletion map
 
-This document names the implemented flows in Cortex 0.3.14. The canonical
+This document names the implemented flows in Cortex 0.4.0. The canonical
 external-context disclosure is [cortex/docs/privacy.md](../cortex/docs/privacy.md);
 security controls are in [cortex/docs/security.md](../cortex/docs/security.md).
 
@@ -34,7 +34,7 @@ flowchart LR
 | Browser activity | Sanitized title/origin/path, tab type, dwell/resume metadata | Browser local storage capped at 200 records | Metadata only when selected and previewed |
 | Browser page content | Bounded active-page excerpt after exact origin permission | Current snapshot only; revocation scrubs content fields | Only when selected, redacted, previewed, and confirmed once |
 | Editor | Basename/symbol/diagnostic metadata; optional bounded visible code | Current snapshot; no repository mirror | Selected fields only through broker |
-| Terminal | Detected bounded error summary | Current snapshot | Selected error summary only; no command history/raw terminal |
+| Terminal | Not collected: the editor extension reads no terminal output or command history, and the daemon's terminal adapter has no producer | — | Never |
 | User goal/note | User-entered bounded text | Current session/settings as applicable | Only when selected and previewed |
 | Credentials | Provider-standard environment during construction or macOS Keychain | Keychain/provider store | Only to the selected provider's authentication endpoint |
 

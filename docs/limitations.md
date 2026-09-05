@@ -1,6 +1,6 @@
 # Product and evidence limitations
 
-Last reviewed: 2026-08-30. Cortex 0.3.14 is an alpha research prototype for
+Last reviewed: 2026-09-04. Cortex 0.4.0 is an alpha research prototype for
 local, user-controlled workspace support. It is not a medical device, clinical
 tool, productivity judge, accessibility accommodation, or validated estimator
 of cognition.
@@ -77,9 +77,10 @@ attest those external settings. See the [privacy disclosure](../cortex/docs/priv
   order cannot silently change the runtime OpenCV major. That final Intel
   MediaPipe wheel also constrains Protobuf to a release affected by
   `PYSEC-2026-1805`; Cortex does not expose the affected Protobuf JSON parser,
-  and a real-model smoke plus an Intel-only audit exception constrain the risk
-  through 2026-09-22. Intel release support must change or adopt a compatible
-  patched backend before that date.
+  and a real-model smoke plus an Intel-only audit exception constrain the risk.
+  The exception is re-reviewed on a dated schedule (currently through
+  2026-10-15) and is never extended silently; Intel release support must
+  change or adopt a compatible patched backend before it lapses.
 - Browser integration targets current Chrome/Edge MV3 behavior; browser
   updates, enterprise policy, service-worker suspension, and native-host
   installation can affect operation.

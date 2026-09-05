@@ -38,7 +38,7 @@ import logging
 from pathlib import Path as FilePath
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException, Path, Request
+from fastapi import APIRouter, Depends, HTTPException, Path, Request
 from fastapi.responses import Response
 
 from cortex.application.clock import Clock, clock_or_system, utc_datetime
@@ -121,6 +121,7 @@ from cortex.libs.schemas.storage import (
 )
 from cortex.libs.schemas.temporal import EventTime
 from cortex.libs.schemas.ws_message_types import MessageType
+from cortex.services.api_gateway.auth import require_capability_token
 from cortex.services.eval.policy_diagnostics import generate_daily_policy_diagnostics
 from cortex.services.eval.research_analysis import (
     ResearchExportError,
@@ -221,6 +222,10 @@ def _get_clock(request: Request) -> Clock:
 # Debt-2 closure in ``audit/execution-log.md``.
 router = APIRouter()
 health_router = APIRouter()
+# D12: ``/metrics`` exposes biometric-derived counters, so it carries the
+# capability-token dependency *on the router itself* — the gate holds no
+# matter how the router is mounted (``app.py`` or a test harness).
+metrics_router = APIRouter(dependencies=[Depends(require_capability_token)])
 
 
 # =============================================================================
@@ -410,7 +415,18 @@ async def _build_snapshot_for_plan(
 
 @health_router.get("/health", response_model=HealthResponse)
 async def health_check(request: Request) -> HealthResponse:
-    """Health check for all services."""
+    """Liveness/readiness probe — unauthenticated, unlimited, and therefore DB-free.
+
+    D4: this route used to await ``storage_maintenance.health()`` — a
+    ``PRAGMA quick_check`` (O(database)) plus record counts on the single
+    SQLite worker — on every call, from any localhost origin, with no
+    rate limit. Everything reported here now comes from in-memory state:
+    readiness (``ready``), whether the WS server listens
+    (``ws_listening``), the capture pipeline state, the operator
+    counters, and the *cached* storage snapshot from the last
+    authenticated ``GET /storage/status`` probe. The live integrity probe
+    stays on ``/storage/status``.
+    """
     reg = _get_registry(request)
     services: dict[str, str] = {}
 
@@ -434,7 +450,11 @@ async def health_check(request: Request) -> HealthResponse:
     camera_recovery_successes = 0
     store_degraded = False
     storage_report: StorageHealthReport | None = None
+    capture_state: Literal["running", "stale", "stopped", "unavailable"] = "unavailable"
     daemon = reg.get("daemon") if hasattr(reg, "get") else None
+    ready = bool(getattr(daemon, "is_ready", False)) if daemon is not None else bool(reg.healthy)
+    ws_server = reg.get("ws_server") if hasattr(reg, "get") else None
+    ws_listening = bool(getattr(ws_server, "is_running", False)) if ws_server is not None else False
     if daemon is not None:
         duplicate_acks = int(getattr(daemon, "_duplicate_intervention_ack_count", 0) or 0)
         store_degraded = bool(getattr(daemon, "_store_degraded", False))
@@ -449,14 +469,21 @@ async def health_check(request: Request) -> HealthResponse:
             camera_recovery_successes = int(
                 getattr(pipeline, "camera_recovery_successes", 0) or 0
             )
+            if capture_stale:
+                capture_state = "stale"
+            elif bool(getattr(pipeline, "is_running", False)):
+                capture_state = "running"
+            else:
+                capture_state = "stopped"
+    # D4: never probe the database from here. Report the cached snapshot
+    # left behind by the last authenticated ``/storage/status`` call.
     storage_maintenance = reg.get("storage_maintenance") if hasattr(reg, "get") else None
-    if storage_maintenance is not None and hasattr(storage_maintenance, "health"):
-        try:
-            storage_report = await storage_maintenance.health()
-            store_degraded = store_degraded or storage_report.degraded
-        except Exception:
-            logger.warning("Storage health probe failed", exc_info=True)
-            store_degraded = True
+    cached_report = getattr(storage_maintenance, "last_health_report", None)
+    if isinstance(cached_report, StorageHealthReport):
+        storage_report = cached_report
+        store_degraded = store_degraded or storage_report.degraded
+    if reg.get("store_healthy") is False:
+        store_degraded = True
 
     clock = _get_clock(request)
     app_state = getattr(getattr(request, "app", None), "state", None)
@@ -472,6 +499,9 @@ async def health_check(request: Request) -> HealthResponse:
         services=services,
         uptime_seconds=uptime_seconds,
         version=_resolve_daemon_version(),
+        ready=ready,
+        ws_listening=ws_listening,
+        capture_state=capture_state,
         duplicate_intervention_acks=duplicate_acks,
         frames_dropped_total=frames_dropped_total,
         capture_stale=capture_stale,
@@ -629,14 +659,17 @@ async def research_mrt_analyze(
     )
 
 
-@health_router.get("/metrics")
+@metrics_router.get("/metrics")
 async def prometheus_metrics() -> Response:
     """P1-19: Prometheus metrics endpoint.
 
     Serves the full prometheus_client default registry in the standard
-    text exposition format (text/plain; version=0.0.4).  Mounted on the
-    public ``health_router`` (no auth) so a Prometheus scraper can reach
-    it without a capability token.
+    text exposition format (text/plain; version=0.0.4).  D12: mounted on
+    ``metrics_router``, which requires the capability token — the
+    counters are derived from the user's biometrics (state transitions,
+    interventions, capture drops) and must not be readable by any
+    localhost origin. A local Prometheus scraper presents the token via
+    ``authorization_credentials`` like every other client.
 
     Guaranteed metrics:
       cortex_ws_coalesce_drops_total
@@ -1941,6 +1974,36 @@ _FEEDBACK_USER_PATH_RE = _re.compile(r"/Users/[^/\s'\")]+")
 _feedback_log_read_failures: int = 0
 
 
+_LOG_TAIL_MAX_LINES = 1000
+_LOG_TAIL_MAX_BYTES = 512 * 1024
+
+
+def _read_log_tail(
+    log_path: FilePath,
+    *,
+    max_lines: int = _LOG_TAIL_MAX_LINES,
+    max_bytes: int = _LOG_TAIL_MAX_BYTES,
+) -> list[str]:
+    """Return the last ``max_lines`` lines of ``log_path`` reading at most ``max_bytes``.
+
+    D9: the previous implementation ``read_text()``-ed the entire daemon
+    log (which grows for the life of an install) on the event-loop
+    thread. This reads only a bounded tail and is meant to be dispatched
+    with ``asyncio.to_thread``. Raises ``OSError`` like the original so
+    the caller's failure accounting is unchanged.
+    """
+    with log_path.open("rb") as handle:
+        handle.seek(0, 2)
+        size = handle.tell()
+        handle.seek(max(0, size - max_bytes))
+        data = handle.read()
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    if size > max_bytes and lines:
+        # The first line is almost certainly cut mid-way; drop it.
+        lines = lines[1:]
+    return lines[-max_lines:]
+
+
 def _scrub_log_tail(lines: list[str]) -> list[str]:
     """Apply the §3.24 PII scrubs in place; return the cleaned list."""
     out: list[str] = []
@@ -1988,10 +2051,8 @@ async def submit_feedback(
         log_path = _Path.home() / "Library" / "Logs" / "Cortex" / "cortex_daemon.log"
         try:
             if log_path.exists():
-                lines = log_path.read_text(
-                    encoding="utf-8",
-                    errors="replace",
-                ).splitlines()[-1000:]
+                # D9: bounded tail, read off the event loop.
+                lines = await asyncio.to_thread(_read_log_tail, log_path)
                 record["log_tail"] = _scrub_log_tail(lines)
         except OSError as exc:
             # B5 (Phase 4.1): elevate to WARNING with structured fields.

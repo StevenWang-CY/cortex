@@ -92,7 +92,6 @@ class RuleScorer:
     ) -> None:
         self._config = config or StateConfig()
         self._baselines = baselines or UserBaselines()
-        self._weights = self._config.weights
         # Optional tab category context for same-category discount
         self._tab_categories: list[str] | None = None
 
@@ -484,302 +483,14 @@ class RuleScorer:
         }
         return values
 
-    def _compute_hyper_score(self, fv: FeatureVector) -> float:
-        """
-        Compute hyper-arousal (overwhelm) score.
-
-        Weighted sum of 7 sub-scores per spec.
-        """
-        w = self._weights
-
-        s1 = self.score_pulse_elevation(fv.hr)
-        s2 = self.score_hrv_drop(fv.hrv_rmssd)
-        s3 = self.score_blink_suppression(fv.blink_rate, hr=fv.hr)
-        s4 = self.score_posture_collapse(fv.forward_lean_angle, fv.shoulder_drop_ratio)
-        s5 = self.score_mouse_thrash(fv.mouse_velocity_variance)
-        s6_switch = self.score_window_switch(fv.tab_switch_frequency)
-        s6_thrash = fv.thrashing_score  # 0-1, from focus graph
-        # Blend: thrashing_score is more accurate when available
-        s6 = (0.6 * s6_thrash + 0.4 * s6_switch) if s6_thrash > 0.1 else s6_switch
-
-        # Same-category discount: switching between tabs of the same type
-        # (e.g., all educational) is topically coherent, not thrashing.
-        cat_ratio = self._same_category_ratio()
-        if cat_ratio > 0.6:
-            # Discount proportional to homogeneity (max 50% reduction)
-            discount = 0.5 * cat_ratio
-            s6 *= (1.0 - discount)
-        s7 = self.score_workspace_complexity(fv)
-
-        # Weighted sum (weights should sum to 1.0)
-        total = (
-            w.pulse_elevation * s1
-            + w.hrv_drop * s2
-            + w.blink_suppression * s3
-            + w.posture_collapse * s4
-            + w.mouse_thrashing * s5
-            + w.window_switching * s6
-            + w.workspace_complexity * s7
-        )
-
-        return float(np.clip(total, 0.0, 1.0))
-
-    def _compute_hypo_score(self, fv: FeatureVector) -> float:
-        """
-        Compute hypo-arousal (under-arousal/disengagement) score.
-
-        Indicators: HR below baseline, HRV dropping, high blink rate,
-        mouse drift (low velocity), long pauses, posture slump.
-        """
-        scores = []
-
-        # HR below baseline
-        if fv.hr is not None:
-            hr_ratio = fv.hr / self._baselines.hr_baseline
-            if hr_ratio < 0.95:
-                scores.append(min(1.0, (0.95 - hr_ratio) / 0.15))
-            else:
-                scores.append(0.0)
-
-        # High blink rate (> 25/min)
-        if fv.blink_rate is not None:
-            if fv.blink_rate > 25.0:
-                scores.append(min(1.0, (fv.blink_rate - 25.0) / 15.0))
-            else:
-                scores.append(0.0)
-
-        # Low mouse velocity (mouse drift / inactivity).
-        # P1 Pipeline A: same telemetry warm-up gate as the window-switch
-        # branch below. Pre-warm-up, mouse_velocity_mean defaults to 0.0
-        # because no telemetry update has populated it yet.
-        if fv.telemetry_seen_count >= 5:
-            if fv.mouse_velocity_mean < 50.0:
-                scores.append(0.8)
-            elif fv.mouse_velocity_mean < 200.0:
-                scores.append(max(0.0, (200.0 - fv.mouse_velocity_mean) / 200.0))
-            else:
-                scores.append(0.0)
-
-        # Posture slump (shoulder drop without forward lean).
-        # P1 Pipeline A: when forward_lean_angle is None we cannot score
-        # posture HYPO from shoulder drop alone — a user simply looking
-        # away from the camera should not be flagged as disengaged.
-        if (
-            fv.shoulder_drop_ratio is not None
-            and fv.shoulder_drop_ratio > 0.1
-            and fv.forward_lean_angle is not None
-        ):
-            lean = fv.forward_lean_angle
-            if lean < 15.0:  # Slump without leaning forward
-                scores.append(min(1.0, fv.shoulder_drop_ratio / 0.3))
-            else:
-                scores.append(0.0)
-
-        # Low window switching (minimal engagement).
-        # P1 Pipeline A: only score telemetry HYPO contributions after
-        # the warm-up gate (>= 5 telemetry samples seen). Cold start
-        # always reads tab_switch_frequency=0 and would otherwise score
-        # HYPO during the very first seconds of a session.
-        if fv.telemetry_seen_count >= 5 and fv.tab_switch_frequency < 2.0:
-            scores.append(0.3)
-        elif fv.telemetry_seen_count >= 5:
-            scores.append(0.0)
-
-        if not scores:
-            return 0.0
-
-        return float(np.clip(np.mean(scores), 0.0, 1.0))
-
-    def _compute_flow_score(self, fv: FeatureVector) -> float:
-        """
-        Compute flow (optimal engagement) score.
-
-        Evidence-aligned signature:
-        - HR in a narrow band around baseline (moderate arousal)
-        - HRV near personal baseline (not stress-low and not boredom-high extremes)
-        - Slight blink suppression vs baseline
-        - Low correction and low mouse chaos
-        - Moderate tab switching (context engagement without thrashing)
-        """
-        scores = []
-
-        # HR near baseline (+/-8%).
-        if fv.hr is not None:
-            hr_deviation = abs(fv.hr - self._baselines.hr_baseline) / max(1e-6, self._baselines.hr_baseline)
-            if hr_deviation <= 0.08:
-                scores.append(1.0 - (hr_deviation / 0.08))
-            else:
-                scores.append(0.0)
-
-        # HRV around personal center (mu +/- 0.5 sigma).
-        if fv.hrv_rmssd is not None:
-            hrv_sigma = self._metric_sigma("hrv_rmssd", fallback=max(6.0, self._baselines.hrv_baseline * 0.2))
-            z = abs((fv.hrv_rmssd - self._baselines.hrv_baseline) / max(1e-6, hrv_sigma))
-            if z <= 0.5:
-                scores.append(1.0 - (z / 0.5))
-            elif z <= 1.5:
-                scores.append(max(0.0, 0.5 - ((z - 0.5) / 2.0)))
-            else:
-                scores.append(0.0)
-
-        # Mild blink suppression relative to baseline.
-        if fv.blink_rate is not None:
-            ratio = fv.blink_rate / max(1e-6, self._baselines.blink_rate_baseline)
-            if 0.55 <= ratio <= 0.95:
-                scores.append(1.0 - abs(ratio - 0.75) / 0.20)
-            elif 0.45 <= ratio <= 1.10:
-                scores.append(0.4)
-            else:
-                scores.append(0.0)
-
-        # Low mouse variance (focused, not erratic).
-        # P1: same telemetry warm-up gate as the HYPO branches
-        # (``_compute_hypo_score`` lines ~189/217). Before 5 telemetry
-        # samples have been seen, ``mouse_velocity_variance`` defaults to
-        # 0.0 (no input-device update has populated it), which is < every
-        # ``mouse_variance_baseline * 1.2`` and would fabricate a 0.8 FLOW
-        # contribution on a telemetry-off / cold-start session. Skip the
-        # branch entirely until telemetry is warm so FLOW does not accrue
-        # from a fake "perfectly steady mouse" reading.
-        if fv.telemetry_seen_count >= 5:
-            if fv.mouse_velocity_variance < self._baselines.mouse_variance_baseline * 1.2:
-                scores.append(0.8)
-            elif fv.mouse_velocity_variance < self._baselines.mouse_variance_baseline * 1.8:
-                scores.append(0.4)
-            else:
-                scores.append(0.0)
-
-        # Low correction rate (if available).
-        # P1: gate on the warm-up count too. ``correction_rate_per_100_keys``
-        # is ``None`` when the keystroke channel is absent (already skipped
-        # below), but it can also read a fabricated 0.0 during the warm-up
-        # window before enough keystrokes have been observed.
-        if fv.telemetry_seen_count >= 5 and fv.correction_rate_per_100_keys is not None:
-            if fv.correction_rate_per_100_keys <= 8.0:
-                scores.append(0.8)
-            elif fv.correction_rate_per_100_keys <= 15.0:
-                scores.append(0.4)
-            else:
-                scores.append(0.0)
-
-        # Moderate tab switching (focused, not thrashing).
-        # P1: same warm-up gate — a cold-start session reads
-        # ``tab_switch_frequency = 0.0`` and would otherwise feed a 0.0
-        # contribution into the FLOW mean before any window-switch
-        # telemetry has arrived.
-        if fv.telemetry_seen_count >= 5:
-            if 0.5 <= fv.tab_switch_frequency <= 4.0:
-                scores.append(0.8)
-            elif 0.2 <= fv.tab_switch_frequency < 0.5 or 4.0 < fv.tab_switch_frequency <= 6.0:
-                scores.append(0.35)
-            else:
-                scores.append(0.0)
-
-        if not scores:
-            return 0.3  # Default slight flow assumption
-
-        return float(np.clip(np.mean(scores), 0.0, 1.0))
-
-    def _compute_recovery_score(
-        self, fv: FeatureVector, hyper: float, hypo: float, flow: float,
-    ) -> float:
-        """
-        Compute recovery score.
-
-        Recovery is the transition from HYPER/HYPO back toward FLOW.
-        Characterized by mixed signals and declining overwhelm indicators.
-        """
-        # Recovery should not dominate during already-stable FLOW.
-        stress_signal = max(hyper, hypo)
-        if 0.15 <= stress_signal <= 0.65 and 0.25 <= flow <= 0.75:
-            # HEURISTIC: mixed profile with moderate stress + improving flow.
-            recovery = 0.15 + 0.35 * flow + 0.35 * stress_signal
-            return float(np.clip(recovery, 0.0, 1.0))
-
-        # Also recovery if hyper is declining
-        if 0.4 <= hyper <= 0.7:
-            return float(np.clip(0.6 - hyper, 0.0, 1.0))
-
-        return 0.0
-
     # =========================================================================
-    # Sub-score functions (all return 0-1)
+    # Sub-score transforms shared by the Level-A rules (all return 0-1).
+    # The pre-v2 physiology/posture scorers (pulse elevation, HRV drop,
+    # blink suppression, posture collapse, workspace complexity and the
+    # legacy hyper/hypo/flow/recovery composites) were removed: nothing in
+    # the production path called them and the model card excludes camera
+    # inputs from every production rule (audit D17).
     # =========================================================================
-
-    def score_pulse_elevation(self, hr: float | None) -> float:
-        """
-        Score pulse elevation: HR > baseline + 15%.
-
-        Returns 0-1, where 1.0 = HR 30%+ above baseline.
-        """
-        if hr is None:
-            return 0.0
-
-        sigma = max(1.0, self._baselines.hr_std)
-        z = (hr - self._baselines.hr_baseline) / sigma
-        if z <= 1.5:
-            return 0.0
-        # HEURISTIC: map z=[1.5, 4.0] to [0, 1].
-        return float(np.clip((z - 1.5) / 2.5, 0.0, 1.0))
-
-    def score_hrv_drop(self, hrv_rmssd: float | None) -> float:
-        """
-        Score HRV drop: RMSSD < 20ms indicates stress.
-
-        Returns 0-1, where 1.0 = RMSSD near 0.
-        """
-        if hrv_rmssd is None:
-            return 0.0
-
-        sigma = self._metric_sigma("hrv_rmssd", fallback=max(6.0, self._baselines.hrv_baseline * 0.2))
-        z = (self._baselines.hrv_baseline - hrv_rmssd) / max(1e-6, sigma)
-        if z <= 1.5:
-            return 0.0
-        # HEURISTIC: map z=[1.5, 3.5] to [0, 1].
-        return float(np.clip((z - 1.5) / 2.0, 0.0, 1.0))
-
-    def score_blink_suppression(self, blink_rate: float | None, hr: float | None = None) -> float:
-        """
-        Score blink suppression: blink rate < 8/min.
-
-        Returns 0-1, where 1.0 = near-zero blinking.
-        If HR is within 110% of baseline, attenuate score (concentration, not stress).
-        """
-        if blink_rate is None:
-            return 0.0
-
-        if blink_rate >= 8.0:
-            return 0.0
-
-        # Linear from 8 → 0 maps to 0 → 1
-        score = (8.0 - blink_rate) / 8.0
-        score = float(np.clip(score, 0.0, 1.0))
-
-        # Attenuate if HR is normal — this is concentration, not stress
-        if hr is not None and hr <= self._baselines.hr_baseline * 1.10:
-            score *= 0.3
-
-        return score
-
-    def score_posture_collapse(
-        self, forward_lean: float | None, shoulder_drop: float | None,
-    ) -> float:
-        """
-        Score posture collapse: forward lean > 20° + shoulder drop.
-
-        Returns 0-1 composite of lean and drop.
-        """
-        lean_score = 0.0
-        drop_score = 0.0
-
-        if forward_lean is not None and forward_lean > 10.0:
-            lean_score = min(1.0, (forward_lean - 10.0) / 20.0)
-
-        if shoulder_drop is not None and shoulder_drop > 0.1:
-            drop_score = min(1.0, (shoulder_drop - 0.1) / 0.2)
-
-        # Composite: lean contributes more to hyper (forward lean = engagement)
-        return float(np.clip(0.7 * lean_score + 0.3 * drop_score, 0.0, 1.0))
 
     def score_mouse_thrash(self, velocity_variance: float) -> float:
         """
@@ -787,7 +498,11 @@ class RuleScorer:
 
         Returns 0-1, where 1.0 = extreme erratic movement.
         """
-        baseline = self._baselines.mouse_variance_baseline
+        # Calibration may persist ``mouse_variance_baseline == 0`` (the schema
+        # allows it). Floor it exactly like ``_flow_transform`` so a zero
+        # baseline degrades to "any variance is thrash-relative" instead of
+        # raising ZeroDivisionError on every state-loop tick (audit D2).
+        baseline = max(1.0, float(self._baselines.mouse_variance_baseline))
         if velocity_variance <= baseline:
             return 0.0
 
@@ -815,48 +530,3 @@ class RuleScorer:
         # Above 20: 0.5 → 1.0
         score = 0.5 + min(0.5, (switch_rate - 20.0) / 20.0)
         return float(np.clip(score, 0.0, 1.0))
-
-    def score_workspace_complexity(self, fv: FeatureVector) -> float:
-        """
-        Score workspace complexity from available signals.
-
-        Uses tab count and typing error indicators as proxies.
-        Currently uses keystroke_interval_variance as a complexity proxy.
-        """
-        score = 0.0
-
-        # High keystroke variance suggests debugging (many corrections)
-        if fv.keystroke_interval_variance > 5000.0:
-            score += 0.3
-        elif fv.keystroke_interval_variance > 2000.0:
-            score += 0.15
-
-        # High click frequency combined with switching suggests multi-tasking
-        if fv.click_frequency > 2.0 and fv.tab_switch_frequency > 10.0:
-            score += 0.4
-        elif fv.click_frequency > 1.0:
-            score += 0.15
-
-        # Mouse velocity high + high variance = searching behavior
-        if (fv.mouse_velocity_mean > 1000.0
-                and fv.mouse_velocity_variance > self._baselines.mouse_variance_baseline * 2):
-            score += 0.3
-
-        if fv.correction_rate_per_100_keys is not None:
-            if fv.correction_rate_per_100_keys > 20.0:
-                score += 0.35
-            elif fv.correction_rate_per_100_keys > 12.0:
-                score += 0.2
-
-        if fv.scroll_back_rate_per_min is not None:
-            if fv.scroll_back_rate_per_min > 35.0:
-                score += 0.25
-            elif fv.scroll_back_rate_per_min > 20.0:
-                score += 0.12
-
-        return float(np.clip(score, 0.0, 1.0))
-
-    def _metric_sigma(self, metric: str, *, fallback: float) -> float:
-        stats = self._baselines.metric_distributions.get(metric, {})
-        sigma = float(stats.get("sigma", fallback))
-        return max(1e-6, sigma)

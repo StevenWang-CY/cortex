@@ -10,6 +10,7 @@ import os
 import platform
 import plistlib
 import re
+import shutil
 import socket
 import struct
 import subprocess
@@ -351,6 +352,43 @@ def _mounted_app_signature_verification(app: Path) -> tuple[list[str], float]:
         ["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app)],
         _DEEP_SIGNATURE_TIMEOUT_SECONDS,
     )
+
+
+def _verify_gui_info_plist(plist: dict[str, Any]) -> dict[str, Any]:
+    """Require the bundle to describe the released, foreground Cortex GUI.
+
+    PyInstaller derives ``LSBackgroundOnly`` from the ``console`` flag of the
+    *last* executable handed to ``COLLECT``. The console-capable native host
+    therefore turned the first two-executable bundles into background-only
+    applications: no Dock presence and windows that never become key, so the
+    goal field and every other control ignored the keyboard. LaunchServices
+    treats an absent key as ``false``, so only an explicit true value fails.
+    """
+
+    required_plist: dict[str, Any] = {
+        "CFBundleIdentifier": "com.cortex.daemon",
+        "CFBundleExecutable": "Cortex",
+        "CFBundleShortVersionString": __version__,
+        "CFBundleVersion": __version__,
+        "LSMinimumSystemVersion": "13.0",
+        "NSCameraUseContinuityCameraDeviceType": True,
+    }
+    mismatches = {
+        key: {"expected": expected, "actual": plist.get(key)}
+        for key, expected in required_plist.items()
+        if plist.get(key) != expected
+    }
+    if mismatches:
+        raise ReleaseVerificationError(f"Info.plist mismatch: {mismatches}")
+    background_flags = {
+        key: plist.get(key) for key in ("LSBackgroundOnly", "LSUIElement") if plist.get(key)
+    }
+    if background_flags:
+        raise ReleaseVerificationError(
+            "Info.plist marks the GUI as a background-only or UI-element process "
+            f"whose windows cannot become key: {background_flags}"
+        )
+    return {**required_plist, "LSBackgroundOnly": False, "LSUIElement": False}
 
 
 def _verify_installer_layout(mount: Path) -> dict[str, str]:
@@ -782,21 +820,7 @@ def verify(
         evidence["installer_layout"] = _verify_installer_layout(mount)
         with plist_path.open("rb") as handle:
             plist = plistlib.load(handle)
-        required_plist = {
-            "CFBundleIdentifier": "com.cortex.daemon",
-            "CFBundleShortVersionString": __version__,
-            "CFBundleVersion": __version__,
-            "LSMinimumSystemVersion": "13.0",
-            "NSCameraUseContinuityCameraDeviceType": True,
-        }
-        mismatches = {
-            key: {"expected": expected, "actual": plist.get(key)}
-            for key, expected in required_plist.items()
-            if plist.get(key) != expected
-        }
-        if mismatches:
-            raise ReleaseVerificationError(f"Info.plist mismatch: {mismatches}")
-        evidence["info_plist"] = required_plist
+        evidence["info_plist"] = _verify_gui_info_plist(plist)
 
         arch_result = _run(["lipo", "-archs", str(executable)])
         commands.append(arch_result)
@@ -838,6 +862,12 @@ def verify(
         signature_command, signature_timeout = _mounted_app_signature_verification(app)
         commands.append(_run(signature_command, timeout=signature_timeout))
         commands.append(_run(["codesign", "-dv", "--verbose=4", str(app)]))
+        if require_notarized:
+            # The bundle inside the image must carry its own stapled ticket so
+            # the dragged-out copy launches offline; the DMG's ticket is
+            # verified separately after the image is detached.
+            commands.append(_run(["xcrun", "stapler", "validate", str(app)], timeout=120.0))
+            evidence["app_stapled"] = True
 
         findings = _scan_forbidden(app)
         if findings:
@@ -847,11 +877,18 @@ def verify(
             )
         evidence["forbidden_pattern_scan"] = "passed"
 
+        # Every executable probe runs under a throwaway HOME so a verification
+        # pass never writes startup logs or state into the operator's real
+        # ~/Library. The directory lives beside the mount point and is removed
+        # with it.
+        smoke_home = Path(tempfile.mkdtemp(prefix="cortex-release-smoke-home-"))
         smoke_env = {
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
             "QT_QPA_PLATFORM": "offscreen",
             "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
+            "HOME": str(smoke_home),
         }
+        evidence["probe_home_isolated"] = True
         commands.append(
             _probe_native_host_executable(
                 native_host_executable,
@@ -876,6 +913,7 @@ def verify(
             )
             evidence["app_executable_probes"] = "passed"
     finally:
+        shutil.rmtree(str(smoke_home), ignore_errors=True) if "smoke_home" in locals() else None
         detach_error: ReleaseVerificationError | None = None
         # A failed attach can still leave a partially mounted image. Inspect
         # the kernel-visible mount state as well as the successful-return flag.

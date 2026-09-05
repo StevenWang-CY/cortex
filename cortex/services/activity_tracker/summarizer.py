@@ -117,10 +117,12 @@ class ActivitySummarizer:
         model_id = resolve_anthropic_model_id(
             config.model_fast, provider=config.provider,
         )
+        # Sampling parameters (temperature / top_p / top_k) are deliberately
+        # omitted: current Claude models reject them with HTTP 400, which the
+        # planner treats as non-retryable.
         response = await sdk.messages.create(
             model=model_id,
             max_tokens=200,
-            temperature=0.3,
             system=[{"type": "text", "text": "You are a concise study assistant."}],
             messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
             timeout=15.0,

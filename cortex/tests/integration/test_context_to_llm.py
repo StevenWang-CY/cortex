@@ -380,11 +380,12 @@ class TestEndToEnd:
         E2E: detect HYPER → build context → generate plan → trigger →
         execute → detect recovery → restore.
         """
+        from cortex.libs.config.settings import InterventionConfig, StateConfig
         from cortex.services.intervention_engine.executor import InterventionExecutor
         from cortex.services.intervention_engine.planner import prepare_plan
         from cortex.services.intervention_engine.restore import RestoreManager
         from cortex.services.intervention_engine.snapshot import capture_snapshot
-        from cortex.services.intervention_engine.trigger import InterventionTrigger
+        from cortex.services.state_engine.trigger_policy import TriggerPolicy
 
         # --- Step 1: State Engine detects HYPER ---
         hyper_estimate = _make_state_estimate(
@@ -393,11 +394,15 @@ class TestEndToEnd:
         assert hyper_estimate.is_overwhelmed
         assert hyper_estimate.should_intervene
 
-        # --- Step 2: Trigger evaluates ---
-        trigger = InterventionTrigger()
-        decision = trigger.evaluate(hyper_estimate, complexity_score=0.75)
+        # --- Step 2: Trigger policy evaluates (the production trigger) ---
+        policy = TriggerPolicy(
+            config=InterventionConfig(receptivity_enforced=False),
+            state_config=StateConfig(hyper_dwell_seconds=5),
+        )
+        decision = policy.evaluate(
+            hyper_estimate, context_complexity=0.75, current_time=100.0,
+        )
         assert decision.should_trigger
-        assert decision.level is not None
 
         # --- Step 3: Build context and get LLM plan ---
         ctx = _make_coding_context()

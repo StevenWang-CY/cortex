@@ -46,6 +46,23 @@ export class FoldController {
     }
 
     /**
+     * A9: both bounds must be non-negative integers with
+     * ``startLine <= endLine``. Accepts ``unknown`` so command-palette
+     * invocations (``undefined``) and JSON-sourced strings are rejected
+     * instead of coerced.
+     */
+    static isValidRange(startLine: unknown, endLine: unknown): boolean {
+        return (
+            typeof startLine === "number"
+            && typeof endLine === "number"
+            && Number.isInteger(startLine)
+            && Number.isInteger(endLine)
+            && startLine >= 0
+            && endLine >= startLine
+        );
+    }
+
+    /**
      * Fold everything in the active editor except the specified line range.
      *
      * Saves a fold state snapshot before applying. The excluded range
@@ -53,8 +70,16 @@ export class FoldController {
      *
      * @param startLine - Start of range to keep visible (0-indexed)
      * @param endLine - End of range to keep visible (0-indexed)
+     * @returns ``false`` — without touching the editor — when the
+     *   arguments are not a valid non-negative integer range. The
+     *   command palette invokes ``cortex.foldExcept`` with no arguments;
+     *   previously that unfolded everything and then folded nothing (A9).
      */
     async foldExcept(startLine: number, endLine: number): Promise<boolean> {
+        if (!FoldController.isValidRange(startLine, endLine)) {
+            return false;
+        }
+
         const editor = vscode.window.activeTextEditor;
         if (!editor) {
             return false;

@@ -34,6 +34,7 @@ from cortex.libs.config.settings import APIConfig, CortexConfig
 from cortex.libs.logging.correlation import correlation_scope
 from cortex.services.api_gateway.auth import require_capability_token
 from cortex.services.api_gateway.middleware.rate_limit import RateLimitMiddleware
+from cortex.services.api_gateway.request_ids import sanitize_correlation_id
 
 _REQUEST_ID_HEADER = "X-Cortex-Request-ID"
 
@@ -103,17 +104,27 @@ def create_app(
     # the last ``add_middleware`` call as the outermost wrapper, so this
     # ordering puts correlation OUTSIDE rate-limit at runtime. The cid is
     # therefore bound by the time the limiter's 429 log line is emitted.
-    app.add_middleware(RateLimitMiddleware)
+    #
+    # D3: ``authenticated_only`` — the limiter runs before routing, while
+    # the capability-token gate is a route dependency, and every local
+    # client shares the 127.0.0.1 bucket. Without this an unauthenticated
+    # localhost page could exhaust the ``/shutdown``, ``/consent/reset``
+    # and ``/api/launch`` budgets and starve the real clients; now budget
+    # is consumed only after the token validates.
+    app.add_middleware(RateLimitMiddleware, authenticated_only=True)
 
     # F19: correlation IDs. Every request enters a scope that mints (or
     # accepts via ``X-Cortex-Request-ID``) a correlation id, binds it to
     # both ``contextvars`` and structlog, and echoes it back on the
     # response so the calling UI can quote it in error toasts.
+    # D16: a supplied id is only honoured when it is bounded and made of
+    # id characters; anything else is replaced with a minted id so junk
+    # can never be echoed into headers or log lines.
     class _CorrelationMiddleware(BaseHTTPMiddleware):
         async def dispatch(
             self, request: Request, call_next: RequestResponseEndpoint,
         ) -> Response:
-            incoming = request.headers.get(_REQUEST_ID_HEADER)
+            incoming = sanitize_correlation_id(request.headers.get(_REQUEST_ID_HEADER))
             with correlation_scope(incoming) as cid:
                 response = await call_next(request)
                 response.headers[_REQUEST_ID_HEADER] = cid
@@ -126,6 +137,13 @@ def create_app(
     # Phase-4b TASK L: the static origin allowlist now lives on
     # APIConfig.cors_allow_origins so deployments can extend it via
     # config rather than patching this file.
+    #
+    # D12: no ``allow_credentials``. The daemon has no cookie or HTTP-auth
+    # session — the capability token travels in an explicitly set
+    # ``Authorization`` / ``X-Cortex-Auth-Token`` header, which CORS
+    # treats as a plain request header, not a credential — so credentialed
+    # cross-origin access to every localhost port bought nothing and
+    # widened the reach of any page served from a local dev server.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(getattr(cfg, "cors_allow_origins", []) or [
@@ -138,7 +156,6 @@ def create_app(
             r"|moz-extension://[A-Za-z0-9-]+"
             r"|vscode-webview://[A-Za-z0-9-]+)$"
         ),
-        allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
         expose_headers=[_REQUEST_ID_HEADER],
@@ -161,25 +178,21 @@ def create_app(
     # liveness-only and visible in code review.
     from cortex.services.api_gateway.routes import (
         health_router,
+        metrics_router,
         router,
     )
 
-    # SECURITY (audit Debt-2 + finding #4): ``/metrics`` and ``/health``
-    # both live on the UNAUTHENTICATED ``health_router``. This is the
-    # standard Prometheus contract — a scraper is tokenless, and the
-    # daemon binds only to ``127.0.0.1`` (see ``APIConfig.host``), so the
-    # exposition surface is reachable only from the same machine.
-    #
-    # Finding #4 resolved a real contradiction here: the
-    # ``prometheus_metrics`` handler docstring promised a public scrape
-    # AND the integration suite (``test_metrics_endpoint.py``) asserts a
-    # tokenless 200, yet the previous wiring re-mounted ``/metrics``
-    # behind ``require_capability_token`` — so an actual Prometheus
-    # scraper got a 401. We now mount the entire ``health_router``
-    # (``/health`` + ``/metrics``) without the gate, matching the
-    # handler docstring, the tests, and Prometheus' tokenless-scrape
-    # convention. Every other route stays on the gated ``router``.
+    # SECURITY (audit Debt-2, revised by D12): only ``/health`` lives on
+    # the UNAUTHENTICATED ``health_router`` — it is the liveness/readiness
+    # probe the launchers poll before they own a token, and it is DB-free
+    # and cheap (D4). ``/metrics`` exposes biometric-derived counters
+    # (state transitions, interventions, capture drops), so it now lives
+    # on ``metrics_router`` which carries the capability-token dependency
+    # itself: a Prometheus scraper on this machine presents the token via
+    # ``authorization_credentials`` exactly like every other client. Every
+    # other route stays on the gated ``router``.
     app.include_router(health_router)
+    app.include_router(metrics_router)
     app.include_router(router, dependencies=[Depends(require_capability_token)])
 
     logger.info(f"API Gateway configured on {cfg.host}:{cfg.port}")

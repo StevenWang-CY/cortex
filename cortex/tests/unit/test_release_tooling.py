@@ -31,8 +31,10 @@ from cortex.scripts.select_notary_auth import (
     select_notary_auth_mode,
 )
 from cortex.scripts.validate_release_records import (
+    CORE_CASE_IDS,
     REQUIRED_CASE_IDS,
     ReleaseRecordError,
+    render_assurance_notes,
     validate_release_records,
 )
 from cortex.scripts.verify_macos_release import (
@@ -45,6 +47,7 @@ from cortex.scripts.verify_macos_release import (
     _probe_native_host_executable,
     _remove_detached_mountpoint,
     _scan_forbidden,
+    _verify_gui_info_plist,
     _verify_installer_layout,
 )
 from cortex.scripts.verify_repository_contracts import (
@@ -249,7 +252,7 @@ def test_production_macos_builder_signs_outer_dmg_before_notarization() -> None:
     secure_timestamp = '--timestamp \\'
     stable_identifier = '--identifier "com.cortex.daemon.dmg" \\'
     signature_check = 'codesign --verify --strict --verbose=2 "${DMG_PATH}"'
-    notary_submission = 'submit "${DMG_PATH}"'
+    notary_submission = 'notarize_and_staple "${DMG_PATH}" "${DMG_PATH}" "dmg"'
 
     integrity_index = build_script.index(integrity_check)
     production_guard_index = build_script.index(production_guard, integrity_index)
@@ -261,6 +264,51 @@ def test_production_macos_builder_signs_outer_dmg_before_notarization() -> None:
     assert stable_identifier in build_script[signature_index:verification_index]
     assert integrity_index < production_guard_index < signature_index
     assert signature_index < verification_index < notary_index
+
+
+def test_production_macos_builder_staples_the_app_before_imaging_it() -> None:
+    """A dragged-out Cortex.app must carry its own notarization ticket.
+
+    Stapling only the disk image leaves the installed bundle dependent on
+    Apple's online ticket lookup at first launch. The bundle is therefore
+    notarized and stapled before it is copied into the image, and the
+    Gatekeeper assessment is recorded only after that staple.
+    """
+
+    build_script = (_ROOT / "cortex/scripts/build_macos_app.sh").read_text(encoding="utf-8")
+    app_notarization = 'notarize_and_staple "${APP_NOTARY_ZIP}" "${APP_PATH}" "app"'
+    staging_copy = 'cp -R "${APP_PATH}" "${DMG_STAGE_DIR}/Cortex.app"'
+    stapled_assessment = 'spctl -a -vv --type execute "${APP_PATH}"'
+    helper_definition = "notarize_and_staple() {"
+
+    helper_index = build_script.index(helper_definition)
+    app_index = build_script.index(app_notarization, helper_index)
+    assessment_index = build_script.index(stapled_assessment, app_index)
+    staging_index = build_script.index(staging_copy, assessment_index)
+
+    assert helper_index < app_index < assessment_index < staging_index
+    assert '--timeout "${CORTEX_NOTARIZE_TIMEOUT:-30m}"' in build_script
+    assert 'xcrun stapler staple "${stapled_target}"' in build_script
+
+
+def test_production_signing_keeps_gui_entitlements_off_nested_code() -> None:
+    build_script = (_ROOT / "cortex/scripts/build_macos_app.sh").read_text(encoding="utf-8")
+    production_start = build_script.index("else\n    # Developer ID:")
+    production_end = build_script.index("\nfi\n", production_start)
+    production_block = build_script[production_start:production_end]
+
+    deep_line_end = production_block.index('"${APP_PATH}"', production_block.index("--deep"))
+    deep_pass = production_block[production_block.index("--deep") : deep_line_end]
+    assert "--entitlements" not in deep_pass
+    assert production_block.count("--entitlements") == 1
+    assert production_block.count("--timestamp") == 3
+
+
+def test_macos_builder_never_mixes_stale_evidence_into_a_new_build() -> None:
+    build_script = (_ROOT / "cortex/scripts/build_macos_app.sh").read_text(encoding="utf-8")
+    assert 'rm -rf "${EVIDENCE_DIR}"' in build_script
+    assert "refusing to mix builds" in build_script
+    assert build_script.index('rm -rf "${EVIDENCE_DIR}"') < build_script.index('mkdir -p "${EVIDENCE_DIR}"')
 
 
 def test_macos_builder_owns_drag_to_applications_layout_before_image_creation() -> None:
@@ -640,6 +688,71 @@ def test_macos_spec_builds_console_native_host_as_a_nested_executable() -> None:
     assert "native_host_a.datas" in collect
 
 
+def _foreground_plist(**overrides: object) -> dict[str, object]:
+    plist: dict[str, object] = {
+        "CFBundleIdentifier": "com.cortex.daemon",
+        "CFBundleExecutable": "Cortex",
+        "CFBundleShortVersionString": __version__,
+        "CFBundleVersion": __version__,
+        "LSMinimumSystemVersion": "13.0",
+        "NSCameraUseContinuityCameraDeviceType": True,
+    }
+    plist.update(overrides)
+    return plist
+
+
+def test_release_verifier_accepts_foreground_gui_plist_with_or_without_flags() -> None:
+    expected = {
+        "CFBundleIdentifier": "com.cortex.daemon",
+        "CFBundleExecutable": "Cortex",
+        "CFBundleShortVersionString": __version__,
+        "CFBundleVersion": __version__,
+        "LSMinimumSystemVersion": "13.0",
+        "NSCameraUseContinuityCameraDeviceType": True,
+        "LSBackgroundOnly": False,
+        "LSUIElement": False,
+    }
+
+    assert _verify_gui_info_plist(_foreground_plist()) == expected
+    assert (
+        _verify_gui_info_plist(_foreground_plist(LSBackgroundOnly=False, LSUIElement=False))
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "flags",
+    (
+        {"LSBackgroundOnly": True},
+        {"LSUIElement": True},
+        {"LSBackgroundOnly": 1},
+    ),
+)
+def test_release_verifier_rejects_background_only_gui_bundle(flags: dict[str, object]) -> None:
+    """PyInstaller inherits ``console`` from the last collected executable.
+
+    The console-capable native host therefore produced ``LSBackgroundOnly``
+    bundles whose windows could never become key. That must fail the release
+    verifier before any DMG is staged.
+    """
+
+    with pytest.raises(ReleaseVerificationError, match="background-only"):
+        _verify_gui_info_plist(_foreground_plist(**flags))
+
+
+def test_release_verifier_rejects_wrong_gui_executable() -> None:
+    with pytest.raises(ReleaseVerificationError, match="Info.plist mismatch"):
+        _verify_gui_info_plist(_foreground_plist(CFBundleExecutable="CortexNativeHost"))
+
+
+def test_macos_spec_pins_foreground_application_despite_console_helper() -> None:
+    spec = (_ROOT / "cortex/scripts/cortex.spec").read_text(encoding="utf-8")
+    bundle = spec[spec.index("app = BUNDLE("):]
+
+    assert '"LSBackgroundOnly": False' in bundle
+    assert '"LSUIElement": False' in bundle
+
+
 def test_release_native_host_probe_validates_real_framing(tmp_path: Path) -> None:
     host = tmp_path / "CortexNativeHost"
     host.write_text(
@@ -684,6 +797,8 @@ def _write_approved_release_record(
     commit: str,
     builder_id: str = "builder-one",
     reviewer_id: str = "reviewer-one",
+    tier: str = "independently-reviewed",
+    not_run: tuple[str, ...] = (),
 ) -> Path:
     artifact_name = f"Cortex-{__version__}-macos-{architecture}.dmg"
     artifact = root / artifact_name
@@ -699,7 +814,8 @@ def _write_approved_release_record(
     evidence_name = f"manual-evidence-{architecture}.zip"
     (root / evidence_name).write_bytes(b"evidence")
     record = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
+        "assurance_tier": tier,
         "artifact": {
             "version": __version__,
             "filename": artifact_name,
@@ -714,28 +830,49 @@ def _write_approved_release_record(
             "clean_profile": True,
         },
         "cases": [
-            {
-                "id": case_id,
-                "result": "passed",
-                "observed": f"Executed {case_id} against the exact candidate artifact.",
-                "evidence_files": [evidence_name],
-            }
+            (
+                {
+                    "id": case_id,
+                    "result": "not_run",
+                    "observed": f"{case_id} was not exercised on this candidate.",
+                    "reason": "Deferred to the next candidate; no hardware for this case.",
+                    "evidence_files": [],
+                }
+                if case_id in not_run
+                else {
+                    "id": case_id,
+                    "result": "passed",
+                    "observed": f"Executed {case_id} against the exact candidate artifact.",
+                    "evidence_files": [evidence_name],
+                }
+            )
             for case_id in sorted(REQUIRED_CASE_IDS)
         ],
-        "reviewers": [
-            {
-                "role": "builder",
-                "reviewer_id": builder_id,
-                "signed_at_utc": "2026-08-25T12:00:00Z",
-                "attestation": "I built and executed this candidate record.",
-            },
-            {
-                "role": "independent_reviewer",
-                "reviewer_id": reviewer_id,
-                "signed_at_utc": "2026-08-25T13:00:00Z",
-                "attestation": "I independently reviewed this candidate evidence.",
-            },
-        ],
+        "reviewers": (
+            [
+                {
+                    "role": "maintainer",
+                    "reviewer_id": builder_id,
+                    "signed_at_utc": "2026-08-25T12:00:00Z",
+                    "attestation": "I built and exercised this candidate myself.",
+                }
+            ]
+            if tier == "self-attested"
+            else [
+                {
+                    "role": "builder",
+                    "reviewer_id": builder_id,
+                    "signed_at_utc": "2026-08-25T12:00:00Z",
+                    "attestation": "I built and executed this candidate record.",
+                },
+                {
+                    "role": "independent_reviewer",
+                    "reviewer_id": reviewer_id,
+                    "signed_at_utc": "2026-08-25T13:00:00Z",
+                    "attestation": "I independently reviewed this candidate evidence.",
+                },
+            ]
+        ),
         "decision": "release",
     }
     path = root / f"manual-release-evidence-{architecture}.json"
@@ -1153,10 +1290,9 @@ def test_manual_release_template_is_valid_and_cannot_be_released() -> None:
     validator = Draft202012Validator(schema, format_checker=FormatChecker())
     assert list(validator.iter_errors(template)) == []
     assert template["decision"] == "block"
-    assert {item["role"] for item in template["reviewers"]} == {
-        "builder",
-        "independent_reviewer",
-    }
+    assert template["schema_version"] == "1.1"
+    assert template["assurance_tier"] == "self-attested"
+    assert {item["role"] for item in template["reviewers"]} == {"maintainer"}
 
     false_release = deepcopy(template)
     false_release["decision"] = "release"
@@ -1269,3 +1405,151 @@ def test_release_record_validator_rejects_automated_asset_as_manual_evidence(
             expected_version=__version__,
             expected_commit=commit,
         )
+
+
+def test_release_record_validator_accepts_self_attested_single_architecture(
+    tmp_path: Path,
+) -> None:
+    commit = "f" * 40
+    _write_approved_release_record(
+        tmp_path,
+        architecture="arm64",
+        commit=commit,
+        tier="self-attested",
+        not_run=("onboarding.keyboard_voiceover", "update.migration"),
+    )
+
+    report = validate_release_records(
+        tmp_path,
+        asset_dir=tmp_path,
+        expected_version=__version__,
+        expected_commit=commit,
+        tier="self-attested",
+    )
+
+    assert report["assurance_tier"] == "self-attested"
+    assert report["hardware_verified_architectures"] == ["arm64"]
+    assert report["ci_only_architectures"] == ["x86_64"]
+    assert report["cases_not_run"] == {
+        "arm64": ["onboarding.keyboard_voiceover", "update.migration"]
+    }
+    assert report["independent_reviewer_ids"] == []
+    notes = render_assurance_notes(report, workflow_run_url="https://example.invalid/run/1")
+    assert "Tier: self-attested" in notes
+    assert "`x86_64`: **CI-verified only**" in notes
+    assert "not run: onboarding.keyboard_voiceover, update.migration" in notes
+
+
+def test_release_record_validator_requires_core_cases_even_when_self_attested(
+    tmp_path: Path,
+) -> None:
+    commit = "1" * 40
+    _write_approved_release_record(
+        tmp_path,
+        architecture="arm64",
+        commit=commit,
+        tier="self-attested",
+        not_run=("browser.chrome_native",),
+    )
+
+    with pytest.raises(ReleaseRecordError, match="core case browser.chrome_native"):
+        validate_release_records(
+            tmp_path,
+            asset_dir=tmp_path,
+            expected_version=__version__,
+            expected_commit=commit,
+        )
+    assert CORE_CASE_IDS <= REQUIRED_CASE_IDS
+
+
+def test_release_record_validator_rejects_not_run_in_independently_reviewed_tier(
+    tmp_path: Path,
+) -> None:
+    commit = "2" * 40
+    _write_approved_release_record(
+        tmp_path,
+        architecture="arm64",
+        commit=commit,
+        not_run=("export.delete",),
+    )
+    _write_approved_release_record(tmp_path, architecture="x86_64", commit=commit)
+
+    with pytest.raises(ReleaseRecordError, match="requires every case to pass"):
+        validate_release_records(
+            tmp_path,
+            asset_dir=tmp_path,
+            expected_version=__version__,
+            expected_commit=commit,
+        )
+
+
+def test_release_record_validator_rejects_operator_tier_mismatch(tmp_path: Path) -> None:
+    commit = "3" * 40
+    _write_approved_release_record(tmp_path, architecture="arm64", commit=commit, tier="self-attested")
+
+    with pytest.raises(ReleaseRecordError, match="operator requested"):
+        validate_release_records(
+            tmp_path,
+            asset_dir=tmp_path,
+            expected_version=__version__,
+            expected_commit=commit,
+            tier="independently-reviewed",
+        )
+
+
+def test_release_record_validator_independent_tier_still_needs_both_architectures(
+    tmp_path: Path,
+) -> None:
+    commit = "4" * 40
+    _write_approved_release_record(tmp_path, architecture="arm64", commit=commit)
+
+    with pytest.raises(ReleaseRecordError, match="must cover"):
+        validate_release_records(
+            tmp_path,
+            asset_dir=tmp_path,
+            expected_version=__version__,
+            expected_commit=commit,
+        )
+
+
+def test_release_record_schema_requires_reason_for_not_run_cases(tmp_path: Path) -> None:
+    commit = "5" * 40
+    record = _write_approved_release_record(
+        tmp_path,
+        architecture="arm64",
+        commit=commit,
+        tier="self-attested",
+        not_run=("export.delete",),
+    )
+    payload = json.loads(record.read_text(encoding="utf-8"))
+    for case in payload["cases"]:
+        if case["result"] == "not_run":
+            case.pop("reason")
+    record.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ReleaseRecordError, match="violates schema"):
+        validate_release_records(
+            tmp_path,
+            asset_dir=tmp_path,
+            expected_version=__version__,
+            expected_commit=commit,
+        )
+
+
+def test_independently_reviewed_notes_state_both_architectures(tmp_path: Path) -> None:
+    commit = "6" * 40
+    _write_approved_release_record(tmp_path, architecture="arm64", commit=commit)
+    _write_approved_release_record(tmp_path, architecture="x86_64", commit=commit)
+
+    report = validate_release_records(
+        tmp_path,
+        asset_dir=tmp_path,
+        expected_version=__version__,
+        expected_commit=commit,
+    )
+    notes = render_assurance_notes(report)
+
+    assert report["ci_only_architectures"] == []
+    assert "Tier: independently reviewed" in notes
+    assert "CI-verified only" not in notes
+

@@ -6,8 +6,8 @@ Please **do not** open a public GitHub issue for security reports.
 
 Use **[GitHub Security Advisories](https://github.com/StevenWang-CY/cortex/security/advisories/new)**
 to file a private report. You will receive an acknowledgement within a
-few days. If you do not have GitHub access, email the maintainer
-listed in [pyproject.toml](cortex/pyproject.toml).
+few days. Private advisories are the only supported reporting channel;
+the project does not publish a maintainer email address.
 
 ## Supported versions
 
@@ -28,9 +28,14 @@ regressions:
 
 1. **No video is persisted.** Webcam frames are processed in memory
    and discarded. No frame buffer is written to disk.
-2. **No biometrics in LLM payloads.** Heart rate, HRV, blink, posture,
-   and respiration never leave the machine. The LLM call carries only
-   workspace text context (file paths, error messages, tab titles).
+2. **No raw biometrics in LLM payloads.** Camera frames, landmarks,
+   waveforms, inter-beat intervals, heart rate, HRV, blink, posture, and
+   respiration never leave the machine. The default planner mode makes
+   no model network call at all. In the explicit external mode, the
+   request carries only the redacted workspace text the user selected
+   and previewed (basenames, error summaries, tab titles) plus, when the
+   user selects it, the heuristic support label with its confidence and
+   dwell time — never a biometric measurement.
 3. **Local-only network surface.** FastAPI (`:9472`), WebSocket
    (`:9473`), and the launcher agent (`:9471`) bind to `127.0.0.1`.
 4. **Capability-token gate.** Every mutating HTTP route and the

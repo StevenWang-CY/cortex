@@ -20,6 +20,18 @@ from scipy.integrate import trapezoid
 from scipy.signal import find_peaks, lombscargle, welch
 
 
+def _quadratic_peak_offset(values: NDArray[np.float64], index: int) -> float:
+    """Sub-bin parabolic peak offset in ``[-0.5, 0.5]`` (0 at the edges)."""
+
+    if index <= 0 or index >= len(values) - 1:
+        return 0.0
+    left, center, right = values[index - 1 : index + 2]
+    denominator = left - 2.0 * center + right
+    if abs(denominator) <= 1e-12:
+        return 0.0
+    return float(np.clip(0.5 * (left - right) / denominator, -0.5, 0.5))
+
+
 def estimate_hr_welch(
     bvp_signal: NDArray[np.float64],
     fs: float = 30.0,
@@ -33,24 +45,29 @@ def estimate_hr_welch(
     Computes the power spectral density via Welch's method and finds the
     dominant frequency within the cardiac band. The frequency resolution
     determines the FFT segment length (nperseg = fs / freq_resolution).
+    The spectrum is zero-padded to at least four times the segment length
+    and the dominant bin is refined with a parabolic fit, matching
+    ``cortex.services.physio_engine.v2.pulse``.  Without this the estimate
+    was quantised to ``60 * freq_resolution`` BPM (6 BPM at the default).
 
     Args:
         bvp_signal: Bandpass-filtered BVP signal (1D).
         fs: Sampling frequency in Hz.
-        freq_resolution: Desired frequency resolution in Hz.
+        freq_resolution: Native (pre-padding) frequency resolution in Hz.
         low_hz: Lower bound of cardiac frequency band in Hz.
         high_hz: Upper bound of cardiac frequency band in Hz.
 
     Returns:
         Tuple of (heart_rate_bpm, peak_power_ratio).
         heart_rate_bpm is None if no valid peak found.
-        peak_power_ratio is the ratio of peak power to total power in band
-        (useful as a quality/confidence indicator).
+        peak_power_ratio is the fraction of in-band power that lies within
+        one native resolution bin of the refined peak (a concentration /
+        confidence indicator in ``[0, 1]``).
     """
     if len(bvp_signal) < 2:
         return None, 0.0
 
-    # nperseg determines frequency resolution: resolution = fs / nperseg
+    # nperseg determines the native frequency resolution: fs / nperseg
     nperseg = int(fs / freq_resolution)
     # Clamp to signal length
     nperseg = min(nperseg, len(bvp_signal))
@@ -58,7 +75,14 @@ def estimate_hr_welch(
     if nperseg < 4:
         return None, 0.0
 
-    freqs, psd = welch(bvp_signal, fs=fs, nperseg=nperseg, noverlap=nperseg // 2)
+    nfft = max(nperseg, 2 ** int(np.ceil(np.log2(nperseg * 4))))
+    freqs, psd = welch(
+        bvp_signal,
+        fs=fs,
+        nperseg=nperseg,
+        noverlap=nperseg // 2,
+        nfft=nfft,
+    )
 
     # Restrict to cardiac band
     band_mask = (freqs >= low_hz) & (freqs <= high_hz)
@@ -68,17 +92,22 @@ def estimate_hr_welch(
     if len(band_psd) == 0:
         return None, 0.0
 
-    total_band_power = np.sum(band_psd)
+    total_band_power = float(np.sum(band_psd))
     if total_band_power <= 0:
         return None, 0.0
 
-    # Find dominant frequency
-    peak_idx = np.argmax(band_psd)
-    dominant_freq = band_freqs[peak_idx]
-    peak_power = band_psd[peak_idx]
+    # Find the dominant bin, then refine it below the padded bin width.
+    peak_idx = int(np.argmax(band_psd))
+    bin_width = float(freqs[1] - freqs[0])
+    dominant_freq = float(band_freqs[peak_idx]) + (
+        _quadratic_peak_offset(band_psd, peak_idx) * bin_width
+    )
+    native_resolution = fs / nperseg
+    neighbourhood = np.abs(band_freqs - dominant_freq) <= native_resolution / 2.0
+    peak_power = float(np.sum(band_psd[neighbourhood]))
 
     hr_bpm = dominant_freq * 60.0
-    peak_power_ratio = float(peak_power / total_band_power)
+    peak_power_ratio = float(np.clip(peak_power / total_band_power, 0.0, 1.0))
 
     return float(hr_bpm), peak_power_ratio
 

@@ -235,11 +235,28 @@ def main() -> None:
     )
     print("=" * 60)
 
+    # D1: record our PID so the launchers (launcher_agent / native host)
+    # can stop exactly this process instead of guessing from port scans.
+    # The daemon proper writes the same file once the runtime owner lands
+    # the pidfile patch; double-writing our own PID is harmless.
+    from cortex.services.launcher.daemon_process import (
+        remove_daemon_pidfile,
+        write_daemon_pidfile,
+    )
+
+    pidfile = None
+    try:
+        pidfile = write_daemon_pidfile()
+    except OSError:
+        logger.warning("Could not write the daemon pidfile", exc_info=True)
+
     try:
         asyncio.run(server.run())
     except KeyboardInterrupt:
         pass
     finally:
+        if pidfile is not None:
+            remove_daemon_pidfile(pidfile)
         if _PROFILE_STARTUP_ENABLED:
             _print_startup_profile()
 

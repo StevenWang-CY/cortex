@@ -13,8 +13,9 @@ or actionable content.
 | 004 | Bound ambient motion and make flow-shield release responsive | MEDIUM | DONE | 001 |
 | 005 | Normalize press and status feedback across surfaces | LOW | DONE | 001–004 |
 | 006 | Stop continuous pacers under reduced motion and hidden views | HIGH | DONE | 001, 004 |
+| 007 | Desktop shell: truthful states, session semantics, window posture | HIGH | DONE | 005, 006 |
 
-Plans 001–006 are complete. Plan 006 was the only actionable result from the
+Plans 001–007 are complete. Plan 007 (2026-09-05) fixes the desktop shell's untrue states and quit-on-end-session routes; its contracts are recorded in `cortex/docs/ui-design.md` under "Desktop shell contracts". Plan 006 was the only actionable result from the
 2026-08-29 full motion re-audit; it extends the established preference/lifecycle
 contracts to the three remaining canvas/timer pacers and restores immediate
 exit agency to the full-screen break. A follow-through search also closed the

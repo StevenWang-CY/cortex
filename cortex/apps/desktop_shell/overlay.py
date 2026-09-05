@@ -1,16 +1,21 @@
 """Desktop Shell — Intervention Overlay (native HUD styling).
 
-A frameless, always-on-top panel that renders LLM-generated intervention
-content. On macOS the window retains Qt's content view and receives the safe
-native window tint from :mod:`cortex.apps.desktop_shell.mac_native`; its dark
-HUD tokens provide the visual material. True ``NSVisualEffectView`` replacement
-is intentionally unavailable because it can orphan the packaged Qt window.
+A frameless, always-on-top *notification-style* card that renders
+LLM-generated intervention content. It anchors to the top-right of the
+screen under the cursor, never activates (``WA_ShowWithoutActivating``) so a
+nudge cannot steal keystrokes from the app the user is typing in, and every
+keyboard shortcut is Command-modified. On macOS the window retains Qt's
+content view and receives the dark HUD appearance from
+:mod:`cortex.apps.desktop_shell.mac_native`; its HUD tokens provide the
+visual material. True ``NSVisualEffectView`` replacement is intentionally
+unavailable because it can orphan the packaged Qt window.
 
-The terracotta brand accent + breathing-pacer animation + causal_explanation
-row are all preserved from the previous implementation. ``BreathingPacer``'s
-geometry math is unchanged.
+Every hide path — user dismiss, timeout, pause/suppress, close — runs
+through :meth:`OverlayWindow._stop_presentation_timers` so no 30 Hz pacer,
+five-minute timeout, or movement countdown keeps ticking on a hidden window.
 
-Public API: ``dismissed(str)`` Signal, ``show_intervention(payload)`` method.
+Public API: ``dismissed(str)`` Signal, ``show_intervention(payload)`` and
+``suppress()`` methods.
 """
 
 from __future__ import annotations
@@ -73,23 +78,22 @@ except ImportError:  # pragma: no cover - lightweight stubs
     _ANIMATION_AVAILABLE = False
 
 from cortex.apps.desktop_shell import mac_native
+from cortex.apps.desktop_shell.palette_runtime import active_state_color
 from cortex.apps.desktop_shell.tokens import (
-    BRAND_DISPLAY_FONT,
+    BREATHING_PACER_SIZE,
     FS_BODY,
     FS_CAPTION,
     FS_FOOTNOTE,
     FS_TITLE,
-    FW_REGULAR,
+    FW_SEMIBOLD,
     HUD_ACCENT,
+    POPUP_WIDTH,
     RADIUS_BUTTON,
     RADIUS_WINDOW,
     SP1,
     SP2,
     SP3,
     SP4,
-    SP6,
-    SP8,
-    STATE_COLORS,
     STATE_LABELS,
     TEXT_HUD_PRIMARY,
     TEXT_HUD_SECONDARY,
@@ -203,7 +207,7 @@ class BreathingPacer(QWidget):
         self._timer = QTimer(self)
         self._timer.setInterval(33)
         self._timer.timeout.connect(self._tick)
-        self.setFixedSize(160, 160)
+        self.setFixedSize(BREATHING_PACER_SIZE, BREATHING_PACER_SIZE)
 
     def start(self, *, reduced_motion: bool = False) -> None:
         self._active = True
@@ -423,8 +427,21 @@ class OverlayWindow(QWidget):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # A nudge is a notification, not a modal: it must never take
+        # keyboard focus away from whatever the user is typing into.
+        # Escape still works once the user has clicked into the card.
+        _safe_call(self, "setAttribute", Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        _safe_call(self, "setFocusPolicy", Qt.FocusPolicy.StrongFocus)
+        _set_accessible_name(self, "Cortex suggestion")
+        _set_accessible_description(
+            self,
+            "A non-blocking suggestion from Cortex. It does not take focus; "
+            "press Escape after clicking into it, or use the × button, to dismiss.",
+        )
 
-        self.setMinimumSize(440, 520)
+        # Notification width: the popup token (380 px). Height follows the
+        # content so a one-line nudge stays small.
+        self.setFixedWidth(POPUP_WIDTH)
 
         # Auto-timeout — 5 min per spec.
         self._timeout_timer = QTimer(self)
@@ -458,7 +475,61 @@ class OverlayWindow(QWidget):
         super().showEvent(event)
         try:
             mac_native.apply_unified_titlebar(self)
-            mac_native.apply_vibrancy(self, material="hudWindow")
+            mac_native.apply_vibrancy(self, appearance="dark")
+        except Exception:
+            pass
+
+    def hideEvent(self, event: object) -> None:  # noqa: D401 - Qt override
+        # Every hide path (dismiss, timeout, suppress, close) lands here, so
+        # this is the single place that guarantees no presentation timer
+        # keeps running against an invisible window.
+        self._stop_presentation_timers()
+        super().hideEvent(event)
+
+    def suppress(self) -> None:
+        """Hide without recording a user decision (pause / restore).
+
+        Stops the pacer, the five-minute timeout, the movement countdown,
+        the rating-reveal timer, and any in-flight text animation. Use this
+        instead of ``hide()`` from host code so a hidden overlay never
+        keeps ticking.
+        """
+        self._stop_presentation_timers()
+        self.hide()
+
+    def _stop_presentation_timers(self) -> None:
+        for timer_name in ("_timeout_timer", "_feedback_reveal_timer"):
+            timer = getattr(self, timer_name, None)
+            stop = getattr(timer, "stop", None)
+            if callable(stop):
+                try:
+                    stop()
+                except RuntimeError:
+                    pass
+        pacer = getattr(self, "_pacer", None)
+        if pacer is not None:
+            try:
+                pacer.stop()
+            except Exception:
+                logger.debug("pacer stop failed", exc_info=True)
+        movement = getattr(self, "_inline_movement_timer", None)
+        if movement is not None:
+            try:
+                movement.stop()
+            except Exception:
+                logger.debug("movement timer stop failed", exc_info=True)
+        for animation in (
+            getattr(self, "_headline_anim", None),
+            getattr(self, "_causal_fade_anim", None),
+        ):
+            stop = getattr(animation, "stop", None)
+            if callable(stop):
+                try:
+                    stop()
+                except Exception:
+                    logger.debug("text animation stop failed", exc_info=True)
+        try:
+            self._reset_text_opacity_to_full()
         except Exception:
             pass
 
@@ -469,38 +540,60 @@ class OverlayWindow(QWidget):
 
     def _build_ui(self) -> None:
         self._main_layout = QVBoxLayout(self)
-        # 24px outer margin — matches SP6 (4pt grid).
-        self._main_layout.setContentsMargins(SP6, SP6, SP6, SP6)
+        # Slim scrim margin: the card is the notification; the window only
+        # carries a faint shadow around it.
+        self._main_layout.setContentsMargins(SP2, SP2, SP2, SP2)
 
         # Card — translucent dark surface that layers on top of the HUD
-        # vibrancy material below. The 6% white border picks out the card
-        # edge against the blur.
+        # material below. The 10% white border picks out the card edge.
         self._card = QFrame()
         self._card.setObjectName("CortexOverlayCard")
         self._card.setStyleSheet(
             "QFrame#CortexOverlayCard {"
-            "  background-color: rgba(30, 30, 32, 0.55);"
+            "  background-color: rgba(30, 30, 32, 0.92);"
             f"  border-radius: {RADIUS_WINDOW}px;"
-            "  border: 0.5px solid rgba(255, 255, 255, 0.10);"
+            "  border: 1px solid rgba(255, 255, 255, 0.10);"
             "}"
         )
         card_layout = QVBoxLayout(self._card)
-        card_layout.setContentsMargins(SP8, SP6, SP8, SP6)
-        card_layout.setSpacing(SP4)
+        card_layout.setContentsMargins(SP4, SP4, SP4, SP4)
+        card_layout.setSpacing(SP3)
 
-        # Headline — Cormorant display (brand-preserved).
+        # Header row: headline (system face — the display serif is reserved
+        # for the wordmark and hero numerals) + × dismiss at top-right.
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(SP2)
         self._headline = QLabel("—")
+        self._headline.setFont(mac_native.system_font(FS_TITLE, "semibold"))
         self._headline.setStyleSheet(
-            f"font-family: {BRAND_DISPLAY_FONT}, ui-serif, Georgia, serif;"
             f"font-size: {FS_TITLE}px;"
-            f"font-weight: {FW_REGULAR};"
-            "font-style: italic;"
+            f"font-weight: {FW_SEMIBOLD};"
             f"color: {_TEXT_PRIMARY.name()};"
             "background: transparent;"
         )
         self._headline.setWordWrap(True)
-        self._headline.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        card_layout.addWidget(self._headline)
+        self._headline.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+        )
+        header_row.addWidget(self._headline, 1)
+
+        self._dismiss_btn = QPushButton("×")
+        self._dismiss_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        _safe_call(self._dismiss_btn, "setFixedSize", 24, 24)
+        _set_accessible_name(self._dismiss_btn, "Dismiss suggestion")
+        _set_accessible_description(
+            self._dismiss_btn,
+            "Close this suggestion. Keyboard shortcut: Escape when the card has focus.",
+        )
+        _safe_call(self._dismiss_btn, "setToolTip", "Dismiss (Escape)")
+        self._dismiss_btn.setFont(mac_native.system_font(FS_BODY, "regular"))
+        self._dismiss_btn.setStyleSheet(self._icon_btn_stylesheet())
+        self._dismiss_btn.clicked.connect(self._user_dismiss)
+        header_row.addWidget(
+            self._dismiss_btn, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight,
+        )
+        card_layout.addLayout(header_row)
 
         # P0 §3.5: cognitive-state pill — small label below the headline
         # that picks up the FLOW/HYPER/HYPO/RECOVERY palette + label.
@@ -616,21 +709,18 @@ class OverlayWindow(QWidget):
         self._inline_movement_remaining: int = 0
         card_layout.addLayout(self._inline_container)
 
-        # "Why this?" causal explanation — surfaces only when supplied.
-        # F51: long explanations are truncated to a one-line preview with
-        # a trailing ellipsis; a "Show more" QToolButton (checkable) toggles
-        # to the full text. The full text is stashed on the label so the
-        # toggle handler can swap without re-parsing the payload.
+        # Single "Why this?" affordance. The toggle below reveals one panel
+        # holding the plain-language causal explanation AND the structured
+        # signal rows (P0 §3.9), so the card never shows two competing
+        # "why" controls. Hidden until the plan supplies either.
         self._causal_label = QLabel("")
         self._causal_label.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         self._causal_label.setStyleSheet(
-            f"color: {_TEXT_TERTIARY.name()};"
+            f"color: {_TEXT_SECONDARY.name()};"
             "background: transparent;"
-            "font-style: italic;"
         )
         self._causal_label.setWordWrap(True)
         self._causal_label.hide()
-        card_layout.addWidget(self._causal_label)
 
         # F29 (audit): "Show more context" affordance. Surfaces only when
         # the daemon stamped ``context_truncated_sections`` onto the
@@ -654,32 +744,37 @@ class OverlayWindow(QWidget):
         self._context_truncation_label.hide()
         card_layout.addWidget(self._context_truncation_label)
 
-        # F51 (audit): expandable causal explanation. When the causal
-        # text exceeds the visible area, ``_causal_label`` shows a
-        # truncated preview with an ellipsis and the toggle below
-        # reveals the full body on click.
+        # The one "Why this?" toggle. Checked → the panel below shows the
+        # full explanation + signal rows; unchecked → collapsed.
         self._causal_full_text: str = ""
-        self._causal_preview_text: str = ""
         self._causal_toggle = QToolButton()
         _safe_call(self._causal_toggle, "setCheckable", True)
-        _safe_call(self._causal_toggle, "setText", "Show more")
-        # F55: accessible name + description for VoiceOver / screen readers.
-        _set_accessible_name(
-            self._causal_toggle, "Show full causal explanation"
+        _safe_call(self._causal_toggle, "setText", "Why this?")
+        _set_accessible_name(self._causal_toggle, "Why Cortex suggested this")
+        _set_accessible_description(
+            self._causal_toggle,
+            "Shows the explanation and the signals behind this suggestion.",
         )
         _safe_call(self._causal_toggle, "setCursor", Qt.CursorShape.PointingHandCursor)
+        _safe_call(self._causal_toggle, "setFocusPolicy", Qt.FocusPolicy.StrongFocus)
         _safe_call(
             self._causal_toggle,
             "setStyleSheet",
             (
-                "QToolButton {"
+                "QToolButton, QPushButton {"
                 f"  color: {_TEXT_SECONDARY.name()};"
                 "  background: transparent;"
-                "  border: none;"
-                "  padding: 2px 0;"
+                "  border: 2px solid transparent;"
+                f"  border-radius: {RADIUS_BUTTON}px;"
+                "  padding: 2px 6px;"
                 f"  font-size: {FS_CAPTION}px;"
+                "  text-decoration: underline;"
                 "}"
-                "QToolButton:hover { color: white; }"
+                "QToolButton:hover, QPushButton:hover { color: white; }"
+                "QToolButton:pressed, QPushButton:pressed {"
+                "  background: rgba(255, 255, 255, 0.10); }"
+                "QToolButton:focus, QPushButton:focus {"
+                "  border-color: rgba(255, 255, 255, 0.45); }"
             ),
         )
         # The toggled signal exists on real QToolButton / QPushButton;
@@ -693,8 +788,12 @@ class OverlayWindow(QWidget):
                 pass
         _safe_call(self._causal_toggle, "hide")
         card_layout.addWidget(self._causal_toggle, alignment=Qt.AlignmentFlag.AlignLeft)
+        # Compatibility alias: older call sites (and the controller's
+        # WHY_DETAIL plumbing) refer to ``_why_toggle``; it is the same
+        # control now.
+        self._why_toggle = self._causal_toggle
 
-        # Breathing pacer.
+        # Breathing pacer — shown only for breathing-type plans.
         pacer_layout = QHBoxLayout()
         pacer_layout.addStretch()
         self._pacer = BreathingPacer()
@@ -702,70 +801,55 @@ class OverlayWindow(QWidget):
         pacer_layout.addStretch()
         card_layout.addLayout(pacer_layout)
 
-        # P0 §3.11: three-button footer row — Dismiss, Snooze 15,
-        # Quiet rest of session. The dashboard owns the Pause
+        # P0 §3.11: footer row — Snooze 15 min / Quiet for this session.
+        # Dismiss lives in the header (×). The dashboard owns the Pause
         # affordance (it must release the camera and orchestrate
-        # cross-surface state); the overlay focuses on the moment-of-
+        # cross-surface state); the overlay keeps the moment-of-
         # intervention escape valves.
         footer_row = QHBoxLayout()
         footer_row.setContentsMargins(0, 0, 0, 0)
         footer_row.setSpacing(SP3)
 
-        # Dismiss button — HUD-style capsule.
-        self._dismiss_btn = QPushButton("Dismiss")
-        self._dismiss_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        # F55: accessible name for VoiceOver.
-        _set_accessible_name(self._dismiss_btn, "Dismiss intervention")
-        _set_accessible_description(
-            self._dismiss_btn,
-            "Close this intervention. Keyboard shortcut: Escape.",
-        )
-        _safe_call(self._dismiss_btn, "setToolTip", "Dismiss (Escape)")
-        self._dismiss_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
-        self._dismiss_btn.setStyleSheet(self._footer_btn_stylesheet())
-        self._dismiss_btn.clicked.connect(self._user_dismiss)
-        footer_row.addWidget(self._dismiss_btn, 1)
-
-        # P0 §3.11: "Snooze 15" — overlay-only 15 min suppression. The
-        # daemon keeps sensing but no new overlays fire during the
-        # window. Reused across the spec where the spec says "snooze".
-        # Phase-3 / Audit-1.2 F7: in-label accelerator hint + Qt
-        # shortcut so keyboard-only users can reach the snooze action.
-        self._snooze_btn = QPushButton("Snooze 15m")
+        # Overlay-only 15 min suppression. The daemon keeps sensing but no
+        # new overlays fire during the window. Shortcuts are Command-
+        # modified so a stray keystroke can never snooze or quiet Cortex.
+        self._snooze_btn = QPushButton("Snooze 15 min")
         self._snooze_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        _set_accessible_name(self._snooze_btn, "Snooze interventions for 15 minutes")
+        _set_accessible_name(self._snooze_btn, "Snooze suggestions for 15 minutes")
         _set_accessible_description(
             self._snooze_btn,
-            "Hide interventions for 15 minutes. Keyboard shortcut: S.",
+            "Hide suggestions for 15 minutes. Shortcut: Command-Shift-S "
+            "while this card has focus.",
         )
-        _safe_call(self._snooze_btn, "setToolTip", "Snooze 15 minutes (S)")
-        self._snooze_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
+        _safe_call(self._snooze_btn, "setToolTip", "Snooze 15 minutes (⌘⇧S)")
+        self._snooze_btn.setFont(mac_native.system_font(FS_CAPTION, "medium"))
         self._snooze_btn.setStyleSheet(self._footer_btn_stylesheet())
         self._snooze_btn.clicked.connect(self._on_snooze_clicked)
         try:
-            self._snooze_btn.setShortcut("S")
+            self._snooze_btn.setShortcut("Ctrl+Shift+S")
         except Exception:
             pass
         footer_row.addWidget(self._snooze_btn, 1)
 
-        # P0 §3.11: "Quiet for session" — overlay-only suppression
-        # until the user explicitly clears it (or until daemon stop).
-        self._quiet_session_btn = QPushButton("Quiet")
+        # Overlay-only suppression until the user clears it (or the
+        # session ends).
+        self._quiet_session_btn = QPushButton("Quiet for this session")
         self._quiet_session_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         _set_accessible_name(
             self._quiet_session_btn,
-            "Quiet interventions for the rest of this session",
+            "Quiet suggestions for the rest of this session",
         )
         _set_accessible_description(
             self._quiet_session_btn,
-            "Hide interventions for the rest of this session. Keyboard shortcut: Q.",
+            "Hide suggestions for the rest of this session. Shortcut: "
+            "Command-Shift-M while this card has focus.",
         )
-        _safe_call(self._quiet_session_btn, "setToolTip", "Quiet for session (Q)")
-        self._quiet_session_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
+        _safe_call(self._quiet_session_btn, "setToolTip", "Quiet for this session (⌘⇧M)")
+        self._quiet_session_btn.setFont(mac_native.system_font(FS_CAPTION, "medium"))
         self._quiet_session_btn.setStyleSheet(self._footer_btn_stylesheet())
         self._quiet_session_btn.clicked.connect(self._on_quiet_session_clicked)
         try:
-            self._quiet_session_btn.setShortcut("Q")
+            self._quiet_session_btn.setShortcut("Ctrl+Shift+M")
         except Exception:
             pass
         footer_row.addWidget(self._quiet_session_btn, 1)
@@ -831,55 +915,41 @@ class OverlayWindow(QWidget):
         self._feedback_reveal_timer.setInterval(30 * 1000)
         self._feedback_reveal_timer.timeout.connect(self._reveal_feedback_row)
 
-        # P0 §3.9: "Why?" chevron + drilldown panel. Renders a row per
-        # causal signal with a tiny sparkline and a delta pill. Hidden
-        # by default; the chevron toggles visibility.
-        self._why_row = QHBoxLayout()
-        self._why_row.setSpacing(SP2)
-        self._why_toggle = QPushButton("Why?")
-        _set_accessible_name(self._why_toggle, "Show structured causal rationale")
-        self._why_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._why_toggle.setStyleSheet(
-            "QPushButton {"
-            f"  color: {_TEXT_SECONDARY.name()};"
-            "  background: transparent;"
-            "  border: none;"
-            f"  font-size: {FS_CAPTION}px;"
-            "  text-decoration: underline;"
-            "  padding: 0;"
-            "}"
-            "QPushButton:hover { color: white; }"
-        )
-        self._why_toggle.clicked.connect(self._on_why_toggle_clicked)
-        self._why_row.addWidget(self._why_toggle)
-        self._why_row.addStretch()
-        card_layout.addLayout(self._why_row)
+        # P0 §3.9: the "Why this?" panel — plain-language explanation on
+        # top, then one row per causal signal with a tiny sparkline and a
+        # delta pill. Toggled by ``_causal_toggle`` above.
         self._why_panel = QFrame()
         self._why_panel.setObjectName("CortexOverlayWhyPanel")
         self._why_panel.setStyleSheet(
             "QFrame#CortexOverlayWhyPanel {"
-            "  background-color: rgba(255, 255, 255, 0.03);"
+            "  background-color: rgba(255, 255, 255, 0.04);"
             f"  border-radius: {RADIUS_BUTTON}px;"
-            "  padding: 6px;"
             "}"
         )
-        self._why_panel_layout = QVBoxLayout(self._why_panel)
-        self._why_panel_layout.setContentsMargins(8, 6, 8, 6)
+        why_outer = QVBoxLayout(self._why_panel)
+        why_outer.setContentsMargins(SP2, SP2, SP2, SP2)
+        why_outer.setSpacing(SP2)
+        why_outer.addWidget(self._causal_label)
+        self._why_signals_host = QWidget()
+        self._why_signals_host.setStyleSheet("background: transparent;")
+        self._why_panel_layout = QVBoxLayout(self._why_signals_host)
+        self._why_panel_layout.setContentsMargins(0, 0, 0, 0)
         self._why_panel_layout.setSpacing(SP1)
+        why_outer.addWidget(self._why_signals_host)
         self._why_panel.hide()
         card_layout.addWidget(self._why_panel)
         self._causal_signals_cache: list[dict] = []
         self._why_open: bool = False
-        # Hide the Why row entirely until the daemon supplies signals.
-        self._why_toggle.hide()
 
         self._main_layout.addWidget(self._card)
 
         # F55: explicit tab-order chain. Without setTabOrder, Qt falls
         # back to widget-creation order which the cascading micro-step
         # rebuilds in show_intervention can scramble. Causal toggle (if
-        # surfaced) comes between the steps and the dismiss button.
-        _set_tab_order(self._causal_toggle, self._dismiss_btn)
+        # surfaced) comes between the steps and the footer pills.
+        _set_tab_order(self._causal_toggle, self._snooze_btn)
+        _set_tab_order(self._snooze_btn, self._quiet_session_btn)
+        _set_tab_order(self._quiet_session_btn, self._dismiss_btn)
 
     # ------------------------------------------------------------------
     # Public API (preserved byte-identical)
@@ -917,13 +987,13 @@ class OverlayWindow(QWidget):
         """
         raw = payload.get("state") or payload.get("cognitive_state") or ""
         kind = str(raw).upper().strip()
-        if kind not in STATE_COLORS:
+        if kind not in STATE_LABELS or kind == "UNKNOWN":
             try:
                 self._state_pill.hide()
             except Exception:
                 pass
             return
-        color = STATE_COLORS[kind]
+        color = active_state_color(kind)
         # Prefer the canonical label from tokens, fall back to our local
         # friendly label set so the audit's "Idle/Recovering/Elevated/Flow"
         # copy ships even if the token map drops a key.
@@ -964,8 +1034,8 @@ class OverlayWindow(QWidget):
 
         # P0 §3.5: visualise cognitive state via a small pill + tinted
         # border on the headline. The palette is keyed by the upper-case
-        # state name (FLOW/HYPER/HYPO/RECOVERY) from tokens.STATE_COLORS;
-        # an unknown state collapses the pill rather than guessing.
+        # state name (FLOW/HYPER/HYPO/RECOVERY) via the active (possibly
+        # colour-blind) palette; an unknown state collapses the pill.
         self._apply_state_visual(payload)
 
         # P0 §3.5: collapse any inline widget left over from a prior
@@ -1013,8 +1083,8 @@ class OverlayWindow(QWidget):
             self._step_intervention_id = self._intervention_id
 
         causal = str(payload.get("causal_explanation") or "").strip()
-        # F51: only surface causal explanations with substantive content;
-        # the prior 20-char filter is preserved for the show/hide gate.
+        # Only surface causal explanations with substantive content; the
+        # 20-char filter is preserved for the show/hide gate.
         if causal and len(causal) > 20:
             self._show_causal_explanation(causal)
         else:
@@ -1058,23 +1128,10 @@ class OverlayWindow(QWidget):
         except Exception:
             logger.debug("Action rendering failed", exc_info=True)
 
-        ui_plan = payload.get("ui_plan", {})
-        level = payload.get("level", "overlay_only")
-        show_pacer = level == "overlay_only" or ui_plan.get("show_overlay", True)
-
-        # FE-3 (P2-FE-MULTIMON): place the overlay on the display under
-        # the cursor, not whatever ``self.screen()`` reports for the
-        # still-hidden window (which on multi-monitor often resolves to
-        # the wrong display). Falls back gracefully on single-monitor and
-        # on the legacy stub where QGuiApplication/QCursor are absent.
-        screen = self._target_screen()
-        if screen is not None:
-            geo = screen.availableGeometry()
-            self.resize(min(460, geo.width() - 40), min(620, geo.height() - 40))
-            self.move(
-                geo.center().x() - self.width() // 2,
-                geo.center().y() - self.height() // 2,
-            )
+        # The pacer is a breathing guide, so it appears only when the plan
+        # is actually about breathing. Any other nudge stays a compact
+        # text card.
+        show_pacer = self._plan_is_breathing(payload)
 
         self._timeout_timer.start()
 
@@ -1118,22 +1175,9 @@ class OverlayWindow(QWidget):
             # visible. Hide the complete window and stop every presentation
             # timer; merely skipping the new ``show`` would leave old private
             # content on the captured display.
-            self._timeout_timer.stop()
             self._stop_feedback_reveal_timer()
-            self._pacer.stop()
             self._pacer.hide()
-            for animation in (self._headline_anim, self._causal_fade_anim):
-                stop = getattr(animation, "stop", None)
-                if callable(stop):
-                    try:
-                        stop()
-                    except Exception:
-                        logger.debug(
-                            "Suppressed overlay animation stop failed",
-                            exc_info=True,
-                        )
-            self._reset_text_opacity_to_full()
-            self.hide()
+            self.suppress()
             logger.info(
                 "Overlay suppressed for intervention %s — screen sharing active",
                 self._intervention_id,
@@ -1147,9 +1191,13 @@ class OverlayWindow(QWidget):
             self._pacer.stop()
             self._pacer.hide()
 
+        # Anchor as a notification: top-right of the display under the
+        # cursor (FE-3 multi-monitor), sized to the content. Never
+        # ``activateWindow()`` — the card must not steal focus from the
+        # app the user is working in.
+        self._place_as_notification()
         self.show()
         self.raise_()
-        self.activateWindow()
 
         # Phase J-4: concurrent opacity feedback for newly presented text.
         # Skipped under Reduce Motion or when Qt lacks QPropertyAnimation.
@@ -1158,6 +1206,57 @@ class OverlayWindow(QWidget):
         self._play_show_animations()
 
         logger.info(f"Overlay shown for intervention {self._intervention_id}")
+
+    @staticmethod
+    def _plan_is_breathing(payload: dict) -> bool:
+        """True when the plan is a breathing exercise (pacer is useful).
+
+        Honest signals: a ``take_biology_break`` suggested action, an
+        explicit ``breathing_pattern`` on the payload, or copy in the
+        headline / focus / micro-steps that talks about breathing.
+        """
+        actions = payload.get("suggested_actions") or []
+        if isinstance(actions, list):
+            for action in actions:
+                if isinstance(action, dict) and (
+                    str(action.get("action_type") or "") == "take_biology_break"
+                ):
+                    return True
+        if payload.get("breathing_pattern"):
+            return True
+        texts: list[str] = [
+            str(payload.get("headline") or ""),
+            str(payload.get("primary_focus") or ""),
+        ]
+        steps = payload.get("micro_steps") or []
+        if isinstance(steps, list):
+            for step in steps:
+                texts.append(
+                    str(step.get("text") or "") if isinstance(step, dict) else str(step)
+                )
+        return any("breath" in text.lower() for text in texts)
+
+    def _place_as_notification(self) -> None:
+        """Size to content and anchor to the top-right of the cursor's screen."""
+        try:
+            self.adjustSize()
+        except Exception:
+            pass
+        screen = self._target_screen()
+        if screen is None:
+            return
+        try:
+            geo = screen.availableGeometry()
+            width = min(POPUP_WIDTH, max(200, geo.width() - 2 * SP4))
+            if width != self.width():
+                self.setFixedWidth(width)
+                self.adjustSize()
+            height = min(self.height(), max(120, geo.height() - 2 * SP4))
+            if height != self.height():
+                self.resize(width, height)
+            self.move(geo.right() - self.width() - SP4 + 1, geo.top() + SP4)
+        except Exception:
+            logger.debug("overlay placement failed", exc_info=True)
 
     def _target_screen(self) -> Any:
         """FE-3 (P2-FE-MULTIMON): the screen the overlay should land on.
@@ -1310,60 +1409,61 @@ class OverlayWindow(QWidget):
                 pass
 
     # ------------------------------------------------------------------
-    # F51: causal-explanation truncation + Show more toggle
+    # "Why this?" — one toggle, one panel
     # ------------------------------------------------------------------
 
-    # Characters above which the explanation gets the truncate + toggle
-    # treatment. ~180 chars is roughly one rendered line at the FS_CAPTION
-    # size inside the 460-pt-wide HUD card — picked empirically rather
-    # than measured because the actual visible area depends on font
-    # metrics that change between dev mode and the bundled .app.
-    _CAUSAL_TRUNCATE_THRESHOLD: int = 180
-
     def _show_causal_explanation(self, causal: str) -> None:
-        """Set the causal explanation label. If the text exceeds the
-        truncation threshold, show a preview with a trailing ellipsis
-        plus a "Show more" toggle button. F51."""
-        full_text = f"Why this? {causal}"
-        self._causal_full_text = full_text
-        if len(causal) > self._CAUSAL_TRUNCATE_THRESHOLD:
-            # Word-boundary truncation: cut at the last space before the
-            # threshold so we never split mid-token.
-            _slice = causal[: self._CAUSAL_TRUNCATE_THRESHOLD]
-            _last_space = _slice.rfind(" ")
-            if _last_space > 0:
-                _slice = _slice[:_last_space]
-            preview = _slice.rstrip()
-            self._causal_preview_text = f"Why this? {preview}…"
-            self._causal_toggle.setChecked(False)
-            self._causal_toggle.setText("Show more")
-            self._causal_toggle.show()
-            self._causal_label.setText(self._causal_preview_text)
-        else:
-            self._causal_preview_text = full_text
-            self._causal_toggle.hide()
-            self._causal_label.setText(full_text)
+        """Stash the explanation in the Why panel and expose the toggle.
+
+        The full text is always available behind the single toggle — the
+        card never shows a truncated preview competing with the panel.
+        """
+        self._causal_full_text = causal.strip()
+        self._causal_label.setText(self._causal_full_text)
         self._causal_label.show()
+        self._sync_why_affordance()
 
     def _hide_causal_explanation(self) -> None:
-        """Reset the causal slot back to its empty / hidden state. F51."""
+        """Reset the causal slot back to its empty / hidden state."""
         self._causal_full_text = ""
-        self._causal_preview_text = ""
         self._causal_label.setText("")
         self._causal_label.hide()
-        self._causal_toggle.hide()
-        self._causal_toggle.setChecked(False)
+        self._sync_why_affordance()
+
+    def _sync_why_affordance(self) -> None:
+        """Show the toggle only when there is something to reveal; collapse
+        the panel whenever the toggle is unchecked or nothing remains."""
+        has_content = bool(self._causal_full_text) or bool(self._causal_signals_cache)
+        try:
+            if has_content:
+                self._causal_toggle.show()
+            else:
+                self._causal_toggle.setChecked(False)
+                self._causal_toggle.hide()
+                self._why_open = False
+                self._why_panel.hide()
+        except Exception:
+            logger.debug("why affordance sync failed", exc_info=True)
 
     def _on_causal_toggled(self, checked: bool) -> None:
-        """Handler for the Show more / Show less QToolButton. F51."""
+        """Handler for the single "Why this?" toggle."""
+        self._why_open = bool(checked)
         if checked:
-            self._causal_label.setText(self._causal_full_text)
-            self._causal_toggle.setText("Show less")
+            self._causal_toggle.setText("Hide why")
+            self._why_panel.show()
+            if not self._causal_signals_cache and self._intervention_id:
+                try:
+                    self.why_requested.emit(self._intervention_id)
+                except Exception:
+                    logger.debug("why_requested.emit failed", exc_info=True)
         else:
-            self._causal_label.setText(self._causal_preview_text)
-            self._causal_toggle.setText("Show more")
+            self._causal_toggle.setText("Why this?")
+            self._why_panel.hide()
 
     def keyPressEvent(self, event: object) -> None:
+        # Escape dismisses whenever the card (or a child) holds focus. The
+        # card never activates on show, so this is opt-in: the user has
+        # clicked into it first.
         if hasattr(event, "key") and event.key() == Qt.Key.Key_Escape:
             self._user_dismiss()
         else:
@@ -1645,24 +1745,11 @@ class OverlayWindow(QWidget):
             btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
             if reason:
                 btn.setToolTip(reason)
-            btn.setStyleSheet(
-                "QPushButton {"
-                "  background-color: rgba(255, 255, 255, 0.10);"
-                "  color: rgba(255, 255, 255, 0.92);"
-                "  border: 0.5px solid rgba(255, 255, 255, 0.18);"
-                f"  border-radius: {RADIUS_BUTTON}px;"
-                "  padding: 8px 16px;"
-                "  text-align: left;"
-                "}"
-                "QPushButton:hover {"
-                "  background-color: rgba(255, 255, 255, 0.18);"
-                "  color: white;"
-                "}"
-                "QPushButton:disabled {"
-                "  color: rgba(255, 255, 255, 0.42);"
-                "  background-color: rgba(255, 255, 255, 0.04);"
-                "}"
-            )
+            btn.setStyleSheet(self._action_btn_stylesheet())
+            try:
+                btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            except Exception:
+                pass
             _set_accessible_name(btn, label)
 
             if suggestion_only:
@@ -1824,16 +1911,7 @@ class OverlayWindow(QWidget):
         )
         confirm = QPushButton("Confirm")
         confirm.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
-        confirm.setStyleSheet(
-            "QPushButton {"
-            f"  background-color: {_ACCENT.name()};"
-            "  color: white;"
-            "  border: none;"
-            f"  border-radius: {RADIUS_BUTTON}px;"
-            "  padding: 6px 14px;"
-            "}"
-            "QPushButton:hover { background-color: rgba(217,119,87,0.85); }"
-        )
+        confirm.setStyleSheet(self._accent_btn_stylesheet())
 
         def _on_confirm() -> None:
             text = edit.text().strip()[:200]
@@ -1889,15 +1967,7 @@ class OverlayWindow(QWidget):
         vbox.addWidget(countdown)
         done_btn = QPushButton("Done")
         done_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
-        done_btn.setStyleSheet(
-            "QPushButton {"
-            f"  background-color: {_ACCENT.name()};"
-            "  color: white;"
-            "  border: none;"
-            f"  border-radius: {RADIUS_BUTTON}px;"
-            "  padding: 6px 14px;"
-            "}"
-        )
+        done_btn.setStyleSheet(self._accent_btn_stylesheet())
         vbox.addWidget(done_btn)
 
         def _on_done(_checked: bool = False) -> None:
@@ -1936,21 +2006,88 @@ class OverlayWindow(QWidget):
 
     @staticmethod
     def _footer_btn_stylesheet() -> str:
-        """Shared style for the three footer pills (Dismiss, Snooze 15,
-        Quiet for session). HUD-flavoured capsule that picks up the
-        terracotta accent only on hover."""
+        """Shared style for the footer pills (Snooze 15 min, Quiet for this
+        session). HUD-flavoured capsule with hover, pressed, and a visible
+        focus ring; the 2px transparent border keeps the ring from
+        shifting layout."""
         return (
             "QPushButton {"
             "  background-color: rgba(255, 255, 255, 0.08);"
-            "  color: rgba(255, 255, 255, 0.85);"
-            "  border: 0.5px solid rgba(255, 255, 255, 0.14);"
+            "  color: rgba(255, 255, 255, 0.88);"
+            "  border: 2px solid transparent;"
             f"  border-radius: {RADIUS_BUTTON}px;"
-            "  padding: 8px 10px;"
+            "  padding: 6px 8px;"
             "}"
             "QPushButton:hover {"
             "  background-color: rgba(255, 255, 255, 0.16);"
             "  color: white;"
             "}"
+            "QPushButton:pressed {"
+            "  background-color: rgba(255, 255, 255, 0.26);"
+            "  color: white;"
+            "}"
+            "QPushButton:focus { border-color: rgba(255, 255, 255, 0.55); }"
+        )
+
+    @staticmethod
+    def _icon_btn_stylesheet() -> str:
+        """Style for the × dismiss glyph button in the header."""
+        return (
+            "QPushButton {"
+            "  background-color: transparent;"
+            "  color: rgba(255, 255, 255, 0.70);"
+            "  border: 2px solid transparent;"
+            f"  border-radius: {RADIUS_BUTTON}px;"
+            "  padding: 0;"
+            "}"
+            "QPushButton:hover {"
+            "  background-color: rgba(255, 255, 255, 0.12); color: white;"
+            "}"
+            "QPushButton:pressed { background-color: rgba(255, 255, 255, 0.24); }"
+            "QPushButton:focus { border-color: rgba(255, 255, 255, 0.55); }"
+        )
+
+    @staticmethod
+    def _action_btn_stylesheet() -> str:
+        """Suggested-action buttons: full-width, left-aligned, with the
+        same hover / pressed / focus / disabled vocabulary as the pills."""
+        return (
+            "QPushButton {"
+            "  background-color: rgba(255, 255, 255, 0.10);"
+            "  color: rgba(255, 255, 255, 0.92);"
+            "  border: 2px solid transparent;"
+            f"  border-radius: {RADIUS_BUTTON}px;"
+            "  padding: 6px 12px;"
+            "  text-align: left;"
+            "}"
+            "QPushButton:hover {"
+            "  background-color: rgba(255, 255, 255, 0.18);"
+            "  color: white;"
+            "}"
+            "QPushButton:pressed { background-color: rgba(255, 255, 255, 0.28); }"
+            "QPushButton:focus { border-color: rgba(255, 255, 255, 0.55); }"
+            "QPushButton:disabled {"
+            "  color: rgba(255, 255, 255, 0.42);"
+            "  background-color: rgba(255, 255, 255, 0.04);"
+            "}"
+        )
+
+    @staticmethod
+    def _accent_btn_stylesheet() -> str:
+        """Filled terracotta confirm buttons inside inline widgets. Dark
+        ink on the accent fill clears AA; pressed darkens to the pressed
+        token and flips to white ink (see tokens.BTN_ACCENT_QSS)."""
+        return (
+            "QPushButton {"
+            f"  background-color: {_ACCENT.name()};"
+            "  color: #1A1A1A;"
+            "  border: 2px solid transparent;"
+            f"  border-radius: {RADIUS_BUTTON}px;"
+            "  padding: 4px 12px;"
+            "}"
+            "QPushButton:hover { background-color: #C46547; color: #111111; }"
+            "QPushButton:pressed { background-color: #B45638; color: #FFFFFF; }"
+            "QPushButton:focus { border-color: rgba(255, 255, 255, 0.85); }"
         )
 
     def _on_snooze_clicked(self) -> None:
@@ -1980,10 +2117,10 @@ class OverlayWindow(QWidget):
             "QPushButton {"
             "  background-color: rgba(255, 255, 255, 0.06);"
             "  color: white;"
-            "  border: 0.5px solid rgba(255, 255, 255, 0.14);"
+            "  border: 2px solid transparent;"
             f"  border-radius: {RADIUS_BUTTON}px;"
-            "  padding: 6px 16px;"
-            "  font-size: 16px;"
+            "  padding: 4px 12px;"
+            f"  font-size: {FS_BODY}px;"
             "}"
             "QPushButton:hover {"
             "  background-color: rgba(255, 255, 255, 0.12);"
@@ -1991,6 +2128,7 @@ class OverlayWindow(QWidget):
             "QPushButton:checked, QPushButton:pressed {"
             f"  background-color: {_ACCENT.name()};"
             "}"
+            "QPushButton:focus { border-color: rgba(255, 255, 255, 0.55); }"
         )
 
     def _reveal_feedback_row(self) -> None:
@@ -2063,20 +2201,6 @@ class OverlayWindow(QWidget):
     # P0 §3.9: structured "Why?" drilldown
     # ─────────────────────────────────────────────────────────────────
 
-    def _on_why_toggle_clicked(self) -> None:
-        self._why_open = not self._why_open
-        if self._why_open:
-            self._why_toggle.setText("Hide why")
-            self._why_panel.show()
-            if not self._causal_signals_cache and self._intervention_id:
-                try:
-                    self.why_requested.emit(self._intervention_id)
-                except Exception:
-                    logger.debug("why_requested.emit failed", exc_info=True)
-        else:
-            self._why_toggle.setText("Why?")
-            self._why_panel.hide()
-
     def apply_causal_signals(self, signals: list[dict]) -> None:
         """Public slot: ingest structured signals and rebuild the panel.
 
@@ -2096,13 +2220,11 @@ class OverlayWindow(QWidget):
             row = self._render_why_row(sig)
             if row is not None:
                 self._why_panel_layout.addWidget(row)
-        if self._causal_signals_cache:
-            self._why_toggle.show()
-        else:
-            self._why_toggle.hide()
-            self._why_panel.hide()
-            self._why_open = False
-            self._why_toggle.setText("Why?")
+        try:
+            self._why_signals_host.setVisible(bool(self._causal_signals_cache))
+        except Exception:
+            pass
+        self._sync_why_affordance()
 
     def _render_why_row(self, sig: dict) -> QFrame | None:
         try:
@@ -2154,19 +2276,25 @@ class OverlayWindow(QWidget):
         return row
 
     def _user_dismiss(self) -> None:
-        # F06: idempotent dismiss. First caller wins; subsequent calls no-op.
-        # Always stop the timeout timer, even if already dismissed, so that
-        # a stale timer cannot re-trigger on a hidden widget.
-        self._timeout_timer.stop()
-        # P0 §3.8 audit fix: tear down the feedback reveal timer + row so
-        # a late-firing 30 s singleShot cannot surface the 👍/👎 row on a
-        # dismissed intervention (which would emit USER_RATING against a
-        # stale intervention_id).
+        self._dismiss(reason="user")
+
+    def _auto_dismiss(self) -> None:
+        self._dismiss(reason="timeout")
+
+    def _dismiss(self, *, reason: str) -> None:
+        """The one dismiss path (user, timeout, rating completion).
+
+        F06: idempotent — first caller wins; subsequent calls no-op. Every
+        presentation timer is stopped unconditionally, even when already
+        dismissed, so a stale timer cannot re-trigger on a hidden widget.
+        P0 §3.8: the rating-reveal timer + row are torn down too so a late
+        30 s single-shot cannot surface 👍/👎 against a stale id.
+        """
+        self._stop_presentation_timers()
         self._stop_feedback_reveal_timer()
         if self._dismissed:
             return
         self._dismissed = True
-        self._pacer.stop()
         try:
             self._clear_inline_widgets()
         except Exception:
@@ -2178,25 +2306,7 @@ class OverlayWindow(QWidget):
         # button click after dismiss (Qt repaint tail, animation queue)
         # cannot emit ``action_invoked`` with the dismissed id.
         self._intervention_id = ""
-        logger.info(f"Intervention {dismissed_id} dismissed by user")
-
-    def _auto_dismiss(self) -> None:
-        # F06: idempotent dismiss. First caller wins; subsequent calls no-op.
-        self._timeout_timer.stop()
-        self._stop_feedback_reveal_timer()
-        if self._dismissed:
-            return
-        self._dismissed = True
-        self._pacer.stop()
-        try:
-            self._clear_inline_widgets()
-        except Exception:
-            logger.debug("clear inline widgets failed", exc_info=True)
-        self.hide()
-        dismissed_id = self._intervention_id
-        self.dismissed.emit(dismissed_id)
-        self._intervention_id = ""
-        logger.info(f"Intervention {dismissed_id} auto-dismissed (timeout)")
+        logger.info("Intervention %s dismissed (%s)", dismissed_id, reason)
 
     def _stop_feedback_reveal_timer(self) -> None:
         """P0 §3.8 audit fix: tear down the rating row reveal timer.
@@ -2218,12 +2328,8 @@ class OverlayWindow(QWidget):
             logger.debug("feedback row teardown failed", exc_info=True)
 
     def closeEvent(self, event: object) -> None:  # noqa: D401 - Qt override
-        # F06: ensure the timeout timer never fires after the window closes.
-        try:
-            self._timeout_timer.stop()
-        except RuntimeError:
-            # Timer already torn down by Qt; safe to ignore.
-            pass
+        # F06: ensure no presentation timer fires after the window closes.
+        self._stop_presentation_timers()
         self._dismissed = True
         super().closeEvent(event)
 
@@ -2232,8 +2338,5 @@ class OverlayWindow(QWidget):
         # against a Qt-collected widget. The flag is set before stop() to
         # short-circuit any callback that races in before the timer is gone.
         self._dismissed = True
-        try:
-            self._timeout_timer.stop()
-        except RuntimeError:
-            pass
+        self._stop_presentation_timers()
         super().deleteLater()

@@ -114,44 +114,46 @@ except ImportError:  # pragma: no cover - test stubs
             return 0
 
 from cortex.apps.desktop_shell import mac_native
-from cortex.apps.desktop_shell.components import install_elide, wrap_capped  # noqa: F401
+from cortex.apps.desktop_shell.components import (  # noqa: F401
+    SegmentedControl,
+    format_relative_age,
+    install_elide,
+    status_pill_qss,
+    wrap_capped,
+)
+from cortex.apps.desktop_shell.palette_runtime import active_state_color
 from cortex.apps.desktop_shell.tokens import (
     BRAND_ACCENT,
     BRAND_ACCENT_DIM,
     BRAND_ACCENT_HOVER,
     BRAND_ACCENT_TEXT,
-    BRAND_DISPLAY_FONT,
+    BTN_FOCUS_RING,
+    BTN_GHOST_QSS,
+    BTN_LINK_QSS,
+    CX_BG,
+    CX_BG_SECONDARY,
+    CX_BORDER_DEFAULT,
+    CX_DANGER_TEXT,
+    CX_SUCCESS_TEXT,
+    CX_SURFACE,
+    CX_TEXT,
     CX_TEXT_SECONDARY,
     CX_TEXT_TERTIARY,
     DASHBOARD_WIDTH,
     FS_CAPTION,
     FS_FOOTNOTE,
     FS_TITLE,
-    FW_SEMIBOLD,
-    RADIUS_BUTTON,
+    PAGE_TITLE_QSS,
     RADIUS_CARD,
     RADIUS_PILL,
-    SEMANTIC_LIGHT,
     SP1,
     SP2,
     SP3,
     SP4,
-    STATE_COLORS,
     STATE_LABELS,
 )
 
 logger = logging.getLogger(__name__)
-
-
-_CONTROL_BG = SEMANTIC_LIGHT["control_bg"]
-_GROUPED_BG = SEMANTIC_LIGHT["grouped_bg"]
-_WINDOW_BG = SEMANTIC_LIGHT["window_bg"]
-_SEPARATOR = SEMANTIC_LIGHT["separator"]
-_LABEL = SEMANTIC_LIGHT["label_primary"]
-_LABEL_SECONDARY = CX_TEXT_SECONDARY
-_LABEL_TERTIARY = CX_TEXT_TERTIARY
-_SUCCESS = SEMANTIC_LIGHT["success"]
-_WARNING = SEMANTIC_LIGHT["warning"]
 
 
 def _safe(target: Any, *args: Any, **kwargs: Any) -> Any:
@@ -264,18 +266,10 @@ def _format_relative_age(iso: str | None) -> tuple[str, bool]:
     except Exception:
         logger.debug("relative-age parse failed for %r", iso, exc_info=True)
         return ("Updated recently", False)
-    # Clock drift / future timestamps: clamp to "just now" so the UI
-    # doesn't render "Updated in 30s" which would confuse the user.
-    if delta_s < 60:
-        return ("Updated just now", False)
-    if delta_s < 3600:
-        minutes = int(delta_s // 60)
-        return (f"Updated {minutes}m ago", False)
-    if delta_s < 86400:
-        hours = int(delta_s // 3600)
-        return (f"Updated {hours}h ago", False)
-    days = int(delta_s // 86400)
-    return (f"Updated {days}d ago", True)
+    # Clock drift / future timestamps clamp to "just now" inside the
+    # shared formatter so the UI never renders "Updated in 30s".
+    stale = delta_s >= 86400
+    return (f"Updated {format_relative_age(delta_s, compact=True)}", stale)
 
 
 # Phase 4.B fix (#13): after this many ms the detail-panel loading state
@@ -333,75 +327,11 @@ class _RenderCacheMixin:
 
 
 # ---------------------------------------------------------------------------
-# Sub-segmented control (Today / Week / Month).
+# Sub-segmented control (Today / Week / Month) — the shared component.
 # ---------------------------------------------------------------------------
 
-
-class _SubSegmented(QWidget):
-    """Mini three-segment control. Visually lighter than the top-level
-    one because it nests inside a tab content area."""
-
-    selection_changed = Signal(int)
-
-    def __init__(self, labels: list[str], parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        outer = QHBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-
-        self._buttons: list[QPushButton] = []
-
-        track = QFrame()
-        track.setObjectName("_subseg_track")
-        track.setStyleSheet(
-            f"#_subseg_track {{ background: {_GROUPED_BG};"
-            f" border: 0.5px solid {_SEPARATOR};"
-            f" border-radius: 7px; }}"
-        )
-        track_layout = QHBoxLayout(track)
-        track_layout.setContentsMargins(3, 3, 3, 3)
-        track_layout.setSpacing(2)
-        for i, label in enumerate(labels):
-            btn = QPushButton(label)
-            btn.setCheckable(True)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
-            try:
-                btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-            except Exception:
-                pass
-            _safe(btn.setAccessibleName, f"{label} history view")
-            btn.setStyleSheet(
-                "QPushButton {"
-                "  padding: 3px 12px;"
-                "  border-radius: 5px;"
-                "  background: transparent;"
-                f"  color: {_LABEL_SECONDARY};"
-                "  border: none;"
-                "}"
-                f"QPushButton:hover {{ color: {_LABEL}; }}"
-                "QPushButton:checked {"
-                f"  background: {_CONTROL_BG};"
-                f"  color: {_LABEL};"
-                f"  font-weight: {FW_SEMIBOLD};"
-                "}"
-            )
-            btn.clicked.connect(lambda _checked=False, idx=i: self._on_clicked(idx))
-            track_layout.addWidget(btn, stretch=1)
-            self._buttons.append(btn)
-        outer.addWidget(track, stretch=1)
-        if self._buttons:
-            self._buttons[0].setChecked(True)
-
-    def _on_clicked(self, index: int) -> None:
-        for i, b in enumerate(self._buttons):
-            b.setChecked(i == index)
-        self.selection_changed.emit(index)
-
-    def set_selected(self, index: int) -> None:
-        if 0 <= index < len(self._buttons):
-            for i, b in enumerate(self._buttons):
-                b.setChecked(i == index)
+# Historical name retained; the implementation is the shared capsule.
+_SubSegmented = SegmentedControl
 
 
 # ---------------------------------------------------------------------------
@@ -420,15 +350,22 @@ class _SessionRow(_RenderCacheMixin, QFrame):
         super().__init__(parent)
         self.setObjectName("_SessionRow")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        # A row is a pressable: hover, pressed (via the dynamic ``pressed``
+        # property), and a visible keyboard focus ring. The 2px border at
+        # rest keeps the ring from shifting the row.
         self.setStyleSheet(
             "#_SessionRow {"
-            f"  background: {_CONTROL_BG};"
-            f"  border: 0.5px solid {_SEPARATOR};"
+            f"  background: {CX_SURFACE};"
+            "  border: 2px solid transparent;"
             f"  border-radius: {RADIUS_CARD}px;"
             "}"
             "#_SessionRow:hover {"
             f"  background: {BRAND_ACCENT_DIM};"
             "}"
+            '#_SessionRow[pressed="true"] {'
+            "  background: rgba(217, 119, 87, 0.22);"
+            "}"
+            f"#_SessionRow:focus {{ border: {BTN_FOCUS_RING}; }}"
         )
         try:
             self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -456,7 +393,7 @@ class _SessionRow(_RenderCacheMixin, QFrame):
         self._date_label = QLabel(_format_date_time(str(summary.get("start_time") or "")))
         self._date_label.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
         self._date_label.setStyleSheet(
-            f"color: {_LABEL}; background: transparent;"
+            f"color: {CX_TEXT}; background: transparent;"
         )
         self._duration_label = QLabel(_format_duration(summary.get("duration_seconds") or 0.0))
         self._duration_label.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
@@ -464,7 +401,7 @@ class _SessionRow(_RenderCacheMixin, QFrame):
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
         self._duration_label.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
         top.addWidget(self._date_label, stretch=1)
         top.addWidget(self._duration_label, stretch=0)
@@ -479,9 +416,9 @@ class _SessionRow(_RenderCacheMixin, QFrame):
         if flow_pct >= 60.0:
             flow_color = BRAND_ACCENT_TEXT
         elif flow_pct < 30.0:
-            flow_color = _LABEL_TERTIARY
+            flow_color = CX_TEXT_TERTIARY
         else:
-            flow_color = _LABEL_SECONDARY
+            flow_color = CX_TEXT_SECONDARY
         self._flow_label = QLabel(f"{flow_pct:.0f}% flow")
         self._flow_label.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
         self._flow_label.setStyleSheet(
@@ -492,7 +429,7 @@ class _SessionRow(_RenderCacheMixin, QFrame):
         self._peak_label = QLabel(f"peak {peak:.0f}")
         self._peak_label.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         self._peak_label.setStyleSheet(
-            f"color: {_LABEL_TERTIARY}; background: transparent;"
+            f"color: {CX_TEXT_TERTIARY}; background: transparent;"
         )
 
         top_domain = str(summary.get("top_distraction_domain") or "").strip()
@@ -503,7 +440,7 @@ class _SessionRow(_RenderCacheMixin, QFrame):
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
         self._domain_label.setStyleSheet(
-            f"color: {_LABEL_TERTIARY}; background: transparent;"
+            f"color: {CX_TEXT_TERTIARY}; background: transparent;"
         )
 
         bottom.addWidget(self._flow_label, stretch=0)
@@ -514,14 +451,36 @@ class _SessionRow(_RenderCacheMixin, QFrame):
         layout.addLayout(top)
         layout.addLayout(bottom)
 
+    def _set_pressed(self, pressed: bool) -> None:
+        try:
+            self.setProperty("pressed", "true" if pressed else "false")
+            style = self.style()
+            style.unpolish(self)
+            style.polish(self)
+        except Exception:
+            pass
+
     def mousePressEvent(self, event: Any) -> None:  # noqa: D401 - Qt
-        if self._session_id:
+        self._set_pressed(True)
+        try:
+            super().mousePressEvent(event)
+        except Exception:
+            pass
+
+    def mouseReleaseEvent(self, event: Any) -> None:  # noqa: D401 - Qt
+        self._set_pressed(False)
+        inside = True
+        try:
+            inside = self.rect().contains(event.position().toPoint())
+        except Exception:
+            pass
+        if inside and self._session_id:
             try:
                 self.clicked.emit(self._session_id)
             except Exception:
                 pass
         try:
-            super().mousePressEvent(event)
+            super().mouseReleaseEvent(event)
         except Exception:
             pass
 
@@ -578,14 +537,14 @@ class _TodayPanel(_RenderCacheMixin, QWidget):
         self._header_title = QLabel("Sessions  ·  last 30 days")
         self._header_title.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
         self._header_title.setStyleSheet(
-            f"color: {_LABEL}; background: transparent;"
+            f"color: {CX_TEXT}; background: transparent;"
         )
         self._count_chip = QLabel("0")
         self._count_chip.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
         self._count_chip.setStyleSheet(
-            f"color: {_LABEL_SECONDARY};"
-            f" background: {_GROUPED_BG};"
-            f" border: 0.5px solid {_SEPARATOR};"
+            f"color: {CX_TEXT_SECONDARY};"
+            f" background: {CX_BG_SECONDARY};"
+            f" border: 0.5px solid {CX_BORDER_DEFAULT};"
             f" border-radius: {RADIUS_PILL}px;"
             "  padding: 1px 9px;"
         )
@@ -602,7 +561,7 @@ class _TodayPanel(_RenderCacheMixin, QWidget):
         scroll.setStyleSheet(
             "QScrollArea { background: transparent; border: none; }"
             "QScrollBar:vertical { width: 8px; background: transparent; }"
-            f"QScrollBar::handle:vertical {{ background: {_LABEL_TERTIARY};"
+            f"QScrollBar::handle:vertical {{ background: {CX_TEXT_TERTIARY};"
             "  border-radius: 4px; min-height: 24px; }"
             "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
         )
@@ -622,7 +581,7 @@ class _TodayPanel(_RenderCacheMixin, QWidget):
             mac_native.system_font(FS_FOOTNOTE, "regular")
         )
         self._list_loading_label.setStyleSheet(
-            f"color: {_LABEL_TERTIARY}; background: transparent;"
+            f"color: {CX_TEXT_TERTIARY}; background: transparent;"
         )
         self._list_loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._list_loading_label.setVisible(False)
@@ -634,7 +593,7 @@ class _TodayPanel(_RenderCacheMixin, QWidget):
         )
         self._empty_label.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
         self._empty_label.setStyleSheet(
-            f"color: {_LABEL_TERTIARY}; background: transparent;"
+            f"color: {CX_TEXT_TERTIARY}; background: transparent;"
         )
         self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._empty_label.setWordWrap(True)
@@ -649,18 +608,7 @@ class _TodayPanel(_RenderCacheMixin, QWidget):
             self._more_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         except Exception:
             pass
-        self._more_btn.setStyleSheet(
-            "QPushButton {"
-            "  padding: 5px 14px;"
-            f"  border-radius: {RADIUS_BUTTON}px;"
-            "  background: transparent;"
-            f"  color: {_LABEL_SECONDARY};"
-            f"  border: 0.5px solid {_SEPARATOR};"
-            "}"
-            "QPushButton:hover { background: rgba(0,0,0,0.03);"
-            f" color: {_LABEL}; }}"
-            f"QPushButton:disabled {{ color: {_LABEL_TERTIARY}; }}"
-        )
+        self._more_btn.setStyleSheet(BTN_GHOST_QSS)
         self._more_btn.clicked.connect(self._on_more_clicked)
         self._more_btn.setVisible(False)
         outer.addWidget(self._more_btn, alignment=Qt.AlignmentFlag.AlignCenter)
@@ -706,6 +654,24 @@ class _TodayPanel(_RenderCacheMixin, QWidget):
             return
         # P2-5: clear the in-flight loading state now that the response landed.
         self.set_list_loading(False)
+        error = str(payload.get("error") or "")
+        if error and not payload.get("items"):
+            # An error envelope is not an empty history. Keep whatever rows
+            # are on screen and say what actually happened.
+            if not self._items:
+                self._set_text_if_changed(
+                    self._empty_label,
+                    "Session history is available while Cortex is running."
+                    if error == "daemon_unavailable"
+                    else "Couldn't load session history. Try again in a moment.",
+                )
+                self._empty_label.setVisible(True)
+            self._restore_more_button(self._next_cursor)
+            return
+        self._set_text_if_changed(
+            self._empty_label,
+            "No sessions yet — your history will appear here as you use Cortex.",
+        )
         new_items_raw = payload.get("items") or []
         if not isinstance(new_items_raw, list):
             new_items_raw = []
@@ -847,7 +813,7 @@ class _StateTimelineWidget(QWidget):
             bg_path = QPainterPath()
             bg_path.addRoundedRect(QRectF(0, 0, w, h), 6.0, 6.0)
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(_GROUPED_BG))
+            painter.setBrush(QColor(CX_BG_SECONDARY))
             painter.drawPath(bg_path)
             if not self._segments:
                 return
@@ -856,7 +822,11 @@ class _StateTimelineWidget(QWidget):
             painter.setClipPath(bg_path)
             for state, weight in self._segments:
                 seg_w = max(1.0, (weight / total) * w)
-                color = STATE_COLORS.get(state, _LABEL_TERTIARY)
+                color = (
+                    active_state_color(state)
+                    if state in STATE_LABELS and state != "UNKNOWN"
+                    else CX_TEXT_TERTIARY
+                )
                 painter.setBrush(QColor(color))
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.drawRect(QRectF(x, 0, seg_w, h))
@@ -901,7 +871,7 @@ class _HeatmapWidget(QWidget):
                 val = self._buckets[hour]
                 # Background tile.
                 painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QColor(_GROUPED_BG))
+                painter.setBrush(QColor(CX_BG_SECONDARY))
                 painter.drawRoundedRect(QRectF(x, y, cell_w, cell_h), 3, 3)
                 if max_val > 0.0 and val > 0.0:
                     intensity = val / max_val
@@ -919,8 +889,8 @@ class _ChipRow(QFrame):
     def __init__(self, label: str, value: str, accent: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setStyleSheet(
-            f"background: {_GROUPED_BG};"
-            f" border: 0.5px solid {_SEPARATOR};"
+            f"background: {CX_BG_SECONDARY};"
+            f" border: 0.5px solid {CX_BORDER_DEFAULT};"
             f" border-radius: {RADIUS_PILL}px;"
         )
         layout = QHBoxLayout(self)
@@ -928,7 +898,7 @@ class _ChipRow(QFrame):
         layout.setSpacing(SP2)
         cap = QLabel(label)
         cap.setFont(mac_native.system_font(FS_CAPTION, "regular"))
-        cap.setStyleSheet(f"color: {_LABEL_SECONDARY}; background: transparent;")
+        cap.setStyleSheet(f"color: {CX_TEXT_SECONDARY}; background: transparent;")
         val = QLabel(value)
         val.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
         val.setStyleSheet(f"color: {accent}; background: transparent;")
@@ -948,7 +918,7 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setStyleSheet(f"background: {_WINDOW_BG};")
+        self.setStyleSheet(f"background: {CX_BG};")
         self.hide()
         self._current_payload_hash: str = ""
         # Phase 4.B fix (#13): tracks whether the panel is currently
@@ -972,37 +942,29 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
             self._back_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         except Exception:
             pass
-        self._back_btn.setStyleSheet(
-            "QPushButton {"
-            "  padding: 4px 10px;"
-            f"  border-radius: {RADIUS_BUTTON}px;"
-            "  background: transparent;"
-            f"  color: {_LABEL_SECONDARY};"
-            "  border: none;"
-            "}"
-            f"QPushButton:hover {{ color: {_LABEL}; }}"
+        self._back_btn.setStyleSheet(BTN_LINK_QSS)
+        _safe(self._back_btn.setAccessibleName, "Back to sessions")
+        _safe(
+            self._back_btn.setAccessibleDescription,
+            "Closes this report and returns to the session list. Escape also closes it.",
         )
         self._back_btn.clicked.connect(self.back_requested.emit)
         top.addWidget(self._back_btn)
         top.addStretch(1)
         outer.addLayout(top)
 
-        # Headline date + duration.
+        # Headline date + duration (system face — the display serif is
+        # reserved for the wordmark and hero numerals).
         self._headline = QLabel("")
-        self._headline.setStyleSheet(
-            f"font-family: {BRAND_DISPLAY_FONT};"
-            f" font-size: {FS_TITLE}pt;"
-            "  font-style: italic;"
-            f"  color: {_LABEL};"
-            "  background: transparent;"
-        )
+        self._headline.setFont(mac_native.system_font(FS_TITLE, "semibold"))
+        self._headline.setStyleSheet(PAGE_TITLE_QSS)
         self._headline.setWordWrap(True)
         outer.addWidget(self._headline)
 
         self._subhead = QLabel("")
         self._subhead.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
         self._subhead.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
         outer.addWidget(self._subhead)
 
@@ -1016,7 +978,7 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
             mac_native.system_font(FS_FOOTNOTE, "regular")
         )
         self._loading_label.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
         self._loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._loading_label.setVisible(False)
@@ -1030,7 +992,7 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
         self._error_label = QLabel("")
         self._error_label.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
         self._error_label.setStyleSheet(
-            f"color: {SEMANTIC_LIGHT['danger']}; background: transparent;"
+            f"color: {CX_DANGER_TEXT}; background: transparent;"
         )
         self._error_label.setWordWrap(True)
         self._error_label.setVisible(False)
@@ -1043,7 +1005,7 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
         scroll.setStyleSheet(
             "QScrollArea { background: transparent; border: none; }"
             "QScrollBar:vertical { width: 8px; background: transparent; }"
-            f"QScrollBar::handle:vertical {{ background: {_LABEL_TERTIARY};"
+            f"QScrollBar::handle:vertical {{ background: {CX_TEXT_TERTIARY};"
             "  border-radius: 4px; min-height: 24px; }"
             "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
         )
@@ -1062,7 +1024,7 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
         self._timeline_label = QLabel("State timeline")
         self._timeline_label.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
         self._timeline_label.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
         self._timeline = _StateTimelineWidget()
         body_layout.addWidget(self._timeline_label)
@@ -1072,7 +1034,7 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
         self._heatmap_label = QLabel("Hourly flow")
         self._heatmap_label.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
         self._heatmap_label.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
         self._heatmap = _HeatmapWidget()
         body_layout.addWidget(self._heatmap_label)
@@ -1082,7 +1044,7 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
         self._distractions_label = QLabel("Top distractions")
         self._distractions_label.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
         self._distractions_label.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
         self._distractions_host = QFrame()
         self._distractions_host.setStyleSheet("background: transparent;")
@@ -1096,7 +1058,7 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
         self._interventions_label = QLabel("Interventions")
         self._interventions_label.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
         self._interventions_label.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
         self._interventions_host = QFrame()
         self._interventions_host.setStyleSheet("background: transparent;")
@@ -1110,7 +1072,7 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
         self._comparison_label = QLabel("Compared to your 7-day rolling average")
         self._comparison_label.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
         self._comparison_label.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
         self._comparison_host = QFrame()
         self._comparison_host.setStyleSheet("background: transparent;")
@@ -1123,6 +1085,23 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
         body_layout.addStretch(1)
         scroll.setWidget(body)
         outer.addWidget(scroll, stretch=1)
+
+    def keyPressEvent(self, event: Any) -> None:  # noqa: D401 - Qt override
+        try:
+            key = event.key()
+        except Exception:
+            key = None
+        if key == Qt.Key.Key_Escape:
+            self.back_requested.emit()
+            try:
+                event.accept()
+            except Exception:
+                pass
+            return
+        try:
+            super().keyPressEvent(event)
+        except Exception:
+            pass
 
     def set_loading(self, loading: bool) -> None:
         """Toggle the explicit "Loading session…" state.
@@ -1374,7 +1353,7 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
             placeholder.setObjectName("CortexDetailDistractionsEmpty")
             placeholder.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
             placeholder.setStyleSheet(
-                f"color: {_LABEL_TERTIARY}; background: transparent;"
+                f"color: {CX_TEXT_TERTIARY}; background: transparent;"
             )
             self._distractions_layout.addWidget(placeholder)
             return
@@ -1382,7 +1361,7 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
             row = QLabel(f"·  {d}")
             row.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
             row.setStyleSheet(
-                f"color: {_LABEL_SECONDARY}; background: transparent;"
+                f"color: {CX_TEXT_SECONDARY}; background: transparent;"
             )
             self._distractions_layout.addWidget(row)
 
@@ -1399,7 +1378,7 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
             placeholder = QLabel("No HYPER spikes recorded.")
             placeholder.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
             placeholder.setStyleSheet(
-                f"color: {_LABEL_TERTIARY}; background: transparent;"
+                f"color: {CX_TEXT_TERTIARY}; background: transparent;"
             )
             self._interventions_layout.addWidget(placeholder)
             return
@@ -1414,7 +1393,7 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
             )
             label.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
             label.setStyleSheet(
-                f"color: {_LABEL_SECONDARY}; background: transparent;"
+                f"color: {CX_TEXT_SECONDARY}; background: transparent;"
             )
             self._interventions_layout.addWidget(label)
 
@@ -1431,15 +1410,15 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
             placeholder = QLabel("Insufficient history yet — try a few more sessions.")
             placeholder.setFont(mac_native.system_font(FS_CAPTION, "regular"))
             placeholder.setStyleSheet(
-                f"color: {_LABEL_TERTIARY}; background: transparent;"
+                f"color: {CX_TEXT_TERTIARY}; background: transparent;"
             )
             self._comparison_layout.addWidget(placeholder)
             self._comparison_layout.addStretch(1)
             return
         focus = float(comparison.get("focus_delta") or 0.0)
         stress = float(comparison.get("stress_delta") or 0.0)
-        focus_color = _SUCCESS if focus >= 0 else SEMANTIC_LIGHT["danger"]
-        stress_color = _SUCCESS if stress <= 0 else SEMANTIC_LIGHT["danger"]
+        focus_color = CX_SUCCESS_TEXT if focus >= 0 else CX_DANGER_TEXT
+        stress_color = CX_SUCCESS_TEXT if stress <= 0 else CX_DANGER_TEXT
         self._comparison_layout.addWidget(
             _ChipRow("Focus", f"{focus:+.1f}pp", focus_color)
         )
@@ -1480,7 +1459,7 @@ class _TrendBarsWidget(QWidget):
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
             w, h = self.width(), self.height()
             if not self._values:
-                painter.setPen(QColor(_LABEL_TERTIARY))
+                painter.setPen(QColor(CX_TEXT_TERTIARY))
                 painter.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
                 painter.drawText(
                     self.rect(),
@@ -1523,15 +1502,15 @@ class _TrendBarsWidget(QWidget):
                 if value >= top_q and value > 0.0:
                     color = QColor(BRAND_ACCENT)
                 elif value <= bot_q:
-                    color = QColor(_LABEL_TERTIARY)
+                    color = QColor(CX_TEXT_TERTIARY)
                 else:
-                    color = QColor(_LABEL_SECONDARY)
+                    color = QColor(CX_TEXT_SECONDARY)
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.setBrush(color)
                 painter.drawRoundedRect(QRectF(x, y, bar_w, max(2.0, height)), 3, 3)
                 # Label.
                 if i < len(self._labels):
-                    painter.setPen(QColor(_LABEL_TERTIARY))
+                    painter.setPen(QColor(CX_TEXT_TERTIARY))
                     font = mac_native.system_font(FS_CAPTION, "regular")
                     if isinstance(font, QFont):
                         painter.setFont(font)
@@ -1607,7 +1586,7 @@ class _GoldenHourStripe(QWidget):
             w, h = self.width(), self.height()
             track_h = h - 12
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(_GROUPED_BG))
+            painter.setBrush(QColor(CX_BG_SECONDARY))
             painter.drawRoundedRect(QRectF(0, 0, w, track_h), 4, 4)
             if not self._hourly:
                 return
@@ -1635,7 +1614,7 @@ class _GoldenHourStripe(QWidget):
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawRoundedRect(QRectF(x + 1, 1, width - 2, track_h - 2), 4, 4)
             # Hour labels (every 4 hours).
-            painter.setPen(QColor(_LABEL_TERTIARY))
+            painter.setPen(QColor(CX_TEXT_TERTIARY))
             font = mac_native.system_font(FS_CAPTION, "regular")
             if isinstance(font, QFont):
                 painter.setFont(font)
@@ -1691,17 +1670,11 @@ class _TrendsPanel(_RenderCacheMixin, QWidget):
         self._header_label = QLabel(header_title)
         self._header_label.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
         self._header_label.setStyleSheet(
-            f"color: {_LABEL}; background: transparent;"
+            f"color: {CX_TEXT}; background: transparent;"
         )
         self._trend_pill = QLabel("Trend: stable")
         self._trend_pill.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
-        self._trend_pill.setStyleSheet(
-            f"color: {_LABEL_SECONDARY};"
-            f" background: {_GROUPED_BG};"
-            f" border: 0.5px solid {_SEPARATOR};"
-            f" border-radius: {RADIUS_PILL}px;"
-            "  padding: 1px 9px;"
-        )
+        self._trend_pill.setStyleSheet(status_pill_qss("neutral"))
         self._trend_pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         header_row1 = QHBoxLayout()
@@ -1718,7 +1691,7 @@ class _TrendsPanel(_RenderCacheMixin, QWidget):
         self._updated_label = QLabel("Not yet aggregated")
         self._updated_label.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         self._updated_label.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
         _safe(
             self._updated_label.setAccessibleName,
@@ -1766,7 +1739,7 @@ class _TrendsPanel(_RenderCacheMixin, QWidget):
         )
         self._empty_label.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
         self._empty_label.setStyleSheet(
-            f"color: {_LABEL_TERTIARY}; background: transparent;"
+            f"color: {CX_TEXT_TERTIARY}; background: transparent;"
         )
         self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._empty_label.setWordWrap(True)
@@ -1781,7 +1754,7 @@ class _TrendsPanel(_RenderCacheMixin, QWidget):
         self._golden_caption = QLabel("Golden hours (lower-overload windows)")
         self._golden_caption.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
         self._golden_caption.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
         outer.addWidget(self._golden_caption)
         self._golden = _GoldenHourStripe()
@@ -1791,7 +1764,7 @@ class _TrendsPanel(_RenderCacheMixin, QWidget):
         self._distractions_caption = QLabel("Top distractions in this window")
         self._distractions_caption.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
         self._distractions_caption.setStyleSheet(
-            f"color: {_LABEL_SECONDARY}; background: transparent;"
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
         outer.addWidget(self._distractions_caption)
         self._distractions_host = QFrame()
@@ -1804,29 +1777,10 @@ class _TrendsPanel(_RenderCacheMixin, QWidget):
         outer.addStretch(1)
 
     def _refresh_btn_qss(self, *, enabled: bool) -> str:
-        """Stylesheet for the small Refresh button. Ghost / tertiary
-        style with a BRAND_ACCENT-tinted border at ~40 % alpha — keeps
-        the warmth without competing visually with the trend pill."""
-        # ``rgba`` strings are inlined because Qt's stylesheet engine
-        # doesn't honour CSS variables. Disabled state drops contrast
-        # so the user can't fight the spinner.
-        text_color = _LABEL if enabled else _LABEL_TERTIARY
-        border_color = "rgba(212, 90, 56, 0.40)" if enabled else "rgba(212, 90, 56, 0.20)"
-        return (
-            "QPushButton {"
-            f"  padding: {SP2}px {SP3}px;"
-            "  border-radius: 6px;"
-            "  background: transparent;"
-            f"  color: {text_color};"
-            f"  border: 0.5px solid {border_color};"
-            "}"
-            f"QPushButton:hover {{ color: {BRAND_ACCENT_TEXT}; background: {BRAND_ACCENT_DIM};"
-            f" border-color: {BRAND_ACCENT}; }}"
-            "QPushButton:disabled {"
-            f"  color: {_LABEL_TERTIARY};"
-            f"  border-color: rgba(212, 90, 56, 0.20);"
-            "}"
-        )
+        """Stylesheet for the small Refresh button: the shared ghost
+        recipe (hover, pressed, focus ring, disabled)."""
+        del enabled  # the recipe carries its own :disabled state
+        return BTN_GHOST_QSS
 
     def _on_refresh_clicked(self) -> None:
         """User clicked Refresh. Flips the button into the pending
@@ -1896,7 +1850,7 @@ class _TrendsPanel(_RenderCacheMixin, QWidget):
             iso = chronotype.get("last_updated")
         text, stale = _format_relative_age(iso if isinstance(iso, str) else None)
         self._set_text_if_changed(self._updated_label, text)
-        colour = BRAND_ACCENT_TEXT if stale else _LABEL_SECONDARY
+        colour = BRAND_ACCENT_TEXT if stale else CX_TEXT_SECONDARY
         self._set_style_if_changed(
             self._updated_label,
             f"color: {colour}; background: transparent;",
@@ -1971,23 +1925,16 @@ class _TrendsPanel(_RenderCacheMixin, QWidget):
 
     def _update_trend_pill(self, direction: str) -> None:
         if direction == "improving":
-            color = _SUCCESS
+            tone = "success"
             text = "Trend: improving"
         elif direction == "declining":
-            color = SEMANTIC_LIGHT["danger"]
+            tone = "danger"
             text = "Trend: declining"
         else:
-            color = _LABEL_SECONDARY
+            tone = "neutral"
             text = "Trend: stable"
         self._set_text_if_changed(self._trend_pill, text)
-        self._set_style_if_changed(
-            self._trend_pill,
-            f"color: {color};"
-            f" background: {_GROUPED_BG};"
-            f" border: 0.5px solid {_SEPARATOR};"
-            f" border-radius: {RADIUS_PILL}px;"
-            "  padding: 1px 9px;",
-        )
+        self._set_style_if_changed(self._trend_pill, status_pill_qss(tone))
 
     def _populate_distractions(self, rows: list[dict]) -> None:
         for i in reversed(range(self._distractions_layout.count())):
@@ -2002,7 +1949,7 @@ class _TrendsPanel(_RenderCacheMixin, QWidget):
             placeholder = QLabel("Not enough samples yet.")
             placeholder.setFont(mac_native.system_font(FS_CAPTION, "regular"))
             placeholder.setStyleSheet(
-                f"color: {_LABEL_TERTIARY}; background: transparent;"
+                f"color: {CX_TEXT_TERTIARY}; background: transparent;"
             )
             self._distractions_layout.addWidget(placeholder)
             return
@@ -2012,7 +1959,7 @@ class _TrendsPanel(_RenderCacheMixin, QWidget):
             label = QLabel(f"·  {key}  —  {rate * 100:.0f}% overload")
             label.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
             label.setStyleSheet(
-                f"color: {_LABEL_SECONDARY}; background: transparent;"
+                f"color: {CX_TEXT_SECONDARY}; background: transparent;"
             )
             self._distractions_layout.addWidget(label)
 
@@ -2034,7 +1981,7 @@ class HistoryTab(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("CortexHistoryTab")
-        self.setStyleSheet(f"background: {_WINDOW_BG};")
+        self.setStyleSheet(f"background: {CX_BG};")
         self.setMaximumWidth(DASHBOARD_WIDTH + 60)
 
         # State: which sub-panels have already been auto-requested so we
@@ -2066,9 +2013,12 @@ class HistoryTab(QWidget):
         self._export_btn = QPushButton("Export…")
         try:
             self._export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._export_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         except Exception:
             pass
         self._export_btn.setFont(mac_native.system_font(FS_CAPTION, "medium"))
+        self._export_btn.setStyleSheet(BTN_GHOST_QSS)
+        _safe(self._export_btn.setAccessibleName, "Export session")
         self._export_btn.setEnabled(False)
         try:
             self._export_btn.setToolTip(
@@ -2080,7 +2030,7 @@ class HistoryTab(QWidget):
         export_row.addWidget(self._export_btn)
         outer.addLayout(export_row)
 
-        self._sub_seg = _SubSegmented(["Today", "Week", "Month"])
+        self._sub_seg = SegmentedControl(["Today", "Week", "Month"], role_suffix="history view")
         outer.addWidget(self._sub_seg)
 
         self._stack = QStackedWidget()
@@ -2197,18 +2147,24 @@ class HistoryTab(QWidget):
         except Exception:
             logger.debug("detail_requested emit failed", exc_info=True)
 
-    def open_detail(self, session_id: str) -> None:
+    def open_detail(self, session_id: str, *, report: dict | None = None) -> None:
         """Public entry point — used by the RecapSheet's
         ``view_full_report`` route. Switches to the Today sub-page so
-        the overlay appears in the right spot, then asks the daemon for
-        the report.
+        the overlay appears in the right spot, then shows the report.
+
+        When ``report`` is supplied (the SESSION_RECAP payload already in
+        hand) it is rendered directly — the daemon has stopped by then and
+        must not be asked for it. Otherwise the detail is requested.
         """
         # Force-switch to Today so the overlay anchors correctly.
-        self._sub_seg.set_selected(0)
+        self._sub_seg.set_selected(0, emit=False)
         try:
             self._stack.setCurrentIndex(0)
         except Exception:
             pass
+        if isinstance(report, dict) and report.get("session_id"):
+            self.apply_session_detail({"report": dict(report)})
+            return
         self._on_row_clicked(session_id)
 
     def _show_detail_panel_loading(self) -> None:
@@ -2285,6 +2241,24 @@ class HistoryTab(QWidget):
             pass
         if self._detail_panel.isVisible():
             self._position_detail_panel()
+
+    def keyPressEvent(self, event: Any) -> None:  # noqa: D401 - Qt override
+        # Escape closes the detail overlay from anywhere inside the tab.
+        try:
+            key = event.key()
+        except Exception:
+            key = None
+        if key == Qt.Key.Key_Escape and self._detail_panel.isVisible():
+            self._hide_detail_panel()
+            try:
+                event.accept()
+            except Exception:
+                pass
+            return
+        try:
+            super().keyPressEvent(event)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Apply incoming WS payloads (called from the controller wiring).

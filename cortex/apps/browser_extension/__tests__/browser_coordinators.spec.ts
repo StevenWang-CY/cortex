@@ -224,7 +224,7 @@ describe("browser bounded coordinators", () => {
     });
 
     it("derives popup copy from transport state outside the React view", () => {
-        expect(connectivityViewModel({
+        const handshake = connectivityViewModel({
             state: "handshake_failed",
             launching: false,
             launchError: false,
@@ -232,12 +232,15 @@ describe("browser bounded coordinators", () => {
             expectedVersion: "2.0.0",
             daemonVersion: "2.0.0",
             handshakeError: "token rejected",
-        })).toMatchObject({
-            title: "Handshake failed",
-            body: "token rejected",
+        });
+        expect(handshake).toMatchObject({
+            title: "Cortex couldn't verify this browser",
             action: "handshake",
             disabled: false,
         });
+        // Raw codes are diagnostics; the body is guidance the user can act on.
+        expect(handshake.body).not.toContain("token rejected");
+        expect(handshake.body).toContain("Connect Extensions");
         expect(supportStateViewModel({
             state: "FLOW",
             status: "insufficient_evidence",

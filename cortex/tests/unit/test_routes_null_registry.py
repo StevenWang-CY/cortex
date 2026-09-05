@@ -13,6 +13,8 @@ Asserts:
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -22,6 +24,7 @@ from cortex.services.api_gateway.routes import (
     _get_registry,
     _NullRegistry,
     health_router,
+    metrics_router,
 )
 
 # ---------------------------------------------------------------------------
@@ -68,9 +71,10 @@ def test_null_registry_healthy_false() -> None:
 
 @pytest.fixture()
 def bare_app() -> FastAPI:
-    """FastAPI app with health_router but NO registry on app.state."""
+    """FastAPI app with the liveness + metrics routers but NO registry on app.state."""
     app = FastAPI()
     app.include_router(health_router)
+    app.include_router(metrics_router)
     # Deliberately omit app.state.registry
     return app
 
@@ -86,10 +90,22 @@ def test_health_endpoint_graceful_without_registry(bare_app: FastAPI) -> None:
     assert body["services"] == {}
 
 
-def test_metrics_endpoint_graceful_without_registry(bare_app: FastAPI) -> None:
-    """/metrics returns 200 with text/plain content."""
+def test_metrics_endpoint_graceful_without_registry(
+    bare_app: FastAPI, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """/metrics returns 200 with text/plain content for an authenticated
+    caller even without a registry; D12: tokenless callers get 401, not a
+    crash and not the exposition."""
+    from cortex.libs.auth.local_token import load_or_create_token
+
+    token_file = tmp_path / "auth.token"
+    monkeypatch.setattr("cortex.libs.auth.local_token.auth_token_path", lambda: token_file)
+    token = load_or_create_token(token_file)
+
     with TestClient(bare_app) as client:
-        r = client.get("/metrics")
+        tokenless = client.get("/metrics")
+        r = client.get("/metrics", headers={"Authorization": f"Bearer {token}"})
+    assert tokenless.status_code == 401
     assert r.status_code == 200
     ct = r.headers.get("content-type", "")
     assert "text/plain" in ct

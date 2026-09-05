@@ -21,6 +21,7 @@ import pytest
 pytest.importorskip("PySide6.QtWidgets")
 
 import cortex.apps.desktop_shell.dashboard as dash  # noqa: E402
+from cortex.apps.desktop_shell.tokens import CX_SURFACE  # noqa: E402
 
 
 def test_global_qss_defines_opaque_menu() -> None:
@@ -28,7 +29,7 @@ def test_global_qss_defines_opaque_menu() -> None:
     assert "QMenu {" in qss, "global stylesheet must style QMenu"
     # An opaque control-surface background (not transparent / unset).
     assert "background-color" in qss.split("QMenu {", 1)[1][:200]
-    assert dash._CONTROL_BG in qss
+    assert CX_SURFACE in qss
 
 
 def test_recent_goals_menu_builder_sets_opaque_scoped_style() -> None:
@@ -42,6 +43,6 @@ def test_recent_goals_menu_builder_sets_opaque_scoped_style() -> None:
     assert 'setObjectName("RecentGoalsMenu")' in src
     assert "setStyleSheet(" in src
     assert "background-color" in src
-    assert "_CONTROL_BG" in src
+    assert "CX_SURFACE" in src
     # Defensive opacity against the translucent parent window.
     assert "WA_TranslucentBackground" in src

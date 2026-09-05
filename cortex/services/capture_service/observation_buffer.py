@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
-from typing import Generic, Protocol, TypeVar
+from typing import Any, Generic, Protocol, TypeVar
 from uuid import UUID
 
 import numpy as np
@@ -81,7 +81,17 @@ class ObservationBuffer(Generic[ObservationT]):
 
 @dataclass(frozen=True)
 class NumericObservation(TimedObservation):
-    """One scalar/vector sample plus its observation integrity metadata."""
+    """One scalar/vector sample plus its observation integrity metadata.
+
+    ``motion_face_widths_per_second`` is the nose-tip translation speed of
+    this observation normalised by face width (resolution and frame-rate
+    independent; computed by :class:`FaceTracker` and exported through the
+    capture quality scorer).  It is the motion evidence consumed by the pulse
+    pipeline.  ``head_jitter_deg`` is the deprecated legacy motion proxy
+    (pixel displacement scaled by ``45 / frame_width``); it is retained only
+    so callers that have not migrated keep constructing observations and is
+    not used by any gate once ``motion_face_widths_per_second`` is present.
+    """
 
     observed_at_unix_ms: int
     observed_at_mono_ns: int
@@ -93,6 +103,7 @@ class NumericObservation(TimedObservation):
     quality: float
     head_jitter_deg: float = 0.0
     head_vertical_face_units: float | None = None
+    motion_face_widths_per_second: float | None = None
 
     @property
     def is_valid(self) -> bool:
@@ -103,9 +114,90 @@ class NumericObservation(TimedObservation):
         )
 
 
+# Closed catalog of structured readiness reason codes.  ``MissingReason``
+# values (lower-cased) are also valid codes: they describe *why* scheduled
+# observations were invalid, while the codes below describe which gate the
+# window as a whole failed.
+READINESS_CODE_NO_OBSERVATIONS = "no_observations"
+READINESS_CODE_FILLING = "filling"
+READINESS_CODE_VALID_FRACTION = "valid_fraction_below_gate"
+READINESS_CODE_GAP_TOO_LONG = "gap_too_long"
+READINESS_CODE_MOTION_FRACTION = "motion_fraction_above_cap"
+READINESS_CODE_DUPLICATE_TIMESTAMPS = "duplicate_timestamps"
+READINESS_CODE_TOO_FEW_VALID = "too_few_valid_samples"
+
+
+@dataclass(frozen=True)
+class ReadinessReason:
+    """One structured, human-readable reason a window is not publishable."""
+
+    code: str
+    message: str
+    observed: float | None = None
+    required: float | None = None
+    missing_reason: MissingReason | None = None
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "code": self.code,
+            "message": self.message,
+            "observed": self.observed,
+            "required": self.required,
+            "missing_reason": (
+                self.missing_reason.value if self.missing_reason is not None else None
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class WindowReadinessDiagnostics:
+    """Structured readiness evidence for status payloads and UI copy.
+
+    Everything here is derived from the scheduled observations inside the
+    requested window; nothing is inferred from the nominal frame rate.
+    """
+
+    ready: bool
+    window_seconds: float
+    observed_span_seconds: float
+    scheduled_count: int
+    valid_count: int
+    valid_fraction: float
+    temporal_coverage: float
+    max_interpolation_gap_ms: float
+    reasons: tuple[ReadinessReason, ...]
+    rejection_counts: dict[str, int]
+
+    def to_payload(self) -> dict[str, Any]:
+        """Return a JSON-serialisable projection for transport/status use."""
+
+        gap = self.max_interpolation_gap_ms
+        return {
+            "ready": self.ready,
+            "window_seconds": self.window_seconds,
+            "observed_span_seconds": self.observed_span_seconds,
+            "scheduled_count": self.scheduled_count,
+            "valid_count": self.valid_count,
+            "valid_fraction": self.valid_fraction,
+            "temporal_coverage": self.temporal_coverage,
+            "max_interpolation_gap_ms": gap if np.isfinite(gap) else None,
+            "reasons": [reason.to_payload() for reason in self.reasons],
+            "rejection_counts": dict(self.rejection_counts),
+        }
+
+
 @dataclass(frozen=True)
 class PreparedObservationWindow:
-    """Result of validating and uniformly resampling a numeric window."""
+    """Result of validating and uniformly resampling a numeric window.
+
+    ``valid_fraction``, ``artifact_fraction`` and ``quality`` are ratios over
+    the observations actually *scheduled* inside the window
+    (``scheduled_sample_count``), never over the nominal frame-rate product
+    (``expected_sample_count``, retained for diagnostics only).  A camera that
+    steadily delivers fewer frames than configured therefore reaches
+    readiness as long as the time gates (``temporal_coverage`` and
+    ``max_interpolation_gap_ms``) hold.
+    """
 
     ready: bool
     values: NDArray[np.float64] | None
@@ -122,6 +214,14 @@ class PreparedObservationWindow:
     max_interpolation_gap_ms: float
     unavailable_reasons: tuple[MissingReason, ...]
     mean_head_jitter_deg: float
+    diagnostics: WindowReadinessDiagnostics
+    scheduled_sample_count: int = 0
+    mean_motion_face_widths_per_second: float | None = None
+
+    def readiness_payload(self) -> dict[str, Any]:
+        """Convenience projection of :attr:`diagnostics` for status payloads."""
+
+        return self.diagnostics.to_payload()
 
 
 def prepare_observation_window(
@@ -140,7 +240,10 @@ def prepare_observation_window(
     Interpolation is allowed only between valid endpoints and only when the
     longest endpoint-to-endpoint gap is bounded.  All-missing, short,
     duplicate-time and low-coverage windows return ``ready=False`` with no
-    numeric values.
+    numeric values.  Coverage ratios are computed over the scheduled
+    observations inside the window; the nominal frame rate is used only for
+    the ``expected_sample_count`` diagnostic and as the resampling fallback
+    when the measured cadence is implausible.
     """
 
     if window_seconds <= 0 or nominal_fps <= 0:
@@ -152,11 +255,22 @@ def prepare_observation_window(
 
     expected_count = max(2, int(round(window_seconds * nominal_fps)))
     reasons: list[MissingReason] = []
+    structured: list[ReadinessReason] = []
 
     if not observations:
         return _unavailable_window(
             expected_count=expected_count,
+            window_seconds=window_seconds,
             reasons=(MissingReason.INSUFFICIENT_WINDOW,),
+            structured=(
+                ReadinessReason(
+                    code=READINESS_CODE_NO_OBSERVATIONS,
+                    message=f"no camera observations yet (window {window_seconds:.0f} s)",
+                    observed=0.0,
+                    required=window_seconds,
+                    missing_reason=MissingReason.INSUFFICIENT_WINDOW,
+                ),
+            ),
         )
 
     ordered = list(observations)
@@ -167,38 +281,95 @@ def prepare_observation_window(
     if not selected:
         return _unavailable_window(
             expected_count=expected_count,
+            window_seconds=window_seconds,
             reasons=(MissingReason.INSUFFICIENT_WINDOW,),
+            structured=(
+                ReadinessReason(
+                    code=READINESS_CODE_NO_OBSERVATIONS,
+                    message=f"no camera observations inside the last {window_seconds:.0f} s",
+                    observed=0.0,
+                    required=window_seconds,
+                    missing_reason=MissingReason.INSUFFICIENT_WINDOW,
+                ),
+            ),
         )
 
     times = np.asarray([item.observed_at_mono_ns for item in selected], dtype=np.int64)
     diffs = np.diff(times)
     if bool((diffs <= 0).any()):
         reasons.append(MissingReason.ARTIFACT)
+        structured.append(
+            ReadinessReason(
+                code=READINESS_CODE_DUPLICATE_TIMESTAMPS,
+                message="repeated capture timestamps inside the window",
+                observed=float(int(np.sum(diffs <= 0))),
+                required=0.0,
+                missing_reason=MissingReason.ARTIFACT,
+            )
+        )
 
     span_ns = max(0, int(times[-1]) - int(times[0]))
+    span_seconds = span_ns / 1_000_000_000.0
     temporal_coverage = min(1.0, span_ns / window_ns) if window_ns else 0.0
 
+    scheduled_count = len(selected)
     valid_items = [item for item in selected if item.is_valid]
     valid_count = len(valid_items)
-    valid_fraction = min(1.0, valid_count / expected_count)
-    artifact_count = sum(not item.is_valid for item in selected)
-    artifact_fraction = min(1.0, artifact_count / expected_count)
+    invalid_items = [item for item in selected if not item.is_valid]
+    valid_fraction = valid_count / scheduled_count
+    artifact_count = len(invalid_items)
+    artifact_fraction = artifact_count / scheduled_count
     motion_count = sum(
-        not item.is_valid and item.missing_reason == MissingReason.MOTION
-        for item in selected
+        item.missing_reason == MissingReason.MOTION for item in invalid_items
     )
-    motion_fraction = min(1.0, motion_count / expected_count)
-    quality_mass = sum(item.quality for item in valid_items) / expected_count
+    motion_fraction = motion_count / scheduled_count
+    quality_mass = sum(item.quality for item in valid_items) / scheduled_count
     quality = float(np.clip(quality_mass * temporal_coverage, 0.0, 1.0))
+    rejection_counts = _rejection_counts(invalid_items)
 
     if valid_count == 0:
         reasons.extend(
             _missing_reasons(selected) or [MissingReason.INSUFFICIENT_WINDOW]
         )
-    if valid_fraction < min_valid_fraction or temporal_coverage < min_valid_fraction:
+    if temporal_coverage < min_valid_fraction:
         reasons.append(MissingReason.INSUFFICIENT_WINDOW)
+        structured.append(
+            ReadinessReason(
+                code=READINESS_CODE_FILLING,
+                message=f"filling {span_seconds:.1f}/{window_seconds:.0f} s",
+                observed=span_seconds,
+                required=window_seconds * min_valid_fraction,
+                missing_reason=MissingReason.INSUFFICIENT_WINDOW,
+            )
+        )
+    if valid_fraction < min_valid_fraction:
+        reasons.append(MissingReason.INSUFFICIENT_WINDOW)
+        structured.append(
+            ReadinessReason(
+                code=READINESS_CODE_VALID_FRACTION,
+                message=(
+                    f"{valid_count}/{scheduled_count} scheduled frames usable "
+                    f"({valid_fraction:.0%}); need {min_valid_fraction:.0%}"
+                ),
+                observed=valid_fraction,
+                required=min_valid_fraction,
+                missing_reason=MissingReason.INSUFFICIENT_WINDOW,
+            )
+        )
     if motion_fraction > max_motion_fraction:
         reasons.append(MissingReason.MOTION)
+        structured.append(
+            ReadinessReason(
+                code=READINESS_CODE_MOTION_FRACTION,
+                message=(
+                    f"{motion_fraction:.0%} of scheduled frames rejected for motion; "
+                    f"cap {max_motion_fraction:.0%}"
+                ),
+                observed=motion_fraction,
+                required=max_motion_fraction,
+                missing_reason=MissingReason.MOTION,
+            )
+        )
 
     valid_times = np.asarray(
         [item.observed_at_mono_ns for item in valid_items], dtype=np.int64
@@ -208,10 +379,50 @@ def prepare_observation_window(
         max_gap_ms = float(np.max(np.diff(valid_times))) / 1_000_000.0
     if max_gap_ms > max_interpolation_gap_ms:
         reasons.append(MissingReason.INSUFFICIENT_WINDOW)
+        if len(valid_times) >= 2:
+            structured.append(
+                ReadinessReason(
+                    code=READINESS_CODE_GAP_TOO_LONG,
+                    message=(
+                        f"longest gap between usable frames {max_gap_ms:.0f} ms "
+                        f"exceeds {max_interpolation_gap_ms:.0f} ms"
+                    ),
+                    observed=max_gap_ms,
+                    required=max_interpolation_gap_ms,
+                    missing_reason=MissingReason.INSUFFICIENT_WINDOW,
+                )
+            )
+
+    # Explain *why* scheduled frames were unusable, most frequent first, so a
+    # status surface can say "face lost" or "low light" rather than "not ready".
+    structured.extend(
+        _rejection_reasons(rejection_counts, scheduled_count=scheduled_count)
+    )
 
     if reasons or len(valid_items) < 2:
         if len(valid_items) < 2:
             reasons.append(MissingReason.INSUFFICIENT_WINDOW)
+            structured.append(
+                ReadinessReason(
+                    code=READINESS_CODE_TOO_FEW_VALID,
+                    message=f"{valid_count} usable frame(s); need at least 2",
+                    observed=float(valid_count),
+                    required=2.0,
+                    missing_reason=MissingReason.INSUFFICIENT_WINDOW,
+                )
+            )
+        diagnostics = WindowReadinessDiagnostics(
+            ready=False,
+            window_seconds=window_seconds,
+            observed_span_seconds=span_seconds,
+            scheduled_count=scheduled_count,
+            valid_count=valid_count,
+            valid_fraction=valid_fraction,
+            temporal_coverage=temporal_coverage,
+            max_interpolation_gap_ms=max_gap_ms,
+            reasons=_unique_structured(structured),
+            rejection_counts=rejection_counts,
+        )
         return PreparedObservationWindow(
             ready=False,
             values=None,
@@ -231,6 +442,9 @@ def prepare_observation_window(
             max_interpolation_gap_ms=max_gap_ms,
             unavailable_reasons=_unique_reasons(reasons),
             mean_head_jitter_deg=_mean_head_jitter(valid_items),
+            diagnostics=diagnostics,
+            scheduled_sample_count=scheduled_count,
+            mean_motion_face_widths_per_second=_mean_motion(valid_items),
         )
 
     positive_diffs_s = np.diff(times).astype(np.float64) / 1_000_000_000.0
@@ -298,6 +512,18 @@ def prepare_observation_window(
                 head_values_raw,
             )
 
+    diagnostics = WindowReadinessDiagnostics(
+        ready=True,
+        window_seconds=window_seconds,
+        observed_span_seconds=span_seconds,
+        scheduled_count=scheduled_count,
+        valid_count=valid_count,
+        valid_fraction=valid_fraction,
+        temporal_coverage=temporal_coverage,
+        max_interpolation_gap_ms=max_gap_ms,
+        reasons=(),
+        rejection_counts=rejection_counts,
+    )
     return PreparedObservationWindow(
         ready=True,
         values=resampled,
@@ -316,6 +542,9 @@ def prepare_observation_window(
         max_interpolation_gap_ms=max_gap_ms,
         unavailable_reasons=(),
         mean_head_jitter_deg=_mean_head_jitter(valid_items),
+        diagnostics=diagnostics,
+        scheduled_sample_count=scheduled_count,
+        mean_motion_face_widths_per_second=_mean_motion(valid_items),
     )
 
 
@@ -331,8 +560,82 @@ def _missing_reasons(observations: list[NumericObservation]) -> list[MissingReas
     return list(_unique_reasons(reasons))
 
 
+def _rejection_counts(invalid_items: list[NumericObservation]) -> dict[str, int]:
+    """Count unusable scheduled observations by closed-catalog reason."""
+
+    counter: Counter[str] = Counter()
+    for item in invalid_items:
+        reason = item.missing_reason
+        if reason is None:
+            counter[MissingReason.UNKNOWN.value] += 1
+            continue
+        try:
+            counter[MissingReason(reason).value] += 1
+        except ValueError:
+            counter[MissingReason.UNKNOWN.value] += 1
+    return dict(sorted(counter.items(), key=lambda pair: (-pair[1], pair[0])))
+
+
+def _rejection_reasons(
+    rejection_counts: dict[str, int],
+    *,
+    scheduled_count: int,
+) -> list[ReadinessReason]:
+    result: list[ReadinessReason] = []
+    for reason_value, count in rejection_counts.items():
+        if count <= 0 or scheduled_count <= 0:
+            continue
+        fraction = count / scheduled_count
+        try:
+            reason = MissingReason(reason_value)
+        except ValueError:
+            reason = MissingReason.UNKNOWN
+        result.append(
+            ReadinessReason(
+                code=reason.value.lower(),
+                message=(
+                    f"{count}/{scheduled_count} scheduled frames unusable "
+                    f"({fraction:.0%}): {_describe_missing_reason(reason)}"
+                ),
+                observed=fraction,
+                required=None,
+                missing_reason=reason,
+            )
+        )
+    return result
+
+
+def _describe_missing_reason(reason: MissingReason) -> str:
+    descriptions = {
+        MissingReason.NO_FACE: "face not detected",
+        MissingReason.LOW_LIGHT: "too dark",
+        MissingReason.SATURATED: "too bright",
+        MissingReason.MOTION: "head motion",
+        MissingReason.OCCLUDED: "face region occluded",
+        MissingReason.CAMERA_WARMUP: "camera warming up",
+        MissingReason.FRAME_DROPPED: "frame dropped or skipped",
+        MissingReason.PERMISSION: "camera permission missing",
+        MissingReason.SOURCE_DISCONNECTED: "camera disconnected",
+        MissingReason.INSUFFICIENT_WINDOW: "insufficient window",
+        MissingReason.ARTIFACT: "timing or detector artifact",
+        MissingReason.UNKNOWN: "unknown",
+    }
+    return descriptions.get(reason, reason.value.lower())
+
+
 def _unique_reasons(reasons: list[MissingReason]) -> tuple[MissingReason, ...]:
     return tuple(dict.fromkeys(reasons))
+
+
+def _unique_structured(reasons: list[ReadinessReason]) -> tuple[ReadinessReason, ...]:
+    seen: set[str] = set()
+    unique: list[ReadinessReason] = []
+    for reason in reasons:
+        if reason.code in seen:
+            continue
+        seen.add(reason.code)
+        unique.append(reason)
+    return tuple(unique)
 
 
 def _mean_head_jitter(observations: list[NumericObservation]) -> float:
@@ -341,10 +644,26 @@ def _mean_head_jitter(observations: list[NumericObservation]) -> float:
     return float(np.mean([item.head_jitter_deg for item in observations]))
 
 
+def _mean_motion(observations: list[NumericObservation]) -> float | None:
+    """Mean nose-tip translation (face widths/second) over valid samples."""
+
+    values = [
+        float(item.motion_face_widths_per_second)
+        for item in observations
+        if item.motion_face_widths_per_second is not None
+        and np.isfinite(item.motion_face_widths_per_second)
+    ]
+    if not values:
+        return None
+    return float(np.mean(values))
+
+
 def _unavailable_window(
     *,
     expected_count: int,
+    window_seconds: float,
     reasons: tuple[MissingReason, ...],
+    structured: tuple[ReadinessReason, ...],
 ) -> PreparedObservationWindow:
     return PreparedObservationWindow(
         ready=False,
@@ -362,4 +681,18 @@ def _unavailable_window(
         max_interpolation_gap_ms=float("inf"),
         unavailable_reasons=reasons,
         mean_head_jitter_deg=0.0,
+        diagnostics=WindowReadinessDiagnostics(
+            ready=False,
+            window_seconds=window_seconds,
+            observed_span_seconds=0.0,
+            scheduled_count=0,
+            valid_count=0,
+            valid_fraction=0.0,
+            temporal_coverage=0.0,
+            max_interpolation_gap_ms=float("inf"),
+            reasons=structured,
+            rejection_counts={},
+        ),
+        scheduled_sample_count=0,
+        mean_motion_face_widths_per_second=None,
     )

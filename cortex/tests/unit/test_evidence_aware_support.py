@@ -214,10 +214,13 @@ def test_no_event_inactivity_is_bounded_by_collector_exposure() -> None:
     aggregator = FeatureAggregator(hooks)
     first = aggregator.build_features(window_seconds=15.0, current_time=1_000_000.0)
     second = aggregator.build_features(window_seconds=15.0, current_time=1_000_010.0)
-    capped = aggregator.build_features(window_seconds=15.0, current_time=1_000_100.0)
+    longer = aggregator.build_features(window_seconds=15.0, current_time=1_000_100.0)
     assert first.inactivity_seconds == 0.0
     assert second.inactivity_seconds == 10.0
-    assert capped.inactivity_seconds == 15.0
+    # Audit D1: inactivity is bounded by observed exposure, never by the
+    # 15 s aggregation window (the old cap made every >15 s inactivity rule
+    # unreachable).
+    assert longer.inactivity_seconds == 100.0
 
 
 def test_camera_presence_cannot_change_behavior_support_scores() -> None:

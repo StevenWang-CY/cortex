@@ -176,7 +176,7 @@ def test_dismiss_button_is_not_animated(overlay):
 
 
 def test_footer_labels_fit_the_production_overlay_width(overlay, qapp):
-    """The three escape controls remain readable at the shipped 460 px width."""
+    """The three escape controls remain readable at the shipped notification width."""
     overlay.show_intervention({
         "intervention_id": "iv_footer_fit",
         "headline": "Take a breath",
@@ -187,18 +187,22 @@ def test_footer_labels_fit_the_production_overlay_width(overlay, qapp):
     })
     qapp.processEvents()
 
-    assert overlay.width() == 460
-    for button in (
-        overlay._dismiss_btn,
-        overlay._snooze_btn,
-        overlay._quiet_session_btn,
-    ):
+    from cortex.apps.desktop_shell.tokens import POPUP_WIDTH
+
+    assert overlay.width() == POPUP_WIDTH
+    for button in (overlay._snooze_btn, overlay._quiet_session_btn):
         text_width = button.fontMetrics().horizontalAdvance(button.text())
         assert text_width + 20 <= button.width(), (
             button.text(),
             text_width,
             button.width(),
         )
+    # The dismiss control is a glyph button; its label lives in the
+    # accessible name and the glyph itself must fit the square.
+    dismiss = overlay._dismiss_btn
+    assert dismiss.accessibleName()
+    glyph_width = dismiss.fontMetrics().horizontalAdvance(dismiss.text())
+    assert glyph_width <= dismiss.width()
 
 
 def test_entrance_animation_never_targets_geometry():

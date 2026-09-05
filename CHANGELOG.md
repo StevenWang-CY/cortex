@@ -4,6 +4,163 @@ All notable changes to Cortex. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.4.0] — 2026-09-04
+
+This release follows a complete re-audit of the v0.3.15 source and of the
+artifact it produced. Every gate had passed while the shipped app was a
+background-only process, the extension overlay threw on every real
+intervention, the LLM path could not succeed on current models, one inference
+state was unreachable, and the stop chain signalled the browser's own
+processes. The full record, including the verified findings, the decisions
+taken, and the rejected alternatives, is Section 30 of `IMPLEMENTATION.md`.
+
+### Fixed — packaging and release
+
+* The macOS bundle is a foreground application again. PyInstaller inherited
+  `console=True` from the native-host executable and marked the app
+  `LSBackgroundOnly`; the spec now sets it explicitly and the release verifier
+  rejects any background-only or UI-element plist.
+* The app itself is notarized and stapled before it is imaged, then the DMG;
+  nested libraries are signed without entitlements; notarization has a bounded
+  timeout; stale evidence directories are reset before a build; the mounted
+  smoke test runs with an isolated `HOME`.
+* The publish workflow supports two truthful assurance tiers (ADR 0007). A
+  self-attested release needs one validated hardware record per architecture
+  the maintainer owns, the five core cases passed, and every other case
+  recorded as `passed` or `not_run` with a reason. The release body carries an
+  Assurance section naming the tier, the hardware-verified and CI-only
+  architectures, and the absence of an independent reviewer.
+* Dependency-audit exceptions were re-reviewed with dated reasons and
+  mitigations; the wiki is published from `wiki/` as an orphan history.
+
+### Fixed — runtime, stop flow, and persistence
+
+* Stopping Cortex no longer signals browser or editor processes. PID discovery
+  uses listening sockets only, an anchored process pattern, and the daemon's
+  own pidfile; graceful `/shutdown` is sent with the capability token and the
+  daemon is given a bounded wait before any signal.
+* `/health` is cheap and database-free and reports readiness; integrity probes
+  stay behind the token; `/metrics` requires the token; rate-limit budget is
+  consumed only after authentication.
+* A shipped migration file whose hash drifted no longer refuses to start
+  existing installs; the hashes are pinned in tests instead.
+* Session history is kept for 180 days inside the storage budget (was seven
+  days); session recordings are transition-only, `0600`, and created lazily.
+* AppleScript names from project files are validated; token files are created
+  with `0600` from the first byte; calibration commits, token reads, and log
+  reads no longer block the event loop.
+
+### Fixed — inference, triggers, and interventions
+
+* Under-engaged (HYPO) support is reachable: inactivity is measured from the
+  last input event instead of being capped at the telemetry window.
+* A zero mouse-variance baseline can no longer raise on every tick.
+* The trigger dwell measures time above the gate, not the age of the label,
+  and the estimate exits to `unknown` below the exit threshold.
+* The configured suggestion threshold is honoured below 0.75.
+* Every intervention surface, including zombie-reading, rabbit-hole, and
+  LeetCode cues, passes through one shared interruption gate (enabled flag,
+  quiet mode, receptivity, hourly cap, cooldown) and is recorded.
+* Repeated dismissals produce a visible, time-boxed pause with a stated resume
+  time instead of a persisted model that could lock suggestions off.
+* Weekly-schedule quiet slots are honoured; receptivity-blocked decision
+  points are recorded; camera presence no longer gates eligibility.
+* Special-path planner calls are bounded; restore retries back off per
+  intervention and never block the state loop; the transaction journal is
+  bounded.
+* Evaluation corrections: late window finalisation is censored, the reward
+  no longer penalises delivery by construction, nightly diagnostics cover the
+  completed local day, delivery is marked before the send, helpfulness
+  tracking closes on natural recovery.
+* Telemetry corrections: switch-rate counting, provenance windows, and
+  transition-only session reports.
+
+### Fixed — signal pipeline
+
+* The pulse spectrum analyses the whole 10 s window (Welch parameters had
+  discarded the last two seconds of every window).
+* Head-pose convention corrected so a frontal face is (0, 0, 0) and looking
+  down is positive pitch; posture uses wrapped deltas and calibration a
+  circular mean. Existing calibration profiles are invalidated automatically.
+* Window readiness counts scheduled observations, so steady low-frame-rate
+  cameras become ready; brief face losses no longer discard the RGB buffer,
+  beat ledger, and blink history.
+* The head-jitter quality term uses a real unit; CHROM is de Haan & Jeanne
+  (2013); the library HR estimator no longer quantises to 6 BPM; the HR prior
+  ages; heuristic bounds are no longer labelled 95 % confidence; readiness
+  reasons are exposed to the UI.
+
+### Fixed — LLM planning and privacy
+
+* Requests carry no sampling parameters (current Claude models reject them),
+  use structured outputs against a draft schema of model-authored fields only,
+  check `stop_reason`, and treat 400/404/422 as terminal with distinct
+  fallback reasons; the circuit breaker is per tier.
+* Model catalogue and pricing updated (`claude-sonnet-5` default,
+  `claude-haiku-4-5` fast, `claude-opus-5` deep); cache reads are priced at
+  0.1×; Bedrock uses the Mantle client with the token passed explicitly.
+* Cancelled calls record their real usage and release their concurrency slot;
+  the daemon's wait is aligned with the planner's worst case.
+* Code reaches the model without doubled braces; every absolute path is
+  minimised; only the catalogued state fields leave the broker; degenerate
+  output is rejected; first-run BYOK no longer needs a restart.
+
+### Changed — desktop app
+
+* "View full report" no longer quits the app; ending a session and quitting
+  are separate, and the destructive control names its consequence.
+* Windows pin the light appearance until the dark palette is wired, so dark
+  mode is readable.
+* The intervention overlay is a non-activating notification anchored to the
+  cursor's screen with Cmd-modified shortcuts; it no longer steals focus or
+  reacts to a stray key.
+* Indicators are truthful: connectivity uses the info colour, status rows
+  carry text and accessible names, unmeasured counters are hidden, the palette
+  control works or is gone, onboarding completion reflects real grants.
+* Visible focus rings, Escape routes, a scrolling Settings window, a floating
+  toast, inline connection checklists, correct contrast for status text, and
+  consumer vocabulary throughout.
+
+### Changed — browser extension
+
+* The overlay renders real `MicroStep` objects; a schema-typed fixture keeps
+  it in step with the wire contract.
+* Dark mode: primary buttons and glass surfaces use the new inverse-label
+  token; every text/background pair is tested at 4.5:1 in both schemes.
+* One apply state machine (`pending`, `applied`, `partial`, `failed`) shared by
+  the popup and the overlay, with Undo and honest failure copy.
+* Overlays are removed on restore, timeout, and the dismiss command; Escape
+  is scoped to the panel; timeouts report `expired`, not `dismissed`.
+* `bookmarks` and `webNavigation` permissions, the unauthorisable "Tab
+  closing" switch, the lockout dead code, and dead message senders are gone.
+* Version skew is a dismissible banner; the native host is probed sparingly;
+  Stop asks for confirmation; localhost dev servers are not tracked; the
+  new-tab override has an opt-out.
+* One token sheet (light and dark) for every injected surface; consumer copy;
+  motion follows the transition contract.
+
+### Changed — VS Code extension
+
+* `cortex.daemonUrl` is machine-scoped and loopback-only, and restricted in
+  untrusted workspaces; the panel has a nonce CSP.
+* Connection state is truthful: connected only after `AUTH_OK`, a missing
+  token names its path, protocol errors offer Retry.
+* Micro-step toggles patch the panel instead of rebuilding it; "Why" details
+  handle timeouts; the view survives being hidden; fold commands validate
+  their arguments and are hidden from the palette.
+* Terminal capture, the inline-suggestion commands, and four dead senders are
+  removed; editor content sharing is limited to file documents and can be
+  turned off; the panel uses VS Code theme colours.
+
+### Documentation
+
+* `IMPLEMENTATION.md` Section 30 records the audit, findings, decisions, and
+  verification for this cycle; ADR 0007 records the tiered release gate.
+* Wiki pages live in `wiki/`; Troubleshooting is split into installed-app and
+  source-checkout guidance and no longer describes camera-driven
+  classification; the API documents list the complete message catalogue and
+  the real lifecycle states; the adapters guide matches the shipped protocol.
+
 ## [v0.3.15] — 2026-08-30
 
 This patch supersedes the staged `v0.3.14` candidate after an installed-app

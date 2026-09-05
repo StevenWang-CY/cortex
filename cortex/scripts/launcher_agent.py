@@ -26,6 +26,9 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 logger = logging.getLogger(__name__)
@@ -33,6 +36,23 @@ logger = logging.getLogger(__name__)
 PORT = 9471
 DAEMON_WS_PORT = 9473
 DAEMON_HTTP_PORT = 9472
+
+# Indirection points for the stop chain so tests can drive the timing
+# without sleeping (see ``stop_daemon``). Production leaves them alone.
+_sleep: Callable[[float], None] = time.sleep
+_monotonic: Callable[[], float] = time.monotonic
+
+# D2: how long a daemon that ACCEPTED ``POST /shutdown`` gets to finish
+# its graceful chain (session recap → WS ack → close ports → DB close)
+# before we escalate to SIGTERM. The previous chain sent SIGTERM
+# immediately and SIGKILL 3 s later, which interrupted the recap and
+# the SQLite close. The daemon's own budget for the recap acknowledgement
+# alone is 5 s, so 20 s is a comfortable ceiling.
+GRACEFUL_SHUTDOWN_TIMEOUT_S = 20.0
+# After SIGTERM (the daemon runs the same graceful chain from its signal
+# handler) wait this long before the last-resort SIGKILL.
+SIGTERM_GRACE_S = 5.0
+_POLL_INTERVAL_S = 0.5
 
 
 # F08: capability-token gate on destructive endpoints. The full helper
@@ -68,21 +88,55 @@ def _allowed_origin(origin: str | None) -> str | None:
     return None
 
 
-def _auth_token_path() -> str:
-    """Resolve the auth-token file path without importing cortex."""
+def _config_dir() -> str:
+    """Resolve the Cortex config directory without importing cortex.
+
+    Mirrors ``cortex.libs.utils.platform.get_config_dir`` — the two must
+    stay in sync because the daemon writes ``auth.token`` and
+    ``daemon.pid`` there and this module reads them.
+    """
     if sys.platform == "darwin":
-        return os.path.expanduser(
-            "~/Library/Application Support/Cortex/auth.token"
-        )
+        return os.path.expanduser("~/Library/Application Support/Cortex")
     if sys.platform.startswith("linux"):
         base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-        return os.path.join(base, "cortex", "auth.token")
+        return os.path.join(base, "cortex")
     if sys.platform in ("win32", "cygwin"):
         base = os.environ.get("APPDATA") or os.path.expanduser(
             "~\\AppData\\Roaming"
         )
-        return os.path.join(base, "Cortex", "auth.token")
-    return os.path.expanduser("~/.cortex/auth.token")
+        return os.path.join(base, "Cortex")
+    return os.path.expanduser("~/.cortex")
+
+
+def _auth_token_path() -> str:
+    """Resolve the auth-token file path without importing cortex."""
+    return os.path.join(_config_dir(), "auth.token")
+
+
+def _daemon_pid_path() -> str:
+    """Resolve the daemon-written pidfile path (``<config_dir>/daemon.pid``).
+
+    The daemon (or ``run_dev``) writes its own PID there on start and
+    removes it on clean exit. The stop chain prefers it because it is
+    the only identification that survives App Translocation (the
+    executable path is then under ``/private/var/folders/.../AppTranslocation``
+    and the anchored ``pgrep`` pattern cannot match it).
+    """
+    return os.path.join(_config_dir(), "daemon.pid")
+
+
+def _read_auth_token() -> str:
+    """Return the on-disk capability token, or ``""`` when unavailable.
+
+    Pure read — the launcher never mints a token; that is the daemon's
+    job at start. An empty return makes ``POST /shutdown`` bounce with
+    401, which the stop chain treats as "graceful path unavailable".
+    """
+    try:
+        with open(_auth_token_path(), encoding="utf-8") as fp:
+            return fp.read().strip()
+    except OSError:
+        return ""
 
 
 def _verify_auth_token(presented: str | None) -> bool:
@@ -91,11 +145,7 @@ def _verify_auth_token(presented: str | None) -> bool:
     a 401 rather than open access."""
     if not presented:
         return False
-    try:
-        with open(_auth_token_path(), encoding="utf-8") as fp:
-            stored = fp.read().strip()
-    except OSError:
-        return False
+    stored = _read_auth_token()
     if not stored:
         return False
     import hmac
@@ -247,83 +297,313 @@ def _launch_daemon() -> dict:
         return {"status": "error", "error": str(e)}
 
 
-def _find_all_daemon_pids() -> set[int]:
-    """Find ALL daemon PIDs — by port AND by process name."""
+# ---------------------------------------------------------------------------
+# D1: daemon PID discovery.
+#
+# The previous chain ran ``lsof -ti tcp:<port>`` — which lists BOTH ends of
+# every socket on the port — and an unanchored ``pgrep -f``. Together they
+# returned Chrome's network process, the VS Code extension host, the
+# WS-mode desktop shell (all *clients* of 9473), the native host itself
+# (``.../MacOS/CortexNativeHost`` contains ``.../MacOS/Cortex``) and any
+# editor with ``cortex/scripts/run_dev.py`` open, and then SIGTERM/SIGKILLed
+# them all. Every candidate below is therefore restricted to a process that
+# is provably the daemon:
+#
+# * ``lsof -sTCP:LISTEN`` — only the socket's listening owner;
+# * anchored ``pgrep`` patterns — only the GUI executable or the dev
+#   module invocation, never ``CortexNativeHost``;
+# * a daemon-written pidfile, cross-checked against the live command line;
+# * never our own PID or our parent's (Chrome for the native host, launchd
+#   or a terminal for the launcher agent).
+# ---------------------------------------------------------------------------
+
+_DAEMON_APP_EXECUTABLE = f"{CORTEX_APP_PATH}/Contents/MacOS/Cortex"
+
+#: ``pgrep -f`` (ERE) pattern for the packaged GUI daemon. Anchored at
+#: both ends so ``CortexNativeHost`` (same directory, longer name) can
+#: never match; ``( |$)`` allows launch arguments after the executable.
+PGREP_APP_PATTERN = rf"^{re.escape(_DAEMON_APP_EXECUTABLE)}( |$)"
+
+#: ``pgrep -f`` pattern for the dev-checkout daemon. Requires the literal
+#: ``-m cortex.scripts.run_dev`` module invocation preceded by a python
+#: executable so ``vim cortex/scripts/run_dev.py``, ``grep run_dev`` or a
+#: ``pgrep`` of our own never match (``.`` is escaped — the old pattern let
+#: ``cortex/scripts/run_dev`` match too).
+PGREP_DEV_PATTERN = r"(^|/)python[0-9.]* -m cortex\.scripts\.run_dev( |$)"
+
+#: Command lines that a pidfile PID must exhibit to be trusted. Looser
+#: than the ``pgrep`` anchors on purpose: the pidfile is written by the
+#: daemon itself, so it may legitimately point at a translocated bundle
+#: (``/private/var/folders/.../AppTranslocation/.../Cortex.app``), the
+#: in-process desktop shell (``-m cortex.apps.desktop_shell.main``) or the
+#: ``cortex-dev`` console script. It must still never be the native host.
+_PIDFILE_CMDLINE_RE = re.compile(
+    r"(Cortex\.app/Contents/MacOS/Cortex( |$))"
+    r"|(-m cortex\.scripts\.run_dev( |$))"
+    r"|(-m cortex\.apps\.desktop_shell\.main( |$))"
+    r"|(/cortex-dev( |$))"
+)
+_NEVER_KILL_CMDLINE_RE = re.compile(r"CortexNativeHost")
+
+
+def _protected_pids() -> set[int]:
+    """PIDs the stop chain must never signal: ourselves and our parent."""
+    protected = {os.getpid()}
+    try:
+        protected.add(os.getppid())
+    except OSError:  # pragma: no cover - platform dependent
+        pass
+    return protected
+
+
+def _parse_pid_lines(stdout: str) -> set[int]:
     pids: set[int] = set()
-    for port in (DAEMON_WS_PORT, DAEMON_HTTP_PORT):
-        try:
-            result = subprocess.run(
-                ["lsof", "-ti", f"tcp:{port}"],
-                capture_output=True, text=True, timeout=5,
-            )
-            for line in result.stdout.strip().split("\n"):
-                line = line.strip()
-                if line.isdigit():
-                    pids.add(int(line))
-        except Exception:
-            logger.debug("lsof probe failed (port=%d)", port, exc_info=True)
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", "cortex.scripts.run_dev"],
-            capture_output=True, text=True, timeout=5,
-        )
-        for line in result.stdout.strip().split("\n"):
-            line = line.strip()
-            if line.isdigit():
-                pids.add(int(line))
-    except Exception:
-        logger.debug("pgrep run_dev failed", exc_info=True)
-    # Bundled app process name/path for DMG installs.
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", f"{CORTEX_APP_PATH}/Contents/MacOS/Cortex"],
-            capture_output=True, text=True, timeout=5,
-        )
-        for line in result.stdout.strip().split("\n"):
-            line = line.strip()
-            if line.isdigit():
-                pids.add(int(line))
-    except Exception:
-        logger.debug("pgrep Cortex.app failed", exc_info=True)
+    for line in stdout.strip().split("\n"):
+        line = line.strip()
+        if line.isdigit():
+            pids.add(int(line))
     return pids
 
 
-def _stop_daemon() -> dict:
-    """Stop the Cortex daemon — guaranteed kill."""
-    # Step 1: HTTP shutdown (graceful)
+def _listening_pids(port: int) -> set[int]:
+    """PIDs *listening* on ``127.0.0.1:port`` (never the clients)."""
     try:
-        import urllib.request
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{DAEMON_HTTP_PORT}/shutdown",
-            method="POST", data=b"",
+        result = subprocess.run(
+            ["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
+            capture_output=True, text=True, timeout=5,
         )
-        urllib.request.urlopen(req, timeout=2)
+    except Exception:
+        logger.debug("lsof probe failed (port=%d)", port, exc_info=True)
+        return set()
+    return _parse_pid_lines(result.stdout)
+
+
+def _pgrep(pattern: str) -> set[int]:
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", pattern],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        logger.debug("pgrep failed (pattern=%s)", pattern, exc_info=True)
+        return set()
+    return _parse_pid_lines(result.stdout)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _process_command_line(pid: int) -> str | None:
+    """Return the full command line of ``pid`` via ``ps``, or ``None``."""
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        logger.debug("ps probe failed (pid=%d)", pid, exc_info=True)
+        return None
+    if result.returncode != 0:
+        return None
+    command = result.stdout.strip()
+    return command or None
+
+
+def _pidfile_daemon_pid() -> int | None:
+    """Return the daemon PID from the pidfile if it is alive and provably ours.
+
+    A stale pidfile (daemon crashed, PID recycled by an unrelated process)
+    is the classic way a pidfile kills the wrong process, so the PID is
+    accepted only when it is alive, not protected, and its live command
+    line matches a daemon shape and is not the native host.
+    """
+    try:
+        with open(_daemon_pid_path(), encoding="utf-8") as fp:
+            text = fp.read().strip()
+    except OSError:
+        return None
+    if not text.isdigit():
+        return None
+    pid = int(text)
+    if pid <= 1 or pid in _protected_pids() or not _pid_alive(pid):
+        return None
+    command = _process_command_line(pid)
+    if command is None:
+        return None
+    if _NEVER_KILL_CMDLINE_RE.search(command):
+        return None
+    if _PIDFILE_CMDLINE_RE.search(command) is None:
+        return None
+    return pid
+
+
+def find_daemon_pids() -> set[int]:
+    """Find every PID that is provably the Cortex daemon (D1).
+
+    Union of: the daemon-written pidfile (preferred, see
+    :func:`_pidfile_daemon_pid`), the *listening* owners of the WS/HTTP
+    ports, and the anchored ``pgrep`` patterns. Our own PID and our parent
+    are always excluded. Works with or without the pidfile.
+    """
+    pids: set[int] = set()
+    pidfile_pid = _pidfile_daemon_pid()
+    if pidfile_pid is not None:
+        pids.add(pidfile_pid)
+    for port in (DAEMON_WS_PORT, DAEMON_HTTP_PORT):
+        pids |= _listening_pids(port)
+    pids |= _pgrep(PGREP_DEV_PATTERN)
+    pids |= _pgrep(PGREP_APP_PATTERN)
+    return pids - _protected_pids()
+
+
+def _find_all_daemon_pids() -> set[int]:
+    """Backward-compatible alias for :func:`find_daemon_pids`."""
+    return find_daemon_pids()
+
+
+# ---------------------------------------------------------------------------
+# D2: graceful stop chain.
+# ---------------------------------------------------------------------------
+
+
+def _request_graceful_shutdown(token: str) -> bool:
+    """``POST /shutdown`` with the capability token. True iff accepted (2xx).
+
+    The route lives on the token-gated router, so the previous tokenless
+    POST always bounced with 401 and graceful shutdown was dead code.
+    """
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{DAEMON_HTTP_PORT}/shutdown",
+        method="POST",
+        data=b"",
+        headers={_AUTH_TOKEN_HEADER: token} if token else {},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            return 200 <= int(resp.status) < 300
+    except urllib.error.HTTPError as exc:
+        logger.debug("HTTP /shutdown rejected: %s", exc.code)
+        return False
     except Exception:
         logger.debug("HTTP /shutdown probe failed", exc_info=True)
+        return False
 
-    # Step 2: SIGTERM all daemon PIDs
-    pids = _find_all_daemon_pids()
+
+def _daemon_http_alive() -> bool:
+    """False only when ``/health`` is refused (nothing listens any more).
+
+    Any HTTP response — including 5xx — and even a timeout means a
+    listener still owns the port, so the daemon has not finished closing.
+    """
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{DAEMON_HTTP_PORT}/health", timeout=1,
+        ):
+            return True
+    except urllib.error.HTTPError:
+        return True
+    except urllib.error.URLError as exc:
+        reason = exc.reason
+        if isinstance(reason, ConnectionRefusedError):
+            return False
+        return True
+    except ConnectionRefusedError:
+        return False
+    except Exception:
+        return True
+
+
+def _wait_for_daemon_exit(timeout_s: float) -> bool:
+    """Poll until ``/health`` is refused AND no daemon PID remains.
+
+    Returns True when the daemon is fully gone, False when ``timeout_s``
+    elapsed first. Uses the module-level ``_sleep``/``_monotonic`` hooks
+    so tests can run the chain without wall-clock waits.
+    """
+    deadline = _monotonic() + timeout_s
+    while True:
+        if not _daemon_http_alive() and not find_daemon_pids():
+            return True
+        if _monotonic() >= deadline:
+            return False
+        _sleep(_POLL_INTERVAL_S)
+
+
+def _signal_pids(pids: set[int], sig: signal.Signals, log: Callable[[str], None]) -> None:
+    protected = _protected_pids()
+    for pid in sorted(pids):
+        if pid in protected:
+            continue
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            log(f"{sig.name} target pid {pid} already gone")
+        except PermissionError:
+            log(f"{sig.name} target pid {pid} not permitted")
+
+
+def stop_daemon(*, log: Callable[[str], None] | None = None) -> dict:
+    """Stop the Cortex daemon: graceful first, escalate only when needed.
+
+    Order (D2):
+
+    1. ``POST /shutdown`` carrying ``X-Cortex-Auth-Token`` read from the
+       token file.
+    2. If accepted, poll ``/health`` for connection-refused (and the PID
+       set for emptiness) for up to :data:`GRACEFUL_SHUTDOWN_TIMEOUT_S`.
+       No signal is sent while the daemon is still finishing its recap /
+       DB close inside that window.
+    3. Only then SIGTERM every PID from :func:`find_daemon_pids` (the
+       daemon's signal handler runs the same graceful chain).
+    4. Wait :data:`SIGTERM_GRACE_S`; SIGKILL any survivor last.
+
+    Returns ``{"status": "stopped", "method": ...}`` or
+    ``{"status": "not_running"}`` when nothing was there to stop.
+    """
+    emit = log or (lambda message: logger.info("%s", message))
+    token = _read_auth_token()
+    if not token:
+        emit("auth token unavailable; graceful /shutdown will be rejected")
+    accepted = _request_graceful_shutdown(token)
+    if accepted:
+        emit("daemon accepted POST /shutdown; waiting for graceful exit")
+        if _wait_for_daemon_exit(GRACEFUL_SHUTDOWN_TIMEOUT_S):
+            return {"status": "stopped", "method": "graceful"}
+        emit(
+            f"daemon still alive {GRACEFUL_SHUTDOWN_TIMEOUT_S:.0f}s after "
+            "accepting shutdown; escalating to SIGTERM"
+        )
+
+    pids = find_daemon_pids()
     if not pids:
+        if accepted:
+            return {"status": "stopped", "method": "graceful"}
         return {"status": "not_running"}
-    for pid in pids:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            logger.debug("SIGTERM target pid %d already gone", pid)
 
-    # Step 3: Wait for graceful shutdown
-    for _ in range(6):
-        time.sleep(0.5)
-        if not _find_all_daemon_pids():
-            return {"status": "stopped"}
+    _signal_pids(pids, signal.SIGTERM, emit)
+    emit(f"sent SIGTERM to pids: {sorted(pids)}")
+    if _wait_for_daemon_exit(SIGTERM_GRACE_S):
+        return {"status": "stopped", "method": "sigterm"}
 
-    # Step 4: SIGKILL stragglers
-    for pid in _find_all_daemon_pids():
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            logger.debug("SIGKILL target pid %d already gone", pid)
-    return {"status": "stopped"}
+    survivors = find_daemon_pids()
+    if survivors:
+        _signal_pids(survivors, signal.SIGKILL, emit)
+        emit(f"sent SIGKILL to pids: {sorted(survivors)}")
+    return {"status": "stopped", "method": "sigkill"}
+
+
+def _stop_daemon() -> dict:
+    """Stop the Cortex daemon (handler entry point)."""
+    return stop_daemon()
 
 
 class LauncherHandler(BaseHTTPRequestHandler):
@@ -367,13 +647,14 @@ class LauncherHandler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._send_json({"ok": True})
         elif self.path == "/status":
+            # D16: this endpoint is unauthenticated (it is the extension's
+            # liveness poll), so it must not leak the checkout location
+            # or the interpreter path to any localhost origin.
             running = _is_daemon_running()
             pid = _find_daemon_pid() if running else None
             self._send_json({
                 "daemon_running": running,
                 "pid": pid,
-                "project_root": _project_root(),
-                "python": _python_path(),
             })
         else:
             self._send_json({"error": "not found"}, 404)

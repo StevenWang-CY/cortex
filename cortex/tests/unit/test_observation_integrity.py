@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
 
+import cv2
 import numpy as np
 import pytest
 from pydantic import ValidationError
@@ -188,12 +190,121 @@ def test_repeated_timestamp_is_rejected_as_artifact() -> None:
     assert MissingReason.ARTIFACT in result.unavailable_reasons
 
 
-def test_variable_24_fps_trace_meets_80_percent_coverage_boundary() -> None:
-    result = _prepare(_numeric_trace(fps=24))
+def _rejected(item: NumericObservation, reason: MissingReason) -> NumericObservation:
+    return NumericObservation(
+        observed_at_unix_ms=item.observed_at_unix_ms,
+        observed_at_mono_ns=item.observed_at_mono_ns,
+        boot_id=item.boot_id,
+        sequence=item.sequence,
+        value=None,
+        validity=ObservationValidity.REJECTED.value,
+        missing_reason=reason,
+        quality=0.0,
+    )
+
+
+@pytest.mark.parametrize("fps", [24, 20])
+def test_steady_sub_nominal_fps_stream_is_ready_with_full_valid_fraction(fps: int) -> None:
+    """Coverage is a ratio over scheduled observations, not the nominal fps.
+
+    A camera that steadily delivers 20-24 fps used to be capped at
+    ``fps / 30`` valid fraction and could never pass the 0.80 gate.
+    """
+
+    result = _prepare(_numeric_trace(fps=fps))
     assert result.ready is True
-    assert result.sample_rate_hz == pytest.approx(24.0, rel=0.02)
-    assert result.valid_fraction == pytest.approx(0.80)
+    assert result.sample_rate_hz == pytest.approx(float(fps), rel=0.02)
+    assert result.valid_fraction == pytest.approx(1.0)
+    assert result.scheduled_sample_count == fps * 10
+    assert result.expected_sample_count == 300  # nominal product, diagnostics only
     assert result.values is not None and np.isfinite(result.values).all()
+    assert result.diagnostics.ready is True
+    assert result.diagnostics.reasons == ()
+
+
+def test_thirty_fps_with_fifteen_percent_motion_rejections_is_not_ready() -> None:
+    trace = _numeric_trace(fps=30)
+    for index in range(len(trace)):
+        if index % 20 in (0, 7, 14):  # 45 of 300 scheduled frames = 15 %
+            trace[index] = _rejected(trace[index], MissingReason.MOTION)
+    result = _prepare(trace)
+    assert result.ready is False
+    assert result.valid_fraction == pytest.approx(0.85)
+    assert result.scheduled_sample_count == 300
+    assert MissingReason.MOTION in result.unavailable_reasons
+    codes = [reason.code for reason in result.diagnostics.reasons]
+    assert "motion_fraction_above_cap" in codes
+    assert "motion" in codes
+    assert result.diagnostics.rejection_counts == {MissingReason.MOTION.value: 45}
+
+
+def test_quarter_of_scheduled_frames_rejected_fails_the_valid_fraction_gate() -> None:
+    trace = _numeric_trace(fps=30)
+    for index in range(0, len(trace), 4):
+        trace[index] = _rejected(trace[index], MissingReason.ARTIFACT)
+    result = _prepare(trace)
+    assert result.ready is False
+    assert result.valid_fraction == pytest.approx(0.75)
+    assert result.max_interpolation_gap_ms < 250.0
+    codes = [reason.code for reason in result.diagnostics.reasons]
+    assert "valid_fraction_below_gate" in codes
+    assert "motion_fraction_above_cap" not in codes
+    assert result.diagnostics.rejection_counts == {MissingReason.ARTIFACT.value: 75}
+
+
+def test_filling_window_exposes_structured_progress_and_serialises() -> None:
+    result = _prepare(_numeric_trace(fps=30, seconds=3.0))
+    assert result.ready is False
+    assert result.valid_fraction == pytest.approx(1.0)
+    filling = [reason for reason in result.diagnostics.reasons if reason.code == "filling"]
+    assert len(filling) == 1
+    assert filling[0].message == "filling 3.0/10 s"
+    assert filling[0].observed == pytest.approx(2.97, abs=0.05)
+    assert filling[0].required == pytest.approx(8.0)
+    payload = result.readiness_payload()
+    encoded = json.loads(json.dumps(payload))
+    assert encoded["ready"] is False
+    assert encoded["scheduled_count"] == 90
+    assert encoded["reasons"][0]["code"] == "filling"
+    assert encoded["reasons"][0]["missing_reason"] == "INSUFFICIENT_WINDOW"
+
+
+def test_face_lost_window_names_the_dominant_rejection_reason() -> None:
+    trace = _numeric_trace(fps=30)
+    for index in range(150, 300):
+        trace[index] = _rejected(trace[index], MissingReason.NO_FACE)
+    result = _prepare(trace)
+    assert result.ready is False
+    assert result.temporal_coverage > 0.9  # scheduled time still covered, frames unusable
+    assert result.valid_duration_ms == pytest.approx(4967, abs=40)
+    codes = [reason.code for reason in result.diagnostics.reasons]
+    assert "valid_fraction_below_gate" in codes
+    assert "no_face" in codes
+    no_face = next(reason for reason in result.diagnostics.reasons if reason.code == "no_face")
+    assert "face not detected" in no_face.message
+    assert no_face.observed == pytest.approx(0.5)
+
+
+def test_window_mean_motion_is_aggregated_over_valid_samples_only() -> None:
+    trace = _numeric_trace(fps=30)
+    with_motion = [
+        NumericObservation(
+            observed_at_unix_ms=item.observed_at_unix_ms,
+            observed_at_mono_ns=item.observed_at_mono_ns,
+            boot_id=item.boot_id,
+            sequence=item.sequence,
+            value=item.value,
+            validity=item.validity,
+            missing_reason=item.missing_reason,
+            quality=item.quality,
+            motion_face_widths_per_second=0.2 if item.sequence % 2 else 0.4,
+        )
+        for item in trace
+    ]
+    result = _prepare(with_motion)
+    assert result.ready is True
+    assert result.mean_motion_face_widths_per_second == pytest.approx(0.3)
+    assert _prepare(trace).mean_motion_face_widths_per_second is None
 
 
 def test_irregular_capture_times_produce_explicit_uniform_monotonic_grid() -> None:
@@ -414,6 +525,57 @@ async def test_webcam_failed_read_and_success_are_both_sequenced_observations() 
     assert (first.sequence, second.sequence) == (0, 1)
     assert first.observed_at_mono_ns is not None
     assert second.observed_at_mono_ns is not None
+
+
+def test_camera_identity_binds_negotiated_geometry_and_rebinds_to_delivered_frames() -> None:
+    """D12: identity geometry follows the backend, not the configured size."""
+
+    capture = WebcamCapture(CaptureConfig(fps=30, width=640, height=480), queue_maxsize=8)
+    negotiated = MagicMock()
+    negotiated.get.side_effect = lambda prop: {
+        cv2.CAP_PROP_FRAME_WIDTH: 1280.0,
+        cv2.CAP_PROP_FRAME_HEIGHT: 720.0,
+    }.get(prop, 0.0)
+    assert capture._negotiated_geometry(negotiated) == (1280, 720)
+    unhelpful = MagicMock()  # get() returns a non-numeric stand-in
+    assert capture._negotiated_geometry(unhelpful) == (640, 480)
+    zeros = MagicMock()
+    zeros.get.return_value = 0.0
+    assert capture._negotiated_geometry(zeros) == (640, 480)
+
+    selection = CameraSelection(0, None, "builtin_mac_camera", "FaceTime HD Camera")
+    capture._camera_selection = selection
+    capture._camera_identity = selection.identity(width=1280, height=720)
+    capture._reconcile_identity_with_frame(np.zeros((48, 64, 3), dtype=np.uint8))
+    assert capture.camera_identity is not None
+    assert (capture.camera_identity.width, capture.camera_identity.height) == (64, 48)
+    assert capture.camera_identity.identity_key == selection.identity(width=64, height=48).identity_key
+    assert capture.camera_identity.identity_key != selection.identity(width=1280, height=720).identity_key
+    # Matching geometry is a no-op.
+    before = capture.camera_identity
+    capture._reconcile_identity_with_frame(np.zeros((48, 64, 3), dtype=np.uint8))
+    assert capture.camera_identity is before
+
+
+@pytest.mark.asyncio
+async def test_delivered_frames_carry_the_delivered_geometry_identity() -> None:
+    cap = MagicMock()
+    cap.isOpened.return_value = True
+    cap.read.return_value = (True, np.zeros((48, 64, 3), dtype=np.uint8))
+    selection = CameraSelection(0, None, "builtin_mac_camera", "FaceTime HD Camera")
+    capture = WebcamCapture(CaptureConfig(fps=30, width=640, height=480), queue_maxsize=8)
+    with patch(
+        "cortex.services.capture_service.webcam.open_video_capture",
+        return_value=(cap, selection),
+    ):
+        await capture.start()
+        try:
+            frame = await capture.get_frame(timeout=1.0)
+        finally:
+            await capture.stop()
+    assert frame is not None and frame.frame is not None
+    assert frame.camera_identity is not None
+    assert (frame.camera_identity.width, frame.camera_identity.height) == (64, 48)
 
 
 def test_camera_identity_survives_index_reorder_but_changes_with_device() -> None:

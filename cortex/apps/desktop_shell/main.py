@@ -593,6 +593,15 @@ class CortexApp:
     def run(self) -> int:
         """Run the application. Returns exit code."""
         self._app = QApplication(sys.argv)
+        # Cortex pins the light appearance per window (mac_native); the
+        # QApplication palette must agree so palette-drawn text never
+        # inverts under a dark system theme.
+        try:
+            app_palette = mac_native.application_palette()
+            if app_palette is not None:
+                self._app.setPalette(app_palette)
+        except Exception:
+            logger.debug("application palette apply failed", exc_info=True)
         self._app.setApplicationName("Cortex")
         self._app.setOrganizationName("Cortex")
         self._app.setQuitOnLastWindowClosed(False)  # Keep running in tray
@@ -779,6 +788,20 @@ class CortexApp:
         self._onboarding.open_settings_requested.connect(self._show_settings)
         self._onboarding.run_calibration_requested.connect(self._run_calibration)
         self._onboarding.completed.connect(self._complete_onboarding)
+        # WS mode talks to a separate daemon process: the shell cannot
+        # start a new session itself, so the dashboard offers no
+        # "Start session" after one ends.
+        if self._dashboard is not None and hasattr(
+            self._dashboard, "set_session_restart_available"
+        ):
+            self._dashboard.set_session_restart_available(False)
+        if self._dashboard is not None and hasattr(
+            self._dashboard, "recalibrate_requested"
+        ):
+            self._dashboard.recalibrate_requested.connect(self._run_calibration)
+        # Accessibility palette: re-render state-coloured surfaces at once.
+        if hasattr(self._settings, "palette_changed"):
+            self._settings.palette_changed.connect(self._on_palette_changed)
         # P0 §3.4: Settings → Sensing → Recalibrate baselines also drives
         # the same in-process CalibrationRunner code path. The controller
         # owns the same wire-up (controller.py:415) — in the WS-mode
@@ -891,9 +914,14 @@ class CortexApp:
         if self._dashboard is not None:
             self._dashboard.update_state(payload)
         if self._tray is not None:
-            state = payload.get("state", "FLOW")
-            confidence = payload.get("confidence", 0.0)
-            self._tray.update_state(state, confidence)
+            # Forward the evidence status so the tray never names a state
+            # the daemon has not actually estimated.
+            self._tray.update_state(
+                payload.get("state", "UNKNOWN"),
+                payload.get("confidence", 0.0),
+                payload.get("status", "insufficient_evidence"),
+                payload.get("evidence_coverage", 0.0),
+            )
 
     @Slot(dict)
     def _on_intervention(self, payload: dict) -> None:
@@ -1033,8 +1061,7 @@ class CortexApp:
         """Handle explicit restore events from the daemon."""
         self._active_intervention_id = None
         self._active_action_manifest = None
-        if self._overlay is not None:
-            self._overlay.hide()
+        self._dismiss_overlay()
 
     @Slot(dict)
     def _on_intervention_failed(self, payload: dict) -> None:
@@ -1118,6 +1145,10 @@ class CortexApp:
             if panel is None:
                 panel = ConnectionsPanel()
                 self._connections_panel = panel
+                # A verified extension connection completes the
+                # onboarding step for real.
+                if hasattr(panel, "connection_verified"):
+                    panel.connection_verified.connect(self._on_connection_verified)
             panel.show()
             panel.raise_()
             panel.activateWindow()
@@ -1192,7 +1223,7 @@ class CortexApp:
             "user_initiated_quit: arming two-phase stop via consumer tab"
         )
         try:
-            consumer._arm_stop()
+            consumer._arm_stop(quit_after=True)
         except Exception:
             logger.exception(
                 "Failed to arm two-phase stop from user-initiated quit"
@@ -1348,15 +1379,12 @@ class CortexApp:
                 ),
             }
             try:
+                # Queued Qt signal only: this callback runs on the runner
+                # thread, and calling a widget slot directly from here
+                # is not thread-safe (``_on_calibration_progress`` is
+                # connected to the signal on the Qt thread).
                 if hasattr(self._bridge, "calibration_progress"):
                     self._bridge.calibration_progress.emit(payload)
-                if self._onboarding is not None and hasattr(
-                    self._onboarding, "apply_calibration_progress"
-                ):
-                    # In WS-mode the bridge may not carry a progress
-                    # signal; call the slot directly (the runner thread
-                    # is fine here because PySide6 queues cross-thread).
-                    self._onboarding.apply_calibration_progress(**payload)
             except Exception:
                 logger.debug("calibration progress emit failed", exc_info=True)
 
@@ -1728,13 +1756,44 @@ class CortexApp:
             self._onboarding.hide()
         self._show_dashboard()
 
+    def _dismiss_overlay(self) -> None:
+        """Single overlay dismissal path: stops its timers, then hides."""
+        overlay = self._overlay
+        if overlay is None:
+            return
+        suppress = getattr(overlay, "suppress", None)
+        try:
+            if callable(suppress):
+                suppress()
+            else:
+                overlay.hide()
+        except Exception:
+            logger.debug("overlay dismiss failed", exc_info=True)
+
+    def _on_palette_changed(self, _variant: str) -> None:
+        """Re-render state-coloured surfaces after a palette swap."""
+        dashboard = self._dashboard
+        if dashboard is not None and hasattr(dashboard, "apply_palette_change"):
+            try:
+                dashboard.apply_palette_change()
+            except Exception:
+                logger.debug("dashboard palette change failed", exc_info=True)
+
+    def _on_connection_verified(self, name: str) -> None:
+        onboarding = self._onboarding
+        if onboarding is not None and hasattr(onboarding, "mark_extensions_connected"):
+            try:
+                onboarding.mark_extensions_connected(name)
+            except Exception:
+                logger.debug("mark_extensions_connected failed", exc_info=True)
+
     def _toggle_pause(self) -> None:
         """Toggle pause/resume state."""
         self._paused = not self._paused
         if self._tray is not None:
             self._tray.set_paused(self._paused)
-        if self._paused and self._overlay is not None:
-            self._overlay.hide()
+        if self._paused:
+            self._dismiss_overlay()
         logger.info(f"Cortex {'paused' if self._paused else 'resumed'}")
 
     def _restore_workspace(self) -> None:
@@ -1759,8 +1818,7 @@ class CortexApp:
         self._paused = True
         if self._tray is not None:
             self._tray.set_paused(True)
-        if self._overlay is not None:
-            self._overlay.hide()
+        self._dismiss_overlay()
 
     def _quit(self) -> None:
         """Quit the application."""

@@ -3,7 +3,7 @@
 //
 // Source of truth: cortex/libs/schemas/*.py (Pydantic v2 models).
 // Schema package: cortex-wire/2.0
-// Source SHA-256: c6f2209847e6f2ed7f8ccc2d0cb1e719991404a568efd4f0228d5421ad9a7dd9
+// Source SHA-256: bb90d644115d5ab82bfd839545b2e29808d90f06229c741d3e08f17ee91fd963
 // Drift-gate: a pre-commit hook and the GitHub Actions CI run
 //   `python -m cortex.scripts.generate_ts_schemas --check`
 // and fail if this file is out of sync with the Python models.
@@ -1823,6 +1823,10 @@ export interface ContextPrivacyStatusResponse {
   pending_previews?: number;
   provider: "bedrock" | "vertex" | "direct";
   retention: ProviderRetentionDisclosure;
+  /**
+   * Why an external request can or cannot be previewed right now: the transport is ready, external planning is configured but no provider credential is available (fixable from Settings without a restart), or external planning is not enabled/acknowledged.
+   */
+  transport_state?: "ready" | "credentials_missing" | "external_context_disabled";
 }
 /**
  * Prepare a preview from the daemon's current in-memory snapshot.
@@ -1900,11 +1904,19 @@ export interface DualClockModel {
 }
 /**
  * Bounded interval around a numeric estimate.
+ *
+ * ``interval_kind`` states what the bound *is*: a ``statistical`` interval
+ * carries a real coverage probability in ``confidence_level``; a
+ * ``heuristic`` bound (spectral resolution, window quality, channel
+ * disagreement) carries no coverage claim and therefore no
+ * ``confidence_level``. Labelling a heuristic bound with a level such as
+ * 0.95 is rejected at construction.
  */
 export interface EstimateUncertainty {
   lower: number;
   upper: number;
-  confidence_level: number;
+  confidence_level?: number | null;
+  interval_kind?: "statistical" | "heuristic";
   method: string;
 }
 /**
@@ -2300,6 +2312,9 @@ export interface HealthResponse {
   };
   uptime_seconds: number;
   version?: string | null;
+  ready?: boolean;
+  ws_listening?: boolean;
+  capture_state?: "running" | "stale" | "stopped" | "unavailable";
   duplicate_intervention_acks?: number;
   frames_dropped_total?: number;
   capture_stale?: boolean;
@@ -4484,6 +4499,25 @@ export interface CaptureStatus {
    * Latest capture-loop sequence number; surfaced for debug overlays that need to detect dropped frames. None when the producer does not stamp a sequence.
    */
   sequence?: number | null;
+  /**
+   * The first gate the pulse window failed, or None when the window is publishable or no window has been prepared yet.
+   */
+  pulse_unavailable?: PulseReadinessReason | null;
+}
+/**
+ * Why the pulse window is not publishable yet (v0.4.0, audit S10).
+ *
+ * Mirrors one ``ReadinessReason`` from the capture window diagnostics so a
+ * client can replace a permanent "Reading your pulse…" with the real
+ * blocker: still filling, too many unusable frames (and why), motion,
+ * or a gap the window cannot bridge.
+ */
+export interface PulseReadinessReason {
+  code: string;
+  message: string;
+  observed?: number | null;
+  required?: number | null;
+  missing_reason?: string | null;
 }
 /**
  * P0 §3.15: COST_RESPONSE wire payload (unified HTTP + WS envelope).
@@ -4505,7 +4539,7 @@ export interface CaptureStatus {
  * or when no LLM client is registered):
  * - ``prompt_tokens``: best-effort prompt-token counter for today.
  * - ``completion_tokens``: best-effort completion-token counter for today.
- * - ``model``: active model id (e.g. ``claude-sonnet-4-5``).
+ * - ``model``: active model id (e.g. ``claude-sonnet-5``).
  */
 export interface CostResponse {
   schema_version?: "1.0" | "2.0";
@@ -4542,7 +4576,7 @@ export interface CostResponse {
    */
   completion_tokens?: number | null;
   /**
-   * Active model id (e.g. ``claude-sonnet-4-5``). ``None`` when no LLM client is registered.
+   * Active model id (e.g. ``claude-sonnet-5``). ``None`` when no LLM client is registered.
    */
   model?: string | null;
 }
@@ -5019,6 +5053,10 @@ export interface CaptureStatus1 {
    * Latest capture-loop sequence number; surfaced for debug overlays that need to detect dropped frames. None when the producer does not stamp a sequence.
    */
   sequence?: number | null;
+  /**
+   * The first gate the pulse window failed, or None when the window is publishable or no window has been prepared yet.
+   */
+  pulse_unavailable?: PulseReadinessReason | null;
 }
 /**
  * Persistence-layer health sub-payload

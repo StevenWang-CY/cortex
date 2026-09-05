@@ -4,7 +4,7 @@ Run with:
     ``QT_QPA_PLATFORM=offscreen pytest cortex/tests/unit/test_dashboard_empty_state.py``
 
 Before the first capture frame arrives, both the consumer biometrics
-card and the advanced developer tab show "Start a session to ..."
+card and the advanced developer tab show "Waiting for the camera…"
 placeholders so the user doesn't read the placeholder ``--`` glyphs as
 "the daemon is broken". The first ``update_state`` call hides the
 placeholders and the flag is sticky — a transient WS disconnect should
@@ -63,13 +63,13 @@ def dashboard(qapp, monkeypatch):
 
 
 def test_consumer_empty_state_visible_before_first_frame(dashboard):
-    """The biometrics card carries the 'Start a session' placeholder
+    """The biometrics card carries the 'Waiting for the camera' placeholder
     paragraph before any state arrives."""
     consumer = dashboard._consumer
     assert consumer._has_received_state is False
     placeholder = consumer._bio_empty_state
     assert placeholder is not None
-    assert "Start a session" in placeholder.text()
+    assert "Waiting for the camera" in placeholder.text()
     assert "biometrics" in placeholder.text().lower()
     # The widget is constructed visible-by-default; under offscreen it
     # only becomes effectively-on-screen when the dashboard is shown,
@@ -113,7 +113,7 @@ def test_advanced_empty_state_visible_before_first_frame(dashboard):
     assert advanced._has_received_state is False
     placeholder = advanced._empty_state
     assert placeholder is not None
-    assert "Start a session" in placeholder.text()
+    assert "Waiting for the camera" in placeholder.text()
     # Mentions at least one of the dev-debug widgets so the user knows
     # what they're about to populate.
     text = placeholder.text().lower()

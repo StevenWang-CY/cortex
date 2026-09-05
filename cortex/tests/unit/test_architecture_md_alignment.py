@@ -1,4 +1,4 @@
-"""audit-w2 — Architecture.md must name every service directory + every
+"""audit-w2 — wiki/Architecture.md must name every service directory + every
 port the daemon actually opens.
 
 The previous Architecture.md repository map listed six service
@@ -49,7 +49,7 @@ _REQUIRED_PORTS = {"9471", "9472", "9473"}
 
 def _arch_md_path() -> Path:
     # cortex/tests/unit/test_*.py -> repo root is three parents up.
-    return Path(__file__).resolve().parents[3] / "Architecture.md"
+    return Path(__file__).resolve().parents[3] / "wiki" / "Architecture.md"
 
 
 def test_architecture_md_lists_every_service_dir() -> None:

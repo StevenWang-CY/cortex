@@ -637,6 +637,22 @@ def open_video_capture(
     return None, last_candidate
 
 
+def _as_frame_dimension(value: object) -> int | None:
+    """Coerce a backend-reported frame dimension; ``None`` when implausible.
+
+    Backends report ``0``/``-1`` for unsupported properties and test doubles
+    may return arbitrary objects, so only real finite numbers within a sane
+    pixel range are accepted.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
+        return None
+    number = float(value)
+    if not np.isfinite(number) or not 16.0 <= number <= 16384.0:
+        return None
+    return int(round(number))
+
+
 class WebcamCapture:
     """
     Threaded webcam capture with stable FPS targeting.
@@ -937,6 +953,50 @@ class WebcamCapture:
                     value,
                 )
 
+    def _negotiated_geometry(self, capture: cv2.VideoCapture) -> tuple[int, int]:
+        """Return the frame geometry the backend agreed to after configuration.
+
+        The backend may deliver a different size than requested (AVFoundation
+        snaps to the nearest supported format), so binding the camera identity
+        and calibration geometry to the *configured* size mislabels every
+        frame.  Query the negotiated properties first and fall back to the
+        configuration when the backend reports nothing usable; the first
+        delivered frame remains authoritative via
+        :meth:`_reconcile_identity_with_frame`.
+        """
+
+        fallback = (int(self._config.width), int(self._config.height))
+        try:
+            width = _as_frame_dimension(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = _as_frame_dimension(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        except Exception:
+            return fallback
+        if width is None or height is None:
+            return fallback
+        return width, height
+
+    def _reconcile_identity_with_frame(self, frame: NDArray[np.uint8]) -> None:
+        """Rebind the camera identity to the delivered frame geometry if needed."""
+
+        identity = self._camera_identity
+        selection = self._camera_selection
+        if identity is None or selection is None or frame.ndim < 2:
+            return
+        height, width = int(frame.shape[0]), int(frame.shape[1])
+        if width <= 0 or height <= 0:
+            return
+        if width == identity.width and height == identity.height:
+            return
+        logger.info(
+            "Camera delivered %dx%d frames instead of the negotiated %dx%d; "
+            "rebinding camera identity to the delivered geometry",
+            width,
+            height,
+            identity.width,
+            identity.height,
+        )
+        self._camera_identity = selection.identity(width=width, height=height)
+
     def _release_active_capture(self) -> None:
         """Release and clear the active handle exactly once."""
 
@@ -1030,9 +1090,10 @@ class WebcamCapture:
         self._configure_capture(capture)
         self._cap = capture
         self._camera_selection = selection
+        recovered_width, recovered_height = self._negotiated_geometry(capture)
         self._camera_identity = selection.identity(
-            width=self._config.width,
-            height=self._config.height,
+            width=recovered_width,
+            height=recovered_height,
         )
         self._source_instance_id = uuid4()
         self._has_successful_frame = False
@@ -1112,9 +1173,10 @@ class WebcamCapture:
             self._cap = capture
             self._camera_selection = selection
             self._configure_capture(capture)
+            negotiated_width, negotiated_height = self._negotiated_geometry(capture)
             self._camera_identity = selection.identity(
-                width=self._config.width,
-                height=self._config.height,
+                width=negotiated_width,
+                height=negotiated_height,
             )
             self._source_instance_id = uuid4()
             startup_succeeded = True
@@ -1125,7 +1187,8 @@ class WebcamCapture:
                     "device_id": selection.device_id,
                     "camera_source": selection.source,
                     "camera_identity_key": self._camera_identity.identity_key,
-                    "resolution": f"{self._config.width}x{self._config.height}",
+                    "resolution": f"{negotiated_width}x{negotiated_height}",
+                    "requested_resolution": f"{self._config.width}x{self._config.height}",
                     "target_fps": self._config.fps,
                 },
             )
@@ -1264,6 +1327,10 @@ class WebcamCapture:
                         self._recovery_successes,
                     )
                 self._recovery_attempts_since_frame = 0
+
+                # The delivered frame is the authoritative geometry for the
+                # identity and calibration binding.
+                self._reconcile_identity_with_frame(cast(NDArray[np.uint8], frame))
 
                 # Create captured frame (wall-clock timestamp per schema).
                 captured = CapturedFrame(

@@ -224,6 +224,13 @@ class FeatureFusion:
             self._telemetry is not None
             and self._telemetry.observation_window_seconds is not None
         )
+        telemetry_window_ms = (
+            int(round(float(self._telemetry.observation_window_seconds) * 1000.0))
+            if self._telemetry is not None
+            and self._telemetry.observation_window_seconds is not None
+            and self._telemetry.observation_window_seconds > 0
+            else 15_000
+        )
         mouse_metrics_ready = bool(
             telemetry_window_ready
             and self._telemetry is not None
@@ -337,12 +344,15 @@ class FeatureFusion:
                 algorithm_version="input-aggregation-v2",
                 measurement_ready=telemetry_window_ready,
             ),
+            # Both rates are per-minute *units* computed over the same 15 s
+            # aggregation window as every other input feature; stamping them
+            # as 60 s measurements misdescribed their provenance (audit D13).
             FeatureName.TAB_SWITCH_RATE_PER_MIN: self._feature_value(
                 tab_switch_frequency,
                 source_present=self._telemetry is not None,
                 quality=quality.telemetry,
                 age_ms=telemetry_age,
-                source_window_ms=60_000,
+                source_window_ms=telemetry_window_ms,
                 algorithm_version="window-aggregation-v2",
                 measurement_ready=window_metrics_ready,
             ),
@@ -351,7 +361,7 @@ class FeatureFusion:
                 source_present=self._telemetry is not None,
                 quality=quality.telemetry,
                 age_ms=telemetry_age,
-                source_window_ms=60_000,
+                source_window_ms=telemetry_window_ms,
                 algorithm_version="input-aggregation-v2",
                 measurement_ready=telemetry_window_ready,
             ),
