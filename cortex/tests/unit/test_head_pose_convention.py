@@ -140,3 +140,127 @@ class TestPostureWrap:
             pitch_deg=170.0, face_scale=180.0, timestamp=2.0, camera_identity_key="cam"
         )
         assert extension.head_neck_flexion_angle == 0.0
+
+
+# ---------------------------------------------------------------------------
+# The intrinsics must describe the frames the camera actually delivers
+# ---------------------------------------------------------------------------
+
+
+def _landmarks_at(
+    pitch_deg: float, *, width: int, height: int, distance_mm: float = 600.0
+) -> np.ndarray:
+    """The same exact projection, at an arbitrary delivered geometry."""
+    rotated = (_rotation_x(pitch_deg) @ _MODEL_POINTS_3D_CAMERA.T).T
+    rotated[:, 2] += distance_mm
+    focal = float(width)
+    u = focal * rotated[:, 0] / rotated[:, 2] + width / 2.0
+    v = focal * rotated[:, 1] / rotated[:, 2] + height / 2.0
+    landmarks = np.full((478, 2), np.nan, dtype=np.float64)
+    landmarks[:, 0] = np.linspace(0.3 * width, 0.7 * width, 478)
+    landmarks[:, 1] = np.linspace(0.3 * height, 0.7 * height, 478)
+    landmarks[_PNP_LANDMARK_INDICES] = np.column_stack([u, v])
+    return landmarks
+
+
+class TestDeliveredGeometry:
+    """A camera asked for one resolution routinely delivers another.
+
+    ``HeadPoseEstimator`` builds a pinhole matrix once — principal point at
+    the frame centre, focal length equal to the frame width — from the
+    *configured* size in ``config.capture``. The capture service already
+    rebinds the camera identity to whatever the frame actually is, precisely
+    because the two disagree in practice. Until this fix the estimator did
+    not, so landmarks in 640-space were solved against a matrix describing
+    1280x720 and every pitch, yaw and roll came out biased.
+    """
+
+    @pytest.mark.parametrize("pitch", [-20.0, -10.0, 0.0, 10.0, 20.0])
+    def test_configured_intrinsics_on_delivered_frames_are_badly_wrong(
+        self, pitch: float
+    ) -> None:
+        """Quantify the defect, so the fix is not judged on plausibility.
+
+        Configured 1280x720, delivered 640x480 — an ordinary negotiation.
+        Measured total angular error across -20 to +20 degrees of true pitch:
+        13.4 to 15.8 degrees, of which roughly 12 to 15 degrees is yaw that
+        is not there at all, plus a +5.4 degree pitch offset at the neutral
+        pose. That last number is the one that matters most: calibration
+        records a neutral head pitch and the posture proxy measures live
+        flexion against it, so a constant offset at neutral lands directly in
+        the head/neck claim.
+        """
+        stale = HeadPoseEstimator(frame_width=1280, frame_height=720)
+
+        result = stale.update(_landmarks_at(pitch, width=640, height=480), 0.0)
+
+        error = float(
+            np.hypot(np.hypot(result.pitch - pitch, result.yaw), result.roll)
+        )
+        assert error > 10.0, (
+            "this test exists because the mismatch produces a large error; "
+            f"true pitch {pitch} gave pitch={result.pitch:.2f} "
+            f"yaw={result.yaw:.2f} roll={result.roll:.2f} (error {error:.2f})"
+        )
+
+    @pytest.mark.parametrize("pitch", [-20.0, -10.0, 0.0, 10.0, 20.0])
+    def test_rebinding_to_the_delivered_geometry_restores_accuracy(
+        self, pitch: float
+    ) -> None:
+        estimator = HeadPoseEstimator(frame_width=1280, frame_height=720)
+
+        changed = estimator.rebind_geometry(frame_width=640, frame_height=480)
+
+        assert changed is True
+        assert estimator.frame_geometry == (640, 480)
+        result = estimator.update(_landmarks_at(pitch, width=640, height=480), 0.0)
+        # Exact, not merely improved: the projection above uses the same
+        # pinhole model the estimator solves with, so a matching matrix
+        # recovers the pose to numerical precision.
+        assert result.pitch == pytest.approx(pitch, abs=0.05)
+        assert result.yaw == pytest.approx(0.0, abs=0.05)
+        assert result.roll == pytest.approx(0.0, abs=0.05)
+
+    def test_rebinding_to_the_same_geometry_is_a_no_op(self) -> None:
+        estimator = HeadPoseEstimator(frame_width=WIDTH, frame_height=HEIGHT)
+        estimator.update(_landmarks_for_pitch(10.0), 0.0)
+
+        assert estimator.rebind_geometry(
+            frame_width=WIDTH, frame_height=HEIGHT
+        ) is False
+        # History is intact, so a no-op rebind cannot be used to reset state.
+        assert estimator._previous is not None
+
+    def test_rebinding_drops_history_so_no_phantom_velocity_is_emitted(
+        self,
+    ) -> None:
+        """Poses solved under two matrices are not comparable.
+
+        Differencing across the boundary would emit a velocity spike the
+        jitter and freeze detectors would read as real head movement.
+        """
+        estimator = HeadPoseEstimator(frame_width=1280, frame_height=720)
+        estimator.update(_landmarks_at(0.0, width=1280, height=720), 0.0)
+        assert estimator._previous is not None
+
+        estimator.rebind_geometry(frame_width=640, frame_height=480)
+
+        assert estimator._previous is None
+        assert len(estimator._pose_history) == 0
+        # ``latest_result`` is deliberately kept so a polling consumer does
+        # not momentarily see nothing.
+        assert estimator.latest_result is not None
+
+        after = estimator.update(_landmarks_at(0.0, width=640, height=480), 0.1)
+        assert after.angular_velocity_deg_per_s == pytest.approx(0.0), (
+            "the first sample after a rebind has no comparable predecessor"
+        )
+        assert after.is_jittery is False
+
+    @pytest.mark.parametrize("width,height", [(0, 480), (640, 0), (-1, 480)])
+    def test_rebinding_rejects_impossible_geometry(
+        self, width: int, height: int
+    ) -> None:
+        estimator = HeadPoseEstimator(frame_width=WIDTH, frame_height=HEIGHT)
+        with pytest.raises(ValueError):
+            estimator.rebind_geometry(frame_width=width, frame_height=height)

@@ -214,3 +214,64 @@ class TestTokenBudgetEnforcement:
         result = _enforce_token_budget(messages, max_context_tokens=max_ctx)
         total = _total_message_tokens(result)
         assert total <= int(max_ctx * 0.80)
+
+
+# ---------------------------------------------------------------------------
+# Templates may only ask for what the draft schema can carry
+# ---------------------------------------------------------------------------
+
+
+class TestTemplatesMatchTheDraftContract:
+    """A prompt that asks for an impossible field misdirects the whole plan.
+
+    ``PlanDraft`` sets ``extra="forbid"`` and the emitted structured-output
+    schema closes every object, so the model cannot return a field the draft
+    does not declare — the grammar will not let it. A template that asks for
+    one therefore does not fail loudly; it produces a plan shaped around an
+    intervention that will never happen. ``active_recall`` asked for three
+    ``recall_*`` fields and told the model the screen would blur until the
+    user answered correctly, and ``ACTIVE_RECALL`` is a compatibility sink in
+    the extension with no page receiver at all.
+    """
+
+    def test_no_template_asks_for_a_field_the_draft_cannot_carry(self) -> None:
+        from cortex.services.llm_engine.plan_draft import PlanDraft
+
+        declared = set(PlanDraft.model_fields)
+        # Fields the model is legitimately told about live on nested draft
+        # models; collect those too rather than flagging them.
+        for field in PlanDraft.model_fields.values():
+            annotation = field.annotation
+            nested = getattr(annotation, "model_fields", None)
+            if nested:
+                declared |= set(nested)
+
+        forbidden = {"recall_question", "recall_answer", "recall_context_sentence"}
+        assert not (forbidden & declared), (
+            "the draft now declares recall fields; update this test rather "
+            "than deleting it"
+        )
+        for name, template in PROMPT_TEMPLATES.items():
+            leaked = sorted(field for field in forbidden if field in template)
+            assert not leaked, (
+                f"template {name!r} asks the model for {leaked}, which the "
+                "closed draft schema cannot carry — the model cannot return "
+                "them and the plan is written for an intervention that never "
+                "occurs"
+            )
+
+    def test_no_template_promises_a_surface_that_does_not_present(self) -> None:
+        """ACTIVE_RECALL, BREATHING_OVERLAY and the lockouts are inert sinks.
+
+        Promising the model that the screen will blur, or that the user will
+        be blocked until they answer, is a promise the extension explicitly
+        does not keep: those frames present nothing and mutate nothing until
+        they have an exact authorization and a receipt-backed escape path.
+        """
+        promises = ("blur the screen", "must answer correctly to unblur")
+        for name, template in PROMPT_TEMPLATES.items():
+            lowered = template.lower()
+            broken = [phrase for phrase in promises if phrase in lowered]
+            assert not broken, (
+                f"template {name!r} promises {broken}; no surface delivers it"
+            )

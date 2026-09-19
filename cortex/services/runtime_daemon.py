@@ -3696,6 +3696,21 @@ class CortexDaemon:
             self._posture.observe_missing(mono_seconds)
             return
 
+        # The pose estimator's pinhole intrinsics are built from a frame size,
+        # and were built once from the *configured* one. Cameras routinely
+        # negotiate something else — ask for 1280x720, receive 640x480 — and
+        # the capture service already rebinds the camera identity to whatever
+        # the frame actually is. Landmarks then arrive in the delivered space
+        # while the matrix still describes the configured one, so solvePnP
+        # returns a pitch, yaw and roll biased by however far apart the two
+        # geometries are, and nothing downstream can tell that from posture.
+        # Reconcile the estimator to the same authority.
+        if identity is not None:
+            self._head_pose.rebind_geometry(
+                frame_width=identity.width,
+                frame_height=identity.height,
+            )
+
         blink = self._blink_detector.update(landmarks_px, mono_seconds)
         pose = self._head_pose.update(landmarks_px, mono_seconds)
         posture = self._posture.update(

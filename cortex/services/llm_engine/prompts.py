@@ -463,21 +463,35 @@ Respiration: {extra_context}
 {constraints_text}
 """
 
+# This template used to ask for three ``recall_*`` fields and promise the
+# model that "the intervention will blur the screen and show the question;
+# the user must answer correctly to unblur". None of that was ever true.
+# ``PlanDraft`` sets ``extra="forbid"`` and the emitted structured-output
+# schema closes every object, so the grammar cannot express those fields —
+# the model could not have returned them if it tried. And the surface that
+# would present a quiz does not exist: ``ACTIVE_RECALL`` is a compatibility
+# sink in the extension with no page receiver, because blurring a page the
+# user is reading is a mutation, and a mutation needs an exact
+# authorization, an immutable manifest, a durable receipt and a
+# receipt-backed escape path before it may touch anyone's screen.
+#
+# The net effect was not a crash. The trigger fired, the model produced a
+# plan, and the plan was shaped around a quiz that would never appear — so
+# the headline and the steps the user actually saw were written for the
+# wrong intervention. Asking for what this pipeline can deliver is what
+# makes the detection useful, and the detection itself is sound.
 _ACTIVE_RECALL = """\
 The user has been passively reading for an extended period (zombie-reading detected). \
 They are scrolling slowly with minimal interaction — likely not absorbing the content.
 
-Based on the visible page text provided below, generate a SPECIFIC, TECHNICAL \
-fill-in-the-blank question that tests comprehension of the material. The question \
-must be directly based on the actual text content, not generic.
-
-Output a JSON object with these additional fields:
-- "recall_question": the fill-in-the-blank question (use ___ for the blank)
-- "recall_answer": the correct answer
-- "recall_context_sentence": the original sentence the question was derived from
-
-The intervention will blur the screen and show the question. The user must answer \
-correctly to unblur.
+Do NOT quiz them and do NOT propose blocking, blurring, or hiding the page. \
+Propose a way back into active engagement with THIS material, grounded in the \
+visible page text below:
+- The headline names what they are reading, briefly and without judgement
+- The micro_steps are concrete and specific to this text — for example, the one \
+  claim on the page worth checking, a term worth looking up, or something to write \
+  down in their own words before scrolling further
+- Prefer one step they can do in under a minute over a reading plan
 
 Include a causal_explanation referencing workspace patterns and behavior signals (not raw biometric numbers).
 
