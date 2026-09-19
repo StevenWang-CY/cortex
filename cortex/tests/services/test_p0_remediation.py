@@ -26,9 +26,21 @@ from cortex.services.consent.policy import (
 class _FakeTriggerPolicy:
     def __init__(self) -> None:
         self.activated_with: list[int] = []
+        self.indefinite_activations: int = 0
         self.cleared: int = 0
 
-    def activate_quiet_mode(self, duration_minutes: int | None = None) -> None:
+    # Mirrors TriggerPolicy.activate_quiet_mode: keyword-only, and able to
+    # express the indefinite window that backs "Pause all sensing".
+    def activate_quiet_mode(
+        self,
+        *,
+        duration_minutes: int | None = None,
+        current_time: float | None = None,
+        indefinite: bool = False,
+    ) -> None:
+        if indefinite:
+            self.indefinite_activations += 1
+            return
         self.activated_with.append(int(duration_minutes or 0))
 
     def clear_quiet_mode(self) -> None:

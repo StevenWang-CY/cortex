@@ -450,3 +450,40 @@ class TestChromBandpass:
         t = _times(10.0)
         rgb = _rgb_from_pulse(np.sin(2 * np.pi * 1.2 * t))
         assert np.allclose(chrom.extract(rgb, fs=FS), extract_bvp_chrom(rgb, FS))
+
+
+def test_replay_reference_follows_the_window_not_the_sequence_mean() -> None:
+    """Replay error metrics must be scored against each window's own truth.
+
+    ``_load_trace`` collapsed the whole ``hr_gt`` series to one scalar mean and
+    every window was compared against it, so a sequence whose true rate drifts
+    — the normal case — charged a perfectly accurate estimator with the drift
+    as error, and the reported MAE/RMSE/bias did not measure what the replay
+    report claimed.
+    """
+
+    from cortex.services.physio_engine.v2.replay import _window_reference_bpm
+
+    # True rate rises 60 -> 90 BPM across the sequence; the mean is 75.
+    reference = np.linspace(60.0, 90.0, 300, dtype=np.float64)
+    samples = 3000  # video samples, 10x the reference rate
+
+    first = _window_reference_bpm(reference, start=0, end=300, sample_count=samples)
+    last = _window_reference_bpm(
+        reference, start=samples - 300, end=samples, sample_count=samples
+    )
+    assert first is not None and last is not None
+    assert first < 63.0, "an early window must be scored against the early rate"
+    assert last > 87.0, "a late window must be scored against the late rate"
+
+    # A single-value reference still works, and non-finite spans abstain
+    # rather than inventing a number.
+    assert _window_reference_bpm(
+        np.asarray([72.0]), start=0, end=300, sample_count=samples
+    ) == pytest.approx(72.0)
+    assert (
+        _window_reference_bpm(
+            np.full(300, np.nan), start=0, end=300, sample_count=samples
+        )
+        is None
+    )

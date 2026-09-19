@@ -3955,7 +3955,16 @@ class CortexDaemon:
                         timestamp=timestamp,
                     )
                     self._services.register("latest_focus_break_decision", break_decision)
-                    if break_decision.should_recommend and self._interventions_enabled:
+                    # Focus-break reminders are an interruption like any other.
+                    # Checking only ``_interventions_enabled`` skipped quiet
+                    # mode, pause, snooze, receptivity, the weekly schedule,
+                    # the cooldown and the hourly cap, so a paused user still
+                    # received break prompts. The shared gate owns that
+                    # decision for every surface (audit D5).
+                    if break_decision.should_recommend and self._interruption_allowed(
+                        surface="focus_break",
+                        current_time=timestamp,
+                    ):
                         from cortex.libs.schemas.realtime import BreakRecommendation
 
                         recommendation = BreakRecommendation(
@@ -3973,6 +3982,10 @@ class CortexDaemon:
                             MessageType.BREAK_RECOMMENDATION.value,
                             recommendation.model_dump(mode="json"),
                         )
+                        # The shared gate's contract: a surface that presents
+                        # an interruption records it, so the cooldown and the
+                        # hourly cap count it like every other proposal.
+                        self._trigger_policy.record_intervention(timestamp=timestamp)
 
                     # P0 §3.9: feed the causal attributor at the same
                     # cadence so the per-signal sparkline buffers fill
@@ -6212,9 +6225,13 @@ class CortexDaemon:
                 # still observable; only ``pause`` releases the camera.
                 await _resume_if_was_paused()
             elif kind == "pause":
-                # Long quiet window so dwell logic still suppresses
-                # triggers even if capture briefly resumes.
-                self._trigger_policy.activate_quiet_mode(duration_minutes=240)
+                # The dashboard documents this control as "Pause all sensing —
+                # releases the camera, indefinite", and the client sends no
+                # duration. A 240-minute window was substituted here, so
+                # browser-side triggers (rabbit-hole, zombie-tab) — which need
+                # no camera — resumed after four hours while the UI still read
+                # "Paused". Quiet now stays on until the user turns it off.
+                self._trigger_policy.activate_quiet_mode(indefinite=True)
                 # Phase-3 P0-N4: pause should also disarm any
                 # auto-armed focus session so the browser doesn't keep
                 # blocking sites while the user is on a call / away.
@@ -8017,19 +8034,31 @@ class CortexDaemon:
         try:
             probe = getattr(client, "ping", None)
             if probe is None or not asyncio.iscoroutinefunction(probe):
-                # Lightweight fallback: a tiny ``generate_intervention_plan``
-                # cannot be invoked without context, so we try the SDK's
-                # raw ``messages.create`` if available. As a final fallback
-                # we report ``ok=True`` only when the SDK object exists
-                # (we successfully constructed credentials), with
-                # latency_ms = construction probe.
-                sdk = getattr(client, "_sdk", None)
-                if sdk is None:
+                # ``create_llm_client`` always returns a privacy wrapper
+                # (PrivacyAwarePlanner / NoContentPlanner / RuleBasedLLMClient),
+                # never a bare transport, so reading ``_sdk`` off the client
+                # found nothing and every healthy provider was reported as
+                # ``no_sdk``. The wrapper already publishes exactly the state
+                # this control needs, and it distinguishes "no credential yet"
+                # from "external planning is switched off".
+                transport_state = getattr(client, "transport_state", None)
+                if isinstance(transport_state, str) and transport_state != "ready":
                     return TestProviderResult(
                         provider=canonical,
                         ok=False,
                         latency_ms=None,
-                        error="no_sdk",
+                        error=transport_state,
+                    )
+                sdk = getattr(client, "_sdk", None)
+                if sdk is None and transport_state is None:
+                    # A wrapper with no transport_state and no SDK cannot be
+                    # probed (rule-based / no-content modes have nothing to
+                    # reach). Say so rather than implying a failed connection.
+                    return TestProviderResult(
+                        provider=canonical,
+                        ok=False,
+                        latency_ms=None,
+                        error="no_external_transport",
                     )
                 # If the SDK has a ``with_options`` / ``messages``
                 # attribute we treat construction-time success as a

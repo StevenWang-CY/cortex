@@ -136,3 +136,28 @@ def test_full_app_unauthenticated_gets_401_and_budget_survives(auth_token: str) 
             assert second.status_code == 429, second.text
     finally:
         registry.reset()
+
+
+def test_parameterised_launch_route_consumes_its_own_bucket() -> None:
+    """``/api/launch`` is declared ``/api/launch/{project_name}``.
+
+    Exact-only matching meant no concrete request path ever equalled the table
+    key, so the one endpoint that spawns subprocesses and AppleScript had no
+    limit. Fixed-path routes must not regain prefix matching: sharing
+    ``/shutdown``'s bucket with ``/shutdown/extra`` was the confused-path
+    bypass that exact matching closed.
+    """
+
+    from cortex.services.api_gateway.middleware.rate_limit import (
+        DEFAULT_LIMITS,
+        _normalise_route,
+    )
+
+    assert _normalise_route("/api/launch/my-project", limits=DEFAULT_LIMITS) == "/api/launch"
+    assert _normalise_route("/api/launch", limits=DEFAULT_LIMITS) == "/api/launch"
+    # Segment boundary only — a lookalike path must not claim the bucket.
+    assert _normalise_route("/api/launchX", limits=DEFAULT_LIMITS) is None
+    # Fixed-path routes stay exact.
+    assert _normalise_route("/shutdown/extra", limits=DEFAULT_LIMITS) is None
+    assert _normalise_route("/shutdown", limits=DEFAULT_LIMITS) == "/shutdown"
+

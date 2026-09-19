@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from cortex.application.clock import FakeClock
+from cortex.application.clock import FakeClock, monotonic_seconds
 from cortex.libs.config.settings import InterventionConfig, StateConfig
 from cortex.libs.schemas.features import FeatureName, FeatureValue, FeatureVector
 from cortex.libs.schemas.observations import MissingReason
@@ -122,6 +122,60 @@ def _policy(tmp_path: Path, **overrides: object) -> TriggerPolicy:
         dismissal_model_path=tmp_path / "dismissal_model.json",
         quiet_mode_history_path=tmp_path / "quiet_mode_history.json",
     )
+
+
+# ---------------------------------------------------------------------------
+# Indefinite pause — "Pause all sensing" must not expire on its own
+# ---------------------------------------------------------------------------
+
+
+def test_indefinite_quiet_mode_never_expires_and_survives_restart(
+    tmp_path: Path,
+) -> None:
+    """The dashboard documents pause as indefinite and the client sends no
+    duration, but the daemon substituted a silent 240-minute window. Browser
+    triggers need no camera, so they resumed after four hours while the UI
+    still read "Paused"; quitting the app dropped the pause entirely."""
+
+    policy = _policy(tmp_path)
+    policy.activate_quiet_mode(indefinite=True)
+    assert policy.is_quiet_mode is True
+
+    # Far beyond the old 240-minute window, and beyond any plausible session.
+    assert policy._quiet_active_at(  # noqa: SLF001
+        monotonic_seconds(policy._clock) + 30 * 24 * 3600.0,  # noqa: SLF001
+        synthetic=True,
+    ) is True
+
+    # A standing user decision must survive a restart.
+    policy._persist_quiet_mode_history()  # noqa: SLF001
+    restarted = _policy(tmp_path)
+    assert restarted.is_quiet_mode is True
+
+    # And it must be releasable.
+    restarted.clear_quiet_mode()
+    assert restarted.is_quiet_mode is False
+
+
+def test_shared_interruption_gate_denies_while_paused(tmp_path: Path) -> None:
+    """Every surface that can interrupt must route through this gate.
+
+    Focus-break reminders checked only ``_interventions_enabled`` and sent
+    ``BREAK_RECOMMENDATION`` straight to the WebSocket, so quiet mode, pause,
+    snooze, receptivity, the weekly schedule, the cooldown and the hourly cap
+    were all bypassed and a paused user still received break prompts.
+    """
+
+    policy = _policy(tmp_path)
+    assert policy.check_interruption_gate().allowed is True
+
+    policy.activate_quiet_mode(indefinite=True)
+    decision = policy.check_interruption_gate()
+    assert decision.allowed is False
+    assert decision.reason
+
+    policy.clear_quiet_mode()
+    assert policy.check_interruption_gate().allowed is True
 
 
 # ---------------------------------------------------------------------------

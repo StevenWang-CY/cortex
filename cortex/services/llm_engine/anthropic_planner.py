@@ -567,12 +567,14 @@ class AnthropicPlanner:
                     clock=self._clock,
                 )
             except (OSError, ValueError) as exc:
-                # Cost tracking is best-effort: a broken ledger path
-                # must not break the planner. The daemon logs the issue
-                # but continues; spend will be invisible until the path
-                # is made writable.
-                logger.warning(
-                    "cost_tracker: disabled (%s: %s)",
+                # Constructing the ledger is best-effort — a broken path must
+                # not stop the planner from loading — but "we cannot account
+                # for spend" must never resolve to "spend without limit". The
+                # planner therefore loads and then refuses paid calls, serving
+                # the deterministic fallback until the path is writable again.
+                logger.error(
+                    "cost_tracker: unavailable (%s: %s); refusing paid model "
+                    "calls until spend can be accounted for",
                     type(exc).__name__,
                     exc,
                 )
@@ -750,7 +752,16 @@ class AnthropicPlanner:
         # F20: hard kill-switch — once today's spend crosses the
         # configured ceiling, serve the deterministic fallback plan and
         # stamp the metadata so the dashboard banner can explain why.
-        if self._cost_tracker is not None and self._cost_tracker.check_budget() == "KILL":
+        if self._cost_tracker is None:
+            # Fail closed: an unavailable ledger cannot bound spend, so the
+            # only safe reading is that the budget is already exhausted.
+            logger.error(
+                "LLM spend accounting unavailable; serving deterministic "
+                "fallback (cid=%s)",
+                get_correlation_id() or "-",
+            )
+            return self._fallback(context, "budget_unaccountable", budget_killed=True)
+        if self._cost_tracker.check_budget() == "KILL":
             logger.error(
                 "LLM daily budget exceeded; serving deterministic fallback (cid=%s)",
                 get_correlation_id() or "-",

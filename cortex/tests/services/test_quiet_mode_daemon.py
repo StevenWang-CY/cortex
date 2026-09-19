@@ -17,9 +17,21 @@ import pytest
 class _FakeTriggerPolicy:
     def __init__(self) -> None:
         self.activated_with: list[int] = []
+        self.indefinite_activations: int = 0
         self.cleared: int = 0
 
-    def activate_quiet_mode(self, duration_minutes: int | None = None) -> None:
+    # Mirrors TriggerPolicy.activate_quiet_mode: keyword-only, and able to
+    # express the indefinite window that backs "Pause all sensing".
+    def activate_quiet_mode(
+        self,
+        *,
+        duration_minutes: int | None = None,
+        current_time: float | None = None,
+        indefinite: bool = False,
+    ) -> None:
+        if indefinite:
+            self.indefinite_activations += 1
+            return
         self.activated_with.append(int(duration_minutes or 0))
 
     def clear_quiet_mode(self) -> None:
@@ -150,8 +162,12 @@ async def test_set_quiet_mode_pause_releases_camera() -> None:
     # Pause releases the camera handle.
     assert d._capture_pipeline.stopped == 1
     assert d._pause_was_capturing is True
-    # Pause uses a long quiet window so trigger policy still suppresses.
-    assert d._trigger_policy.activated_with == [240]
+    # The dashboard documents this control as indefinite and the client sends
+    # no duration, so the quiet window must carry no expiry. This previously
+    # asserted a hidden 240-minute window, which let camera-free browser
+    # triggers resume after four hours while the UI still read "Paused".
+    assert d._trigger_policy.indefinite_activations == 1
+    assert d._trigger_policy.activated_with == []
 
 
 @pytest.mark.asyncio

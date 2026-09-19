@@ -281,6 +281,34 @@ async def test_kill_returns_fallback_with_metadata(tmp_path: Path) -> None:
     sdk.messages.create.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_planner_fails_closed_when_spend_cannot_be_accounted_for(
+    tmp_path: Path,
+) -> None:
+    """An unavailable ledger must not mean unlimited spend.
+
+    The planner builds its ledger best-effort so a broken path cannot stop it
+    from loading, but "we cannot account for spend" previously resolved to
+    "spend without limit": both kill checks were guarded by
+    ``self._cost_tracker is not None``. The planner now serves the
+    deterministic fallback instead of issuing a paid call.
+    """
+
+    tracker = CostTracker(tmp_path / "cost_ledger.json", warn_usd=1.0, kill_usd=2.0)
+    sdk = _make_stub_sdk()
+    planner = _make_planner(tracker, sdk=sdk)
+    # Simulate the construction failure the planner catches (unwritable ledger).
+    planner._cost_tracker = None  # noqa: SLF001
+
+    plan = await planner.generate_intervention_plan(
+        _make_context(), _make_state(), template_name="micro_step_planner",
+    )
+
+    assert plan.metadata.get("budget_killed") is True
+    assert plan.metadata.get("fallback_reason") == "budget_unaccountable"
+    sdk.messages.create.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # 7. Budget fields read from LLMConfig
 # ---------------------------------------------------------------------------

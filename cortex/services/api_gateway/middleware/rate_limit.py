@@ -70,17 +70,29 @@ DEFAULT_LIMITS: dict[str, int] = {
 WINDOW_SECONDS: float = 60.0
 
 
+# Routes whose sub-paths share the parent's bucket. Only routes that take a
+# path parameter belong here: ``/api/launch`` is declared as
+# ``/api/launch/{project_name}``, so no concrete request path ever equals the
+# table key and exact matching left the one endpoint that spawns subprocesses
+# and AppleScript with no limit at all. The set is explicit so restoring
+# prefix matching cannot silently re-broaden a fixed-path route such as
+# ``/shutdown``, where ``/shutdown/extra`` sharing the bucket was the
+# confused-path bypass that P1-3 closed.
+_PREFIX_ROUTES: frozenset[str] = frozenset({"/api/launch"})
+
+
 def _normalise_route(path: str, *, limits: dict[str, int]) -> str | None:
     """Return the limit-table key for *path*, or ``None`` for pass-through.
 
-    P1-3: exact match only. The previous prefix-with-trailing-slash clause
-    (``path.startswith(route + "/")``) allowed paths like ``/shutdownX``
-    or ``/shutdown/extra`` to match the ``/shutdown`` bucket, enabling a
-    confused-path bypass. Removing the prefix clause means only the
-    exact path string hits the bucket.
+    P1-3: exact match, except for the parameterised routes named in
+    :data:`_PREFIX_ROUTES`, which also claim their ``/``-delimited sub-paths.
+    Matching on the segment boundary means ``/api/launchX`` still misses the
+    bucket; only ``/api/launch/<project>`` shares it.
     """
     for route in limits:
         if path == route:
+            return route
+        if route in _PREFIX_ROUTES and path.startswith(route + "/"):
             return route
     return None
 

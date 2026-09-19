@@ -245,7 +245,9 @@ def _error_metrics(
     )
 
 
-def _load_trace(sequence: DatasetSequence) -> tuple[NDArray[np.float64], float]:
+def _load_trace(
+    sequence: DatasetSequence,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     try:
         with np.load(sequence.path, allow_pickle=False) as archive:
             rgb = np.asarray(archive["rgb_trace"], dtype=np.float64)
@@ -263,7 +265,39 @@ def _load_trace(sequence: DatasetSequence) -> tuple[NDArray[np.float64], float]:
         raise DatasetManifestError(
             f"{sequence.sequence_id} contains no finite signal/reference"
         )
-    return rgb, float(np.mean(finite_reference))
+    return rgb, reference
+
+
+def _window_reference_bpm(
+    reference: NDArray[np.float64],
+    *,
+    start: int,
+    end: int,
+    sample_count: int,
+) -> float | None:
+    """Mean reference heart rate over the span a window actually covers.
+
+    The reference series is resampled positionally rather than by timestamp so
+    it works whether ``hr_gt`` is stored per video sample or per second. A
+    whole-sequence mean was previously compared against every window, so a
+    sequence whose true rate drifts (the normal case) charged a perfectly
+    accurate estimator with the drift as error, and MAE/RMSE/bias did not
+    measure what the report claimed.
+    """
+
+    if reference.size == 0 or sample_count <= 0:
+        return None
+    if reference.size == 1:
+        value = float(reference[0])
+        return value if np.isfinite(value) else None
+    scale = reference.size / sample_count
+    ref_start = max(0, min(reference.size - 1, int(np.floor(start * scale))))
+    ref_end = max(ref_start + 1, min(reference.size, int(np.ceil(end * scale))))
+    window = reference[ref_start:ref_end]
+    finite = window[np.isfinite(window)]
+    if finite.size == 0:
+        return None
+    return float(np.mean(finite))
 
 
 def evaluate_dataset_manifest(
@@ -289,7 +323,7 @@ def evaluate_dataset_manifest(
     condition_values: dict[str, tuple[list[float], list[float]]] = {}
     condition_attempted: dict[str, int] = {}
     for sequence in selected:
-        rgb, reference_bpm = _load_trace(sequence)
+        rgb, reference_series = _load_trace(sequence)
         fs = sequence.sample_rate_hz
         window_samples = max(2, int(round(window_seconds * fs)))
         stride_samples = max(1, int(round(stride_seconds * fs)))
@@ -312,6 +346,16 @@ def evaluate_dataset_manifest(
                 observation_quality=1.0,
             )
             if result.summary.hr.value is not None:
+                reference_bpm = _window_reference_bpm(
+                    reference_series,
+                    start=start,
+                    end=end,
+                    sample_count=len(rgb),
+                )
+                if reference_bpm is None:
+                    # No finite ground truth covers this window, so it can
+                    # neither be scored nor counted as accepted coverage.
+                    continue
                 value = float(result.summary.hr.value)
                 predicted.append(value)
                 reference.append(reference_bpm)

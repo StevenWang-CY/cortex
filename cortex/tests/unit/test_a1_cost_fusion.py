@@ -57,11 +57,24 @@ def test_cost_tracker_positive_caps_still_kill(tmp_path: Path) -> None:
     assert tracker.budget_exhausted() is True
 
 
-def test_cost_tracker_rejects_kill_below_warn_when_both_set(tmp_path: Path) -> None:
-    import pytest
+def test_cost_tracker_clamps_warn_to_a_lower_kill_instead_of_disarming(
+    tmp_path: Path,
+) -> None:
+    """A misordered pair must not cost the user their spend cap.
 
-    with pytest.raises(ValueError):
-        CostTracker(tmp_path / "ledger.json", warn_usd=10.0, kill_usd=2.0)
+    This previously raised ``ValueError``, which the planner's
+    ``except (OSError, ValueError)`` swallowed by dropping the tracker
+    entirely — so lowering ``daily_cost_budget_usd`` beneath the default
+    ``cost_warn_usd`` turned "spend less" into no accounting and no
+    kill-switch at all. The ceiling is now honoured and the warning is
+    pulled down to meet it.
+    """
+
+    tracker = CostTracker(tmp_path / "ledger.json", warn_usd=10.0, kill_usd=2.0)
+
+    assert tracker.check_budget() == "OK"
+    tracker.record(None, "claude-opus-5", 2.5)
+    assert tracker.check_budget() == "KILL"
 
 
 # ─── CONTRACT-2: shared cost-response probes ─────────────────────────────

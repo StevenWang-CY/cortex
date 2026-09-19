@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -36,6 +37,21 @@ _MUTATION_RISK_STATES = {
     "restoring",
     "restore_failed",
 }
+
+
+# Every scope the ``all`` shorthand expands to. Declared once so the delete
+# path and the "did this request cover everything" check can never drift.
+_ALL_DELETE_SCOPES: frozenset[str] = frozenset(
+    {
+        "consent",
+        "interventions",
+        "policy",
+        "calibration",
+        "sessions",
+        "derived",
+        "analytics",
+    }
+)
 
 
 class ActiveInterventionDataError(RuntimeError):
@@ -249,19 +265,7 @@ class StorageMaintenance:
         self,
         scopes: tuple[StorageDeleteScope, ...],
     ) -> tuple[dict[str, int], bool]:
-        selected: set[str] = (
-            {
-                "consent",
-                "interventions",
-                "policy",
-                "calibration",
-                "sessions",
-                "derived",
-                "analytics",
-            }
-            if "all" in scopes
-            else set(scopes)
-        )
+        selected: set[str] = set(_ALL_DELETE_SCOPES) if "all" in scopes else set(scopes)
 
         legacy_kinds: set[str] = set()
         if "sessions" in selected:
@@ -398,6 +402,16 @@ class StorageMaintenance:
             candidates.add(self._root / "intervention_transactions.json")
         if "consent" in selected:
             candidates.add(self._root / "consent_overrides.json")
+        if selected.intersection({"sessions", "derived"}):
+            # Chronotype rollups are per-day baselines and hourly/task patterns
+            # derived from session history, stored as files rather than rows.
+            # They were outside every delete scope, so "Delete all Cortex data"
+            # left them behind and the Trends panel kept serving the deleted
+            # days' figures from disk.
+            chronotype = self._root / "chronotype"
+            candidates.add(chronotype / "model.json")
+            candidates.add(chronotype / "scheduler_state.json")
+            candidates.update((chronotype / "daily").glob("*.json"))
         for backup_name in backup_names:
             if Path(backup_name).name != backup_name:
                 raise ValueError("invalid migration backup name")
@@ -412,6 +426,22 @@ class StorageMaintenance:
 
         if self._legacy_store_path is not None and selected.intersection({"consent", "derived"}):
             removed += self._sanitize_legacy_store(selected)
+
+        # Migration backups are verbatim copies of the user's own records, kept
+        # so an import can be retried. Only ledger-named legacy files were
+        # removed above, so a whole-database backup — or a legacy copy whose
+        # ledger row had already gone — outlived a request to erase everything.
+        # A delete covering every scope must leave no copy behind.
+        if selected.issuperset(_ALL_DELETE_SCOPES):
+            backup_root = self._database.backup_dir
+            if backup_root.exists():
+                for path in sorted(backup_root.rglob("*"), key=str, reverse=True):
+                    if path.is_symlink() or path.is_file():
+                        path.unlink()
+                        removed += 1
+                    elif path.is_dir():
+                        with suppress(OSError):
+                            path.rmdir()
         return removed
 
     def _sanitize_legacy_store(self, selected: set[str]) -> int:

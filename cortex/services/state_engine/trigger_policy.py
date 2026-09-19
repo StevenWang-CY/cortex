@@ -273,6 +273,12 @@ class TriggerPolicy:
         # Quiet mode
         self._quiet_mode_until: float = 0.0
         self._quiet_mode_deadline: BoundedDeadline | None = None
+        # "Pause all sensing" is documented to the user as indefinite. A
+        # duration cannot express that, and the daemon previously substituted
+        # a silent 240-minute window, so suggestions returned after four hours
+        # while the UI still read "Paused". An explicit flag keeps the promise
+        # and stays JSON-safe, which a float infinity would not.
+        self._quiet_mode_indefinite: bool = False
         self._quiet_mode_count: int = 0
         self._quiet_mode_count_reset_at: float = 0.0
 
@@ -428,6 +434,8 @@ class TriggerPolicy:
     @property
     def is_quiet_mode(self) -> bool:
         """Check if quiet mode is currently active."""
+        if self._quiet_mode_indefinite:
+            return True
         if self._quiet_mode_deadline is not None:
             return not self._quiet_mode_deadline.expired(self._clock)
         return monotonic_seconds(self._clock) < self._quiet_mode_until
@@ -641,7 +649,7 @@ class TriggerPolicy:
         # policy-clock expiry; the live path honours the bounded deadline
         # that survives wall-clock rollback.
         if synthetic:
-            return now < self._quiet_mode_until
+            return self._quiet_mode_indefinite or now < self._quiet_mode_until
         return self.is_quiet_mode
 
     def _interruption_gate(
@@ -1541,13 +1549,26 @@ class TriggerPolicy:
         *,
         duration_minutes: int | None = None,
         current_time: float | None = None,
+        indefinite: bool = False,
     ) -> None:
-        """Force quiet mode on for an explicit duration."""
+        """Force quiet mode on for an explicit duration, or indefinitely.
+
+        ``indefinite=True`` backs the "Pause all sensing" control, which the
+        dashboard documents as lasting until the user turns it off. It stays
+        active across restarts and is cleared only by :meth:`clear_quiet_mode`
+        or :meth:`reset_quiet_mode`.
+        """
         now = (
             monotonic_seconds(self._clock)
             if current_time is None
             else current_time
         )
+        if indefinite:
+            self._quiet_mode_indefinite = True
+            self._quiet_mode_until = 0.0
+            self._quiet_mode_deadline = None
+            return
+        self._quiet_mode_indefinite = False
         minutes = duration_minutes or self._config.quiet_mode_minutes
         duration_seconds = max(1, minutes) * 60.0
         self._quiet_mode_until = now + duration_seconds
@@ -1560,6 +1581,7 @@ class TriggerPolicy:
         """Disable quiet mode immediately."""
         self._quiet_mode_until = 0.0
         self._quiet_mode_deadline = None
+        self._quiet_mode_indefinite = False
 
     def reset_quiet_mode(self) -> None:
         """User-driven quiet-mode reset (F26).
@@ -1572,6 +1594,7 @@ class TriggerPolicy:
         """
         self._quiet_mode_until = 0.0
         self._quiet_mode_deadline = None
+        self._quiet_mode_indefinite = False
         self._quiet_mode_count = 0
         self._quiet_mode_count_reset_at = 0.0
         try:
@@ -1617,6 +1640,7 @@ class TriggerPolicy:
                     0.0,
                     self._quiet_mode_until - now,
                 ),
+                "quiet_mode_indefinite": bool(self._quiet_mode_indefinite),
                 "quiet_mode_deadline": deadline_record,
                 "last_escalation_age_seconds": max(
                     0.0,
@@ -1678,6 +1702,13 @@ class TriggerPolicy:
         count = data.get("quiet_mode_count", 0)
         if isinstance(count, int) and count >= 0:
             self._quiet_mode_count = count
+        # An indefinite pause is a standing user decision, not a timed window:
+        # it must survive a restart, or quitting the app would silently undo
+        # the control the user set to stop being interrupted. The record
+        # carries no deadline and a zero remainder, so the duration-based
+        # restore below is a no-op for it and the escalation memory still
+        # rehydrates normally.
+        self._quiet_mode_indefinite = data.get("quiet_mode_indefinite") is True
         # v2 persists both wall expiry and a duration cap. In the same
         # boot, monotonic elapsed time wins; after restart, wall expiry is
         # bounded by the original duration so clock rollback cannot create
