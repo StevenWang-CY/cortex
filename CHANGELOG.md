@@ -9,9 +9,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 A second full audit cycle over the v0.4.0 source. Thirteen review dimensions
 produced findings that were each judged by two independent skeptics — one
 arguing for refutation, one required to reproduce the defect by execution —
-and only findings that survived both were acted on. Sixty-seven survived; this
-release fixes fifty of them and records the rest, with the reason, in
-`docs/limitations.md` and Section 31 of `IMPLEMENTATION.md`.
+and only findings that survived both were acted on. Sixty-seven survived.
+
+A second pass then re-verified every survivor against the *fixed* tree rather
+than the audited one, and returned a verdict for sixty-five of them. Of those,
+forty-seven are fixed here, one is recorded as a product decision rather than a
+defect, and seventeen remain — all medium or low severity, listed with their
+evidence in Section 31 of `IMPLEMENTATION.md`. Every critical and every
+high-severity finding is closed.
 
 Three things are worth stating plainly before the list. The audit's own
 proposed fix for the most serious finding was measured and found wrong, and the
@@ -141,8 +146,10 @@ measurement against this pipeline rather than from literature.
 * The suggestion card's action buttons remain mouse-only. Making them reachable
   needs a system-wide hotkey and the macOS Accessibility permission — a product
   decision with a privacy cost, not a defect fix.
-* Seventeen verified findings of lower severity are not yet fixed. They are
-  listed with their evidence in Section 31 of `IMPLEMENTATION.md`.
+* Seventeen verified findings — fourteen medium, three low — are not yet fixed.
+  They are listed with their evidence in Section 31 of `IMPLEMENTATION.md`.
+  Two of the sixty-seven survivors received no verdict in the re-verification
+  pass and are listed there as unresolved rather than counted either way.
 * The four completed research tracks are **unreviewed**: the peer-review stage
   hit a usage limit. Their proposals are recorded but none were implemented as
   validated, and the one defect found among them was verified from scratch

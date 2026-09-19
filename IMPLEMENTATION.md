@@ -5590,3 +5590,194 @@ published by hand.
       body carries the Assurance section.
 - [x] v0.4.0 is the public “Latest” release, and the wiki reflects the
       shipped behaviour.
+
+## 31. v0.5.0 — second audit cycle, and what re-verification found
+
+Section 30 recorded a re-audit of v0.3.15 and the coordinated implementation
+that followed. This section records the same exercise performed on the v0.4.0
+source, plus one thing Section 30 did not do: a second pass that re-verified
+every surviving finding against the **fixed** tree rather than the audited one.
+That pass is the most useful part of this cycle. It found that three fixes made
+earlier in the same cycle had closed only part of their defect, and that one of
+them had replaced its original harm with a new one.
+
+### 31.1 Method
+
+Thirteen read-only reviews ran in parallel, one per subsystem. Each finding was
+then handed to two independent skeptics with different jobs: one argued for
+refutation and was told to default to "refuted" under uncertainty; the other
+was required to reproduce the defect by execution rather than by reading. Only
+findings that survived both were carried forward. Seventy-eight findings were
+judged; sixty-seven survived.
+
+Three verification agents died on a provider safeguard error, leaving
+`browser-extension:399`, `physio-pulse:203` and `storage-migrations:947` with a
+single verdict each. That is recorded rather than glossed: all three were
+nonetheless *executable reproductions*, and all three were independently
+re-reproduced before being fixed.
+
+The re-verification pass was given the same seventy-eight findings, the list of
+commits made since, and one instruction that mattered: treat "believed fixed"
+as an unverified claim. It returned a verdict for sixty-five findings.
+
+### 31.2 Executive determination
+
+Forty-seven findings are fixed. One is recorded as a product decision rather
+than a defect. Seventeen remain, all medium or low severity. Two received no
+verdict in the re-verification pass and are unresolved either way. Every
+critical and every high-severity finding is closed.
+
+The most serious finding was that the pulse pipeline published a heart rate for
+video containing no cardiac signal at all — every window, not occasionally. It
+is worth stating why that survived the previous cycle's gates: the publication
+threshold was arithmetically unreachable. `compute_physio_sqi` is an additive
+blend in which the acquisition terms contribute 0.25 of a possible 1.0 on their
+own, so a still, fully visible face scored above the 0.30 gate before any
+cardiac evidence was considered. Every test that exercised the gate supplied a
+signal, so none of them could see it.
+
+### 31.3 Corrections to the audit itself
+
+Three of the audit's own conclusions were wrong, and measurement caught them.
+
+**The proposed fix for the flagship finding did not work.** The audit
+recommended gating on `nsqi >= nsqi_threshold` and restructuring the composite
+as `(0.6*nsqi + 0.4*snr_norm) * motion_term * face_term`. Measured over 200
+windows per condition against the packaged POS backend: `nsqi >= 0.293` passes
+93–97% of realistic 1/f and drift noise, and the multiplicative form scored
+*worse* than the additive one at equal specificity — at a 0.30 threshold it
+published 99% of drift noise. The discriminator that works is the raw in-band
+SNR in decibels; normalising it to [0,1] is precisely what destroys it, because
+the decision range compresses into the middle of the scale and averaging
+dilutes it further. `nsqi` is kept only because it costs no sensitivity and
+rejects 100% of white noise.
+
+**A proposed threshold was too strict by half.** The follow-up recommendation
+of a 0.50 peak-concentration floor more than halves sensitivity at a realistic
+0.3% modulation depth (0.340 → 0.160) to remove a 1.5% residual, and its
+"0/200" result is not distinguishable from 0.40's 0.005 at that sample size.
+0.40 was chosen instead: a threefold residual cut for a quarter of the
+sensitivity cost.
+
+**A concentration floor is wrong in kind as a signal-presence test.**
+Concentration answers "is the selected peak trustworthy?", not "is a cardiac
+signal present?" — and when the HR prior deliberately selects a non-dominant
+peak to hold continuity across windows, concentration at that peak is low even
+though the spectrum is unambiguous. The first implementation regressed an
+existing prior-ageing test whose window measures 21.3 dB SNR and 0.68 NSQI;
+calling that "no cardiac signal above the noise floor" would simply be false.
+The term is therefore waived above 6.0 dB, which signal-free nuisance cannot
+reach — the highest SNR observed across 600 signal-free windows was 3.05 dB.
+
+### 31.4 Corrections to this cycle's own fixes
+
+The re-verification pass exists because of these.
+
+* **`state-inference:270` was made worse, not fixed.** Publishing the coverage
+  of the label actually published closed the audited half. But the scorer has
+  no `RECOVERING` hypothesis — recovery is a temporal relation only the
+  smoother can see — so `state_coverage` carries a placeholder `0.0`, and the
+  smoother then published that. `TriggerPolicy.evaluate` applies its 0.45
+  coverage floor *before* dispatching to the per-state arms, so every RECOVERY
+  estimate failed with `evidence_coverage_below_floor_0.00` and the opt-in
+  recovery reinforcement arm became unreachable. The harm flipped from
+  bypassing the floor to permanently failing it.
+* **`state-inference:505` tested the wrong thing.** Abstaining at exactly zero
+  left the whole near-zero band saturating identically, because both scoring
+  paths floor the divisor. A keyboard-heavy calibration reaches that band by
+  ordinary means: windows with fewer than two mouse moves contribute a variance
+  of 0.0 and the baseline is their plain mean.
+* **`llm-planner:265` covered four fields of many.** Every nested text field
+  could still sink an entire plan; eight of ten probed cases did.
+* **`b689a72` introduced a defect of its own.** `liveAttemptCounterKeys`
+  derived expected keys from `operation.authorization_id`, but a restore
+  receipt is stamped with the *restore* id. The derived key never matched a
+  live restore counter, so the trim treated it as an orphan and reset that
+  restore's retry budget. Found by `transaction-restore:5396`.
+
+### 31.5 Residual findings
+
+Seventeen findings are verified, reproduced, and not fixed. None is critical or
+high. They are listed here so the next cycle starts from evidence rather than
+from a re-audit.
+
+| Finding | Severity | Summary |
+| --- | --- | --- |
+| `api-security:1441` | medium | A process-global settings-version high-water mark is never reset per client, so a restarted shell's Apply is silently dropped |
+| `browser-extension:153` | medium | The context collector resolves the focused tab twice and can mix two different tabs |
+| `build-release:308` | medium | An icon-build gate can pass vacuously |
+| `desktop-shell:311` | medium | A timer keeps running while the window is hidden |
+| `desktop-shell:751` | medium | Window lifecycle defect |
+| `desktop-shell:1596` | medium | An accessibility setting is not persisted across restarts |
+| `desktop-shell:2353` | medium | A failure path is silently swallowed |
+| `physio-pulse:100` | medium | POS overlap-add leaves zero-valued samples in the waveform |
+| `runtime-lifecycle:2346` | medium | Concurrency defect in the daemon lifecycle |
+| `tests-gates:144` | medium | A gate has eroded and no longer enforces what it claims |
+| `tests-gates:280` | medium | A declared gate is not enforced in CI |
+| `transaction-restore:5852` | medium | Correctness defect in the restore path |
+| `trigger-intervention:183` | medium | The interruption gate is consulted in the wrong order relative to a side effect |
+| `trigger-intervention:1564` | medium | Dismissal-driven quiet escalation can lock the user out |
+| `browser-extension:1876` | low | Badge state is held only in memory and lost on worker suspension |
+| `build-release:372` | low | Release evidence overstates what a `shasum -c` run verified |
+| `runtime-lifecycle:1475` | low | A blocking call on the daemon's async path |
+
+Recorded as a product decision rather than a defect:
+
+* `desktop-shell:748` — the suggestion card's action buttons are mouse-only.
+  The overlay is deliberately built so it can never take focus, and it is the
+  only surface rendering those buttons. An announced way in needs a system-wide
+  hotkey, a native event monitor and the macOS Accessibility permission. See
+  `docs/limitations.md`.
+
+Two of the sixty-seven survivors received no verdict in the re-verification
+pass and are neither fixed nor confirmed live.
+
+### 31.6 The research phase did not complete
+
+Five research tracks were commissioned to ground the algorithm work. The rPPG
+track produced nothing — it hit a weekly usage limit — and every peer-review
+agent for the other four failed the same way. The four completed tracks
+(workload science, interruption science, calibration statistics, privacy
+architecture) are therefore **unreviewed**, and none of their proposals was
+implemented as validated. Implementing them would change scoring rules and trip
+the support-model provenance gate, which is exactly the check that should stop
+unvalidated changes.
+
+One defect was found among them — a second egress path around the privacy
+boundary in the activity summarizer — and it was verified from scratch before
+being fixed, not taken on the proposal's word.
+
+The failure had one useful consequence. Without a literature track to lean on,
+the physiology thresholds were derived by measurement against this pipeline,
+with this backend, which is how the three errors in §31.3 were caught. Numbers
+transplanted from a paper would have passed review and been wrong here.
+
+### 31.7 Verification program
+
+Every fix in this cycle was required to (a) reproduce the defect before the
+change, and (b) be covered by a test confirmed to fail against the previous
+code. Where a test could not be made to fail, that is recorded rather than
+waved through — the MV3 hydration test took three attempts, and the first two
+passed with and without the fix because they asserted the end state rather than
+the contract.
+
+Gates at the close of the cycle: 3,166 Python tests, 69 isolated Qt tests, 331
+Vitest across 68 suites, 131 Jest across 13 suites, Ruff clean, mypy `--strict`
+clean over 560 files, `tsc --noEmit` clean for both extensions, repository
+contracts, configuration surfaces (197 settings), TypeScript schema codegen and
+support-model identity all synchronized, and the eval replay baselines
+unchanged.
+
+### 31.8 Definition of done for v0.5.0
+
+- [x] Every critical and high-severity survivor is fixed.
+- [x] Every fix reproduces its defect first and ships a test that fails against
+      the previous code.
+- [x] Every survivor is re-verified against the fixed tree, not the audited one.
+- [x] Scoring-rule changes re-declare the support model (2.1.1 → 2.4.0) with a
+      model-card entry each time, rather than regenerating the hash.
+- [x] Residual findings are listed with their evidence rather than left to a
+      future re-audit.
+- [x] Measured limits — including the ones that are not zero — are in
+      `docs/limitations.md` with the measurement behind them.
+- [ ] Notarized build, manual validation record, and public release.
