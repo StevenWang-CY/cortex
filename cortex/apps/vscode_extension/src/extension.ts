@@ -25,6 +25,36 @@ let panelProvider: CortexPanelProvider | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
 /** Last connection state applied to the status bar (survives re-creation). */
 let statusBarConnected = false;
+// Quiet mode is sticky state, not a one-off paint. Four independent writers
+// touch the status bar (connection, SETTINGS_SYNC, QUIET_MODE_STATE, the
+// not-focused pulse, and updateStatusBar) with no shared source of truth, and
+// updateStatusBar runs on every STATE_UPDATE — a 500 ms broadcast — so it
+// overwrote the quiet/snoozed/paused label within half a second of it being
+// painted. The user saw a normal status bar while interventions were actually
+// suppressed. These three fields are the source of truth the writers consult.
+let quietModeKind = "off";
+let quietModeLabel = "Cortex";
+let quietModeEndsAtSeconds: number | undefined;
+
+/** Paint the quiet-mode label. Returns false when quiet mode is off. */
+function renderQuietModeStatus(): boolean {
+    if (!statusBarItem || quietModeKind === "off") return false;
+    statusBarItem.text = `$(circle-slash) ${quietModeLabel}`;
+    if (typeof quietModeEndsAtSeconds === "number") {
+        // Recomputed on every render so the countdown does not freeze at the
+        // value it happened to have when the frame arrived.
+        const remainingMin = Math.max(
+            0,
+            Math.round((quietModeEndsAtSeconds * 1000 - Date.now()) / 60000),
+        );
+        statusBarItem.tooltip = remainingMin > 0
+            ? `${quietModeLabel} for ${remainingMin} more min`
+            : quietModeLabel;
+    } else {
+        statusBarItem.tooltip = quietModeLabel;
+    }
+    return true;
+}
 type ExecutionMode = "suggest_only" | "authorized" | "research_autonomous";
 let currentExecutionMode: ExecutionMode = "suggest_only";
 let editorTransactionChain: Promise<void> = Promise.resolve();
@@ -213,8 +243,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     context.subscriptions.push(services.contextProvider);
 
     // --- WebSocket client ---
+    // Per-window, not per-machine. ``globalState`` is shared by every VS Code
+    // window on the machine, so all of them identified with the SAME
+    // client_instance_id — and the daemon treats that id as a unique durable
+    // identity, evicting any peer that reuses it. Opening a second window
+    // therefore knocked the first one off the socket, and exact-restore
+    // routing could not tell the two apart. ``workspaceState`` is per-window
+    // and still survives extension-host restarts, which is what restore
+    // routing actually needs.
     const instanceKey = "cortex.clientInstanceId.v1";
-    const storedInstanceId = context.globalState.get<string>(instanceKey);
+    const storedInstanceId = context.workspaceState.get<string>(instanceKey);
     const clientInstanceId = (
         typeof storedInstanceId === "string"
         && /^[A-Za-z0-9._:-]{8,128}$/.test(storedInstanceId)
@@ -224,7 +262,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (clientInstanceId !== storedInstanceId) {
         // Exact restore routing depends on this surviving extension-host
         // restarts, so complete the durable write before opening the socket.
-        await context.globalState.update(instanceKey, clientInstanceId);
+        await context.workspaceState.update(instanceKey, clientInstanceId);
     }
     const client = new CortexWSClient(daemonUrl, clientInstanceId);
     wsClient = client;
@@ -304,22 +342,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             pause: "Cortex · Paused",
         };
         const label = labels[kind] || "Cortex";
-        statusBarItem.text = kind === "off"
-            ? "$(pulse) Cortex"
-            : `$(circle-slash) ${label}`;
         const endsAt = typeof payload.ends_at_unix_ms === "number"
             ? payload.ends_at_unix_ms / 1000
             : payload.ends_at as number | undefined;
-        if (kind !== "off" && typeof endsAt === "number") {
-            const remainingMin = Math.max(
-                0,
-                Math.round((endsAt * 1000 - Date.now()) / 60000),
-            );
-            statusBarItem.tooltip = remainingMin > 0
-                ? `${label} for ${remainingMin} more min`
-                : label;
-        } else if (kind === "off") {
-            statusBarItem.tooltip = "Cortex — Active";
+        quietModeKind = kind;
+        quietModeLabel = label;
+        quietModeEndsAtSeconds = kind !== "off" && typeof endsAt === "number"
+            ? endsAt
+            : undefined;
+        if (!renderQuietModeStatus()) {
+            // Leaving quiet mode hands the bar back to the connection state
+            // rather than assuming "connected".
+            applyStatusBarConnection(statusBarConnected);
         }
     });
 
@@ -344,8 +378,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (osNotifPulseTimeout) clearTimeout(osNotifPulseTimeout);
         osNotifPulseTimeout = setTimeout(() => {
             if (statusBarItem) {
-                statusBarItem.text = '$(pulse) Cortex';
                 statusBarItem.backgroundColor = undefined;
+                // Restore whatever the bar should actually say, rather than
+                // hardcoding the connected label over a disconnected or
+                // quiet-mode state.
+                if (!renderQuietModeStatus()) {
+                    applyStatusBarConnection(statusBarConnected);
+                }
             }
             osNotifPulseTimeout = undefined;
         }, 5000);
@@ -377,7 +416,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             } else if (choice === 'Snooze') {
                 // Phase-3 / Audit-1.2 F11: surface a warning instead
                 // of silently dropping when wsClient is undefined.
-                if (!wsClient) {
+                //
+                // The existence test alone was unreachable in practice:
+                // ``wsClient`` is assigned once in activate() and cleared only
+                // in deactivate(), so it is non-undefined for the whole
+                // session. With the daemon actually down, sendSnoozeRequest
+                // reached ``_send``, which queues the frame in a 16-entry
+                // outbox and returns — so the user saw no warning and the
+                // snooze silently never happened. Test connectivity too.
+                if (!wsClient || !wsClient.isConnected) {
                     void vscode.window.showWarningMessage(
                         "Cortex not connected — open Cortex to snooze.",
                     );
@@ -552,6 +599,13 @@ export function deactivate(): void {
  */
 function updateStatusBar(payload: Record<string, unknown>): void {
     if (!statusBarItem) {
+        return;
+    }
+    // Quiet mode outranks the live estimate. STATE_UPDATE is a 500 ms
+    // broadcast, so without this the quiet/snoozed/paused label survived less
+    // than a second and the user saw a normal bar while interventions were
+    // suppressed.
+    if (renderQuietModeStatus()) {
         return;
     }
 

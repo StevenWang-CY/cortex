@@ -162,6 +162,58 @@ function validateEditorReceiptBatch(value: unknown): InterventionReceiptBatch {
     return value as unknown as InterventionReceiptBatch;
 }
 
+// Write-side target for ``attempt_counters``. The twin of the browser
+// extension's journal bug: the read-side validator rejects a journal holding
+// more than MAX_EDITOR_COUNTERS keys, but nothing bounded the key *count* on
+// write — only each key's value (<= 100) — and counters were reclaimed only
+// for operations retired through `acknowledgeTransactionState`. Past the cap
+// the journal stopped loading, and because `_readJournal` throws rather than
+// repairing, every subsequent editor apply and restore failed permanently.
+// Pruning starts below the hard cap so a burst between prunes cannot reach it.
+const MAX_EDITOR_COUNTERS_SOFT = 1_536;
+
+/** Counter keys a live operation could still consult. */
+function liveAttemptCounterKeys(
+    operations: Record<string, EditorOperation>,
+): Set<string> {
+    const live = new Set<string>();
+    for (const operation of Object.values(operations)) {
+        for (const phase of ["apply", "restore", "compensate"]) {
+            live.add(
+                [operation.authorization_id, operation.action_id, phase].join(":"),
+            );
+        }
+    }
+    return live;
+}
+
+/** Bound ``counters`` in place, discarding the least useful entries first.
+ *
+ * A counter only means anything while its operation is live, so orphans go
+ * first — that alone reclaims everything the acknowledgement-driven GC missed.
+ * Anything still over the limit is dropped oldest-first; string keys iterate
+ * in insertion order, which makes `Object.keys` a FIFO queue. Dropping a
+ * counter at worst grants a fresh retry allowance, which beats bricking the
+ * journal.
+ */
+function trimAttemptCounters(
+    counters: Record<string, number>,
+    operations: Record<string, EditorOperation>,
+    limit: number,
+): void {
+    if (Object.keys(counters).length <= limit) return;
+    const live = liveAttemptCounterKeys(operations);
+    for (const key of Object.keys(counters)) {
+        if (!live.has(key)) delete counters[key];
+    }
+    const remaining = Object.keys(counters);
+    if (remaining.length > limit) {
+        for (const key of remaining.slice(0, remaining.length - limit)) {
+            delete counters[key];
+        }
+    }
+}
+
 function validateEditorJournal(raw: unknown): EditorJournal {
     if (!isEditorRecord(raw) || raw.schema_version !== "1") {
         throw new Error("Cortex editor transaction journal is corrupt");
@@ -177,7 +229,12 @@ function validateEditorJournal(raw: unknown): EditorJournal {
         || !Array.isArray(outbox)
         || Object.keys(consumed).length > 256
         || Object.keys(operations).length > MAX_EDITOR_OPERATIONS
-        || Object.keys(counters).length > MAX_EDITOR_COUNTERS
+        // Only an absurd count is corruption here, to bound the validation
+        // work below. A merely over-cap counter map is repaired after
+        // validation rather than rejected: these are a retry guard, not an
+        // integrity record, and refusing to load the journal over them
+        // disabled editor apply and restore for good.
+        || Object.keys(counters).length > MAX_EDITOR_COUNTERS * 8
         || outbox.length > MAX_RECEIPT_OUTBOX
     ) throw new Error("Cortex editor transaction journal is corrupt");
 
@@ -243,6 +300,9 @@ function validateEditorJournal(raw: unknown): EditorJournal {
             receiptIds.add(receiptId);
         }
     }
+    // Repair a journal written before the write-side bound existed, so a
+    // profile already past the cap recovers on load instead of staying stuck.
+    trimAttemptCounters(validatedCounters, validatedOperations, MAX_EDITOR_COUNTERS);
     return {
         schema_version: "1",
         consumed_authorizations: validatedConsumed,
@@ -622,6 +682,14 @@ export class EditorTransactionAdapter {
         const attempt = (journal.attempt_counters[counterKey] ?? 0) + 1;
         if (attempt > 100) throw new Error("receipt retry limit exceeded");
         journal.attempt_counters[counterKey] = attempt;
+        // Bound the key count here, where it grows. Pruning after the insert
+        // keeps this counter (its operation is live by construction) and
+        // reclaims orphans left by operations that never retired.
+        trimAttemptCounters(
+            journal.attempt_counters,
+            journal.operations,
+            MAX_EDITOR_COUNTERS_SOFT,
+        );
         await this._writeJournal(journal);
         return receipt({ ...args, attempt });
     }

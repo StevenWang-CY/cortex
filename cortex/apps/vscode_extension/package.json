@@ -30,9 +30,11 @@
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": "limited",
-      "description": "The daemon URL is machine-scoped and only loopback hosts are accepted; untrusted workspaces cannot redirect editor context or the local auth token.",
+      "description": "The daemon URL and both content-sharing switches are machine-scoped; an untrusted workspace cannot redirect editor context, raise what is shared, or reach the local auth token.",
       "restrictedConfigurations": [
-        "cortex.daemonUrl"
+        "cortex.daemonUrl",
+        "cortex.shareEditorContent",
+        "cortex.shareUntitledDocuments"
       ]
     }
   },
@@ -146,11 +148,13 @@
         "cortex.shareEditorContent": {
           "type": "boolean",
           "default": true,
+          "scope": "machine",
           "description": "Send the visible code of the active file to the local Cortex daemon when it asks for editor context. When off, only the file path, visible line range, symbol name and diagnostics are shared."
         },
         "cortex.shareUntitledDocuments": {
           "type": "boolean",
           "default": false,
+          "scope": "machine",
           "description": "Also share unsaved (untitled) documents as editor context. Off by default; other non-file documents (output panels, settings, diffs) are never shared."
         },
         "cortex.debug": {
