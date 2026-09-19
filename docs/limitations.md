@@ -70,6 +70,21 @@ deferred because v2 publishes one estimate per window with its own provenance,
 and a held or smoothed value is not measured in the window it is attributed
 to. That is a design decision, not an oversight.
 
+**The published waveform no longer contains fabricated samples, and fixing
+that changed nothing measurable.** Until v0.5.0 the POS overlap-add
+reconstruction left the first sample and the trailing ~0.4 s of every window
+at the allocator's exact 0.0 — 14 of 300 samples at the default 30 fps — and
+the backend contract checks only shape and finiteness, so those reached the
+quality metrics and the spectral estimator as measurement. They are gone. It
+is worth being clear that this was a correctness fix and not an accuracy
+improvement: over 1,500 paired windows through the shipped publication gate,
+sensitivity at a realistic 0.3% modulation depth moved 0.2360 → 0.2340
+(discordant 9/6, McNemar p = 0.61) and false publication on drift and 1/f
+noise was unchanged. The first repair attempted — a strictly positive taper,
+which is the obvious one — removed the same zeros but perturbed the interior
+and cost real sensitivity for it: 0.2360 → 0.2260, discordant 20/5,
+p = 0.004. It was measured and discarded.
+
 **Rates at or below the passband edge are withheld, not measured.** The
 analysis band starts at 0.7 Hz (42 BPM), so a slower fundamental is removed by
 the bandpass while its harmonics survive; before v0.5.0 such rates published at
@@ -119,6 +134,25 @@ attest those external settings. See the [privacy disclosure](../cortex/docs/priv
   so it is recorded here rather than implemented unilaterally. The dashboard
   itself is keyboard-navigable and every control in it carries an accessible
   name.
+
+- **Source test coverage is 68.79%, and is now enforced.** The repository
+  carried a declared 85% floor for several releases that no gate ever ran: no
+  workflow, script or pytest option passed `--cov`, and the canonical gate runs
+  from the repository root where coverage finds no configuration at all — so
+  even a run that did pass it would have read none of those settings, including
+  the rule that excludes test modules from the denominator. Measured with
+  branch coverage on and the suite omitted, the figure is 68.79% over 44,086
+  statements. The floor is set to 68 rather than restored to 85, because a
+  floor above the measurement enforces nothing; it ratchets upward and nothing
+  may lower it. Closing the gap is ordinary work with no shortcut.
+
+- **The shipped browser extension is 263,803 bytes gzipped**, measured
+  2026-09-19 from `plasmo build` (820,399 bytes uncompressed, 17 files). Prior
+  documentation quoted a "< 250 KB" target, calibrated in 2026-08 against a
+  bundle that has since grown; the guard now bounds what is measured rather
+  than what was hoped. Its own size guard had meanwhile lost a third of its
+  measurement surface to a refactor, so this is the first figure in several
+  releases that reflects the whole bundle.
 
 - Supported release target: macOS 13 or later, arm64 and x86_64 artifacts.
   MediaPipe no longer publishes current Intel wheels, so the locked Intel

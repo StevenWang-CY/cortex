@@ -14,18 +14,20 @@ and only findings that survived both were acted on. Sixty-seven survived.
 A second pass then re-verified every survivor against the *fixed* tree rather
 than the audited one, and returned a verdict for sixty-five of them. Of those,
 forty-seven are fixed here, one is recorded as a product decision rather than a
-defect, and seventeen remain — all medium or low severity, listed with their
-evidence in Section 31 of `IMPLEMENTATION.md`. Every critical and every
-high-severity finding is closed.
+defect, and the remaining seventeen — all medium or low severity — were closed
+in a second pass. Every survivor with a verdict is now either fixed or recorded
+as a decision; the evidence for each is in Section 31 of `IMPLEMENTATION.md`.
 
 Three things are worth stating plainly before the list. The audit's own
 proposed fix for the most serious finding was measured and found wrong, and the
-implemented fix differs from it. Three fixes made earlier in this same cycle
-turned out to close only part of their defect, and were completed after a
-re-verification pass ran against the fixed tree rather than the audited one.
-And the research phase that was meant to ground the physiology work hit a usage
-limit and produced nothing for that track, so the thresholds below come from
-measurement against this pipeline rather than from literature.
+implemented fix differs from it — as does the fix for a second physiology
+finding, where the obvious repair cost measurable sensitivity and a less
+obvious one cost none. Three fixes made earlier in this same cycle turned out
+to close only part of their defect, and were completed after a re-verification
+pass ran against the fixed tree rather than the audited one. And the research
+phase that was meant to ground the physiology work hit a usage limit and
+produced nothing for that track, so the thresholds below come from measurement
+against this pipeline rather than from literature.
 
 ### Fixed — physiological signal integrity
 
@@ -125,6 +127,76 @@ measurement against this pipeline rather than from literature.
   user-owned exports, correctly exempt from the retention sweep, were reachable
   by no erase path either.
 
+### Fixed — windows, teardown, and the promises they make
+
+* **Closing the dashboard no longer quits Cortex.** `lastWindowClosed` fires on
+  any close of the last visible window, including the ordinary macOS red
+  button, and regardless of `setQuitOnLastWindowClosed(False)` — so the close
+  button ended the session and made the tray's own "Dashboard" item
+  permanently unreachable. On macOS the red button and ⌘W are the same
+  gesture, so there was no way to put the window away without quitting. Close
+  hides; quit is hooked where quit happens.
+* **The camera cannot be reopened during shutdown.** Capture is stopped early
+  in teardown but the WebSocket command surface stays up through roughly
+  eleven seconds of bounded waits, and neither the quiet-mode toggle nor a
+  settings apply had a stop gate — so the camera light could come back on
+  while Cortex was quitting.
+* **A restarted desktop shell can apply settings again.** The daemon kept one
+  process-global settings-version high-water mark and routinely outlives the
+  shell, whose counter restarts at zero. After a few applies and a shell
+  restart, every subsequent apply was dropped for the daemon's whole life —
+  silently, because the dialog persisted the file and reported success either
+  way. A dropped apply now replies with the reason.
+* **A colour-blind palette survives a restart.** It applied live but was
+  written only by Apply, and the live recolour is exactly the cue that says no
+  Apply is needed.
+* **A failed session export says so.** It was caught, logged at WARNING, and
+  otherwise indistinguishable from success.
+* **Quiet-mode escalation can come back down.** Persisting the counter was
+  right; leaving it monotonic meant a user who once reached the maximum quiet
+  window stayed there for the life of the install. An accepted suggestion now
+  walks it back one step.
+* **A concurrent restore is no longer orphaned.** The shutdown sweep removed
+  still-pending restore waiters, so arriving receipts could never complete
+  them and the caller reported "unverified" for a transaction that had
+  durably restored.
+
+### Fixed — signal and extension correctness
+
+* **POS no longer fabricates the last 0.4 s of every waveform.** The
+  overlap-add stride loop never reached the tail and the symmetric Hann taper
+  is zero at both ends, so 14 of 300 samples at the default rate — including
+  the entire most recent 0.43 s — kept the allocator's exact 0.0 and reached
+  the quality metrics as if they were measurement. The boundary treatment was
+  chosen by measurement: the obvious fix removes the zeros but costs real
+  sensitivity (McNemar p = 0.004 over 1,500 paired windows); the one shipped
+  costs none (p = 0.61).
+* **The browser context describes one page, not two.** With more than one
+  window open, the active-tab title and URL could come from a different window
+  than the page excerpt, and the prompt builder presented them as the same
+  page.
+* **The unread-recap badge survives a service-worker restart.** The toolbar
+  badge persists across an MV3 eviction; the record deciding what it should
+  say did not, so the first dismissal after a restart cleared it.
+
+### Fixed — gates that were not enforcing anything
+
+* **Coverage is measured.** `fail_under = 85` had never run: nothing passed
+  `--cov`, and the canonical gate runs from the repository root where coverage
+  finds no configuration at all — which is also why test modules were never
+  omitted from the denominator. Measured source coverage is 68.79 %, now
+  enforced at a floor of 68.
+* **The extension bundle guard measures the whole bundle.** It budgeted a
+  hand-maintained file list and waved through every other directory, so a
+  refactor moved 32 % of the shipping source outside it and the guard stayed
+  green while its own aggregate was 13 % over. Sources are discovered now, and
+  CI measures the real built bundle rather than only a source proxy.
+* **The icon pipeline's fatal guard can fire.** Its two conditions were
+  mutually exclusive and its third was unreachable, so a failed icon render
+  produced a brand-less build and exit 0.
+* **The published checksum command works.** Downloaders were told to run a
+  command that exits non-zero on a correct download.
+
 ### Added
 
 * A pre-routing capability gate, a signal-presence gate and a sub-harmonic
@@ -133,23 +205,36 @@ measurement against this pipeline rather than from literature.
 * Coverage for the extension's central behaviour: that an intervention
   actually injects the overlay. The whole worker-to-page path could previously
   be deleted with the suite green.
+* Source-coverage enforcement in the canonical Python gate, and a real
+  built-bundle size check in CI.
+* Tests that assert the repository's declared gates actually execute — the
+  check that would have caught two of the findings above years earlier.
 
 ### Changed
 
 * Deterministic support model `2.1.1` → `2.4.0`. Three changes altered scoring
   rules, and the provenance gate required a re-declaration rather than a
   regenerated hash each time. The model card records each one.
-* Pulse algorithm identity `pulse-v2/2.1.0` → `pulse-v2/2.3.0`.
+* Pulse algorithm identity `pulse-v2/2.1.0` → `pulse-v2/2.3.0`, and the POS
+  backend `pos/2.0.0` → `pos/2.1.0`.
+* The TCC permission polls in Settings and Onboarding start when their window
+  is shown rather than when it is constructed. Both windows are built eagerly
+  at startup, and a window never shown never receives the hide event that was
+  supposed to pause them.
 
 ### Known limitations
 
 * The suggestion card's action buttons remain mouse-only. Making them reachable
   needs a system-wide hotkey and the macOS Accessibility permission — a product
   decision with a privacy cost, not a defect fix.
-* Seventeen verified findings — fourteen medium, three low — are not yet fixed.
-  They are listed with their evidence in Section 31 of `IMPLEMENTATION.md`.
-  Two of the sixty-seven survivors received no verdict in the re-verification
-  pass and are listed there as unresolved rather than counted either way.
+* Source coverage is 68.79 %, not the 85 % the repository used to claim.
+  The floor is now real and ratchets upward; closing the gap is ordinary work,
+  not a configuration change.
+* The shipped extension bundle is 263,803 bytes gzipped, above the 250 KB
+  figure earlier documentation quoted. That figure was calibrated in 2026-08
+  against a smaller bundle; the ceiling now reflects what is measured.
+* Two of the sixty-seven survivors received no verdict in the re-verification
+  pass and are recorded as unresolved rather than counted either way.
 * The four completed research tracks are **unreviewed**: the peer-review stage
   hit a usage limit. Their proposals are recorded but none were implemented as
   validated, and the one defect found among them was verified from scratch

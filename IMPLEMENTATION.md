@@ -5697,29 +5697,50 @@ The re-verification pass exists because of these.
 
 ### 31.5 Residual findings
 
-Seventeen findings are verified, reproduced, and not fixed. None is critical or
-high. They are listed here so the next cycle starts from evidence rather than
-from a re-audit.
+**None.** All seventeen were closed in a second pass after §31.4 was written.
+The table is kept because the evidence is the useful part, and because two of
+the entries turned out to be larger than their summaries said.
 
-| Finding | Severity | Summary |
-| --- | --- | --- |
-| `api-security:1441` | medium | A process-global settings-version high-water mark is never reset per client, so a restarted shell's Apply is silently dropped |
-| `browser-extension:153` | medium | The context collector resolves the focused tab twice and can mix two different tabs |
-| `build-release:308` | medium | An icon-build gate can pass vacuously |
-| `desktop-shell:311` | medium | A timer keeps running while the window is hidden |
-| `desktop-shell:751` | medium | Window lifecycle defect |
-| `desktop-shell:1596` | medium | An accessibility setting is not persisted across restarts |
-| `desktop-shell:2353` | medium | A failure path is silently swallowed |
-| `physio-pulse:100` | medium | POS overlap-add leaves zero-valued samples in the waveform |
-| `runtime-lifecycle:2346` | medium | Concurrency defect in the daemon lifecycle |
-| `tests-gates:144` | medium | A gate has eroded and no longer enforces what it claims |
-| `tests-gates:280` | medium | A declared gate is not enforced in CI |
-| `transaction-restore:5852` | medium | Correctness defect in the restore path |
-| `trigger-intervention:183` | medium | The interruption gate is consulted in the wrong order relative to a side effect |
-| `trigger-intervention:1564` | medium | Dismissal-driven quiet escalation can lock the user out |
-| `browser-extension:1876` | low | Badge state is held only in memory and lost on worker suspension |
-| `build-release:372` | low | Release evidence overstates what a `shasum -c` run verified |
-| `runtime-lifecycle:1475` | low | A blocking call on the daemon's async path |
+| Finding | Severity | What it was | How it closed |
+| --- | --- | --- | --- |
+| `api-security:1441` | medium | One process-global settings-version high-water mark, never reset per client | Per-socket, popped on disconnect; unusable versions refused; a dropped apply now replies |
+| `browser-extension:153` | medium | The focused tab resolved twice, from two differently-scoped queries | Resolved once, via `lastFocusedWindow`; both halves derive from it |
+| `build-release:308` | medium | The icon FATAL guard was unreachable in the case it was written for | Tests the artefact, not the bookkeeping |
+| `desktop-shell:311` | medium | A 1.5 s TCC poll started at construction and never stopped | `showEvent` owns the lifecycle |
+| `desktop-shell:751` | medium | The dashboard's close button quit Cortex | Close hides; quit is hooked at `QEvent.Quit` |
+| `desktop-shell:1596` | medium | The colour-blind palette applied live but persisted only on Apply | Persisted on change |
+| `desktop-shell:2353` | medium | A failed session export was logged and nowhere else | Dialog + `export_failed`; an empty output counts as failure |
+| `physio-pulse:100` | medium | POS fabricated the first sample and the last ~0.4 s of every window | Tail anchored, rectangular edge halves; backend bumped `pos/2.1.0` |
+| `runtime-lifecycle:1475` | low | A 1 s blocking enumeration on the Qt main thread at every launch | Probed off-thread on first show |
+| `runtime-lifecycle:2346` | medium | A late command could reopen the camera during shutdown | `_capture_restart_permitted` on both restart paths |
+| `tests-gates:144` | medium | The bundle guard lost a third of its measurement surface | Sources discovered, not listed; real bundle measured in CI |
+| `tests-gates:280` | medium | `fail_under = 85` was never executed; the real figure is 68.79 % | Coverage runs in the canonical gate at an enforceable floor |
+| `transaction-restore:5852` | medium | Still-pending restore futures were popped, orphaning a concurrent restore | Only resolved futures are removed |
+| `trigger-intervention:183` | medium | The interruption gate consulted in the wrong order | Already closed by the `record_recommended()` split; verified, not re-fixed |
+| `trigger-intervention:1564` | medium | Quiet-mode escalation only ever ratcheted up | An approval walks the ladder back one step |
+| `browser-extension:1876` | low | Badge state was module-only while the toolbar badge persists | Rides the existing session snapshot |
+| `build-release:372` | low | The published checksum command exits non-zero on a correct download | `--ignore-missing`, which still fails when nothing was verified |
+
+Two were worse than their summaries suggested, and both were found by fixing
+them rather than by reading them:
+
+* `tests-gates:280` was not only unenforced. Coverage searches the working
+  directory for its configuration, and the canonical gate runs from the
+  repository root while the settings live in `cortex/pyproject.toml` — so even
+  a run that did pass `--cov` would have read none of that block. That is also
+  why `omit` never excluded the test modules: roughly thirty thousand
+  statements of ~98 %-covered test code were sitting in the denominator,
+  reporting 83 % where the source figure is 68.79 %.
+
+* `physio-pulse:100`'s obvious fix is wrong. A strictly positive taper removes
+  every fabricated zero, and it was what this cycle wrote first — but it
+  perturbs the interior and cost measurable sensitivity for it: 0.2360 →
+  0.2260 at a realistic 0.3 % modulation depth, discordant 20/5, McNemar
+  p = 0.004 over 1,500 paired windows. Anchoring the tail and making only the
+  outward-facing halves of the first and last sub-window rectangular removes
+  the same zeros at no measurable cost (0.2360 → 0.2340, discordant 9/6,
+  p = 0.61). This is the second time in this cycle that the first fix for a
+  physiology finding was wrong in kind and measurement caught it; see §31.3.
 
 Recorded as a product decision rather than a defect:
 
@@ -5761,12 +5782,28 @@ waved through — the MV3 hydration test took three attempts, and the first two
 passed with and without the fix because they asserted the end state rather than
 the contract.
 
-Gates at the close of the cycle: 3,166 Python tests, 69 isolated Qt tests, 331
-Vitest across 68 suites, 131 Jest across 13 suites, Ruff clean, mypy `--strict`
-clean over 560 files, `tsc --noEmit` clean for both extensions, repository
+Two tests in this cycle encoded a defect as contract and were rewritten rather
+than worked around. `test_permission_timer_started_on_construction` asserted
+the TCC poll was already running after `__init__`, on the stated grounds that
+it would otherwise start 1.5 s late — which `showEvent`'s immediate refresh
+disproves, while the contract it pinned kept the poll running for the app's
+whole life. `test_api_docs_are_not_served_without_an_explicit_opt_in` asserted
+a 404 where 401 is now also correct. A third,
+`test_continuity_callout_absent_when_no_iphone`, asserted a widget did not
+exist, which is no longer how absence is expressed.
+
+One regression was introduced and caught here rather than in review: the
+capture-restart gate broke four tests whose daemon stubs borrow
+`set_quiet_mode` from `CortexDaemon` and had to learn about the new method.
+The coverage run surfaced them.
+
+Gates at the close of the cycle: 3,215 Python tests, 69 isolated Qt tests, 336
+Vitest across 69 suites, 131 Jest across 13 suites, Ruff clean, mypy `--strict`
+clean over 563 files, `tsc --noEmit` clean for both extensions, repository
 contracts, configuration surfaces (197 settings), TypeScript schema codegen and
-support-model identity all synchronized, and the eval replay baselines
-unchanged.
+support-model identity all synchronized, the eval replay baselines unchanged,
+and — for the first time — source coverage measured and enforced at 68.79 %
+against a floor of 68.
 
 ### 31.8 Definition of done for v0.5.0
 
@@ -5780,4 +5817,8 @@ unchanged.
       future re-audit.
 - [x] Measured limits — including the ones that are not zero — are in
       `docs/limitations.md` with the measurement behind them.
+- [x] Every residual finding from §31.5 is closed, not carried.
 - [ ] Notarized build, manual validation record, and public release.
+
+The last item needs Developer ID signing credentials and a clean Mac, and
+cannot be completed from here.
