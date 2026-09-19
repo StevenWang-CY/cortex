@@ -291,6 +291,70 @@ class TestRPPGAlgorithms:
         bvp = extract_bvp_green(rgb)
         assert bvp.shape == (rgb.shape[0],)
 
+    def test_pos_covers_every_sample_it_returns(self) -> None:
+        """No sample of the returned waveform may be fabricated.
+
+        ``extract_bvp_pos`` allocates ``np.zeros(n_samples)`` and fills it by
+        overlap-add. The stride loop stops at the last start that is a
+        multiple of ``stride``, so whenever
+        ``(n_samples - window_length) % stride != 0`` — the normal case,
+        including the exact 30 fps / 10 s default, which left 12 samples —
+        the trailing samples received no sub-window, their overlap weight
+        stayed 0, the normalisation skipped them, and they kept the
+        initialiser value of exactly 0.0. The symmetric Hann taper is 0 at
+        both ends, so the first and last sample were fabricated too: 14 of
+        300 samples at the default rate, covering the most recent 0.43 s.
+
+        The backend contract in ``ResolvedBackend.extract`` validates only
+        shape and finiteness, so a flat-lined tail reached the quality
+        metrics and the spectral estimator as if it were measurement.
+        """
+        for fs in (15.0, 24.0, 25.0, 30.0, 60.0):
+            duration_s = 10.0
+            rgb = make_synthetic_rgb_window(
+                hr_bpm=72, duration_s=duration_s, fs=fs
+            )
+            window_length = max(8, int(round(1.6 * fs)))
+            stride = max(1, window_length // 2)
+            assert (rgb.shape[0] - window_length) % stride != 0, (
+                f"fs={fs} does not exercise the uncovered-tail case"
+            )
+
+            bvp = extract_bvp_pos(rgb, fs)
+
+            fabricated = np.flatnonzero(bvp == 0.0)
+            assert fabricated.size == 0, (
+                f"fs={fs}: {fabricated.size} samples were never written by "
+                f"any sub-window and kept the allocator's 0.0: "
+                f"{fabricated.tolist()}"
+            )
+
+    def test_pos_edge_samples_are_the_measurement_not_a_taper(self) -> None:
+        """The first and last sample must be exactly what POS computed there.
+
+        Only one sub-window covers each end of the signal, so the boundary
+        treatment decides what those samples are. With a symmetric Hann the
+        weight there is 0, which is why they were fabricated zeros. Making
+        the outward-facing half of the first and last sub-window rectangular
+        gives them weight 1.0, and since the overlap-add normalisation
+        divides by that same weight the result is exactly the sub-window's
+        own value — no attenuation, no invented data.
+        """
+        from cortex.services.physio_engine.rppg import _pos_single_window
+
+        fs = 30.0
+        rgb = make_synthetic_rgb_window(hr_bpm=72, duration_s=10.0, fs=fs)
+        window_length = max(8, int(round(1.6 * fs)))
+
+        bvp = extract_bvp_pos(rgb, fs)
+
+        assert bvp[0] == pytest.approx(
+            _pos_single_window(rgb[:window_length])[0]
+        )
+        assert bvp[-1] == pytest.approx(
+            _pos_single_window(rgb[-window_length:])[-1]
+        )
+
     def test_pos_zero_mean(self) -> None:
         """POS BVP output should be approximately zero-mean."""
         rgb = make_synthetic_rgb_window(hr_bpm=72, snr=10.0)

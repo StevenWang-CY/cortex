@@ -110,10 +110,17 @@ class RPPGBackendRegistry:
     @classmethod
     def with_packaged_backends(cls) -> RPPGBackendRegistry:
         registry = cls()
+        # pos/2.1.0: the overlap-add reconstruction now covers every sample
+        # it returns. Up to 2.0.0 the stride loop stopped at the last start
+        # that was a multiple of the stride, and the symmetric Hann taper was
+        # exactly 0 at both ends, so the first sample and the trailing ~0.4 s
+        # of every window were never written and kept the allocator's 0.0 —
+        # fabricated data that the backend contract (shape and finiteness
+        # only) could not catch.
         registry.register(
             BackendDefinition(
                 RPPGAlgorithm.POS,
-                "pos/2.0.0",
+                "pos/2.1.0",
                 extract_bvp_pos,
                 implementation_components=(_pos_single_window,),
             )
