@@ -88,6 +88,12 @@ logger = logging.getLogger(__name__)
 # enough that an unauthenticated socket cannot linger for the daemon's life.
 AUTH_DEADLINE_SECONDS: float = 30.0
 
+# Upper bound on an accepted ``settings_version``. The producer is a
+# per-dialog counter incremented once per Apply, so any real value is tiny;
+# the bound exists so one hostile or corrupted frame cannot pin the socket's
+# high-water mark at a number no honest apply can ever exceed.
+_MAX_SETTINGS_VERSION: int = 2**31
+
 
 def _receipt_has_restorable_effect(receipt: Any) -> bool:
     """Project only verified, non-empty effects as user-restorable.
@@ -405,9 +411,23 @@ class WebSocketServer:
         # correlation_ids; remove the cid from the set as soon as its
         # future resolves so the set never grows past in-flight requests.
         self._pending_cids_by_client: dict[str, set[str]] = {}
-        # F04: monotonic settings version last applied. Older payloads are
-        # rejected (stale double-click that arrived behind a newer apply).
-        self._last_settings_version: int = 0
+        # F04: monotonic settings version last applied, tracked PER SOCKET.
+        # Older payloads from the same socket are rejected (a stale
+        # double-click that arrived behind a newer apply).
+        #
+        # A single process-global high-water mark was wrong: the shell's
+        # counter is an in-memory, per-dialog integer that restarts at 0
+        # every time the shell process does, while the daemon routinely
+        # outlives it (documented WebSocket mode). A shell restart then
+        # replayed 1, 2, 3 ... against a daemon still holding, say, 7, and
+        # every Apply was dropped — silently, because the dialog persisted
+        # the file and logged "Settings applied" either way, so the shown
+        # settings and live daemon behaviour diverged until the daemon was
+        # restarted too. Keying on ``client_id`` (one entry per socket,
+        # popped on disconnect) keeps the ordering guarantee F04 needs,
+        # which only ever concerned two applies racing inside one dialog
+        # session, without carrying a stale ceiling across reconnects.
+        self._last_settings_version: dict[str, int] = {}
 
         # F16-srv: track the cid the daemon stamped on the most recent
         # outbound INTERVENTION_TRIGGER for each intervention_id. A
@@ -882,6 +902,7 @@ class WebSocketServer:
                 )
 
         self._clients.clear()
+        self._last_settings_version.clear()
         self._published_client_connectivity.clear()
 
         if self._server is not None:
@@ -947,6 +968,8 @@ class WebSocketServer:
         finally:
             auth_deadline.cancel()
             self._clients.pop(client_id, None)
+            # The settings high-water mark belongs to this socket only.
+            self._last_settings_version.pop(client_id, None)
             # Phase-4b TASK I: dispose of the per-client coalesce queue
             # + drain task so a dropped client doesn't leak a Task
             # awaiting forever on a queue nobody will fill.
@@ -1467,24 +1490,53 @@ class WebSocketServer:
         """Forward settings updates to the daemon.
 
         F04: payloads with a ``settings_version`` field are checked against
-        the last applied version. Older versions (a stale double-click that
-        arrived behind a newer apply) are dropped with a warning so a
+        the last version applied *on this socket*. Older versions (a stale
+        double-click that arrived behind a newer apply) are dropped so a
         rapid-fire user cannot accidentally rewind their settings.
+
+        A drop is never silent: the sender gets an ``ERROR`` frame carrying
+        the reason and the ceiling that rejected it, because the dialog on
+        the other end has already written the file and told the user
+        "Settings applied". Without the reply the only record of a
+        discarded apply was a daemon log line the user never sees.
         """
         if self._settings_callback is None:
             return
         version = msg.payload.get("settings_version")
-        if isinstance(version, int):
-            if version <= self._last_settings_version:
+        if version is not None:
+            # A present-but-unusable version is refused rather than applied
+            # unchecked: the ordering guarantee cannot be honoured for it,
+            # and applying it anyway is precisely the rewind F04 prevents.
+            # ``bool`` is an ``int`` subclass, so ``True`` would otherwise
+            # read as version 1 and pin the ceiling for the socket's life.
+            if (
+                isinstance(version, bool)
+                or not isinstance(version, int)
+                or not 0 < version < _MAX_SETTINGS_VERSION
+            ):
+                logger.warning(
+                    "Rejecting unusable settings version from %s: %r",
+                    client.client_id,
+                    version,
+                )
+                await self._send_settings_sync_rejected(
+                    client, msg, reason="version_out_of_range", ceiling=None,
+                )
+                return
+            ceiling = self._last_settings_version.get(client.client_id, 0)
+            if version <= ceiling:
                 logger.warning(
                     "Dropping stale settings sync from %s: version=%d "
                     "(last applied=%d)",
                     client.client_id,
                     version,
-                    self._last_settings_version,
+                    ceiling,
+                )
+                await self._send_settings_sync_rejected(
+                    client, msg, reason="stale_version", ceiling=ceiling,
                 )
                 return
-            self._last_settings_version = version
+            self._last_settings_version[client.client_id] = version
         try:
             if asyncio.iscoroutinefunction(self._settings_callback):
                 await self._settings_callback(msg.payload)
@@ -2628,6 +2680,43 @@ class WebSocketServer:
                 bool(raw_healthy) if raw_healthy is not None else None
             ),
         )
+
+    async def _send_settings_sync_rejected(
+        self,
+        client: WebSocketClient,
+        msg: WSMessage,
+        *,
+        reason: str,
+        ceiling: int | None,
+    ) -> None:
+        """Tell the sender its ``SETTINGS_SYNC`` was not applied.
+
+        The dialog has already persisted the payload and logged success by
+        the time this arrives, so a dropped apply that produced only a
+        daemon-side log line left the shown settings and the live daemon
+        silently out of step.
+        """
+        payload: dict[str, Any] = {
+            "code": f"settings_sync_rejected:{reason}",
+            "correlation_id": getattr(msg, "correlation_id", None),
+            "reason": reason,
+        }
+        if ceiling is not None:
+            payload["last_applied_version"] = ceiling
+        try:
+            await self._send_to(
+                client,
+                MessageType.ERROR.value,
+                payload,
+                correlation_id=msg.correlation_id,
+                causation_id=str(msg.event_id),
+            )
+        except Exception:
+            logger.debug(
+                "settings rejection reply failed for %s",
+                client.client_id,
+                exc_info=True,
+            )
 
     async def _send_daemon_not_ready(
         self,

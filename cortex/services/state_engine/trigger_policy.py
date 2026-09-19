@@ -1404,6 +1404,22 @@ class TriggerPolicy:
             self._dismissal_pause_level = 0
             self._dismissal_pause_until = 0.0
             self._dismissal_probe_pending = False
+            # The quiet-mode escalation ladder walks back one step too.
+            # Without this it only ever ratchets up: the counter is
+            # persisted and rehydrated, nothing decays it, and only an
+            # explicit ``reset_quiet_mode()`` zeroes it. A user who once
+            # reached level 3 stayed there permanently, so every later
+            # burst of dismissals bought the maximum quiet window for the
+            # rest of the install's life, however long ago the bad patch
+            # was and however many suggestions they had accepted since.
+            #
+            # One step per approval, not a reset: the escalation is meant
+            # to be hard to unwind, just not impossible. And it is driven
+            # by behaviour rather than by elapsed time, so it does not
+            # reintroduce the silent 2-hour idle reset that F26 removed.
+            if self._quiet_mode_count > 0:
+                self._quiet_mode_count -= 1
+                self._persist_quiet_mode_history()
 
         # F27: a fallback-origin outcome is real user behaviour that the
         # quiet-mode counter and adaptive threshold should reflect, but
