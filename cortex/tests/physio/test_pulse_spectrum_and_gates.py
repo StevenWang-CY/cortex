@@ -594,17 +594,23 @@ def _run_windows(
     return published, withheld
 
 
-# Residual single-window false-positive rate on signal-free input, measured
-# over 2400 windows spanning white, 1/f and drift nuisance: 8 published, i.e.
-# 0.33%, against 100% before the fix. It is not zero and cannot be driven to
-# zero by this gate alone -- pushing ``min_cardiac_snr_db`` past 2.0 dB starts
-# discarding genuine low-amplitude pulses (measured: 2.5 dB halves sensitivity
-# at a realistic 0.3% modulation depth for a specificity gain of 0.5 points).
-# The remainder is a job for temporal hysteresis, not for a per-window
-# threshold: an isolated window surviving the gate should not be able to move
-# a displayed rate. The legacy estimator already has that stabilizer; porting
-# it to v2 is tracked as a residual risk rather than papered over here.
-MAX_SIGNAL_FREE_PUBLICATION_RATE = 0.01
+# Residual single-window false-publication rate on signal-free input, measured
+# over 2400 windows spanning white, 1/f and drift nuisance: 0 published, from
+# 100% before the gate existed and 0.33% before the peak-concentration term was
+# added. 0/2400 bounds the rate near 0.12% rather than proving zero, so the
+# assertion below is a rate and not an equality -- and the bound stays loose
+# enough that a seed change cannot make it flap.
+#
+# It is not driven lower by tightening these thresholds further: past 2.0 dB
+# SNR, or above a 0.40 concentration floor, genuine low-amplitude pulses start
+# being discarded (measured: a 0.50 floor more than halves sensitivity at a
+# realistic 0.3% modulation depth, for a specificity gain indistinguishable
+# from noise at this sample size). Anything beyond this is a job for temporal
+# hysteresis, not a per-window threshold: an isolated surviving window should
+# not be able to move a displayed rate. The legacy estimator already has that
+# stabilizer; porting it to v2 is tracked as a residual risk rather than
+# papered over here.
+MAX_SIGNAL_FREE_PUBLICATION_RATE = 0.005
 
 
 def test_signal_free_windows_almost_never_publish_a_heart_rate() -> None:

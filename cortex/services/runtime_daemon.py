@@ -3984,7 +3984,13 @@ class CortexDaemon:
                         )
                         # The shared gate's contract: a surface that presents
                         # an interruption records it, so the cooldown and the
-                        # hourly cap count it like every other proposal.
+                        # hourly cap count it like every other proposal. The
+                        # focus-break policy's own one-shot budget is consumed
+                        # here for the same reason -- ``evaluate`` used to
+                        # consume it before the gate was consulted, so a
+                        # reminder suppressed by quiet mode or cooldown was
+                        # spent rather than deferred.
+                        self._focus_break_policy.record_recommended()
                         self._trigger_policy.record_intervention(timestamp=timestamp)
 
                     # P0 §3.9: feed the causal attributor at the same

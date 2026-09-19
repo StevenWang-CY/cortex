@@ -673,6 +673,16 @@ class RPPGSignalConfig(BaseModel):
             "heart rate read out of noise"
         ),
     )
+    min_peak_concentration: float = Field(
+        0.40,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum share of in-band power concentrated at the selected "
+            "spectral peak for a window to count as carrying a cardiac signal; "
+            "separates a cardiac line from wandering illumination drift"
+        ),
+    )
     minimum_window_quality: float = Field(
         0.30,
         ge=0.0,

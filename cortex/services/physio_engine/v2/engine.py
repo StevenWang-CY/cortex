@@ -56,6 +56,7 @@ class PhysiologyEngineV2:
             # a cardiac signal was present at all.
             nsqi_threshold=config.nsqi_threshold,
             min_cardiac_snr_db=config.min_cardiac_snr_db,
+            min_peak_concentration=config.min_peak_concentration,
             minimum_window_quality=config.minimum_window_quality,
             experimental_hrv_enabled=config.experimental_hrv_enabled,
             hrv_min_window_seconds=float(config.hrv_min_window_seconds),

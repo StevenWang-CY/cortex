@@ -85,6 +85,20 @@ PRIOR_MAX_AGE_SECONDS = 30.0
 # Widening it is close to free because the ratio separates the populations by
 # two orders of magnitude -- genuine rates in the newly audited span
 # (84-109 BPM published) measure 0.002-0.018 against a 0.30 threshold.
+# In-band SNR above which the peak-concentration term is waived. Concentration
+# answers "is the selected peak trustworthy?", which is not the same question
+# as "is a cardiac signal present?". When the HR prior deliberately selects a
+# non-dominant peak to keep continuity across windows, concentration measured
+# at that peak is low even though the spectrum is unambiguous -- a clean
+# two-tone window scores 21 dB SNR and 0.68 NSQI, and rejecting it as "no
+# cardiac signal above the noise floor" would be simply false. The waiver is
+# safe because the nuisance this term exists to catch cannot reach it: the
+# highest SNR observed across 600 signal-free windows was 3.05 dB (drift), so
+# 6.0 dB sits at twice the worst observed noise. Measured, the waiver changes
+# neither specificity nor sensitivity on the synthetic corpus; it only stops
+# the gate contradicting itself on strong signals.
+UNAMBIGUOUS_CARDIAC_SNR_DB = 6.0
+
 SUBHARMONIC_AUDIT_LOW_HZ = 0.40
 SUBHARMONIC_AUDIT_MARGIN = 1.30
 # Which harmonics a removed fundamental can surface as. A real BVP upstroke
@@ -356,6 +370,7 @@ class PulsePipelineV2:
         minimum_window_quality: float = 0.30,
         nsqi_threshold: float = 0.293,
         min_cardiac_snr_db: float = 2.0,
+        min_peak_concentration: float = 0.40,
         experimental_hrv_enabled: bool = False,
         hrv_min_window_seconds: float = 180.0,
         hrv_min_valid_ibi: int = 120,
@@ -373,6 +388,7 @@ class PulsePipelineV2:
         self._minimum_window_quality = float(minimum_window_quality)
         self._nsqi_threshold = float(nsqi_threshold)
         self._min_cardiac_snr_db = float(min_cardiac_snr_db)
+        self._min_peak_concentration = float(min_peak_concentration)
         self._experimental_hrv_enabled = bool(experimental_hrv_enabled)
         self._hrv_min_window_seconds = float(hrv_min_window_seconds)
         self._hrv_min_valid_ibi = int(hrv_min_valid_ibi)
@@ -390,6 +406,8 @@ class PulsePipelineV2:
             "minimum_window_quality": self._minimum_window_quality,
             "nsqi_threshold": self._nsqi_threshold,
             "min_cardiac_snr_db": self._min_cardiac_snr_db,
+            "min_peak_concentration": self._min_peak_concentration,
+            "unambiguous_cardiac_snr_db": UNAMBIGUOUS_CARDIAC_SNR_DB,
             "subharmonic_audit_low_hz": SUBHARMONIC_AUDIT_LOW_HZ,
             "subharmonic_audit_margin": SUBHARMONIC_AUDIT_MARGIN,
             "subharmonic_audit_divisors": ",".join(
@@ -404,7 +422,7 @@ class PulsePipelineV2:
         }
         self._algorithm_identity = SignalAlgorithmIdentity(
             name=f"pulse-v2:{backend.identity.name}",
-            version="pulse-v2/2.2.0",
+            version="pulse-v2/2.3.0",
             implementation_sha256=code_sha256(
                 (
                     PulsePipelineV2.process_window,
@@ -576,10 +594,30 @@ class PulsePipelineV2:
         # no discrimination against 1/f noise (it passes ~94% of it) but costs
         # no sensitivity either and rejects 100% of white noise, so it is kept
         # as a cheap guard on the degenerate flat-spectrum case.
+        # A third term for the one nuisance the first two do not separate.
+        # ``snr_db >= 2.0`` rejects 100% of white and 99.5% of 1/f signal-free
+        # windows, but only 98.5% of drift-dominated ones -- and drift is the
+        # realistic webcam nuisance. Peak concentration is already computed for
+        # the uncertainty interval and measures whether the in-band power sits
+        # in one peak or is smeared, which is exactly what distinguishes a
+        # cardiac line from wandering illumination.
+        #
+        # 0.40, not higher: measured over 200 windows per condition, adding
+        # this term cuts drift false-publication from 1.5% to 0.5% at a cost of
+        # 25% relative sensitivity at a realistic 0.3% modulation depth
+        # (0.340 -> 0.255). A 0.50 floor observed 0/200 on drift but more than
+        # halved that sensitivity (to 0.160), and 0/200 is not distinguishable
+        # from 0.005 at this sample size -- so the stricter floor buys noise
+        # and costs real measurements.
         nsqi = float(sqi_components.get("nsqi", 0.0))
         snr_db = float(sqi_components.get("snr_db", -99.0))
         signal_present = (
-            nsqi >= self._nsqi_threshold and snr_db >= self._min_cardiac_snr_db
+            nsqi >= self._nsqi_threshold
+            and snr_db >= self._min_cardiac_snr_db
+            and (
+                snr_db >= UNAMBIGUOUS_CARDIAC_SNR_DB
+                or hr_confidence >= self._min_peak_concentration
+            )
         )
 
         # A peak whose own sub-harmonic sits below the publication band may be

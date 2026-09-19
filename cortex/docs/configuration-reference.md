@@ -4,7 +4,7 @@
 
 `CortexConfig` is the runtime source of truth. YAML uses dotted paths below; environment overrides use the corresponding `CORTEX_…` name and double underscores. Secrets are deliberately not fields on `CortexConfig`.
 
-This reference contains **196 runtime settings**.
+This reference contains **197 runtime settings**.
 
 | YAML path | Environment variable | Type | Default | Constraints | Description |
 | --- | --- | --- | --- | --- | --- |
@@ -118,6 +118,7 @@ This reference contains **196 runtime settings**.
 | `signal.rppg.bandpass_order` | `CORTEX_SIGNAL__RPPG__BANDPASS_ORDER` | `int` | `4` | ≥ 1; ≤ 8 | — |
 | `signal.rppg.nsqi_threshold` | `CORTEX_SIGNAL__RPPG__NSQI_THRESHOLD` | `float` | `0.293` | ≥ 0.0; ≤ 1.0 | Minimum normalized spectral quality index for a window to count as carrying a cardiac signal |
 | `signal.rppg.min_cardiac_snr_db` | `CORTEX_SIGNAL__RPPG__MIN_CARDIAC_SNR_DB` | `float` | `2.0` | — | Minimum in-band to out-of-band SNR in dB for a window to count as carrying a cardiac signal; the dominant guard against publishing a heart rate read out of noise |
+| `signal.rppg.min_peak_concentration` | `CORTEX_SIGNAL__RPPG__MIN_PEAK_CONCENTRATION` | `float` | `0.4` | ≥ 0.0; ≤ 1.0 | Minimum share of in-band power concentrated at the selected spectral peak for a window to count as carrying a cardiac signal; separates a cardiac line from wandering illumination drift |
 | `signal.rppg.minimum_window_quality` | `CORTEX_SIGNAL__RPPG__MINIMUM_WINDOW_QUALITY` | `float` | `0.3` | ≥ 0.0; ≤ 1.0 | Minimum composite acquisition quality (motion, face coverage and spectrum) for a pulse window to be published |
 | `signal.rppg.max_head_jitter_deg` | `CORTEX_SIGNAL__RPPG__MAX_HEAD_JITTER_DEG` | `float` | `7.5` | > 0.0 | — |
 | `signal.rppg.min_valid_coverage` | `CORTEX_SIGNAL__RPPG__MIN_VALID_COVERAGE` | `float` | `0.8` | ≥ 0.0; ≤ 1.0 | — |

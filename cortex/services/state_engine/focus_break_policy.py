@@ -96,8 +96,26 @@ class FocusBreakPolicy:
             return self._decision(
                 "already_recommended", False, "focus_break_already_recommended"
             )
-        self._recommended = True
+        # Deliberately does NOT consume the one-shot budget. ``evaluate`` is
+        # advisory: the caller still has to clear the shared interruption gate
+        # (quiet mode, pause, snooze, receptivity, schedule, cooldown, hourly
+        # cap) before anything is shown. Setting ``_recommended`` here burned
+        # the reminder whenever that gate said no, and every later evaluate
+        # returned "already_recommended" until a break was taken or snoozed --
+        # so a user who was merely in cooldown lost the reminder for the whole
+        # interval and never saw it. The surface that actually presents the
+        # reminder calls ``record_recommended``, mirroring the same
+        # present-then-record contract as ``TriggerPolicy.record_intervention``.
         return self._decision("due", True, "preferred_focus_interval_reached")
+
+    def record_recommended(self) -> None:
+        """Consume the one-shot budget for the current focus interval.
+
+        Called by the surface that presented the reminder, never by
+        ``evaluate``. Until it is called, a gated reminder stays due.
+        """
+
+        self._recommended = True
 
     def record_break_taken(self) -> None:
         self._active_elapsed = 0.0
