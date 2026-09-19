@@ -115,7 +115,14 @@ def test_why_copy_is_substantive(wizard):
 
 def test_continuity_callout_appears_when_iphone_present(qapp, monkeypatch):
     """When AVFoundation lists an iPhone Continuity Camera, the Camera card
-    renders the skip callout inline. Without one, the callout is absent."""
+    shows the skip callout.
+
+    The callout widget is built up front but hidden; the probe that decides
+    whether to reveal it runs on a worker thread, because the enumeration it
+    calls sleeps a full second whenever AVFoundation has not warmed up — and
+    ``_build_ui`` runs before the Qt event loop starts. The probe result is
+    delivered to ``_on_continuity_probed`` on the main thread.
+    """
     from cortex.apps.desktop_shell import mac_native
     from cortex.apps.desktop_shell import onboarding as onb_mod
 
@@ -131,6 +138,13 @@ def test_continuity_callout_appears_when_iphone_present(qapp, monkeypatch):
     try:
         callout = getattr(w._camera_step, "_cortex_continuity_callout", None)
         assert callout is not None, "Continuity callout missing when iPhone present"
+        assert not callout.isVisibleTo(w._camera_step), (
+            "the callout must stay hidden until the probe has answered"
+        )
+
+        w._run_continuity_probe()
+
+        assert callout.isVisibleTo(w._camera_step)
         assert "iPhone" in callout.text()
         assert "MacBook" in callout.text()
         # The other cards never carry a callout.
@@ -143,9 +157,58 @@ def test_continuity_callout_appears_when_iphone_present(qapp, monkeypatch):
             pass
 
 
-def test_continuity_callout_absent_when_no_iphone(wizard):
-    """Default fixture sets _detect_continuity_camera → False; callout absent."""
-    assert getattr(wizard._camera_step, "_cortex_continuity_callout", None) is None
+def test_continuity_callout_stays_hidden_when_no_iphone(wizard):
+    """Default fixture sets _detect_continuity_camera → False."""
+    callout = getattr(wizard._camera_step, "_cortex_continuity_callout", None)
+    assert callout is not None
+    assert not callout.isVisibleTo(wizard._camera_step)
+
+    wizard._run_continuity_probe()
+
+    assert not callout.isVisibleTo(wizard._camera_step)
+
+
+def test_building_the_wizard_never_enumerates_cameras(qapp, monkeypatch):
+    """Construction must not touch AVFoundation.
+
+    ``CortexAppController.run`` builds this window unconditionally, before the
+    Qt event loop starts and regardless of whether onboarding was ever
+    completed. The Continuity probe used to run inside ``_build_ui``, and
+    ``_list_macos_video_devices`` does a bare, non-cancellable
+    ``time.sleep(1.0)`` whenever the first enumeration returns empty — a case
+    the capture service documents as expected during early app startup. So
+    every launch could block the Qt main thread for a second before it drew
+    anything, on behalf of a cosmetic hint most users never see.
+    """
+    from cortex.apps.desktop_shell import mac_native
+    from cortex.apps.desktop_shell import onboarding as onb_mod
+    from cortex.services.capture_service import webcam as webcam_mod
+
+    monkeypatch.setattr(mac_native, "apply_vibrancy", lambda *a, **kw: False)
+    monkeypatch.setattr(
+        mac_native, "apply_unified_titlebar", lambda *a, **kw: False
+    )
+
+    calls: list[None] = []
+
+    def _record_and_fail() -> list[object]:
+        calls.append(None)
+        raise AssertionError(
+            "building the onboarding wizard must not enumerate cameras"
+        )
+
+    monkeypatch.setattr(
+        webcam_mod, "_list_macos_video_devices", _record_and_fail
+    )
+
+    w = onb_mod.OnboardingWindow()
+    try:
+        assert calls == []
+    finally:
+        try:
+            w.deleteLater()
+        except RuntimeError:
+            pass
 
 
 def test_detect_continuity_camera_descriptor(monkeypatch):

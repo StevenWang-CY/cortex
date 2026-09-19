@@ -2965,8 +2965,43 @@ class DashboardWindow(QWidget):
     session_start_requested = Signal()
     recalibrate_requested = Signal()
 
+    def closeEvent(self, event: object) -> None:  # noqa: D401 - Qt override
+        """Put the dashboard away; do not end the session.
+
+        Cortex is a menu-bar app: ``setQuitOnLastWindowClosed(False)`` is set
+        at startup and the tray's "Dashboard" item exists to bring this
+        window back. On macOS the red close button and Cmd+W are the same
+        gesture, so letting the close through terminated the app via
+        ``QApplication.lastWindowClosed`` and left that tray item pointing at
+        nothing. Hiding is the behaviour every other menu-bar app has, and it
+        is what makes the tray item mean something. Quit is Cmd+Q and the
+        tray's own Quit, both of which route through the recap flow.
+        """
+        if getattr(self, "_closing_for_quit", False):
+            super().closeEvent(event)
+            return
+        try:
+            event.ignore()  # type: ignore[attr-defined]
+        except Exception:
+            logger.debug("close event ignore failed", exc_info=True)
+        try:
+            self.hide()
+        except Exception:
+            logger.debug("dashboard hide on close failed", exc_info=True)
+
+    def close_for_quit(self) -> None:
+        """Close for real, for the shutdown path only.
+
+        ``closeEvent`` deliberately refuses an ordinary close so the tray can
+        bring the window back. Teardown still needs a genuine close, and it
+        is the one caller entitled to one.
+        """
+        self._closing_for_quit = True
+        self.close()
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._closing_for_quit = False
         self._connected = False
         self._last_recap_payload: dict = {}
         self.setObjectName("CortexDashboard")

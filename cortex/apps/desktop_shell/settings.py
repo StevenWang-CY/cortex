@@ -304,12 +304,19 @@ class SettingsDialog(QWidget):
         # no callback into the app when the user flips the toggle. Poll
         # every 1.5s while the dialog is visible so the camera /
         # accessibility status pills reflect reality without a relaunch
-        # or "Check again" click. Paused on hide via ``hideEvent``.
+        # or "Check again" click.
+        #
+        # Started by ``showEvent``, stopped by ``hideEvent``, and NOT here.
+        # The controller constructs this dialog eagerly at startup, and a
+        # widget that has never been shown never receives a ``hideEvent``,
+        # so starting it in the constructor ran the poll — a TCC query plus
+        # an AVCaptureDevice query, ~40 of each per minute — for the app's
+        # entire life on behalf of every user who never opens Settings.
+        # ``showEvent`` already starts the timer and forces an immediate
+        # refresh, so nothing is visibly deferred.
         self._permission_timer: QTimer = QTimer(self)
         self._permission_timer.setInterval(1500)
         self._permission_timer.timeout.connect(self._refresh_permission_states)
-        self._permission_timer.start()
-        self._refresh_permission_states()
 
     # -- Native chrome ---------------------------------------------------
 
@@ -1616,6 +1623,13 @@ class SettingsDialog(QWidget):
             set_active_palette(str(value))
         except Exception:
             logger.debug("palette runtime swap failed", exc_info=True)
+        # Persist here, not only on Apply. The whole surface recolours the
+        # instant the combo changes, and that is precisely the cue that tells
+        # the user the choice has taken — so closing Settings without
+        # clicking Apply silently reverted an accessibility setting at the
+        # next launch. Going through ``_persist_settings`` keeps the F53
+        # sync-failure reporting, so a palette that cannot be saved says so.
+        self._persist_settings({"palette_variant": str(value)})
         try:
             self.palette_changed.emit(str(value))
         except Exception:

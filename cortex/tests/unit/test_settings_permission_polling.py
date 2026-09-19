@@ -287,10 +287,42 @@ def test_first_camera_request_does_not_obscure_native_prompt(
     assert calls == []
 
 
-def test_permission_timer_started_on_construction(settings_dialog):
+def test_permission_timer_is_idle_until_the_dialog_is_shown(settings_dialog):
+    """Construction must not start the poll.
+
+    This test used to assert the opposite — that the timer was already
+    running after ``__init__`` — on the stated grounds that polling would
+    otherwise begin 1.5 s after the first ``showEvent``. That reasoning does
+    not hold: ``showEvent`` starts the timer *and* forces an immediate
+    ``_refresh_permission_states()``, so nothing is deferred. What the old
+    contract did cause is real: the controller constructs this dialog eagerly
+    at startup, and a widget that has never been shown never receives a
+    ``hideEvent``, so the documented "paused when not visible" behaviour was
+    violated from launch. The poll — a TCC query plus an AVCaptureDevice
+    query, ~40 of each per minute — ran for the app's whole life for every
+    user who never opened Settings.
+    """
     dlg, _ = settings_dialog
-    # The QTimer should be created and running after __init__ so polling
-    # begins immediately, not 1.5s after the first showEvent.
     assert dlg._permission_timer is not None
     assert dlg._permission_timer.interval() == 1500
-    assert dlg._permission_timer.isActive()
+    assert not dlg._permission_timer.isActive(), (
+        "the permission poll must not run before the dialog is shown"
+    )
+
+
+def test_showing_the_dialog_starts_the_poll_and_refreshes_at_once(
+    settings_dialog,
+):
+    """Show starts it; hide stops it; neither defers the visible state."""
+    dlg, set_perms = settings_dialog
+    set_perms(True, False)
+
+    dlg.show()
+    try:
+        assert dlg._permission_timer.isActive()
+        # Not 1.5 s later — ``showEvent`` refreshes on the spot.
+        assert dlg._camera_perm_row["granted"] is True
+    finally:
+        dlg.hide()
+
+    assert not dlg._permission_timer.isActive()
