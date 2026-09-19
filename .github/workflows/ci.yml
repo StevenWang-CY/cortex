@@ -226,7 +226,7 @@ jobs:
       - name: Bundle size budget
         working-directory: ${{ github.workspace }}
         run: |
-          uv run --project . pytest \
+          uv run --project cortex --locked --extra dev pytest \
             cortex/tests/performance/test_bundle_size.py -q
 
   extension-vscode:

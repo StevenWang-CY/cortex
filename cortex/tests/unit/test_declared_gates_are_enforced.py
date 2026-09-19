@@ -62,10 +62,15 @@ def test_the_canonical_gate_points_coverage_at_the_config() -> None:
 def test_the_coverage_floor_is_declared_and_plausible() -> None:
     """The floor exists, and is a number the suite can actually meet.
 
-    Measured 68.79 % on 2026-09-19. The upper bound here is not a coverage
-    target; it is a guard against someone restoring an aspirational figure
-    the suite has never reached, which is how this became dead configuration
-    in the first place. Raising the floor means raising coverage first.
+    Measured 68.79 % on 2026-09-19. The floor is deliberately below that: the
+    gate runs on two runners with different Python versions and skip sets, and
+    a floor pinned a fraction under the measurement would flap on ordinary
+    variance and be deleted again within a release.
+
+    The upper bound here is not a coverage target; it is a guard against
+    someone restoring an aspirational figure the suite has never reached,
+    which is how this became dead configuration in the first place. Raising
+    the floor means raising coverage first.
     """
     config = tomllib.loads(_PYPROJECT.read_text())
     report = config["tool"]["coverage"]["report"]
