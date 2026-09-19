@@ -123,6 +123,7 @@ class RabbitHoleDetector:
         tab_titles: list[str] | None = None,
         state: str = "FLOW",
         current_time: float | None = None,
+        may_trigger: bool = True,
     ) -> RabbitHoleAlert | None:
         """
         Check for goal-context mismatch.
@@ -134,6 +135,13 @@ class RabbitHoleDetector:
             tab_titles: List of open tab/window titles.
             state: Current cognitive state.
             current_time: Override timestamp.
+            may_trigger: When False the detector still tracks on-task files and
+                drift, but never fires. The cooldown and the drift accumulator
+                were previously committed the moment drift was detected, before
+                the caller consulted the interruption gate; a detection dropped
+                by quiet mode, pause or the hourly cap was therefore discarded
+                rather than deferred, and the user had to drift for the whole
+                window again once interruptions resumed.
 
         Returns:
             RabbitHoleAlert if drift exceeds threshold, None otherwise.
@@ -177,6 +185,11 @@ class RabbitHoleDetector:
 
         drift_minutes = (current_time - self._drift_start) / 60.0
         if drift_minutes < self._min_drift_minutes:
+            return None
+
+        # Drift is established. Hold the accumulator and the cooldown until
+        # the caller is actually allowed to interrupt.
+        if not may_trigger:
             return None
 
         # Trigger!

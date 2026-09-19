@@ -4162,6 +4162,14 @@ class CortexDaemon:
                             mouse_velocity=telemetry.mouse_velocity_mean if telemetry else 0.0,
                             blink_rate=kinematics.blink_rate,
                             current_time=timestamp,
+                            # Keep accumulating while an interruption is
+                            # barred, so the dwell already served is deferred
+                            # rather than consumed and discarded.
+                            may_trigger=signal_ok
+                            and self._interruption_allowed(
+                                surface="zombie_reading",
+                                current_time=timestamp,
+                            ),
                         )
                         if signal_ok and zombie_detected:
                             logger.info("Zombie reading detected — triggering active recall")
@@ -4183,6 +4191,14 @@ class CortexDaemon:
                                 current_app=active_app,
                                 state=estimate.state,
                                 current_time=timestamp,
+                                # Let the detector keep tracking while an
+                                # interruption is barred, so a detection is
+                                # deferred rather than consumed and discarded.
+                                may_trigger=signal_ok
+                                and self._interruption_allowed(
+                                    surface="rabbit_hole",
+                                    current_time=timestamp,
+                                ),
                             )
                             if signal_ok and alert is not None:
                                 logger.info("Rabbit hole detected — goal drift intervention")

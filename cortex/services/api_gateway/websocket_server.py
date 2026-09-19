@@ -14,6 +14,7 @@ Message types (JSON-over-WebSocket):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
 import logging
@@ -81,6 +82,11 @@ from cortex.libs.schemas.ws_message_types import MessageType
 from cortex.services.api_gateway.request_ids import sanitize_correlation_id
 
 logger = logging.getLogger(__name__)
+
+# A client must prove capability with an AUTH frame before anything else.
+# Generous enough for a browser extension waking its service worker, short
+# enough that an unauthenticated socket cannot linger for the daemon's life.
+AUTH_DEADLINE_SECONDS: float = 30.0
 
 
 def _receipt_has_restorable_effect(receipt: Any) -> bool:
@@ -885,6 +891,27 @@ class WebSocketServer:
 
         logger.info("WebSocket server stopped")
 
+    async def _disconnect_if_unauthenticated(self, client: WebSocketClient) -> None:
+        """Close a socket that has not proved capability within the deadline.
+
+        AUTH is required as the first frame, so a peer that has sent nothing
+        valid by now is not a Cortex client. Cancelled on normal teardown.
+        """
+
+        try:
+            await asyncio.sleep(AUTH_DEADLINE_SECONDS)
+        except asyncio.CancelledError:
+            return
+        if client.authenticated:
+            return
+        logger.warning(
+            "Closing client %s: no AUTH within %.0fs",
+            client.client_id,
+            AUTH_DEADLINE_SECONDS,
+        )
+        with contextlib.suppress(Exception):
+            await client.websocket.close(code=1008, reason="auth timeout")
+
     async def _handle_client(self, websocket: Any) -> None:
         """Handle a new WebSocket client connection.
 
@@ -903,12 +930,22 @@ class WebSocketServer:
         self._clients[client_id] = client
         logger.info(f"Client connected: {client_id}")
 
+        # A socket that never AUTHs was kept in ``self._clients`` for the
+        # daemon's lifetime, so any local process could hold connections open
+        # indefinitely and grow the registry without ever proving capability.
+        # Authentication is the first frame by contract, so it gets a deadline.
+        auth_deadline = asyncio.create_task(
+            self._disconnect_if_unauthenticated(client),
+            name=f"cortex-ws-auth-deadline-{client_id}",
+        )
+
         try:
             async for raw_message in websocket:
                 await self._process_message(client, raw_message)
         except Exception as e:
             logger.debug(f"Client {client_id} disconnected: {e}")
         finally:
+            auth_deadline.cancel()
             self._clients.pop(client_id, None)
             # Phase-4b TASK I: dispose of the per-client coalesce queue
             # + drain task so a dropped client doesn't leak a Task

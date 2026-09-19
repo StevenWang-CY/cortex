@@ -17,12 +17,18 @@ from cortex.libs.config.settings import InterventionConfig, StateConfig
 from cortex.libs.schemas.features import FeatureName, FeatureValue, FeatureVector
 from cortex.libs.schemas.observations import MissingReason
 from cortex.libs.schemas.state import (
+    EstimateStatus,
+    FeatureContribution,
+    RuleEvaluation,
     SignalQuality,
     StateEstimate,
     StateScores,
+    SupportScores,
+    SupportState,
     UserBaselines,
 )
 from cortex.services.state_engine.feature_schema import FEATURE_DEFINITIONS
+from cortex.services.state_engine.model_registry import deterministic_support_identity
 from cortex.services.state_engine.rule_scorer import RuleScorer
 from cortex.services.state_engine.smoother import (
     EXIT_TO_UNKNOWN_DWELL_SECONDS,
@@ -537,3 +543,174 @@ def test_d11_camera_off_with_telemetry_coverage_can_trigger(tmp_path: Path) -> N
     decision = policy.evaluate(estimate, current_time=100.0)
     assert decision.should_trigger is True, decision.reason
     assert policy.hyper_eligible(estimate, current_time=100.0) is True
+
+
+def test_published_coverage_describes_the_published_label() -> None:
+    """The figure beside the label must be about that label.
+
+    ``RuleEvaluation.evidence_coverage`` is the coverage of the scorer's
+    instantaneous dominant state, but the smoother publishes a temporally
+    smoothed one — frequently a different state, which is the point of
+    smoothing. The estimate therefore paired a label with another hypothesis'
+    coverage. (The 0.45 eligibility gate is applied inside the scorer against
+    the correct per-state coverage and was never affected.)
+    """
+
+    config = StateConfig(
+        ema_alpha=1.0,
+        estimate_entry_threshold=0.4,
+        estimate_exit_threshold=0.25,
+        hyper_dwell_seconds=1,
+        flow_dwell_seconds=1,
+        hypo_dwell_seconds=1,
+    )
+    quality = SignalQuality(telemetry=1.0)
+    smoother = ScoreSmoother(config)
+
+    def evaluation(support: float, flow: float) -> RuleEvaluation:
+        return RuleEvaluation(
+            status=EstimateStatus.ESTIMATED,
+            scores=SupportScores(support_likely=support, flow_like=flow),
+            # Dominant-state coverage, as the scorer reports it.
+            evidence_coverage=0.9 if flow > support else 0.5,
+            state_coverage={
+                SupportState.SUPPORT_LIKELY: 0.5,
+                SupportState.FLOW_LIKE: 0.9,
+                SupportState.UNDER_ENGAGED: 0.0,
+                SupportState.RECOVERING: 0.0,
+                SupportState.UNKNOWN: 0.0,
+            },
+            contributing_features=[],
+            exclusions=[],
+            model=deterministic_support_identity(),
+        )
+
+    smoother.update(evaluation(support=0.8, flow=0.0), quality, timestamp=0.0)
+    held = smoother.update(evaluation(support=0.8, flow=0.0), quality, timestamp=1.5)
+    assert held.support_state == SupportState.SUPPORT_LIKELY
+    assert held.evidence_coverage == 0.5
+
+    # Flow now dominates instantaneously while dwell still holds the label.
+    mixed = smoother.update(evaluation(support=0.3, flow=0.6), quality, timestamp=2.0)
+    if mixed.support_state == SupportState.SUPPORT_LIKELY:
+        assert mixed.evidence_coverage == 0.5, (
+            "a held support label must not borrow flow's coverage"
+        )
+    else:
+        assert mixed.evidence_coverage == 0.9
+
+
+
+def test_detections_are_deferred_not_consumed_when_interruption_is_barred() -> None:
+    """A detection dropped by the gate must not burn the detector's state.
+
+    Both detectors committed their cooldown and discarded their accumulator the
+    moment the threshold was crossed, before the caller consulted the
+    interruption gate. A detection that quiet mode, pause or the hourly cap then
+    dropped was therefore thrown away rather than deferred, and the user had to
+    serve the whole dwell again once interruptions resumed — indefinitely,
+    while paused.
+    """
+    from cortex.services.state_engine.rabbit_hole import RabbitHoleDetector
+    from cortex.services.state_engine.zombie_detector import ZombieReadingDetector
+
+    # ── Rabbit hole: drift is held, then fires as soon as it may ──
+    rabbit = RabbitHoleDetector()
+    kwargs = {
+        "goal": "finish the parser",
+        "current_file": "unrelated/video.mp4",
+        "current_app": "Player",
+        "state": "FLOW",
+    }
+    # Start past the 600 s startup cooldown, then drift for 11 min (>10 min gate).
+    start = 700.0
+    rabbit.check(**kwargs, current_time=start, may_trigger=False)
+    barred = rabbit.check(**kwargs, current_time=start + 660.0, may_trigger=False)
+    assert barred is None, "it must not fire while interruptions are barred"
+
+    allowed = rabbit.check(**kwargs, current_time=start + 661.0, may_trigger=True)
+    assert allowed is not None, "the accumulated drift must survive the bar"
+    assert allowed.drift_minutes > 10.0
+
+    # ── Zombie reading: the same contract ──
+    zombie = ZombieReadingDetector()
+    conditions = {
+        "state": "HYPO",
+        "mouse_velocity": 0.0,
+        # No camera kinematics: the detector requires the longer 120 s dwell.
+        "blink_rate": None,
+        "active_app": "Google Chrome",
+    }
+    # Past the 300 s startup cooldown, sustain beyond the 120 s no-blink gate.
+    for tick in range(400, 600, 20):
+        assert (
+            zombie.update(**conditions, current_time=float(tick), may_trigger=False)
+            is False
+        )
+    assert zombie.is_accumulating, "the dwell already served must be retained"
+    assert zombie.update(**conditions, current_time=620.0, may_trigger=True) is True
+
+
+def test_reasons_explain_the_published_label_only() -> None:
+    """Each contribution records which rule produced it.
+
+    Reasons were ranked across all three rules at once, so a "support may
+    help" estimate could be explained by the features that argued for steady
+    activity — the opposite claim. Persisted transitions were worse: they were
+    generated from an empty contribution list, so every stored row carried the
+    same placeholder sentence.
+    """
+
+    config = StateConfig(
+        ema_alpha=1.0,
+        estimate_entry_threshold=0.4,
+        estimate_exit_threshold=0.25,
+        hyper_dwell_seconds=1,
+        flow_dwell_seconds=1,
+        hypo_dwell_seconds=1,
+    )
+    smoother = ScoreSmoother(config)
+
+    def contribution(feature: str, state: SupportState, value: float) -> FeatureContribution:
+        return FeatureContribution(
+            feature=feature,
+            support_state=state,
+            direction="positive",
+            contribution=value,
+            quality=1.0,
+            observed=True,
+            note="test",
+        )
+
+    evaluation = RuleEvaluation(
+        status=EstimateStatus.ESTIMATED,
+        scores=SupportScores(support_likely=0.8, flow_like=0.1),
+        evidence_coverage=0.8,
+        state_coverage={
+            SupportState.SUPPORT_LIKELY: 0.8,
+            SupportState.FLOW_LIKE: 0.8,
+            SupportState.UNDER_ENGAGED: 0.0,
+            SupportState.RECOVERING: 0.0,
+            SupportState.UNKNOWN: 0.0,
+        },
+        contributing_features=[
+            # The strongest contribution argues for the *other* hypothesis.
+            contribution("keypress_rate_per_min", SupportState.FLOW_LIKE, 0.95),
+            contribution("correction_rate_per_100_keys", SupportState.SUPPORT_LIKELY, 0.30),
+        ],
+        exclusions=[],
+        model=deterministic_support_identity(),
+    )
+    quality = SignalQuality(telemetry=1.0)
+
+    smoother.update(evaluation, quality, timestamp=0.0)
+    estimate = smoother.update(evaluation, quality, timestamp=2.0)
+
+    assert estimate.support_state == SupportState.SUPPORT_LIKELY
+    joined = " ".join(estimate.reasons)
+    assert "correction rate" in joined, "the label's own evidence must be cited"
+    assert "keypress rate" not in joined, "the opposing rule's evidence must not be"
+
+    # The persisted transition carries real evidence, not a placeholder.
+    transition_reasons = " ".join(smoother.transitions[-1].trigger_reasons)
+    assert "stable but not diagnostic" not in transition_reasons
