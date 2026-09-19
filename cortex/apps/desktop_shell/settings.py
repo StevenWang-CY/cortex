@@ -1498,7 +1498,22 @@ class SettingsDialog(QWidget):
             # apply that arrives after a newer one.
             settings["settings_version"] = self._settings_version
             self._persist_settings(settings)
-            self.settings_changed.emit(settings)
+            # Apply must not restate quiet mode the user never touched here.
+            # The payload always carried this checkbox, defaulting to
+            # unchecked, so pausing from the tray and then applying an
+            # unrelated setting cancelled the pause and the dismissal-driven
+            # quiet window, releasing the camera latch with no indication.
+            # The preference is still persisted above; only the live
+            # instruction is withheld.
+            outbound = dict(settings)
+            if outbound.get("quiet_mode") == getattr(
+                self, "_quiet_mode_baseline", outbound.get("quiet_mode")
+            ):
+                outbound.pop("quiet_mode", None)
+                outbound.pop("quiet_duration_minutes", None)
+            else:
+                self._quiet_mode_baseline = bool(outbound.get("quiet_mode"))
+            self.settings_changed.emit(outbound)
             logger.info(
                 "Settings applied: sensitivity=%s llm=%s version=%d",
                 settings["sensitivity"],
@@ -1855,6 +1870,10 @@ class SettingsDialog(QWidget):
             self._sensitivity_slider.setValue(_get_int("sensitivity", 3))
             self._cooldown_spin.setValue(_get_int("cooldown_seconds", 60))
             self._quiet_mode.setChecked(_get_bool("quiet_mode", False))
+            # Baseline for "did the user actually touch this control?". Quiet
+            # state is live and owned by the tray, the dashboard capsule and
+            # the extension; this dialog holds only a persisted preference.
+            self._quiet_mode_baseline = self._quiet_mode.isChecked()
             self._quiet_duration.setValue(_get_int("quiet_duration_minutes", 30))
             llm_mode = str(self._qs.value("llm_mode", "bedrock"))
             llm_modes = ["bedrock", "vertex", "direct", "rule_based"]

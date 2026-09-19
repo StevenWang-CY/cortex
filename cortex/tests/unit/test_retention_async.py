@@ -99,3 +99,34 @@ async def test_async_sweep_keeps_fresh_files(tmp_path: Path) -> None:
     results = await sweep_once_async(cfg, storage_root=tmp_path)
     assert results["sessions"].files_deleted == 0
     assert fresh.exists()
+
+
+@pytest.mark.asyncio
+async def test_user_requested_exports_are_never_swept(tmp_path: Path) -> None:
+    """``StorageMaintenance.export`` calls what it writes "user-owned".
+
+    ``exports/`` was swept as a derived feature cache, so a file the user
+    explicitly asked Cortex to produce was deleted after
+    ``feature_retention_days`` — 7 by default, usually before they noticed it
+    existed. Genuine derived caches are still pruned.
+    """
+    from cortex.services.janitor.retention import sweep_once
+
+    ancient = time.time() - 365 * 86400.0
+    for name in ("exports", "cache"):
+        (tmp_path / name).mkdir(parents=True, exist_ok=True)
+    export_file = tmp_path / "exports" / "cortex-export-2026-01-01.json"
+    export_file.write_text('{"data": {}}', encoding="utf-8")
+    cache_file = tmp_path / "cache" / "features.bin"
+    cache_file.write_bytes(b"derived")
+    for path in (export_file, cache_file):
+        import os
+
+        os.utime(path, (ancient, ancient))
+
+    cfg = StorageConfig(path=str(tmp_path), feature_retention_days=7)
+    results = sweep_once(cfg, storage_root=tmp_path)
+
+    assert export_file.exists(), "the user's own export must survive the sweep"
+    assert "exports" not in results, "exports must not be a sweep target at all"
+    assert not cache_file.exists(), "a genuine derived cache is still pruned"

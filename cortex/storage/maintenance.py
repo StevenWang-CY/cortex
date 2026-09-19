@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,8 @@ from cortex.libs.schemas.storage import (
 from cortex.libs.utils.atomic_write import atomic_write_json, atomic_write_text
 from cortex.storage.database import DEFAULT_SESSION_RETENTION_DAYS, SQLiteDatabase
 from cortex.storage.event_writer import BoundedAnalyticsWriter
+
+logger = logging.getLogger(__name__)
 
 # D13: decisions recorded under the randomized research policy are the
 # study's primary data (propensities, randomization ids, consent version)
@@ -83,6 +86,9 @@ class StorageMaintenance:
             else None
         )
         self._last_health_report: StorageHealthReport | None = None
+        # Files a delete could not remove; reported, never raised, because
+        # the rows are already gone by the time files are swept.
+        self._unlink_failures = 0
 
     @property
     def last_health_report(self) -> StorageHealthReport | None:
@@ -266,6 +272,7 @@ class StorageMaintenance:
         scopes: tuple[StorageDeleteScope, ...],
     ) -> tuple[dict[str, int], bool]:
         selected: set[str] = set(_ALL_DELETE_SCOPES) if "all" in scopes else set(scopes)
+        self._unlink_failures = 0
 
         legacy_kinds: set[str] = set()
         if "sessions" in selected:
@@ -373,7 +380,35 @@ class StorageMaintenance:
         if any(deleted.values()):
             await self._database.maintenance(lambda connection: connection.execute("VACUUM"))
             vacuumed = True
+        if self._unlink_failures:
+            # Reported rather than raised: the rows are already gone, so the
+            # caller needs to know exactly what is left on disk.
+            deleted["files_not_removed"] = self._unlink_failures
         return deleted, vacuumed
+
+    def _unlink_best_effort(self, path: Path) -> bool:
+        """Remove one file, recording rather than raising on failure.
+
+        The database erase has already committed by the time these files are
+        swept, so letting a single ``OSError`` escape answered the request with
+        HTTP 500 after the user's rows were gone: the operation looked failed
+        while most of it had succeeded, and the caller could not tell what
+        remained. Every removable file is now removed and the survivors are
+        reported in ``deleted_counts`` as ``files_not_removed``.
+        """
+
+        try:
+            path.unlink()
+        except OSError as exc:
+            self._unlink_failures += 1
+            logger.warning(
+                "delete: could not remove %s (%s: %s)",
+                path.name,
+                type(exc).__name__,
+                exc,
+            )
+            return False
+        return True
 
     def _delete_compatibility_projections(
         self,
@@ -421,8 +456,8 @@ class StorageMaintenance:
         for path in sorted(candidates, key=str):
             # unlink() on a symlink removes the link itself, never its target.
             if path.is_symlink() or path.is_file():
-                path.unlink()
-                removed += 1
+                if self._unlink_best_effort(path):
+                    removed += 1
 
         if self._legacy_store_path is not None and selected.intersection({"consent", "derived"}):
             removed += self._sanitize_legacy_store(selected)
@@ -437,8 +472,8 @@ class StorageMaintenance:
             if backup_root.exists():
                 for path in sorted(backup_root.rglob("*"), key=str, reverse=True):
                     if path.is_symlink() or path.is_file():
-                        path.unlink()
-                        removed += 1
+                        if self._unlink_best_effort(path):
+                            removed += 1
                     elif path.is_dir():
                         with suppress(OSError):
                             path.rmdir()

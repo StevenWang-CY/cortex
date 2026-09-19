@@ -1,11 +1,11 @@
-# Model card: deterministic support rules v2.1.0
+# Model card: deterministic support rules v2.2.0
 
 ## Status and ownership
 
 | Field | Value |
 | --- | --- |
 | Registry name | `deterministic-support` |
-| Version | `2.1.0` |
+| Version | `2.2.0` |
 | Feature schema | `support-features-v2.1.0` |
 | Implementation | `cortex/services/state_engine/rule_scorer.py` |
 | Operational wrapper | `cortex/services/state_engine/support_inference.py` |
@@ -175,6 +175,21 @@ execution permission.
 Break reminders are outside this model. They are opt-in and based only on the
 user's preferred elapsed active-work interval. Pulse, HRV, camera features,
 state labels, and the research stress integral are not inputs.
+
+## Change log
+
+**2.2.0** — `mouse_velocity_variance` abstains when no personal
+`mouse_variance_baseline` has been measured. Calibration may legitimately
+persist a zero baseline; the previous release floored it to `1.0` so the state
+loop could not raise, but mouse velocity variance is measured in thousands, so
+every window scored as maximum thrash evidence and minimum flow evidence. The
+verdict was permanent, invisible, and derived from a baseline that was never
+taken. The feature now contributes neither evidence nor score until a baseline
+exists, which is what the abstention contract already promised for any
+unavailable feature.
+
+This card previously read `2.1.0` while the registry shipped `2.1.1`; the two
+are reconciled here.
 
 ## Known limitations and failure modes
 

@@ -22,9 +22,13 @@ plain dict the existing parser normalisation consumes.
 from __future__ import annotations
 
 import copy
+from functools import lru_cache
 from typing import Any, Final, Literal
 
+from annotated_types import MaxLen
 from pydantic import BaseModel, ConfigDict, Field
+
+from cortex.libs.schemas.intervention import InterventionPlan
 
 # Fields of InterventionPlan / SuggestedAction / UIPlan that only the
 # daemon may set. ``test_plan_draft.py`` asserts none of them appear
@@ -259,6 +263,53 @@ def structured_output_schema() -> dict[str, Any]:
     return tightened
 
 
+_PLAN_TEXT_FIELDS: Final[tuple[str, ...]] = (
+    "situation_summary",
+    "primary_focus",
+    "headline",
+    "causal_explanation",
+)
+
+
+@lru_cache(maxsize=1)
+def _plan_text_limits() -> dict[str, int]:
+    """Read each model-authored text field's cap straight from the plan schema.
+
+    The structured-output grammar rejects ``maxLength``, so the schema handed
+    to the model carries no length bound while ``InterventionPlan`` still
+    enforces one. An otherwise-good plan whose headline ran a few characters
+    long therefore failed validation and was discarded whole, and the user got
+    the deterministic fallback instead. Reading the caps from the schema keeps
+    the clamp and the contract from drifting apart.
+    """
+
+    limits: dict[str, int] = {}
+    for name in _PLAN_TEXT_FIELDS:
+        field = InterventionPlan.model_fields.get(name)
+        if field is None:
+            continue
+        cap = next(
+            (item.max_length for item in field.metadata if isinstance(item, MaxLen)),
+            None,
+        )
+        if isinstance(cap, int) and cap > 1:
+            limits[name] = cap
+    return limits
+
+
+def _clamp_text(value: str, limit: int | None) -> str:
+    """Trim to *limit* on a word boundary, marking that it was shortened."""
+
+    if limit is None or len(value) <= limit:
+        return value
+    head = value[: limit - 1].rstrip()
+    cut = head.rfind(" ")
+    # Only fall back to a hard cut when there is no sensible word boundary.
+    if cut >= limit // 2:
+        head = head[:cut].rstrip()
+    return head + "\u2026"
+
+
 def draft_to_plan_data(draft: PlanDraft) -> dict[str, Any]:
     """Convert a validated draft into the dict the parser normalisation takes.
 
@@ -268,11 +319,18 @@ def draft_to_plan_data(draft: PlanDraft) -> dict[str, Any]:
     optional analyses are omitted (not ``None``) when the model declined
     them so the downstream defaults apply.
     """
+    limits = _plan_text_limits()
     data: dict[str, Any] = {
-        "situation_summary": draft.situation_summary.strip(),
-        "primary_focus": draft.primary_focus.strip(),
-        "headline": draft.headline.strip(),
-        "causal_explanation": draft.causal_explanation.strip(),
+        "situation_summary": _clamp_text(
+            draft.situation_summary.strip(), limits.get("situation_summary")
+        ),
+        "primary_focus": _clamp_text(
+            draft.primary_focus.strip(), limits.get("primary_focus")
+        ),
+        "headline": _clamp_text(draft.headline.strip(), limits.get("headline")),
+        "causal_explanation": _clamp_text(
+            draft.causal_explanation.strip(), limits.get("causal_explanation")
+        ),
         "micro_steps": [step.strip() for step in draft.micro_steps if step.strip()],
         "hide_targets": list(draft.hide_targets),
         "ui_plan": draft.ui_plan.model_dump(),

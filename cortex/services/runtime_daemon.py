@@ -8313,6 +8313,20 @@ class CortexDaemon:
                     duration_minutes=duration if duration > 0 else None,
                     source=str(settings.get("source") or "settings_sync"),
                 )
+            elif self._quiet_mode_kind == "pause":
+                # The Settings dialog owns a plain "Quiet mode" checkbox and
+                # always includes it in the Apply payload, defaulting to
+                # unchecked. Pausing from the tray and then applying an
+                # unrelated setting therefore cancelled the pause, released
+                # the camera latch and resumed interventions with no
+                # indication. A bare boolean from a settings sync is not an
+                # instruction to undo an explicit indefinite pause; the
+                # dedicated quiet controls do that.
+                logger.info(
+                    "settings_sync quiet_mode=false ignored while paused "
+                    "(source=%s)",
+                    settings.get("source") or "settings_sync",
+                )
             else:
                 await self.set_quiet_mode(
                     "off",

@@ -282,7 +282,13 @@ class RuleScorer:
         observed_count = 0
         for name, weight in weights.items():
             feature = features.get(name)
-            if feature is None or not feature.valid or feature.value is None:
+            baseline_missing = not self._baseline_ready(name)
+            if (
+                feature is None
+                or not feature.valid
+                or feature.value is None
+                or baseline_missing
+            ):
                 contributions.append(FeatureContribution(
                     feature=name.value,
                     support_state=state,
@@ -290,7 +296,13 @@ class RuleScorer:
                     contribution=0.0,
                     quality=0.0,
                     observed=False,
-                    note="Feature unavailable; it contributes neither evidence nor score.",
+                    note=(
+                        "Personal baseline not measured; the feature abstains "
+                        "rather than scoring against a placeholder."
+                        if baseline_missing
+                        else "Feature unavailable; it contributes neither "
+                        "evidence nor score."
+                    ),
                 ))
                 continue
             observed_count += 1
@@ -318,6 +330,22 @@ class RuleScorer:
             float(np.clip(coverage, 0.0, 1.0)),
             observed_count,
         )
+
+    def _baseline_ready(self, name: FeatureName) -> bool:
+        """Is the personal baseline this feature scores against a measurement?
+
+        ``mouse_variance_baseline`` may legitimately be ``0`` before
+        calibration runs. Flooring it to ``1.0`` kept the state loop from
+        raising, but mouse velocity variance is measured in thousands, so every
+        window then scored as maximum thrash evidence and minimum flow
+        evidence — a permanent, invisible verdict derived from a baseline that
+        was never taken. Abstaining is the honest reading: without a personal
+        baseline there is nothing to be relative to.
+        """
+
+        if name is FeatureName.MOUSE_VELOCITY_VARIANCE:
+            return float(self._baselines.mouse_variance_baseline) > 0.0
+        return True
 
     def _support_transform(self, name: FeatureName, value: float) -> float:
         if name == FeatureName.MOUSE_VELOCITY_VARIANCE:

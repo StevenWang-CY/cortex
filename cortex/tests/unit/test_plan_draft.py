@@ -272,3 +272,46 @@ def test_draft_to_plan_data_drops_blank_steps_and_omits_null_analyses() -> None:
     assert data["micro_steps"] == ["Read it"]
     assert "error_analysis" not in data
     assert "tab_recommendations" not in data
+
+
+def test_overlong_model_text_is_clamped_not_discarded() -> None:
+    """The grammar rejects ``maxLength``, so the model is never told the caps.
+
+    ``InterventionPlan`` still enforces them, so a plan whose headline ran a
+    few characters long failed validation and was thrown away whole — the user
+    got the deterministic fallback for what was a formatting overrun, not a
+    content problem.
+    """
+    from cortex.libs.schemas.intervention import InterventionPlan
+    from cortex.services.llm_engine.plan_draft import (
+        _clamp_text,
+        _plan_text_limits,
+        draft_to_plan_data,
+    )
+
+    limits = _plan_text_limits()
+    assert limits["headline"] == 100, "limits must come from the plan schema"
+
+    # A word-boundary trim keeps the text readable and marks the shortening.
+    clamped = _clamp_text("alpha beta gamma delta epsilon", 20)
+    assert len(clamped) <= 20
+    assert clamped.endswith("…")
+    assert "gamma" not in clamped or clamped.startswith("alpha beta")
+
+    # A draft that overruns every text cap still yields a valid plan.
+    draft = PlanDraft.model_validate(
+        {
+            **VALID_DRAFT,
+            "headline": "Headline words " * 40,
+            "situation_summary": "Summary words " * 60,
+            "primary_focus": "Focus words " * 40,
+            "causal_explanation": "Because words " * 60,
+        }
+    )
+    data = draft_to_plan_data(draft)
+    for name, cap in limits.items():
+        assert len(data[name]) <= cap, f"{name} must be clamped to its schema cap"
+
+    data["intervention_id"] = "int_clamp_test"
+    plan = InterventionPlan.model_validate(data)
+    assert plan.headline

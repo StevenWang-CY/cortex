@@ -259,6 +259,46 @@ def test_d2_zero_mouse_variance_baseline_does_not_break_evaluation() -> None:
     assert 0.0 < evaluation.scores.support_likely <= 1.0
 
 
+def test_uncalibrated_mouse_variance_abstains_instead_of_scoring_maximum() -> None:
+    """A zero baseline is the absence of a measurement, not a measurement of zero.
+
+    Flooring it to 1.0 stopped the state loop raising, but mouse velocity
+    variance is measured in thousands, so the ratio saturated and every window
+    scored as maximum thrash evidence and minimum flow evidence — a permanent,
+    invisible verdict derived from a baseline that was never taken.
+    """
+
+    vector = _vector(
+        {
+            FeatureName.MOUSE_VELOCITY_VARIANCE: 80_000.0,
+            FeatureName.CLICK_FREQUENCY: 3.0,
+            FeatureName.KEYPRESS_RATE_PER_MIN: 90.0,
+            FeatureName.INACTIVITY_SECONDS: 0.5,
+        }
+    )
+
+    uncalibrated = RuleScorer(baselines=UserBaselines(mouse_variance_baseline=0.0))
+    contributions = uncalibrated.evaluate(vector).contributing_features
+    variance = [
+        item
+        for item in contributions
+        if item.feature == FeatureName.MOUSE_VELOCITY_VARIANCE.value
+    ]
+    assert variance, "the feature must still be reported"
+    assert all(item.observed is False for item in variance)
+    assert all(item.contribution == 0.0 for item in variance)
+    assert any("baseline not measured" in item.note for item in variance)
+
+    # With a real baseline the feature scores normally again.
+    calibrated = RuleScorer(baselines=UserBaselines(mouse_variance_baseline=40_000.0))
+    observed = [
+        item
+        for item in calibrated.evaluate(vector).contributing_features
+        if item.feature == FeatureName.MOUSE_VELOCITY_VARIANCE.value
+    ]
+    assert any(item.observed for item in observed)
+
+
 # ---------------------------------------------------------------------------
 # D3 — dwell counts time above the trigger gate, not label age
 # ---------------------------------------------------------------------------

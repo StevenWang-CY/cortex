@@ -3,7 +3,8 @@
 Cortex collects three families of on-disk artifacts:
 
 * ``storage/sessions/`` — JSONL telemetry + per-session reports.
-* ``storage/cache/`` and ``storage/exports/`` — derived feature caches.
+* ``storage/cache/`` — derived feature caches. (``storage/exports/`` holds
+  user-requested exports and is never swept; see ``sweep_once``.)
 * ``storage/logs/`` — daemon logs.
 
 ``StorageConfig`` exposes three retention windows (``session_retention_days``,
@@ -146,10 +147,15 @@ def sweep_once(
     day = 86400.0
     results: dict[str, SweepResult] = {}
 
+    # ``exports/`` is deliberately absent. ``StorageMaintenance.export`` calls
+    # what it writes there "user-owned": the user asked for that file. Sweeping
+    # it as a derived cache deleted their own export after
+    # ``feature_retention_days`` (7 by default), usually before they noticed it
+    # existed. Cortex prunes what it derives, not what the user asked it to
+    # produce; a full delete still removes exports on request.
     targets: list[tuple[str, float]] = [
         ("sessions", config.session_retention_days * day),
         ("cache", config.feature_retention_days * day),
-        ("exports", config.feature_retention_days * day),
         ("logs", config.error_retention_days * day),
     ]
 
@@ -286,10 +292,15 @@ async def sweep_once_async(
     day = 86400.0
     results: dict[str, SweepResult] = {}
 
+    # ``exports/`` is deliberately absent. ``StorageMaintenance.export`` calls
+    # what it writes there "user-owned": the user asked for that file. Sweeping
+    # it as a derived cache deleted their own export after
+    # ``feature_retention_days`` (7 by default), usually before they noticed it
+    # existed. Cortex prunes what it derives, not what the user asked it to
+    # produce; a full delete still removes exports on request.
     targets: list[tuple[str, float]] = [
         ("sessions", config.session_retention_days * day),
         ("cache", config.feature_retention_days * day),
-        ("exports", config.feature_retention_days * day),
         ("logs", config.error_retention_days * day),
     ]
 

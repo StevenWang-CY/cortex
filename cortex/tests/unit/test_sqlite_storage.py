@@ -472,6 +472,52 @@ async def test_delete_all_leaves_no_derived_rollups_or_migration_backups(
 
 
 @pytest.mark.asyncio
+async def test_delete_reports_unremovable_files_instead_of_failing_the_request(
+    tmp_path: Path,
+) -> None:
+    """The rows are already gone by the time files are swept.
+
+    Letting one ``OSError`` escape answered the request with HTTP 500 after the
+    database had been erased: the operation looked failed while most of it had
+    succeeded, and the caller could not tell what remained on disk.
+    """
+
+    clock = _clock()
+    database = _database(tmp_path, clock=clock)
+    await database.start()
+
+    chronotype = tmp_path / "chronotype"
+    (chronotype / "daily").mkdir(parents=True)
+    (chronotype / "model.json").write_text("{}", encoding="utf-8")
+    stubborn = chronotype / "daily" / "2026-09-05.json"
+    stubborn.write_text('{"hr": 61}', encoding="utf-8")
+
+    maintenance = StorageMaintenance(
+        database,
+        storage_root=tmp_path,
+        analytics_writer=BoundedAnalyticsWriter(database),
+        clock=clock,
+        retention_days={"sessions": 7, "policy": 90, "interventions": 90},
+    )
+
+    real_unlink = Path.unlink
+
+    def refuse_one(self: Path, *args: object, **kwargs: object) -> None:
+        if self.name == "2026-09-05.json":
+            raise PermissionError(errno.EACCES, "Operation not permitted")
+        real_unlink(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(Path, "unlink", refuse_one)
+        deleted, _vacuumed = await maintenance.delete(("all",))
+
+    assert deleted.get("files_not_removed") == 1, "the survivor must be reported"
+    assert stubborn.exists(), "the unremovable file is genuinely still there"
+    assert not (chronotype / "model.json").exists(), "every other file still goes"
+    await database.close()
+
+
+@pytest.mark.asyncio
 async def test_legacy_amip_rewards_import_against_the_composite_reward_key(
     tmp_path: Path,
 ) -> None:
