@@ -1,11 +1,11 @@
-# Model card: deterministic support rules v2.2.0
+# Model card: deterministic support rules v2.3.0
 
 ## Status and ownership
 
 | Field | Value |
 | --- | --- |
 | Registry name | `deterministic-support` |
-| Version | `2.2.0` |
+| Version | `2.3.0` |
 | Feature schema | `support-features-v2.1.0` |
 | Implementation | `cortex/services/state_engine/rule_scorer.py` |
 | Operational wrapper | `cortex/services/state_engine/support_inference.py` |
@@ -177,6 +177,27 @@ user's preferred elapsed active-work interval. Pulse, HRV, camera features,
 state labels, and the research stress integral are not inputs.
 
 ## Change log
+
+**2.3.0** — the `mouse_velocity_variance` abstention threshold is a magnitude,
+not `> 0.0`. Both scoring paths floor the divisor, so *any* baseline below
+roughly 3 000 px^2/s^2 saturates exactly as a zero one does: the feature is
+pinned to maximum support evidence and zero flow evidence permanently. A small
+non-zero baseline is an ordinary calibration outcome rather than a corrupt one
+— windows with fewer than two mouse moves contribute a variance of 0.0, and the
+baseline is their plain mean, so a keyboard-heavy calibration averages down
+into that band and passed the previous guard. The threshold is now
+`_MIN_MOUSE_VARIANCE_BASELINE` (1 000 px^2/s^2, an order of magnitude below the
+10 000 working default in `causal_attribution`, so genuine calibrations still
+pass), and both divisor floors use the same constant so a caller that skips the
+abstention check cannot obtain the saturating substitution either.
+
+Also in this release, a `RECOVERING` label now publishes the evidence coverage
+its own score was built from (the flow / under-engaged components) instead of
+the scorer's placeholder `0.0`. The scorer has no `RECOVERING` hypothesis to
+measure — recovery is a temporal relation only the smoother can see — and
+publishing the placeholder made `TriggerPolicy.evaluate` reject every recovery
+estimate at its 0.45 coverage floor, which runs before the per-state arm
+dispatch. The opt-in recovery reinforcement arm was therefore unreachable.
 
 **2.2.0** — `mouse_velocity_variance` abstains when no personal
 `mouse_variance_baseline` has been measured. Calibration may legitimately

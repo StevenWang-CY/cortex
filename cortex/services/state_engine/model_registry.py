@@ -21,7 +21,7 @@ from cortex.services.state_engine.generated_model_identity import (
     DETERMINISTIC_SUPPORT_IMPLEMENTATION_SHA256,
 )
 
-DETERMINISTIC_SUPPORT_VERSION = "2.2.0"
+DETERMINISTIC_SUPPORT_VERSION = "2.3.0"
 NO_INFERENCE_VERSION = "safety-null-v1"
 
 

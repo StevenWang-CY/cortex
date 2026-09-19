@@ -331,6 +331,18 @@ class RuleScorer:
             observed_count,
         )
 
+    # Smallest mouse-velocity-variance baseline that can be used as a divisor.
+    # A strict ``> 0.0`` test was not enough: both scoring paths floor the
+    # divisor at 1.0, so any persisted baseline below roughly 3 000 px^2/s^2
+    # pinned the feature to maximum support evidence and zero flow evidence
+    # permanently. Such a baseline is reachable through ordinary calibration --
+    # windows with fewer than two mouse moves contribute a variance of 0.0 and
+    # the baseline is their plain mean, so a keyboard-heavy session averages
+    # down to a small non-zero value that passed the old gate. 1 000 px^2/s^2
+    # is an order of magnitude below the 10 000 working default in
+    # ``causal_attribution``, so genuine calibrations still pass.
+    _MIN_MOUSE_VARIANCE_BASELINE: float = 1_000.0
+
     def _baseline_ready(self, name: FeatureName) -> bool:
         """Is the personal baseline this feature scores against a measurement?
 
@@ -341,10 +353,21 @@ class RuleScorer:
         evidence — a permanent, invisible verdict derived from a baseline that
         was never taken. Abstaining is the honest reading: without a personal
         baseline there is nothing to be relative to.
+
+        The test is a magnitude, not ``> 0.0``. Because both scoring paths
+        floor the divisor, every baseline below roughly 3 000 px^2/s^2
+        saturates exactly as a zero one does, and a small non-zero baseline is
+        an ordinary calibration outcome rather than a corrupt one: windows with
+        fewer than two mouse moves contribute a variance of 0.0, and the
+        baseline is their plain mean, so a keyboard-heavy session averages down
+        into that band and used to pass.
         """
 
         if name is FeatureName.MOUSE_VELOCITY_VARIANCE:
-            return float(self._baselines.mouse_variance_baseline) > 0.0
+            return (
+                float(self._baselines.mouse_variance_baseline)
+                >= self._MIN_MOUSE_VARIANCE_BASELINE
+            )
         return True
 
     def _support_transform(self, name: FeatureName, value: float) -> float:
@@ -370,7 +393,10 @@ class RuleScorer:
         if name == FeatureName.MOUSE_VELOCITY_MEAN:
             return self._band(value, 100.0, 800.0, 1_500.0)
         if name == FeatureName.MOUSE_VELOCITY_VARIANCE:
-            baseline = max(1.0, self._baselines.mouse_variance_baseline)
+            baseline = max(
+                self._MIN_MOUSE_VARIANCE_BASELINE,
+                self._baselines.mouse_variance_baseline,
+            )
             return 1.0 - self._ramp(value / baseline, 1.0, 2.5)
         if name == FeatureName.CLICK_FREQUENCY:
             return self._band(value, 0.05, 1.5, 3.0)
@@ -529,8 +555,14 @@ class RuleScorer:
         # Calibration may persist ``mouse_variance_baseline == 0`` (the schema
         # allows it). Floor it exactly like ``_flow_transform`` so a zero
         # baseline degrades to "any variance is thrash-relative" instead of
-        # raising ZeroDivisionError on every state-loop tick (audit D2).
-        baseline = max(1.0, float(self._baselines.mouse_variance_baseline))
+        # raising ZeroDivisionError on every state-loop tick (audit D2). The
+        # floor is the abstention threshold rather than 1.0, so a direct caller
+        # that skips ``_baseline_ready`` cannot get the saturating divisor
+        # either.
+        baseline = max(
+            self._MIN_MOUSE_VARIANCE_BASELINE,
+            float(self._baselines.mouse_variance_baseline),
+        )
         if velocity_variance <= baseline:
             return 0.0
 

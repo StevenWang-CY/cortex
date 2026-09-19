@@ -22,13 +22,21 @@ plain dict the existing parser normalisation consumes.
 from __future__ import annotations
 
 import copy
-from functools import lru_cache
+from functools import cache, lru_cache
 from typing import Any, Final, Literal
 
 from annotated_types import MaxLen
 from pydantic import BaseModel, ConfigDict, Field
 
-from cortex.libs.schemas.intervention import InterventionPlan
+from cortex.libs.schemas.intervention import (
+    _TARGET_MAX_LEN,
+    ErrorAnalysis,
+    InterventionPlan,
+    MicroStep,
+    SuggestedAction,
+    TabRecommendation,
+    TabRecommendations,
+)
 
 # Fields of InterventionPlan / SuggestedAction / UIPlan that only the
 # daemon may set. ``test_plan_draft.py`` asserts none of them appear
@@ -271,30 +279,61 @@ _PLAN_TEXT_FIELDS: Final[tuple[str, ...]] = (
 )
 
 
-@lru_cache(maxsize=1)
-def _plan_text_limits() -> dict[str, int]:
-    """Read each model-authored text field's cap straight from the plan schema.
+@cache
+def _text_limits(model_cls: type[BaseModel]) -> tuple[tuple[str, int], ...]:
+    """Every ``MaxLen``-bounded string field on *model_cls*, read from the schema.
 
     The structured-output grammar rejects ``maxLength``, so the schema handed
-    to the model carries no length bound while ``InterventionPlan`` still
-    enforces one. An otherwise-good plan whose headline ran a few characters
-    long therefore failed validation and was discarded whole, and the user got
-    the deterministic fallback instead. Reading the caps from the schema keeps
-    the clamp and the contract from drifting apart.
+    to the model carries no length bound while the real models still enforce
+    one. An otherwise-good plan whose text ran a few characters long therefore
+    failed validation and was discarded whole, the planner burned every retry
+    (each one billed — ``_record_cost`` runs before the parse), and the user
+    got the deterministic fallback.
+
+    The first fix clamped only the four top-level plan fields, which left every
+    nested one still able to sink a whole plan: a 250-character micro-step, a
+    long ``suggested_actions[].reason``, any ``error_analysis`` field, or a
+    ``start_timer`` target over its 32-character cap. Caps are read per model
+    rather than listed, so a schema change cannot silently escape the clamp.
     """
 
-    limits: dict[str, int] = {}
-    for name in _PLAN_TEXT_FIELDS:
-        field = InterventionPlan.model_fields.get(name)
-        if field is None:
-            continue
+    limits: list[tuple[str, int]] = []
+    for name, field in model_cls.model_fields.items():
         cap = next(
             (item.max_length for item in field.metadata if isinstance(item, MaxLen)),
             None,
         )
         if isinstance(cap, int) and cap > 1:
-            limits[name] = cap
-    return limits
+            limits.append((name, cap))
+    return tuple(limits)
+
+
+def _plan_text_limits() -> dict[str, int]:
+    """Caps for the top-level plan fields this module emits directly."""
+
+    return {
+        name: cap
+        for name, cap in _text_limits(InterventionPlan)
+        if name in _PLAN_TEXT_FIELDS
+    }
+
+
+def _clamp_model_strings(
+    data: dict[str, Any],
+    model_cls: type[BaseModel],
+    *,
+    overrides: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """Clamp every bounded string in *data* against *model_cls*'s own caps."""
+
+    limits = dict(_text_limits(model_cls))
+    for name, cap in (overrides or {}).items():
+        limits[name] = min(limits.get(name, cap), cap)
+    for name, cap in limits.items():
+        value = data.get(name)
+        if isinstance(value, str):
+            data[name] = _clamp_text(value, cap)
+    return data
 
 
 def _clamp_text(value: str, limit: int | None) -> str:
@@ -331,24 +370,61 @@ def draft_to_plan_data(draft: PlanDraft) -> dict[str, Any]:
         "causal_explanation": _clamp_text(
             draft.causal_explanation.strip(), limits.get("causal_explanation")
         ),
-        "micro_steps": [step.strip() for step in draft.micro_steps if step.strip()],
+        "micro_steps": [
+            _clamp_text(step.strip(), _micro_step_limit())
+            for step in draft.micro_steps
+            if step.strip()
+        ],
         "hide_targets": list(draft.hide_targets),
         "ui_plan": draft.ui_plan.model_dump(),
         "level": draft.ui_plan.intervention_type,
         "tone": draft.tone,
         "suggested_actions": [
-            {
-                **action.model_dump(exclude={"metadata"}),
-                "metadata": {entry.key: entry.value for entry in action.metadata},
-            }
+            _clamp_action(action)
             for action in draft.suggested_actions
         ],
     }
     if draft.error_analysis is not None:
-        data["error_analysis"] = draft.error_analysis.model_dump()
+        data["error_analysis"] = _clamp_model_strings(
+            draft.error_analysis.model_dump(), ErrorAnalysis,
+        )
     if draft.tab_recommendations is not None:
-        data["tab_recommendations"] = draft.tab_recommendations.model_dump()
+        recommendations = _clamp_model_strings(
+            draft.tab_recommendations.model_dump(), TabRecommendations,
+        )
+        tabs = recommendations.get("tabs")
+        if isinstance(tabs, list):
+            recommendations["tabs"] = [
+                _clamp_model_strings(tab, TabRecommendation)
+                if isinstance(tab, dict) else tab
+                for tab in tabs
+            ]
+        data["tab_recommendations"] = recommendations
     return data
+
+
+@lru_cache(maxsize=1)
+def _micro_step_limit() -> int | None:
+    return dict(_text_limits(MicroStep)).get("text")
+
+
+def _clamp_action(action: DraftSuggestedAction) -> dict[str, Any]:
+    """Clamp one suggested action, honouring its per-type target cap.
+
+    ``target`` has both a field-level cap and a tighter per-``action_type`` one
+    (``start_timer`` allows 32 characters against the field's 500), and the
+    narrower of the two is what validation enforces.
+    """
+
+    payload: dict[str, Any] = {
+        **action.model_dump(exclude={"metadata"}),
+        "metadata": {entry.key: entry.value for entry in action.metadata},
+    }
+    overrides: dict[str, int] = {}
+    target_cap = _TARGET_MAX_LEN.get(str(action.action_type))
+    if isinstance(target_cap, int) and target_cap > 1:
+        overrides["target"] = target_cap
+    return _clamp_model_strings(payload, SuggestedAction, overrides=overrides)
 
 
 __all__ = [

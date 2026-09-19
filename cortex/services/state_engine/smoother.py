@@ -82,6 +82,27 @@ _SUPPORT_TO_LEGACY = {
 _LEGACY_TO_SUPPORT = {value: key for key, value in _SUPPORT_TO_LEGACY.items()}
 
 
+def _recovery_coverage(evaluation: RuleEvaluation) -> float:
+    """Evidence coverage to publish beside a smoother-owned RECOVERING label.
+
+    The scorer has no RECOVERING hypothesis — recovery is a temporal relation
+    between windows, which only the smoother can see — so ``state_coverage``
+    carries a placeholder ``0.0`` for it. ``ScoreSmoother.update`` builds the
+    recovery score from the flow and under-engaged components, so the evidence
+    behind the label is theirs, and that is what gets reported.
+
+    Publishing the placeholder instead made ``TriggerPolicy.evaluate`` reject
+    every RECOVERY estimate at its 0.45 coverage floor, which runs before the
+    per-state arm dispatch — so the opt-in recovery reinforcement arm could
+    never be reached.
+    """
+
+    return max(
+        evaluation.state_coverage.get(SupportState.FLOW_LIKE, 0.0),
+        evaluation.state_coverage.get(SupportState.UNDER_ENGAGED, 0.0),
+    )
+
+
 class ScoreSmoother:
     """Apply EMA, Schmitt hysteresis, and elapsed-time dwell confirmation."""
 
@@ -280,8 +301,20 @@ class ScoreSmoother:
             # is unaffected: it is applied inside the scorer against the correct
             # per-state coverage.) Report the coverage of the label actually
             # published; ``state_coverage`` carries an entry for every state,
-            # including 0.0 for the smoother-owned RECOVERING.
-            evidence_coverage=evaluation.state_coverage.get(
+            # including 0.0 for the smoother-owned RECOVERING -- which is why
+            # that one label cannot simply read the map. The scorer has no
+            # RECOVERING hypothesis to measure (recovery is a temporal
+            # relation), so it stores a placeholder 0.0, and publishing that
+            # verbatim made the number misdescribe the label a second way:
+            # ``TriggerPolicy.evaluate`` applies the 0.45 coverage floor before
+            # dispatching to the per-state arms, so a RECOVERY estimate failed
+            # the floor with ``evidence_coverage_below_floor_0.00`` and the
+            # opt-in recovery reinforcement arm became unreachable. Recovery's
+            # score is built from the flow and under-engaged evidence, so it
+            # reports that evidence.
+            evidence_coverage=_recovery_coverage(evaluation)
+            if support_state is SupportState.RECOVERING
+            else evaluation.state_coverage.get(
                 support_state, evaluation.evidence_coverage
             ),
             contributing_features=evaluation.contributing_features,

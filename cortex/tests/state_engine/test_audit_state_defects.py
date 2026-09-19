@@ -741,3 +741,119 @@ def test_quiet_escalation_can_be_reset(tmp_path: Path) -> None:
     # The reset is durable: a restart must not resurrect the old level.
     assert _policy(tmp_path).quiet_mode_escalation_level == 0
 
+
+
+# ---------------------------------------------------------------------------
+# A RECOVERING label must publish the evidence its score was built from
+# ---------------------------------------------------------------------------
+
+
+def test_recovery_estimate_does_not_fail_the_coverage_floor() -> None:
+    """RECOVERY must be reachable by the trigger policy.
+
+    The scorer has no RECOVERING hypothesis — recovery is a temporal relation
+    between windows, which only the smoother can see — so ``state_coverage``
+    carries a placeholder 0.0 for it. Publishing that verbatim made the number
+    misdescribe the label a second way: ``TriggerPolicy.evaluate`` applies its
+    0.45 coverage floor *before* dispatching to the per-state arms, so every
+    RECOVERY estimate was rejected with ``evidence_coverage_below_floor_0.00``
+    and the opt-in recovery reinforcement arm became unreachable.
+
+    No existing test caught this because ``StateEstimate.evidence_coverage``
+    defaults to 1.0 and the HYPO/RECOVERY tests hand-construct estimates that
+    never pass through the smoother.
+    """
+    config = StateConfig(
+        ema_alpha=1.0,
+        estimate_entry_threshold=0.4,
+        estimate_exit_threshold=0.25,
+        hyper_dwell_seconds=1,
+        flow_dwell_seconds=1,
+        hypo_dwell_seconds=1,
+    )
+    quality = SignalQuality(telemetry=1.0)
+    smoother = ScoreSmoother(config)
+
+    def evaluation(support: float, under: float) -> RuleEvaluation:
+        return RuleEvaluation(
+            status=EstimateStatus.ESTIMATED,
+            scores=SupportScores(support_likely=support, under_engaged=under),
+            evidence_coverage=0.85,
+            state_coverage={
+                SupportState.SUPPORT_LIKELY: 0.85,
+                SupportState.FLOW_LIKE: 0.10,
+                SupportState.UNDER_ENGAGED: 0.80,
+                # The scorer's placeholder for the state it cannot measure.
+                SupportState.RECOVERING: 0.0,
+                SupportState.UNKNOWN: 0.0,
+            },
+            contributing_features=[],
+            exclusions=[],
+            model=deterministic_support_identity(),
+        )
+
+    # Commit a support label, then let it fall away so recovery can take over.
+    # ``support_state`` is a plain ``str`` on the estimate, so these compare
+    # with ``==`` rather than ``is``.
+    smoother.update(evaluation(support=0.9, under=0.0), quality, timestamp=0.0)
+    smoother.update(evaluation(support=0.9, under=0.0), quality, timestamp=2.0)
+    recovering = None
+    for step in range(3, 16):
+        estimate = smoother.update(
+            evaluation(support=0.0, under=0.7), quality, timestamp=float(step),
+        )
+        if estimate.support_state == SupportState.RECOVERING:
+            recovering = estimate
+            break
+
+    assert recovering is not None, "smoother never reached RECOVERING"
+    assert recovering.evidence_coverage > 0.45, (
+        "a RECOVERING label published the scorer's 0.0 placeholder and could "
+        f"never clear the trigger policy's coverage floor: "
+        f"{recovering.evidence_coverage}"
+    )
+    # It reports the evidence its own score was built from (the under-engaged
+    # component here), not the scorer's placeholder and not a borrowed one.
+    assert recovering.evidence_coverage == pytest.approx(0.80)
+
+
+def test_mouse_variance_abstains_for_a_small_nonzero_baseline() -> None:
+    """A near-zero baseline saturates exactly as a zero one does.
+
+    Both scoring paths floor the divisor, so any baseline below roughly
+    3 000 px^2/s^2 pinned the feature to maximum support evidence and zero flow
+    evidence permanently. The previous guard tested ``> 0.0``, which such a
+    baseline passes — and it is an ordinary calibration outcome, not a corrupt
+    one: windows with fewer than two mouse moves contribute a variance of 0.0
+    and the baseline is their plain mean, so a keyboard-heavy session averages
+    down into that band.
+    """
+    vector = _vector(
+        {
+            FeatureName.MOUSE_VELOCITY_VARIANCE: 10_000.0,
+            FeatureName.CLICK_FREQUENCY: 3.0,
+            FeatureName.KEYPRESS_RATE_PER_MIN: 90.0,
+            FeatureName.INACTIVITY_SECONDS: 0.5,
+        }
+    )
+
+    for baseline in (0.0, 0.0001, 50.0, 500.0):
+        scorer = RuleScorer(baselines=UserBaselines(mouse_variance_baseline=baseline))
+        variance = [
+            item
+            for item in scorer.evaluate(vector).contributing_features
+            if item.feature == FeatureName.MOUSE_VELOCITY_VARIANCE.value
+        ]
+        assert variance, "the feature must still be reported"
+        assert all(item.observed is False for item in variance), (
+            f"baseline {baseline} is too small to be a divisor but was used"
+        )
+
+    # A calibration that genuinely measured the user still scores.
+    scorer = RuleScorer(baselines=UserBaselines(mouse_variance_baseline=40_000.0))
+    observed = [
+        item
+        for item in scorer.evaluate(vector).contributing_features
+        if item.feature == FeatureName.MOUSE_VELOCITY_VARIANCE.value
+    ]
+    assert any(item.observed for item in observed)

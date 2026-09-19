@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Iterator
 from typing import Any, get_args
 
@@ -315,3 +316,70 @@ def test_overlong_model_text_is_clamped_not_discarded() -> None:
     data["intervention_id"] = "int_clamp_test"
     plan = InterventionPlan.model_validate(data)
     assert plan.headline
+
+
+# ---------------------------------------------------------------------------
+# Length clamping reaches every model-authored string, not just the top level
+# ---------------------------------------------------------------------------
+#
+# The structured-output grammar rejects ``maxLength``, so the schema handed to
+# the model carries no length bound while the real models still enforce one. An
+# overrun therefore failed validation, the whole plan was discarded, and the
+# planner burned every retry (each billed — ``_record_cost`` runs before the
+# parse) before serving the deterministic fallback.
+#
+# The first fix clamped only the four top-level plan fields. Every nested one
+# could still sink a plan on its own, which is what these cases pin.
+
+
+def _draft_with(**overrides: Any) -> dict[str, Any]:
+    payload = copy.deepcopy(VALID_DRAFT)
+    payload.update(overrides)
+    return payload
+
+
+def _action(**overrides: Any) -> dict[str, Any]:
+    action = copy.deepcopy(VALID_DRAFT["suggested_actions"][0])
+    action.update(overrides)
+    return action
+
+
+@pytest.mark.parametrize(
+    ("label", "payload"),
+    [
+        ("micro_step", _draft_with(micro_steps=["x" * 250])),
+        ("action label", _draft_with(suggested_actions=[_action(label="L" * 250)])),
+        ("action reason", _draft_with(suggested_actions=[_action(reason="R" * 400)])),
+        # ``target`` has a tighter per-action_type cap (32) than the field's own
+        # (500); the narrower one is what validation enforces.
+        (
+            "start_timer target",
+            _draft_with(suggested_actions=[
+                _action(action_type="start_timer", target="T" * 60),
+            ]),
+        ),
+    ],
+)
+def test_overlong_nested_text_does_not_discard_the_whole_plan(
+    label: str, payload: dict[str, Any],
+) -> None:
+    draft = PlanDraft.model_validate(payload)
+    plan = validate_intervention_plan(draft_to_plan_data(draft))
+    assert plan is not None, (
+        f"an overlong {label} discarded an otherwise-valid plan"
+    )
+
+
+def test_clamped_text_respects_the_schema_cap_it_was_read_from() -> None:
+    """The clamp trims to the contract, and does not invent its own limit."""
+    draft = PlanDraft.model_validate(
+        _draft_with(suggested_actions=[
+            _action(action_type="start_timer", target="T" * 60),
+        ]),
+    )
+    data = draft_to_plan_data(draft)
+    target = data["suggested_actions"][0]["target"]
+    assert len(target) <= 32, f"target still {len(target)} characters"
+
+    plan = validate_intervention_plan(data)
+    assert plan is not None
