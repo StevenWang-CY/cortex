@@ -457,6 +457,67 @@ function validateJournalReceiptBatch(value: unknown): InterventionReceiptBatch {
     return value as unknown as InterventionReceiptBatch;
 }
 
+// Write-side target for ``attempt_counters``. The read-side validator rejects
+// a journal holding more than MAX_TRANSACTION_COUNTERS keys, but nothing ever
+// bounded the key *count* on write — only each key's value (<= 100). Every
+// other collection in the journal is bounded where it grows: `receipt_outbox`
+// and `operations` refuse to exceed their cap, `consumed_authorizations` trims
+// to 256. `attempt_counters` was the one that was not, and counters were
+// reclaimed only for operations retired through `acknowledgeReceipts`. Once
+// the map passed 2048 keys the journal failed to load, and because
+// `readTransactionJournal` throws rather than repairing, every subsequent
+// apply and restore failed permanently with no way back.
+//
+// Pruning starts well below the hard cap so a burst between prunes cannot
+// reach it.
+const MAX_TRANSACTION_COUNTERS_SOFT = 1_536;
+
+/** Counter keys a live operation could still consult. */
+function liveAttemptCounterKeys(
+    operations: Record<string, BrowserOperationRecord>,
+): Set<string> {
+    const live = new Set<string>();
+    for (const operation of Object.values(operations)) {
+        for (const phase of ["apply", "restore", "compensate"]) {
+            live.add(
+                [operation.authorization_id, operation.action_id, phase].join(":"),
+            );
+        }
+    }
+    return live;
+}
+
+/** Bound ``counters`` in place, discarding the least useful entries first.
+ *
+ * A counter only means anything while its operation is live, so orphans go
+ * first — that alone reclaims everything the old acknowledgement-driven GC
+ * missed. Anything still over the limit is dropped oldest-first; string keys
+ * iterate in insertion order, which makes `Object.keys` a FIFO queue. Dropping
+ * a counter at worst grants an action a fresh retry allowance, which is a far
+ * better failure than bricking the journal.
+ */
+function trimAttemptCounters(
+    counters: Record<string, number>,
+    operations: Record<string, BrowserOperationRecord>,
+    limit: number,
+): void {
+    if (Object.keys(counters).length <= limit) return;
+    const live = liveAttemptCounterKeys(operations);
+    for (const key of Object.keys(counters)) {
+        if (!live.has(key)) delete counters[key];
+    }
+    const remaining = Object.keys(counters);
+    if (remaining.length > limit) {
+        for (const key of remaining.slice(0, remaining.length - limit)) {
+            delete counters[key];
+        }
+    }
+}
+
+// Test seams: both paths are otherwise reachable only through
+// chrome.storage.local, following the `_resetWsParseErrorCounter` convention.
+export const _trimAttemptCounters = trimAttemptCounters;
+
 function validateBrowserTransactionJournal(raw: unknown): BrowserTransactionJournal {
     if (!isJournalRecord(raw) || raw.schema_version !== "1") {
         throw new Error("Cortex transaction journal is corrupt");
@@ -472,7 +533,12 @@ function validateBrowserTransactionJournal(raw: unknown): BrowserTransactionJour
         || !Array.isArray(outbox)
         || Object.keys(consumed).length > 256
         || Object.keys(operations).length > MAX_TRANSACTION_OPERATIONS
-        || Object.keys(counters).length > MAX_TRANSACTION_COUNTERS
+        // Only an absurd count is treated as corruption here, to bound the
+        // validation work below. A merely over-cap counter map is repaired
+        // after validation rather than rejected: these are a retry guard, not
+        // an integrity record, and refusing to load the journal over them
+        // disabled apply and restore for good.
+        || Object.keys(counters).length > MAX_TRANSACTION_COUNTERS * 8
         || outbox.length > MAX_RECEIPT_OUTBOX
     ) {
         throw new Error("Cortex transaction journal is corrupt");
@@ -532,6 +598,11 @@ function validateBrowserTransactionJournal(raw: unknown): BrowserTransactionJour
         ) throw new Error("receipt attempt counter is invalid");
         validatedCounters[key] = Number(value);
     }
+    // Repair a journal written before the write-side bound existed, so a user
+    // already past the cap recovers on next load instead of staying stuck.
+    trimAttemptCounters(
+        validatedCounters, validatedOperations, MAX_TRANSACTION_COUNTERS,
+    );
     const validatedOutbox = outbox.map(validateJournalReceiptBatch);
     const receiptIds = new Set<string>();
     for (const batch of validatedOutbox) {
@@ -551,6 +622,8 @@ function validateBrowserTransactionJournal(raw: unknown): BrowserTransactionJour
         receipt_outbox: validatedOutbox,
     };
 }
+
+export const _validateBrowserTransactionJournal = validateBrowserTransactionJournal;
 
 async function readTransactionJournal(): Promise<BrowserTransactionJournal> {
     const data = await chrome.storage.local.get(TRANSACTION_JOURNAL_KEY);
@@ -3133,6 +3206,14 @@ async function makeActionReceipt(args: {
             throw new Error("receipt retry limit exceeded");
         }
         journal.attempt_counters[counterKey] = next;
+        // Bound the key count here, where it grows. Pruning after the insert
+        // keeps this counter (its operation is live by construction) and
+        // reclaims orphans left by operations that never retired.
+        trimAttemptCounters(
+            journal.attempt_counters,
+            journal.operations,
+            MAX_TRANSACTION_COUNTERS_SOFT,
+        );
         return next;
     });
     const endedMonoNs = Math.max(args.startedMonoNs, monotonicNowNs());
