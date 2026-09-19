@@ -26,9 +26,21 @@ from cortex.services.consent.policy import (
 class _FakeTriggerPolicy:
     def __init__(self) -> None:
         self.activated_with: list[int] = []
+        self.indefinite_activations: int = 0
         self.cleared: int = 0
 
-    def activate_quiet_mode(self, duration_minutes: int | None = None) -> None:
+    # Mirrors TriggerPolicy.activate_quiet_mode: keyword-only, and able to
+    # express the indefinite window that backs "Pause all sensing".
+    def activate_quiet_mode(
+        self,
+        *,
+        duration_minutes: int | None = None,
+        current_time: float | None = None,
+        indefinite: bool = False,
+    ) -> None:
+        if indefinite:
+            self.indefinite_activations += 1
+            return
         self.activated_with.append(int(duration_minutes or 0))
 
     def clear_quiet_mode(self) -> None:
@@ -101,6 +113,10 @@ class _MinimalDaemon:
         self._quiet_mode_source = "daemon"
         self._quiet_mode_lock = asyncio.Lock()
         self._quiet_mode_decay_task = None
+        # The shutdown latch that ``_capture_restart_permitted`` reads. A
+        # capture restart arriving during teardown must not reopen a camera
+        # the stop chain has already released.
+        self._stop_started = False
         self._auto_focus_armed = False
         self._auto_focus_dwell_started_at = 0.0
         self._auto_focus_recovery_started_at = 0.0
@@ -124,6 +140,7 @@ class _MinimalDaemon:
             "_emit_stop_focus_auto",
             "disarm_auto_focus",
             "_reset_auto_focus_timers",
+            "_capture_restart_permitted",
         ):
             setattr(
                 self,

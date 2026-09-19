@@ -81,6 +81,7 @@ class ZombieReadingDetector:
         blink_rate: float | None,
         active_app: str,
         current_time: float | None = None,
+        may_trigger: bool = True,
     ) -> bool:
         """
         Check if zombie-reading conditions are met.
@@ -91,6 +92,12 @@ class ZombieReadingDetector:
             blink_rate: Current blink rate in blinks/min. None = no data.
             active_app: Name of the currently active application.
             current_time: Override timestamp. None = use the injected clock.
+            may_trigger: When False the detector keeps accumulating, but never
+                fires. The cooldown and the accumulator were previously
+                committed the moment the threshold was crossed, before the
+                caller consulted the interruption gate, so a detection dropped
+                by quiet mode, pause or the hourly cap was discarded rather
+                than deferred and the whole dwell had to be served again.
 
         Returns:
             True if zombie-reading has been sustained long enough to trigger.
@@ -123,6 +130,10 @@ class ZombieReadingDetector:
             if blink_rate is None:
                 required_duration = max(required_duration, _NO_BLINK_MIN_DURATION_SECONDS)
             if duration >= required_duration:
+                if not may_trigger:
+                    # Hold the accumulator so the dwell already served counts
+                    # once interruptions are allowed again.
+                    return False
                 self._last_trigger = current_time
                 self._reset()
                 logger.info(

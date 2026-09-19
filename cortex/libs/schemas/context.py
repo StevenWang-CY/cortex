@@ -336,6 +336,20 @@ _TAB_TYPE_PRIORITY: dict[str, int] = {
 }
 
 
+def llm_visible_tab_indices(
+    tabs: list[TabInfo], *, max_tabs: int = 30
+) -> frozenset[int]:
+    """Original indices of the tabs ``to_llm_context`` actually renders.
+
+    The rendered list is a prioritised subset carrying ORIGINAL indices, so it
+    is frequently non-contiguous and its largest index can exceed the number of
+    lines shown. A plan referring to an index outside this set names a tab the
+    model could not see.
+    """
+
+    return frozenset(index for index, _tab in _select_tabs_for_llm(tabs, max_tabs=max_tabs))
+
+
 def _select_tabs_for_llm(
     tabs: list[TabInfo], *, max_tabs: int = 30
 ) -> list[tuple[int, TabInfo]]:

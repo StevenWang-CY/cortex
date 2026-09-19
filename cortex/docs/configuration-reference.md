@@ -4,7 +4,7 @@
 
 `CortexConfig` is the runtime source of truth. YAML uses dotted paths below; environment overrides use the corresponding `CORTEX_…` name and double underscores. Secrets are deliberately not fields on `CortexConfig`.
 
-This reference contains **194 runtime settings**.
+This reference contains **198 runtime settings**.
 
 | YAML path | Environment variable | Type | Default | Constraints | Description |
 | --- | --- | --- | --- | --- | --- |
@@ -105,6 +105,7 @@ This reference contains **194 runtime settings**.
 | `api.port` | `CORTEX_API__PORT` | `int` | `9472` | — | — |
 | `api.ws_port` | `CORTEX_API__WS_PORT` | `int` | `9473` | — | — |
 | `api.cors_allow_origins` | `CORTEX_API__CORS_ALLOW_ORIGINS` | `list[str]` | `["http://localhost", "http://127.0.0.1"]` | — | Static CORS allowlist for the HTTP API. The dynamic extension/webview regex is still applied in app.py via ``allow_origin_regex``; this list is the simple-match fallback for browser tabs that aren't extensions. |
+| `api.expose_api_docs` | `CORTEX_API__EXPOSE_API_DOCS` | `bool` | `false` | — | Serve FastAPI's /docs, /redoc and /openapi.json. These are mounted by FastAPI itself, outside the public-liveness and capability-gated routers, so they published the whole local API surface — every mutating route, its parameters and its response shapes — to any local process without a capability token. Off by default; enable only for local development. |
 | `telemetry.mouse_sample_hz` | `CORTEX_TELEMETRY__MOUSE_SAMPLE_HZ` | `int` | `60` | — | — |
 | `telemetry.window_seconds` | `CORTEX_TELEMETRY__WINDOW_SECONDS` | `int` | `15` | — | — |
 | `signal.rppg.window_seconds` | `CORTEX_SIGNAL__RPPG__WINDOW_SECONDS` | `int` | `10` | ≥ 8; ≤ 60 | — |
@@ -115,8 +116,10 @@ This reference contains **194 runtime settings**.
 | `signal.rppg.bandpass_low` | `CORTEX_SIGNAL__RPPG__BANDPASS_LOW` | `float` | `0.7` | > 0.0 | — |
 | `signal.rppg.bandpass_high` | `CORTEX_SIGNAL__RPPG__BANDPASS_HIGH` | `float` | `3.5` | > 0.0 | — |
 | `signal.rppg.bandpass_order` | `CORTEX_SIGNAL__RPPG__BANDPASS_ORDER` | `int` | `4` | ≥ 1; ≤ 8 | — |
-| `signal.rppg.nsqi_threshold` | `CORTEX_SIGNAL__RPPG__NSQI_THRESHOLD` | `float` | `0.293` | — | — |
-| `signal.rppg.min_cardiac_snr_db` | `CORTEX_SIGNAL__RPPG__MIN_CARDIAC_SNR_DB` | `float` | `2.0` | — | — |
+| `signal.rppg.nsqi_threshold` | `CORTEX_SIGNAL__RPPG__NSQI_THRESHOLD` | `float` | `0.293` | ≥ 0.0; ≤ 1.0 | Minimum normalized spectral quality index for a window to count as carrying a cardiac signal |
+| `signal.rppg.min_cardiac_snr_db` | `CORTEX_SIGNAL__RPPG__MIN_CARDIAC_SNR_DB` | `float` | `2.0` | — | Minimum in-band to out-of-band SNR in dB for a window to count as carrying a cardiac signal; the dominant guard against publishing a heart rate read out of noise |
+| `signal.rppg.min_peak_concentration` | `CORTEX_SIGNAL__RPPG__MIN_PEAK_CONCENTRATION` | `float` | `0.4` | ≥ 0.0; ≤ 1.0 | Minimum share of in-band power concentrated at the selected spectral peak for a window to count as carrying a cardiac signal; separates a cardiac line from wandering illumination drift |
+| `signal.rppg.minimum_window_quality` | `CORTEX_SIGNAL__RPPG__MINIMUM_WINDOW_QUALITY` | `float` | `0.3` | ≥ 0.0; ≤ 1.0 | Minimum composite acquisition quality (motion, face coverage and spectrum) for a pulse window to be published |
 | `signal.rppg.max_head_jitter_deg` | `CORTEX_SIGNAL__RPPG__MAX_HEAD_JITTER_DEG` | `float` | `7.5` | > 0.0 | — |
 | `signal.rppg.min_valid_coverage` | `CORTEX_SIGNAL__RPPG__MIN_VALID_COVERAGE` | `float` | `0.8` | ≥ 0.0; ≤ 1.0 | — |
 | `signal.rppg.max_interpolation_gap_ms` | `CORTEX_SIGNAL__RPPG__MAX_INTERPOLATION_GAP_MS` | `float` | `250.0` | > 0.0 | — |
@@ -160,9 +163,9 @@ This reference contains **194 runtime settings**.
 | `storage.sqlite_busy_timeout_ms` | `CORTEX_STORAGE__SQLITE_BUSY_TIMEOUT_MS` | `int` | `5000` | ≥ 1; ≤ 60000 | — |
 | `storage.backup_retention_count` | `CORTEX_STORAGE__BACKUP_RETENTION_COUNT` | `int` | `3` | ≥ 1; ≤ 20 | — |
 | `storage.analytics_queue_capacity` | `CORTEX_STORAGE__ANALYTICS_QUEUE_CAPACITY` | `int` | `256` | ≥ 16; ≤ 16384 | — |
-| `storage.session_retention_days` | `CORTEX_STORAGE__SESSION_RETENTION_DAYS` | `int` | `180` | — | — |
-| `storage.feature_retention_days` | `CORTEX_STORAGE__FEATURE_RETENTION_DAYS` | `int` | `7` | — | — |
-| `storage.error_retention_days` | `CORTEX_STORAGE__ERROR_RETENTION_DAYS` | `int` | `90` | — | — |
+| `storage.session_retention_days` | `CORTEX_STORAGE__SESSION_RETENTION_DAYS` | `int` | `180` | ≥ 1; ≤ 3650 | — |
+| `storage.feature_retention_days` | `CORTEX_STORAGE__FEATURE_RETENTION_DAYS` | `int` | `7` | ≥ 1; ≤ 3650 | — |
+| `storage.error_retention_days` | `CORTEX_STORAGE__ERROR_RETENTION_DAYS` | `int` | `90` | ≥ 1; ≤ 3650 | — |
 | `storage.max_total_size_mb` | `CORTEX_STORAGE__MAX_TOTAL_SIZE_MB` | `int` | `500` | — | — |
 | `storage.session_checkpoint_seconds` | `CORTEX_STORAGE__SESSION_CHECKPOINT_SECONDS` | `float` | `90.0` | — | — |
 | `storage.session_checkpoint_min_seconds` | `CORTEX_STORAGE__SESSION_CHECKPOINT_MIN_SECONDS` | `float` | `30.0` | — | — |
@@ -171,6 +174,7 @@ This reference contains **194 runtime settings**.
 | `debug.rppg` | `CORTEX_DEBUG__RPPG` | `bool` | `false` | — | — |
 | `debug.state` | `CORTEX_DEBUG__STATE` | `bool` | `false` | — | — |
 | `debug.llm` | `CORTEX_DEBUG__LLM` | `bool` | `false` | — | — |
+| `debug.record_full_state_stream` | `CORTEX_DEBUG__RECORD_FULL_STATE_STREAM` | `bool` | `false` | — | — |
 | `logging.level` | `CORTEX_LOGGING__LEVEL` | `str` | `"INFO"` | — | — |
 | `logging.format` | `CORTEX_LOGGING__FORMAT` | `str` | `"json"` | — | — |
 | `logging.include_timestamp` | `CORTEX_LOGGING__INCLUDE_TIMESTAMP` | `bool` | `true` | — | — |

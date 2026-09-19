@@ -282,3 +282,75 @@ def test_resume_last_active_file_target_length_cap() -> None:
             label="too long",
         )
     assert "too long" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# An index can be "in range" and still name a tab the model never saw
+# ---------------------------------------------------------------------------
+
+
+def test_filter_drops_a_tab_index_that_was_never_rendered() -> None:
+    """The rendered tab list is a prioritised subset carrying ORIGINAL indices.
+
+    ``to_llm_context`` renders at most 30 tabs, chosen by priority, and keeps
+    each tab's original index — so the list is frequently non-contiguous and
+    its largest index can exceed the number of lines shown. The system prompt
+    used to assert the opposite ("tab_index must be within range [0, N-1] where
+    N = number of tabs shown"), so a compliant model renumbered a high-indexed
+    tab onto a lower index belonging to a different tab, and nothing downstream
+    caught it: the only check was ``tab_index >= tab_count``.
+    """
+    shown = frozenset({0, 3, 39})
+    plan = _plan_with_actions(
+        SuggestedAction(action_type="close_tab", tab_index=0, label="shown"),
+        SuggestedAction(action_type="close_tab", tab_index=39, label="shown high"),
+        # In range for a 40-tab window, but never rendered.
+        SuggestedAction(action_type="close_tab", tab_index=7, label="not shown"),
+    )
+
+    filtered = filter_unsafe_actions(plan, tab_count=40, shown_tab_indices=shown)
+
+    assert [a.tab_index for a in filtered.suggested_actions] == [0, 39]
+
+
+def test_filter_without_a_shown_set_keeps_the_range_check_only() -> None:
+    """Callers that cannot supply the rendered set must not lose the old guard."""
+    plan = _plan_with_actions(
+        SuggestedAction(action_type="close_tab", tab_index=7, label="in range"),
+        SuggestedAction(action_type="close_tab", tab_index=99, label="out of range"),
+    )
+
+    filtered = filter_unsafe_actions(plan, tab_count=40)
+
+    assert [a.tab_index for a in filtered.suggested_actions] == [7]
+
+
+def test_rendered_indices_are_original_and_can_exceed_the_shown_count() -> None:
+    """Pin the property the prompt rule got wrong, against the real selector."""
+    from cortex.libs.schemas.context import TabInfo, llm_visible_tab_indices
+
+    # Distinct hosts so nothing is deduplicated, and put the high-priority
+    # tabs at the END of the list — which is exactly when priority ordering
+    # makes the rendered indices non-contiguous.
+    tabs = [
+        TabInfo(
+            title=f"tab {i}",
+            url=f"https://host{i}.example/page",
+            is_active=(i == 0),
+            tab_type="goal_relevant" if i >= 25 else "distraction",
+        )
+        for i in range(40)
+    ]
+
+    shown = llm_visible_tab_indices(tabs)
+
+    assert len(shown) <= 30
+    assert max(shown) >= len(shown), (
+        "the rendered indices are original, so the largest may exceed the "
+        f"number of lines shown: max={max(shown)} count={len(shown)}"
+    )
+    # Non-contiguous: indices below the maximum were skipped entirely.
+    assert set(range(max(shown))) - shown, "expected gaps in the rendered indices"
+    # And some in-range index was never rendered, which is what the extra
+    # rejection branch exists to catch.
+    assert set(range(len(tabs))) - shown

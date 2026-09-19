@@ -166,6 +166,45 @@ async def test_test_provider_rule_based_short_circuits() -> None:
     assert result.provider == "rule_based"
 
 
+@pytest.mark.asyncio
+async def test_test_provider_reads_the_privacy_wrapper_not_a_bare_sdk() -> None:
+    """``create_llm_client`` never returns a bare transport.
+
+    It always returns a privacy wrapper, so probing ``client._sdk`` found
+    nothing and every healthy provider was reported to the settings UI as
+    ``ok=False, error="no_sdk"``. The wrapper publishes ``transport_state``,
+    which also separates "no credential yet" from "external planning is off".
+    """
+    from cortex.services.runtime_daemon import CortexDaemon
+
+    class _Wrapper:
+        """Shaped like PrivacyAwarePlanner: no ``ping``, no ``_sdk``."""
+
+        def __init__(self, state: str) -> None:
+            self.transport_state = state
+
+    class _Stub:
+        config = type("C", (), {"llm": type("L", (), {"provider": "bedrock"})()})()
+
+        def __init__(self, state: str) -> None:
+            self._llm_client = _Wrapper(state)
+
+        async def test_provider(self, provider: str) -> Any:
+            return await CortexDaemon.test_provider(self, provider)
+
+    ready = await _Stub("ready").test_provider("bedrock")
+    assert ready.ok is True, "a configured, credentialed provider must not report failure"
+    assert ready.error is None
+
+    missing = await _Stub("credentials_missing").test_provider("bedrock")
+    assert missing.ok is False
+    assert missing.error == "credentials_missing"
+
+    disabled = await _Stub("external_context_disabled").test_provider("bedrock")
+    assert disabled.ok is False
+    assert disabled.error == "external_context_disabled"
+
+
 # ─── §3.15 daemon.get_cost_response ──────────────────────────────────
 
 

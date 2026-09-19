@@ -19,6 +19,8 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -383,9 +385,26 @@ class ConnectionsPanel(QWidget):
     # Emitted with the display name when every locally verifiable layer
     # for that browser passes (bridge, extension present, Cortex running).
     connection_verified = Signal(str)
+    # Internal: carries a finished worker result back onto the Qt thread.
+    # Emitting a signal from a worker thread to an object that lives on the GUI
+    # thread is queued by Qt, which is the only safe way to touch widgets from
+    # background work. ``QTimer.singleShot`` from a non-GUI thread is not.
+    _work_finished = Signal(object, object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        # Every subprocess and network probe in this panel used to run
+        # synchronously on the Qt main thread — the editor install is a
+        # ``subprocess.run(..., timeout=30)``, so a click could freeze the whole
+        # UI for half a minute. Worse, the "Installing into …" status written
+        # immediately before it could not repaint, so the window simply went
+        # unresponsive with no explanation. One worker is enough: these actions
+        # are user-initiated and mutually exclusive in practice.
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="cortex-connections",
+        )
+        self._work_finished.connect(self._on_work_finished)
+        self.destroyed.connect(lambda: self._executor.shutdown(wait=False))
         self.setWindowTitle("Cortex — Connect")
         self.setFixedWidth(480)
         self.setMinimumHeight(560)
@@ -1031,6 +1050,43 @@ class ConnectionsPanel(QWidget):
         except OSError:
             return False
 
+    def _on_work_finished(
+        self, on_done: object, outcome: object,
+    ) -> None:
+        """Run a worker's completion callback on the Qt thread."""
+
+        if callable(on_done):
+            on_done(outcome)
+
+    def _run_off_thread(
+        self,
+        work: Callable[[], Any],
+        on_done: Callable[[tuple[str, Any]], None],
+    ) -> None:
+        """Run *work* off the Qt thread, then hand its outcome to *on_done*.
+
+        *on_done* receives ``("ok", result)`` or ``("error", exception)`` and
+        always runs on the Qt thread, so it may touch widgets freely.
+        """
+
+        def _task() -> None:
+            try:
+                outcome: tuple[str, Any] = ("ok", work())
+            except BaseException as exc:  # noqa: BLE001 - reported to the caller
+                outcome = ("error", exc)
+            self._work_finished.emit(on_done, outcome)
+
+        future: Future[None] = self._executor.submit(_task)
+        # A crash inside the submit machinery itself would otherwise be
+        # swallowed and the card would sit on its pending status forever.
+        future.add_done_callback(
+            lambda done: (
+                logger.error("connections worker failed: %s", done.exception())
+                if done.exception() is not None
+                else None
+            )
+        )
+
     def _connect_editor(self, cli_path: str, editor_name: str) -> None:
         # Resolve VSIX via glob so the desktop shell tracks whatever version
         # the build pipeline produced (vsix filename derives from package.json).
@@ -1063,13 +1119,20 @@ class ConnectionsPanel(QWidget):
             tone="neutral",
             steps=[],
         )
-        try:
-            result = subprocess.run(
+        def _install() -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
                 [cli_path, "--install-extension", str(vsix)],
                 capture_output=True,
                 text=True,
                 timeout=30,
             )
+
+        def _finish(outcome: tuple[str, Any]) -> None:
+            kind, payload = outcome
+            if kind == "error":
+                self._editor_install_failed(editor_name, cli_path, payload)
+                return
+            result = payload
             if result.returncode == 0:
                 self._set_status(
                     editor_name,
@@ -1093,7 +1156,14 @@ class ConnectionsPanel(QWidget):
                         "Extensions view (… menu → Install from VSIX).",
                     ],
                 )
-        except subprocess.TimeoutExpired:
+        self._run_off_thread(_install, _finish)
+
+    def _editor_install_failed(
+        self, editor_name: str, cli_path: str, error: BaseException,
+    ) -> None:
+        """Render the failure branches the blocking version handled inline."""
+
+        if isinstance(error, subprocess.TimeoutExpired):
             self._set_status(
                 editor_name,
                 rows={"installed": False},
@@ -1101,7 +1171,8 @@ class ConnectionsPanel(QWidget):
                 tone="danger",
                 steps=[f"Quit {editor_name} fully, then try again."],
             )
-        except FileNotFoundError:
+            return
+        if isinstance(error, FileNotFoundError):
             self._set_status(
                 editor_name,
                 rows={"editor": False, "installed": False},
@@ -1112,3 +1183,19 @@ class ConnectionsPanel(QWidget):
                     "in PATH”, then try again.",
                 ],
             )
+            return
+        # Anything else. The blocking version let an unexpected exception
+        # propagate out of the click handler, which Qt swallowed and the card
+        # kept its "Installing…" status forever. Off the Qt thread nothing
+        # would surface it at all, so it is reported here.
+        logger.exception("Editor install failed unexpectedly", exc_info=error)
+        self._set_status(
+            editor_name,
+            rows={"installed": False},
+            note=f"Installation failed: {error}",
+            tone="danger",
+            steps=[
+                "Try again. If it keeps failing, install the .vsix from the "
+                "Extensions view (… menu → Install from VSIX).",
+            ],
+        )

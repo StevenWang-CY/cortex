@@ -1010,6 +1010,72 @@ class TestWebSocketBridge:
         assert bridge._port == 9473
         assert not bridge._running
 
+    def test_send_shutdown_stamps_the_capability_token(self, monkeypatch):
+        """The Stop button's SHUTDOWN frame must carry the token.
+
+        SHUTDOWN is double-gated: the AUTH handshake authenticates the socket,
+        and the daemon still rejects a SHUTDOWN payload without the capability
+        token. Nothing exercised the outbound half — every other bridge test
+        drives inbound ``_handle_message`` — so the stamping could regress and
+        the Stop button would silently become a no-op, leaving the daemon (and
+        the camera) running with the UI reporting success.
+        """
+        import json as _json
+
+        from cortex.apps.desktop_shell import main as main_module
+
+        bridge = WebSocketBridge()
+        bridge._auth_token = "t" * 64
+        bridge._loop = object()
+        bridge._ws = object()
+
+        sent: list[str] = []
+
+        def _capture(coro, _loop):
+            # ``_send`` is a coroutine function, so calling it already appended
+            # the frame; run it to completion here so Python does not warn
+            # about a coroutine that was never awaited.
+            try:
+                coro.send(None)
+            except StopIteration:
+                pass
+            return None
+
+        monkeypatch.setattr(
+            main_module.asyncio, "run_coroutine_threadsafe", _capture,
+        )
+        async def _record(message: str) -> None:
+            sent.append(message)
+
+        monkeypatch.setattr(bridge, "_send", _record)
+
+        bridge.send_shutdown()
+
+        assert len(sent) == 1, "no SHUTDOWN frame was built"
+        frame = _json.loads(sent[0])
+        assert frame["type"] == "SHUTDOWN"
+        assert frame["payload"]["auth_token"] == "t" * 64
+
+    def test_send_shutdown_is_a_noop_when_disconnected(self, monkeypatch):
+        """No socket means nothing is scheduled — not a crash, not a stray frame."""
+        from cortex.apps.desktop_shell import main as main_module
+
+        bridge = WebSocketBridge()
+        bridge._auth_token = "t" * 64
+        bridge._loop = None
+        bridge._ws = None
+
+        scheduled: list[object] = []
+        monkeypatch.setattr(
+            main_module.asyncio,
+            "run_coroutine_threadsafe",
+            lambda coro, _loop: scheduled.append(coro),
+        )
+
+        bridge.send_shutdown()
+
+        assert scheduled == []
+
     def test_handle_state_update(self):
         bridge = WebSocketBridge()
         received = []

@@ -42,6 +42,59 @@ committed. A future report must publish abstention coverage, error and agreement
 by preregistered condition/subgroup, reference hardware and alignment, sealed
 participant splits, exclusions, and uncertainty.
 
+### Measured limits of the pulse publication gate
+
+Two failure modes were measured directly against the packaged POS backend and
+are bounded, not eliminated. Both are stated here because the honest number
+matters more than a clean claim.
+
+**A heart rate read out of noise is now rare, not impossible.** Before v0.5.0
+the publication gate tested only a composite quality score whose acquisition
+terms (motion and face coverage) alone contributed 0.25 of a possible 1.0, so a
+still, fully visible face cleared the 0.30 threshold with no cardiac evidence
+at all: every signal-free window published a rate. The gate now tests signal
+presence on the raw spectrum — in-band SNR in decibels, a normalised spectral
+quality index, and the share of in-band power concentrated at the selected
+peak. Over 2,400 signal-free windows spanning white, 1/f and drift nuisance,
+none published a rate, down from all of them. That measurement bounds the rate
+near 0.1%; it does not establish zero.
+
+The thresholds are not set as tight as they could be, deliberately. Past
+2.0 dB SNR, or above a 0.40 concentration floor, genuine low-amplitude pulses
+start being discarded — a 0.50 floor more than halves sensitivity at a
+realistic 0.3% modulation depth, for a specificity gain indistinguishable from
+noise at this sample size. Driving the residual lower is a job for temporal
+hysteresis, so that one surviving window cannot move a displayed rate. The
+legacy estimator has such a stabilizer; porting it to the published v2 path is
+deferred because v2 publishes one estimate per window with its own provenance,
+and a held or smoothed value is not measured in the window it is attributed
+to. That is a design decision, not an oversight.
+
+**The published waveform no longer contains fabricated samples, and fixing
+that changed nothing measurable.** Until v0.5.0 the POS overlap-add
+reconstruction left the first sample and the trailing ~0.4 s of every window
+at the allocator's exact 0.0 — 14 of 300 samples at the default 30 fps — and
+the backend contract checks only shape and finiteness, so those reached the
+quality metrics and the spectral estimator as measurement. They are gone. It
+is worth being clear that this was a correctness fix and not an accuracy
+improvement: over 1,500 paired windows through the shipped publication gate,
+sensitivity at a realistic 0.3% modulation depth moved 0.2360 → 0.2340
+(discordant 9/6, McNemar p = 0.61) and false publication on drift and 1/f
+noise was unchanged. The first repair attempted — a strictly positive taper,
+which is the obvious one — removed the same zeros but perturbed the interior
+and cost real sensitivity for it: 0.2360 → 0.2260, discordant 20/5,
+p = 0.004. It was measured and discarded.
+
+**Rates at or below the passband edge are withheld, not measured.** The
+analysis band starts at 0.7 Hz (42 BPM), so a slower fundamental is removed by
+the bandpass while its harmonics survive; before v0.5.0 such rates published at
+exactly double or triple the truth (35 BPM as 69.9, 40 as 80.1, 42 as 124.8).
+These are now detected by re-examining the pre-bandpass waveform and withheld
+with an explicit reason. The consequence is that genuine bradycardia — trained
+endurance athletes at rest, or bradyarrhythmia — yields no reading rather than
+a wrong one. Widening the band instead would admit respiration and drift into
+the cardiac band for every user, which is the worse trade.
+
 ## Suggestions, effects, and efficacy
 
 The default mode is `suggest_only`; a proposal is not permission to close,
@@ -67,6 +120,42 @@ account, model, features, terms, and current configuration. Cortex cannot
 attest those external settings. See the [privacy disclosure](../cortex/docs/privacy.md).
 
 ## Platform, reliability, and release scope
+
+- **The suggestion card's action buttons are mouse-only.** The overlay is a
+  notification-style window: it is created with `WA_ShowWithoutActivating` and
+  is shown with `raise_()` but deliberately never `activateWindow()`, so that a
+  suggestion cannot steal focus from whatever the user is actually doing. The
+  consequence is that the window can never receive keyboard focus, and it is
+  the only surface that renders the action buttons — so a keyboard-only user
+  cannot reach them. Giving it an explicit, announced way in requires a
+  system-wide hotkey (the card is not focusable from the app that owns the
+  keyboard), which needs a native event monitor and the macOS Accessibility
+  permission. That is a product decision with a privacy cost, not a defect fix,
+  so it is recorded here rather than implemented unilaterally. The dashboard
+  itself is keyboard-navigable and every control in it carries an accessible
+  name.
+
+- **Source test coverage is 68.79%, and is now enforced.** The repository
+  carried a declared 85% floor for several releases that no gate ever ran: no
+  workflow, script or pytest option passed `--cov`, and the canonical gate runs
+  from the repository root where coverage finds no configuration at all — so
+  even a run that did pass it would have read none of those settings, including
+  the rule that excludes test modules from the denominator. Measured with
+  branch coverage on and the suite omitted, the figure is 68.79% over 44,086
+  statements. The floor is set to 65 rather than restored to 85, because a
+  floor above the measurement enforces nothing and one pinned a fraction below
+  it would flap across the two CI runners and be deleted again; 65 holds, and
+  still notices a subsystem's tests being removed or silently skipped. It
+  ratchets upward and nothing may lower it. Closing the gap is ordinary work
+  with no shortcut.
+
+- **The shipped browser extension is 263,803 bytes gzipped**, measured
+  2026-09-19 from `plasmo build` (820,399 bytes uncompressed, 17 files). Prior
+  documentation quoted a "< 250 KB" target, calibrated in 2026-08 against a
+  bundle that has since grown; the guard now bounds what is measured rather
+  than what was hoped. Its own size guard had meanwhile lost a third of its
+  measurement surface to a refactor, so this is the first figure in several
+  releases that reflects the whole bundle.
 
 - Supported release target: macOS 13 or later, arm64 and x86_64 artifacts.
   MediaPipe no longer publishes current Intel wheels, so the locked Intel

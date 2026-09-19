@@ -690,11 +690,18 @@ class LegacyDataMigrator:
                             {"legacy_reward": reward, "diagnostic_only": True}
                         )
                         connection.execute(
+                            # Migration 0002 replaced this table's single-column
+                            # primary key with ``PRIMARY KEY(decision_id,
+                            # reward_version)``. SQLite resolves an upsert target
+                            # against a real unique index, so the conflict clause
+                            # must name both columns; ``ON CONFLICT(decision_id)``
+                            # raised on every schema-v2 database and aborted the
+                            # whole import transaction, decisions included.
                             "INSERT INTO policy_rewards("
                             "decision_id, reward_version, reward_value, "
                             "finalized_at_unix_ms, components_json, payload_sha256"
                             ") VALUES (?, 'legacy-latest-v1', ?, ?, ?, ?) "
-                            "ON CONFLICT(decision_id) DO NOTHING",
+                            "ON CONFLICT(decision_id, reward_version) DO NOTHING",
                             (
                                 decision_id,
                                 reward,

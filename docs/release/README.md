@@ -128,12 +128,10 @@ uv run --project cortex --locked python -m cortex.scripts.verify_macos_release \
 
 ## Consumer verification
 
-After downloading an artifact, its `SHA256SUMS-<arch>`, and its
-architecture-specific evidence ZIP, extract the ZIP and place the DMG beside
-the checksum file before running:
+After downloading an artifact and its `SHA256SUMS-<arch>`, run:
 
 ```bash
-shasum -a 256 -c SHA256SUMS-arm64
+shasum -a 256 --ignore-missing -c SHA256SUMS-arm64
 gh attestation verify Cortex-<version>-macos-arm64.dmg \
   --repo StevenWang-CY/cortex
 codesign --verify --strict --verbose=2 Cortex-<version>-macos-arm64.dmg
@@ -144,8 +142,13 @@ spctl -a -vv --type open --context context:primary-signature \
 ```
 
 The checksum file covers the DMG, metadata, SBOMs, verifier output, and command
-evidence. Verify only the DMG line when you intentionally did not download the
-full evidence bundle.
+evidence — but only the DMG, the checksum file, and the evidence ZIP are
+published as release assets; everything else lives inside that ZIP. So a plain
+`shasum -a 256 -c` exits non-zero on a correct DMG-only download, once per
+unextracted file. `--ignore-missing` checks what you actually have, and still
+fails with "no file was verified" if the DMG is absent or misnamed. To verify
+every line, extract the evidence ZIP beside the checksum file first and drop
+the flag.
 
 ## Required real-device release-candidate pass
 

@@ -52,6 +52,12 @@ _CLICK_BURST_INTERVAL_S = 0.3
 # Keyboard burst detection: keystrokes within this interval count as burst
 _KEY_BURST_INTERVAL_S = 0.1
 
+# Scroll burst detection: upward scrolls within this interval are one gesture.
+# macOS momentum scrolling emits events every ~16 ms for the tail of a flick,
+# so the interval need only exceed that train; it stays well under the pause
+# between two deliberate scroll-backs.
+_SCROLL_BURST_INTERVAL_S = 0.4
+
 # Maximum expected mouse velocity for normalization (px/s)
 _MAX_MOUSE_VELOCITY = 5000.0
 
@@ -553,8 +559,29 @@ class FeatureAggregator:
         scrolls: list[MouseScrollEvent],
         window_seconds: float,
     ) -> float:
-        """Compute upward scroll-back rate per minute."""
+        """Compute upward scroll-back *bursts* per minute.
+
+        The feature catalogue declares this feature's unit as ``bursts/min``,
+        but the implementation counted every upward callback. macOS momentum
+        scrolling emits a train of discrete events per gesture, so a single
+        ordinary trackpad flick registered as a high scroll-back rate and was
+        fed to the rule scorer as evidence of re-reading. Consecutive upward
+        events within :data:`_SCROLL_BURST_INTERVAL_S` are one gesture, and a
+        downward scroll ends the burst because reversing direction is a
+        semantic boundary rather than a continuation.
+        """
         if window_seconds <= 1e-6 or not scrolls:
             return 0.0
-        upward = sum(1 for s in scrolls if s.direction == ScrollDirection.UP)
-        return float((upward * 60.0) / window_seconds)
+        bursts = 0
+        last_up_timestamp: float | None = None
+        for event in sorted(scrolls, key=lambda item: item.timestamp):
+            if event.direction is not ScrollDirection.UP:
+                last_up_timestamp = None
+                continue
+            if (
+                last_up_timestamp is None
+                or (event.timestamp - last_up_timestamp) > _SCROLL_BURST_INTERVAL_S
+            ):
+                bursts += 1
+            last_up_timestamp = event.timestamp
+        return float((bursts * 60.0) / window_seconds)

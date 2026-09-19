@@ -64,4 +64,36 @@ describe("badge priority", () => {
         expect(badge.setIntervention(false)).toBe("✓");
         expect(badge.setRecap(false)).toBe("");
     });
+
+    it("survives a service-worker restart", () => {
+        // `chrome.action.setBadgeText` persists across an MV3 eviction; the
+        // record that decides what it should say did not. A restarted worker
+        // came up with `recap: false` even though the "✓" was still painted
+        // and `cortex.lastRecap` was still in storage, so the first
+        // `setIntervention(false)` — which every dismissal reaches —
+        // recomputed the text as "" and destroyed the unread-recap signal.
+        const before = new BadgeState();
+        before.setRecap(true);
+        before.setIntervention(true);
+        expect(before.text()).toBe("1");
+
+        const persisted = JSON.parse(JSON.stringify(before.snapshot()));
+
+        const after = new BadgeState();
+        expect(after.text()).toBe("");  // cold module state
+        after.hydrate(persisted);
+
+        expect(after.text()).toBe("1");
+        // The dismissal that used to wipe the recap now reveals it.
+        expect(after.setIntervention(false)).toBe("✓");
+    });
+
+    it("ignores a malformed or absent persisted record", () => {
+        const badge = new BadgeState();
+        badge.setRecap(true);
+        badge.hydrate(undefined);
+        badge.hydrate({} as never);
+        badge.hydrate({ recap: "yes" } as never);
+        expect(badge.text()).toBe("✓");
+    });
 });

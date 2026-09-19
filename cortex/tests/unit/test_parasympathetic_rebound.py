@@ -1,6 +1,5 @@
 """Unit tests for ParasympatheticReboundDetector."""
 
-import time
 
 from cortex.services.state_engine.parasympathetic_rebound import (
     ParasympatheticReboundDetector,
@@ -115,9 +114,19 @@ class TestParasympatheticReboundDetector:
         assert result is False
 
     def test_rebound_rejected_20min_after_acceptance(self):
-        """Rebound 20 min after last acceptance must return False (outside 5-min window)."""
+        """Rebound 20 min after last acceptance must return False (outside 5-min window).
+
+        Both timestamps are monotonic and explicit. The test used to build
+        ``last_submission_ts`` from ``time.time()`` while the detector
+        subtracted it from ``time.time()`` too — so it passed, but it pinned a
+        wall-clock contract that an NTP step or DST change could invert. The
+        detector now measures on the monotonic clock like every sibling in the
+        package, and mixing the two produced an ``elapsed`` of roughly minus
+        1.8 billion seconds: permanently "inside" the window.
+        """
         detector = ParasympatheticReboundDetector()
-        twenty_min_ago = time.time() - 20 * 60  # 20 min ago
+        now = 10_000.0
+        twenty_min_ago = now - 20 * 60
         result = detector.update(
             accepted=True,
             hr=71.0,
@@ -125,6 +134,7 @@ class TestParasympatheticReboundDetector:
             hrv_current=55.0,
             hrv_prev=48.0,
             last_submission_ts=twenty_min_ago,
+            current_time=now,
         )
         assert result is False
         assert detector.is_rebounding() is False
@@ -132,7 +142,8 @@ class TestParasympatheticReboundDetector:
     def test_rebound_accepted_within_5min_of_acceptance(self):
         """Rebound 2 min after last acceptance must still pass."""
         detector = ParasympatheticReboundDetector()
-        two_min_ago = time.time() - 2 * 60  # 2 min ago
+        now = 10_000.0
+        two_min_ago = now - 2 * 60
         result = detector.update(
             accepted=True,
             hr=71.0,
@@ -140,6 +151,7 @@ class TestParasympatheticReboundDetector:
             hrv_current=55.0,
             hrv_prev=48.0,
             last_submission_ts=two_min_ago,
+            current_time=now,
         )
         assert result is True
         assert detector.is_rebounding() is True

@@ -106,16 +106,9 @@ async def require_capability_token(
     """
     token = _extract_token(authorization, x_cortex_auth_token)
     if not token or not verify_token(token):
-        path = request.url.path
-        reason = "missing" if not token else "invalid"
-        # Emit the structured event so log aggregators see auth failures
-        # at fixed schema (the cid + path is the indexable join key).
-        logger.warning(
-            "%s reason=%s path=%s cid=%s",
-            EventType.AUTH_REJECTED.value,
-            reason,
-            path,
-            get_correlation_id() or "-",
+        log_auth_rejected(
+            reason="missing" if not token else "invalid",
+            path=request.url.path,
         )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -123,6 +116,27 @@ async def require_capability_token(
             headers={"WWW-Authenticate": "Bearer"},
         )
     return token
+
+
+def log_auth_rejected(*, reason: str, path: str) -> None:
+    """Emit ``EventType.AUTH_REJECTED`` for a refused request.
+
+    One owner for the event, on this module's logger, because that is the
+    channel log aggregators alarm on for the hostile-localhost-scanner signal
+    (the cid + path is the indexable join key). The pre-routing
+    ``CapabilityGateMiddleware`` now refuses most unauthenticated requests
+    before the dependency runs, and it calls this rather than logging under its
+    own name -- otherwise moving the rejection earlier would have silently
+    moved the alarm signal to a logger nobody watches.
+    """
+
+    logger.warning(
+        "%s reason=%s path=%s cid=%s",
+        EventType.AUTH_REJECTED.value,
+        reason,
+        path,
+        get_correlation_id() or "-",
+    )
 
 
 async def optional_capability_token(

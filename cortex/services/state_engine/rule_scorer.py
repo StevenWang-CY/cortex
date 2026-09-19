@@ -282,7 +282,13 @@ class RuleScorer:
         observed_count = 0
         for name, weight in weights.items():
             feature = features.get(name)
-            if feature is None or not feature.valid or feature.value is None:
+            baseline_missing = not self._baseline_ready(name)
+            if (
+                feature is None
+                or not feature.valid
+                or feature.value is None
+                or baseline_missing
+            ):
                 contributions.append(FeatureContribution(
                     feature=name.value,
                     support_state=state,
@@ -290,7 +296,13 @@ class RuleScorer:
                     contribution=0.0,
                     quality=0.0,
                     observed=False,
-                    note="Feature unavailable; it contributes neither evidence nor score.",
+                    note=(
+                        "Personal baseline not measured; the feature abstains "
+                        "rather than scoring against a placeholder."
+                        if baseline_missing
+                        else "Feature unavailable; it contributes neither "
+                        "evidence nor score."
+                    ),
                 ))
                 continue
             observed_count += 1
@@ -319,6 +331,45 @@ class RuleScorer:
             observed_count,
         )
 
+    # Smallest mouse-velocity-variance baseline that can be used as a divisor.
+    # A strict ``> 0.0`` test was not enough: both scoring paths floor the
+    # divisor at 1.0, so any persisted baseline below roughly 3 000 px^2/s^2
+    # pinned the feature to maximum support evidence and zero flow evidence
+    # permanently. Such a baseline is reachable through ordinary calibration --
+    # windows with fewer than two mouse moves contribute a variance of 0.0 and
+    # the baseline is their plain mean, so a keyboard-heavy session averages
+    # down to a small non-zero value that passed the old gate. 1 000 px^2/s^2
+    # is an order of magnitude below the 10 000 working default in
+    # ``causal_attribution``, so genuine calibrations still pass.
+    _MIN_MOUSE_VARIANCE_BASELINE: float = 1_000.0
+
+    def _baseline_ready(self, name: FeatureName) -> bool:
+        """Is the personal baseline this feature scores against a measurement?
+
+        ``mouse_variance_baseline`` may legitimately be ``0`` before
+        calibration runs. Flooring it to ``1.0`` kept the state loop from
+        raising, but mouse velocity variance is measured in thousands, so every
+        window then scored as maximum thrash evidence and minimum flow
+        evidence — a permanent, invisible verdict derived from a baseline that
+        was never taken. Abstaining is the honest reading: without a personal
+        baseline there is nothing to be relative to.
+
+        The test is a magnitude, not ``> 0.0``. Because both scoring paths
+        floor the divisor, every baseline below roughly 3 000 px^2/s^2
+        saturates exactly as a zero one does, and a small non-zero baseline is
+        an ordinary calibration outcome rather than a corrupt one: windows with
+        fewer than two mouse moves contribute a variance of 0.0, and the
+        baseline is their plain mean, so a keyboard-heavy session averages down
+        into that band and used to pass.
+        """
+
+        if name is FeatureName.MOUSE_VELOCITY_VARIANCE:
+            return (
+                float(self._baselines.mouse_variance_baseline)
+                >= self._MIN_MOUSE_VARIANCE_BASELINE
+            )
+        return True
+
     def _support_transform(self, name: FeatureName, value: float) -> float:
         if name == FeatureName.MOUSE_VELOCITY_VARIANCE:
             return self.score_mouse_thrash(value)
@@ -342,7 +393,10 @@ class RuleScorer:
         if name == FeatureName.MOUSE_VELOCITY_MEAN:
             return self._band(value, 100.0, 800.0, 1_500.0)
         if name == FeatureName.MOUSE_VELOCITY_VARIANCE:
-            baseline = max(1.0, self._baselines.mouse_variance_baseline)
+            baseline = max(
+                self._MIN_MOUSE_VARIANCE_BASELINE,
+                self._baselines.mouse_variance_baseline,
+            )
             return 1.0 - self._ramp(value / baseline, 1.0, 2.5)
         if name == FeatureName.CLICK_FREQUENCY:
             return self._band(value, 0.05, 1.5, 3.0)
@@ -501,8 +555,14 @@ class RuleScorer:
         # Calibration may persist ``mouse_variance_baseline == 0`` (the schema
         # allows it). Floor it exactly like ``_flow_transform`` so a zero
         # baseline degrades to "any variance is thrash-relative" instead of
-        # raising ZeroDivisionError on every state-loop tick (audit D2).
-        baseline = max(1.0, float(self._baselines.mouse_variance_baseline))
+        # raising ZeroDivisionError on every state-loop tick (audit D2). The
+        # floor is the abstention threshold rather than 1.0, so a direct caller
+        # that skips ``_baseline_ready`` cannot get the saturating divisor
+        # either.
+        baseline = max(
+            self._MIN_MOUSE_VARIANCE_BASELINE,
+            float(self._baselines.mouse_variance_baseline),
+        )
         if velocity_variance <= baseline:
             return 0.0
 
@@ -520,13 +580,23 @@ class RuleScorer:
         Score window switching: > 20 switches/min.
 
         Returns 0-1, where 1.0 = 40+ switches/min.
+
+        Both branches used the wrong divisor. The 10-20 band divided by 20
+        where continuity requires 10, so it reached only 0.25 at its top and
+        the function stepped 0.25 -> 0.50 across an infinitesimal change at
+        exactly 20 switches/min. The upper branch divided by 20 as well, so it
+        saturated at 30 rather than the 40 this docstring promises. Feeding an
+        0.18-weighted support feature, that step meant two windows a hair
+        either side of 20 switches/min produced materially different support
+        scores for no real difference in behaviour.
         """
         if switch_rate <= 10.0:
             return 0.0
 
+        # 10 -> 0.0, 20 -> 0.5, continuous at both ends.
         if switch_rate <= 20.0:
-            return float((switch_rate - 10.0) / 20.0 * 0.5)
+            return float((switch_rate - 10.0) / 10.0 * 0.5)
 
-        # Above 20: 0.5 → 1.0
-        score = 0.5 + min(0.5, (switch_rate - 20.0) / 20.0)
+        # 20 -> 0.5, 40 -> 1.0, matching the documented saturation point.
+        score = 0.5 + min(0.5, (switch_rate - 20.0) / 40.0)
         return float(np.clip(score, 0.0, 1.0))

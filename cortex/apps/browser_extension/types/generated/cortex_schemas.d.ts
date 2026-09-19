@@ -3,7 +3,7 @@
 //
 // Source of truth: cortex/libs/schemas/*.py (Pydantic v2 models).
 // Schema package: cortex-wire/2.0
-// Source SHA-256: bb90d644115d5ab82bfd839545b2e29808d90f06229c741d3e08f17ee91fd963
+// Source SHA-256: 4fbcc7e6a3cd4bd68233d9fc5ab09e3835952d15126df17b6156800ac87e1e15
 // Drift-gate: a pre-commit hook and the GitHub Actions CI run
 //   `python -m cortex.scripts.generate_ts_schemas --check`
 // and fail if this file is out of sync with the Python models.
@@ -4094,6 +4094,25 @@ export interface EmergencyRestoreResponse {
   restored?: number;
   failed?: number;
   pending?: number;
+}
+/**
+ * Result of clearing the dismissal-driven quiet escalation.
+ */
+export interface SuggestionPacingResetResponse {
+  schema_version?: "1.0" | "2.0";
+  observed_at_unix_ms?: number;
+  observed_at_mono_ns?: number;
+  boot_id?: string;
+  /**
+   * @deprecated
+   * Deprecated v1 compatibility mirror in UTC Unix seconds; never use it for elapsed-time decisions.
+   */
+  timestamp?: number | null;
+  reset?: boolean;
+  /**
+   * Escalation level before the reset (0 when none was held).
+   */
+  previous_level?: number;
 }
 /**
  * P0 audit / Phase-4a: client → daemon ack of an intervention apply.

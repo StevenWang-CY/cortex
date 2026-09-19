@@ -163,9 +163,16 @@ def _bundled_env_files() -> tuple[str, ...]:
     if _is_bundled():
         app_support = Path.home() / "Library" / "Application Support" / "Cortex"
         meipass = Path(sys._MEIPASS)  # type: ignore[attr-defined]
+        # LAST file wins. pydantic-settings reads the tuple in order and each
+        # file updates the accumulated mapping, so the final entry has the
+        # highest precedence -- which is why the dev branch below puts
+        # ``.env.local`` last. The bundled branch had the two the other way
+        # round while its comment claimed the user file was "highest
+        # priority", so inside the .app the shipped defaults silently
+        # overrode anything the user had set in Application Support.
         return (
-            str(app_support / ".env"),  # User overrides (highest priority)
-            str(meipass / ".env"),  # Bundled defaults
+            str(meipass / ".env"),  # Bundled defaults (lowest precedence)
+            str(app_support / ".env"),  # User overrides — last file wins
         )
     return (".env", ".env.local")
 
@@ -618,6 +625,17 @@ class APIConfig(BaseModel):
             "fallback for browser tabs that aren't extensions."
         ),
     )
+    expose_api_docs: bool = Field(
+        default=False,
+        description=(
+            "Serve FastAPI's /docs, /redoc and /openapi.json. These are "
+            "mounted by FastAPI itself, outside the public-liveness and "
+            "capability-gated routers, so they published the whole local API "
+            "surface — every mutating route, its parameters and its response "
+            "shapes — to any local process without a capability token. Off by "
+            "default; enable only for local development."
+        ),
+    )
 
 
 class TelemetryConfig(BaseModel):
@@ -645,8 +663,42 @@ class RPPGSignalConfig(BaseModel):
     bandpass_low: float = Field(0.7, gt=0.0)
     bandpass_high: float = Field(3.5, gt=0.0)
     bandpass_order: int = Field(4, ge=1, le=8)
-    nsqi_threshold: float = 0.293
-    min_cardiac_snr_db: float = 2.0
+    nsqi_threshold: float = Field(
+        0.293,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum normalized spectral quality index for a window to count "
+            "as carrying a cardiac signal"
+        ),
+    )
+    min_cardiac_snr_db: float = Field(
+        2.0,
+        description=(
+            "Minimum in-band to out-of-band SNR in dB for a window to count as "
+            "carrying a cardiac signal; the dominant guard against publishing a "
+            "heart rate read out of noise"
+        ),
+    )
+    min_peak_concentration: float = Field(
+        0.40,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum share of in-band power concentrated at the selected "
+            "spectral peak for a window to count as carrying a cardiac signal; "
+            "separates a cardiac line from wandering illumination drift"
+        ),
+    )
+    minimum_window_quality: float = Field(
+        0.30,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum composite acquisition quality (motion, face coverage and "
+            "spectrum) for a pulse window to be published"
+        ),
+    )
     max_head_jitter_deg: float = Field(7.5, gt=0.0)
     min_valid_coverage: float = Field(0.80, ge=0.0, le=1.0)
     max_interpolation_gap_ms: float = Field(250.0, gt=0.0)
@@ -944,9 +996,14 @@ class StorageConfig(BaseModel):
     analytics_queue_capacity: int = Field(256, ge=16, le=16_384)
     # v0.4.0: session reports are the History feature's data; the size budget
     # below bounds growth, so retention is generous rather than a week.
-    session_retention_days: int = 180
-    feature_retention_days: int = 7
-    error_retention_days: int = 90
+    # Bounded like every other field in this class. These were bare ints, so a
+    # negative value made the janitor's ``retention_seconds`` negative, putting
+    # its cutoff in the future — every file counted as older than the cutoff
+    # and the sweep deleted the lot. A config typo could erase the user's
+    # history; one day is the floor, and zero is not a sentinel anywhere.
+    session_retention_days: int = Field(180, ge=1, le=3_650)
+    feature_retention_days: int = Field(7, ge=1, le=3_650)
+    error_retention_days: int = Field(90, ge=1, le=3_650)
     # F36: hard ceiling on the cumulative size of ``storage/sessions/*.json``.
     # When writing a new session report would push the total over budget,
     # oldest sessions (lowest mtime) are evicted first until the total
@@ -976,6 +1033,18 @@ class DebugConfig(BaseModel):
     rppg: bool = False
     state: bool = False
     llm: bool = False
+    # The session recorder writes one ``state_estimate`` record per *change*
+    # of (state, status), which is what History and the receipts need and is
+    # a tiny fraction of the tick rate. The offline replay harness wants the
+    # opposite: every tick, so a rerun sees the same input sequence the live
+    # run did. Without this the harness replays a session with most of its
+    # estimates missing and silently reports different behaviour.
+    #
+    # Off by default because a full stream is roughly two orders of magnitude
+    # more JSONL for a signal nobody reads outside a replay capture. Turn it
+    # on for the session you intend to replay:
+    # ``CORTEX_DEBUG__RECORD_FULL_STATE_STREAM=true``.
+    record_full_state_stream: bool = False
 
 
 class LoggingConfig(BaseModel):

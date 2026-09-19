@@ -33,6 +33,10 @@ from cortex.application.services import ServiceRegistry as ServiceRegistry
 from cortex.libs.config.settings import APIConfig, CortexConfig
 from cortex.libs.logging.correlation import correlation_scope
 from cortex.services.api_gateway.auth import require_capability_token
+from cortex.services.api_gateway.middleware.capability_gate import (
+    DEFAULT_PUBLIC_PATHS,
+    CapabilityGateMiddleware,
+)
 from cortex.services.api_gateway.middleware.rate_limit import RateLimitMiddleware
 from cortex.services.api_gateway.request_ids import sanitize_correlation_id
 
@@ -92,11 +96,18 @@ def create_app(
     app_clock = clock or SYSTEM_CLOCK
     app_services = services if services is not None else registry
 
+    # FastAPI mounts /docs, /redoc and /openapi.json itself, outside both the
+    # public-liveness router and the capability-gated one, so the structural
+    # split in routes.py did not cover them and the full local API surface was
+    # readable without a token. Off unless explicitly enabled for development.
     app = FastAPI(
         title="Cortex API Gateway",
         description="Somatic Workspace Engine — Internal Service API",
         version=__version__,
         lifespan=lifespan,
+        docs_url="/docs" if cfg.expose_api_docs else None,
+        redoc_url="/redoc" if cfg.expose_api_docs else None,
+        openapi_url="/openapi.json" if cfg.expose_api_docs else None,
     )
 
     # F13: per-route rate limiting. Registered BEFORE the correlation
@@ -112,6 +123,27 @@ def create_app(
     # and ``/api/launch`` budgets and starve the real clients; now budget
     # is consumed only after the token validates.
     app.add_middleware(RateLimitMiddleware, authenticated_only=True)
+
+    # Auth must be decided BEFORE the body is read. The capability token is a
+    # route dependency, and FastAPI runs dependencies only after the router has
+    # already pumped and JSON-parsed the body, so an unauthenticated caller
+    # could make the daemon allocate and parse a body of any size -- and the
+    # limiter above deliberately waives budget for unauthenticated requests, so
+    # nothing bounded the repetition either. Registered after the limiter in
+    # source order, which puts it OUTSIDE the limiter at runtime (Starlette
+    # treats the last ``add_middleware`` as outermost): CORS -> correlation ->
+    # capability gate -> rate limit -> router. The route dependency stays as
+    # defence in depth.
+    # When the docs are explicitly exposed they must actually be reachable:
+    # Swagger UI is opened in a browser that cannot attach the capability
+    # header, so gating them would make the opt-in do nothing. With the opt-in
+    # off they are not mounted at all and the gate simply answers first.
+    _public_paths = set(DEFAULT_PUBLIC_PATHS)
+    if cfg.expose_api_docs:
+        _public_paths.update({"/docs", "/redoc", "/openapi.json"})
+    app.add_middleware(
+        CapabilityGateMiddleware, public_paths=frozenset(_public_paths),
+    )
 
     # F19: correlation IDs. Every request enters a scope that mints (or
     # accepts via ``X-Cortex-Request-ID``) a correlation id, binds it to

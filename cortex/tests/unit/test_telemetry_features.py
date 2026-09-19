@@ -13,6 +13,7 @@ Tests use synthetic event sequences to verify:
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from cortex.libs.config.settings import TelemetryConfig
 from cortex.services.telemetry_engine.feature_aggregator import FeatureAggregator
@@ -670,3 +671,46 @@ class TestTelemetryEngineImports:
         from cortex.services.telemetry_engine import FeatureAggregator
 
         assert FeatureAggregator is not None
+
+
+class TestScrollBackBursts:
+    """The feature catalogue declares this feature's unit as ``bursts/min``."""
+
+    @staticmethod
+    def _scroll(timestamp: float, direction: ScrollDirection) -> MouseScrollEvent:
+        return MouseScrollEvent(
+            timestamp=timestamp, x=0, y=0, dx=0, dy=1, direction=direction
+        )
+
+    def test_one_trackpad_flick_is_one_burst_not_one_per_callback(self) -> None:
+        """macOS momentum scrolling emits a train of events per gesture.
+
+        Counting every callback turned a single ordinary flick into a high
+        scroll-back rate, which the rule scorer consumed as evidence of
+        re-reading.
+        """
+        # One flick: 30 momentum events at ~60 Hz, spanning half a second.
+        flick = [self._scroll(i * 0.016, ScrollDirection.UP) for i in range(30)]
+
+        rate = FeatureAggregator._compute_scroll_back_rate_per_min(flick, 60.0)
+
+        assert rate == pytest.approx(1.0), "one gesture must count once"
+
+    def test_separate_gestures_and_direction_changes_are_separate_bursts(self) -> None:
+        events = [
+            *[self._scroll(i * 0.016, ScrollDirection.UP) for i in range(5)],
+            # A clear pause, then a second deliberate scroll-back.
+            *[self._scroll(2.0 + i * 0.016, ScrollDirection.UP) for i in range(5)],
+            # Scrolling down and back up again is a third.
+            self._scroll(2.5, ScrollDirection.DOWN),
+            self._scroll(2.6, ScrollDirection.UP),
+        ]
+
+        rate = FeatureAggregator._compute_scroll_back_rate_per_min(events, 60.0)
+
+        assert rate == pytest.approx(3.0)
+
+    def test_downward_only_scrolling_is_not_scroll_back(self) -> None:
+        events = [self._scroll(i * 0.5, ScrollDirection.DOWN) for i in range(10)]
+
+        assert FeatureAggregator._compute_scroll_back_rate_per_min(events, 60.0) == 0.0

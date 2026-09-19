@@ -1472,12 +1472,42 @@ function CortexPopup(): React.ReactElement {
         setApplyState((prev) => ({ ...prev, undoBusy: true }));
         sendWithCid(
             { type: "UNDO_ALL_RECENT", intervention_id: interventionId },
-            () => setApplyState({
-                phase: "idle",
-                outcome: null,
-                undone: true,
-                undoBusy: false,
-            }),
+            (raw: unknown) => {
+                // The callback used to ignore its argument entirely and set
+                // `undone: true` unconditionally, so the popup claimed the
+                // workspace had been restored even when nothing was.
+                const response = raw as {
+                    ok?: unknown;
+                    attempted?: unknown;
+                    undone?: unknown;
+                    reason?: unknown;
+                } | undefined;
+                if (response?.ok === true) {
+                    setApplyState({
+                        phase: "idle",
+                        outcome: null,
+                        undone: true,
+                        undoBusy: false,
+                    });
+                    return;
+                }
+                const undoneCount = typeof response?.undone === "number"
+                    ? response.undone
+                    : 0;
+                const attempted = typeof response?.attempted === "number"
+                    ? response.attempted
+                    : 0;
+                const reason = typeof response?.reason === "string" && response.reason
+                    ? response.reason
+                    : "Cortex didn't respond";
+                setInterventionError(
+                    undoneCount > 0
+                        ? `Undid ${undoneCount} of ${attempted} changes — ${reason}.`
+                        : `Couldn't undo — ${reason}.`,
+                );
+                // Keep the applied state so Undo stays available for a retry.
+                setApplyState((prev) => ({ ...prev, undone: false, undoBusy: false }));
+            },
         );
     }, [interventionId]);
 

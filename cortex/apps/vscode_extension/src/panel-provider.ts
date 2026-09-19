@@ -92,11 +92,21 @@ export class CortexPanelProvider
         //
         // P0-4: same guard — _updatePanel should not take down the
         // subscription if the webview is mid-teardown.
-        wsClient.onConnectionChange((_connected) => {
+        wsClient.onConnectionChange((connected) => {
             try {
-                if (!this._currentPayload) {
-                    this._updatePanel();
+                if (!connected) {
+                    // The state bar reads ``_currentState``, which only ever
+                    // grew: nothing cleared it, and the panel was repainted on
+                    // disconnect only when no intervention was on screen. A
+                    // user who lost the daemon kept seeing the last label and
+                    // "Evidence 84%" indefinitely, as a live reading. Drop the
+                    // cache so the bar falls back to "No estimate".
+                    this._currentState = {};
                 }
+                // Repaint unconditionally. Gating on ``!this._currentPayload``
+                // meant an intervention-bearing panel never learned it had
+                // gone offline.
+                this._updatePanel();
             } catch (err) {
                 console.error("[CortexPanel] onConnectionChange handler threw:", err);
             }

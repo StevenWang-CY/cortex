@@ -304,12 +304,19 @@ class SettingsDialog(QWidget):
         # no callback into the app when the user flips the toggle. Poll
         # every 1.5s while the dialog is visible so the camera /
         # accessibility status pills reflect reality without a relaunch
-        # or "Check again" click. Paused on hide via ``hideEvent``.
+        # or "Check again" click.
+        #
+        # Started by ``showEvent``, stopped by ``hideEvent``, and NOT here.
+        # The controller constructs this dialog eagerly at startup, and a
+        # widget that has never been shown never receives a ``hideEvent``,
+        # so starting it in the constructor ran the poll — a TCC query plus
+        # an AVCaptureDevice query, ~40 of each per minute — for the app's
+        # entire life on behalf of every user who never opens Settings.
+        # ``showEvent`` already starts the timer and forces an immediate
+        # refresh, so nothing is visibly deferred.
         self._permission_timer: QTimer = QTimer(self)
         self._permission_timer.setInterval(1500)
         self._permission_timer.timeout.connect(self._refresh_permission_states)
-        self._permission_timer.start()
-        self._refresh_permission_states()
 
     # -- Native chrome ---------------------------------------------------
 
@@ -1498,7 +1505,22 @@ class SettingsDialog(QWidget):
             # apply that arrives after a newer one.
             settings["settings_version"] = self._settings_version
             self._persist_settings(settings)
-            self.settings_changed.emit(settings)
+            # Apply must not restate quiet mode the user never touched here.
+            # The payload always carried this checkbox, defaulting to
+            # unchecked, so pausing from the tray and then applying an
+            # unrelated setting cancelled the pause and the dismissal-driven
+            # quiet window, releasing the camera latch with no indication.
+            # The preference is still persisted above; only the live
+            # instruction is withheld.
+            outbound = dict(settings)
+            if outbound.get("quiet_mode") == getattr(
+                self, "_quiet_mode_baseline", outbound.get("quiet_mode")
+            ):
+                outbound.pop("quiet_mode", None)
+                outbound.pop("quiet_duration_minutes", None)
+            else:
+                self._quiet_mode_baseline = bool(outbound.get("quiet_mode"))
+            self.settings_changed.emit(outbound)
             logger.info(
                 "Settings applied: sensitivity=%s llm=%s version=%d",
                 settings["sensitivity"],
@@ -1601,6 +1623,13 @@ class SettingsDialog(QWidget):
             set_active_palette(str(value))
         except Exception:
             logger.debug("palette runtime swap failed", exc_info=True)
+        # Persist here, not only on Apply. The whole surface recolours the
+        # instant the combo changes, and that is precisely the cue that tells
+        # the user the choice has taken — so closing Settings without
+        # clicking Apply silently reverted an accessibility setting at the
+        # next launch. Going through ``_persist_settings`` keeps the F53
+        # sync-failure reporting, so a palette that cannot be saved says so.
+        self._persist_settings({"palette_variant": str(value)})
         try:
             self.palette_changed.emit(str(value))
         except Exception:
@@ -1855,6 +1884,10 @@ class SettingsDialog(QWidget):
             self._sensitivity_slider.setValue(_get_int("sensitivity", 3))
             self._cooldown_spin.setValue(_get_int("cooldown_seconds", 60))
             self._quiet_mode.setChecked(_get_bool("quiet_mode", False))
+            # Baseline for "did the user actually touch this control?". Quiet
+            # state is live and owned by the tray, the dashboard capsule and
+            # the extension; this dialog holds only a persisted preference.
+            self._quiet_mode_baseline = self._quiet_mode.isChecked()
             self._quiet_duration.setValue(_get_int("quiet_duration_minutes", 30))
             llm_mode = str(self._qs.value("llm_mode", "bedrock"))
             llm_modes = ["bedrock", "vertex", "direct", "rule_based"]

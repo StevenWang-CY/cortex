@@ -22,6 +22,7 @@ defensive isolation is cheap).
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import textwrap
@@ -29,12 +30,25 @@ import textwrap
 
 def _run_python(snippet: str) -> tuple[int, str, str]:
     """Run a Python snippet in a fresh subprocess. Returns
-    ``(exit_code, stdout, stderr)``."""
+    ``(exit_code, stdout, stderr)``.
+
+    The child inherits the parent's resolved ``sys.path`` rather than
+    re-deriving its own. The suite sandboxes ``HOME`` (see
+    ``cortex/tests/conftest.py``), which relocates ``site.USER_SITE``; a child
+    that recomputes its path can therefore import a *different* copy of a
+    dependency than the parent -- on a machine with a package in both user and
+    system site-packages it silently picked up the older system one and this
+    test failed with an unrelated ``ImportError``. Pinning the path keeps the
+    test measuring import laziness instead of install layout.
+    """
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(entry for entry in sys.path if entry)
     proc = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(snippet)],
         capture_output=True,
         text=True,
         timeout=60,
+        env=env,
     )
     return proc.returncode, proc.stdout, proc.stderr
 

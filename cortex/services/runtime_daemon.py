@@ -56,7 +56,9 @@ from cortex.application.task_supervisor import TaskFailure, TaskGroupName
 from cortex.libs.adapters.leetcode_adapter import LeetCodeAdapter
 from cortex.libs.config.settings import CortexConfig, get_config
 from cortex.libs.logging.structured import (
+    DEBUG_SUBSYSTEM_LOGGERS,
     EventType,
+    apply_debug_subsystems,
     configure_logging,
     get_logger,
 )
@@ -837,6 +839,21 @@ class CortexDaemon:
         self._intervention_callback_seq: int = 0
 
         self._recorder = SessionRecorder(self.config.storage.path, clock=self._clock)
+        # Audit D15 / roadmap: the recorder writes one state_estimate per
+        # change of (state, status). The offline replay harness needs every
+        # tick, so a rerun sees the input sequence the live run saw; without
+        # it the harness replays a session with most of its estimates missing
+        # and reports different behaviour without saying why. Configurable
+        # rather than a source edit — see DebugConfig.
+        self._record_full_state_stream = bool(
+            self.config.debug.record_full_state_stream
+        )
+        # Honour the configured support switches from the first frame, not
+        # only after the user re-applies settings.
+        apply_debug_subsystems({
+            subsystem: bool(getattr(self.config.debug, subsystem, False))
+            for subsystem in DEBUG_SUBSYSTEM_LOGGERS
+        })
         # Audit D15: the JSONL state stream records label/status transitions
         # only (see ``_record_state_estimate``).
         self._last_recorded_state_key: tuple[str, str] | None = None
@@ -1820,6 +1837,66 @@ class CortexDaemon:
                 exc_info=True,
             )
 
+    def _restore_quiet_mode_from_policy(self) -> None:
+        """Adopt an indefinite pause the trigger policy rehydrated from disk.
+
+        ``TriggerPolicy`` persists ``quiet_mode_indefinite`` and reloads it in
+        ``__init__`` precisely because an indefinite pause is a standing user
+        decision. The daemon's own mirror of that state was rebuilt as "off" on
+        every construction, so after a restart the UI, the WS envelope and the
+        tray all reported "off" while the policy still suppressed triggers --
+        and the camera was started again regardless. The two halves are
+        reconciled here, before anything reads the daemon's quiet state.
+
+        Only the indefinite case is restored. A timed window is measured
+        against a monotonic clock, which does not survive the process, so a
+        snooze or quiet session legitimately lapses on restart.
+        """
+
+        try:
+            indefinite = self._trigger_policy.quiet_mode_indefinite
+        except AttributeError:  # pragma: no cover - older policy doubles
+            return
+        if not indefinite:
+            return
+        self._quiet_mode_kind = "pause"
+        self._quiet_mode_ends_at = None
+        self._quiet_mode_deadline = None
+        self._quiet_mode_source = "restored"
+        self._pause_was_capturing = True
+        logger.info("Quiet mode restored from policy: kind=pause (indefinite)")
+
+    def _capture_restart_permitted(self, *, surface: str) -> bool:
+        """Whether a live command may (re)open the camera right now.
+
+        ``_stop_once`` stops the capture pipeline early but does not stop the
+        WebSocket command surface until much later, and between the two it can
+        await roughly eleven seconds of bounded waits — the session-report
+        persist, the recap broadcast and dismissal timeouts, the midnight
+        scheduler, the copilot re-enable. ``_handle_client`` dispatches frames
+        inline, so a ``QUIET_MODE_TOGGLE`` or a ``SETTINGS_SYNC`` arriving in
+        that window reached a restart path with no readiness or stop gate and
+        reopened the camera *after* teardown had released it. The camera light
+        came back on while Cortex was quitting, and the handle outlived the
+        daemon's own release.
+
+        ``_stop_started`` is set at the very top of ``_stop_once``, before any
+        service is touched, so it covers the whole window. Callers check it
+        after taking whatever lock they hold, because the flag can flip while
+        they wait for it.
+
+        Only the camera is gated here. The rest of what those commands do —
+        broadcasting state, updating the trigger policy, persisting a
+        preference — is idempotent and has no hardware to leak.
+        """
+        if self._stop_started:
+            logger.info(
+                "Refusing capture restart from %s: the daemon is stopping",
+                surface,
+            )
+            return False
+        return True
+
     async def _start_optional_hardware(self) -> None:
         """Start capture without gating core daemon readiness.
 
@@ -2049,6 +2126,7 @@ class CortexDaemon:
         # native extension call it can lead to a segfault on resume.
         self._install_loop_signal_handlers()
         self._register_services()
+        self._restore_quiet_mode_from_policy()
         ws_started = await self._ws_server.start()
         if not ws_started:
             raise RuntimeError(
@@ -2068,6 +2146,15 @@ class CortexDaemon:
         await self._wait_for_api_server_ready()
 
         hardware_probe_enabled = os.environ.get("CORTEX_HEADLESS_STARTUP") != "1"
+        if self._quiet_mode_kind == "pause":
+            # A restored indefinite pause means the user asked for sensing to
+            # stop and has not resumed. Starting the camera here would honour
+            # the UI label while contradicting it in hardware -- the camera
+            # light would come back on by itself after a restart.
+            logger.info(
+                "Restored indefinite pause: capture stays stopped until resumed"
+            )
+            hardware_probe_enabled = False
         if hardware_probe_enabled:
             # Input/window hooks are fast and independently useful when the
             # camera is unavailable.  Capture itself is supervised in the
@@ -3626,6 +3713,21 @@ class CortexDaemon:
             self._posture.observe_missing(mono_seconds)
             return
 
+        # The pose estimator's pinhole intrinsics are built from a frame size,
+        # and were built once from the *configured* one. Cameras routinely
+        # negotiate something else — ask for 1280x720, receive 640x480 — and
+        # the capture service already rebinds the camera identity to whatever
+        # the frame actually is. Landmarks then arrive in the delivered space
+        # while the matrix still describes the configured one, so solvePnP
+        # returns a pitch, yaw and roll biased by however far apart the two
+        # geometries are, and nothing downstream can tell that from posture.
+        # Reconcile the estimator to the same authority.
+        if identity is not None:
+            self._head_pose.rebind_geometry(
+                frame_width=identity.width,
+                frame_height=identity.height,
+            )
+
         blink = self._blink_detector.update(landmarks_px, mono_seconds)
         pose = self._head_pose.update(landmarks_px, mono_seconds)
         posture = self._posture.update(
@@ -3883,6 +3985,22 @@ class CortexDaemon:
                     vector.hrv_sdnn = None
                     vector.respiration_rate = None
 
+                    # Same-category tab switching is topically coherent and
+                    # is meant to discount the window-switch support signal.
+                    # Nothing in production ever called ``set_tab_categories``,
+                    # so ``_same_category_ratio`` returned 0.0 on every tick
+                    # and the discount branch could not be reached. The data
+                    # was already assembled -- ``BrowserAdapter`` classifies
+                    # every tab and ``TabInfo.tab_type`` is populated -- it
+                    # simply never reached the scorer.
+                    browser_context = getattr(
+                        self._latest_context, "browser_context", None
+                    )
+                    self._scorer.set_tab_categories(
+                        [tab.tab_type for tab in browser_context.all_tabs]
+                        if browser_context is not None
+                        else None
+                    )
                     evaluation = self._support_inference.evaluate(vector)
                     estimate = self._smoother.update(
                         evaluation,
@@ -3955,7 +4073,16 @@ class CortexDaemon:
                         timestamp=timestamp,
                     )
                     self._services.register("latest_focus_break_decision", break_decision)
-                    if break_decision.should_recommend and self._interventions_enabled:
+                    # Focus-break reminders are an interruption like any other.
+                    # Checking only ``_interventions_enabled`` skipped quiet
+                    # mode, pause, snooze, receptivity, the weekly schedule,
+                    # the cooldown and the hourly cap, so a paused user still
+                    # received break prompts. The shared gate owns that
+                    # decision for every surface (audit D5).
+                    if break_decision.should_recommend and self._interruption_allowed(
+                        surface="focus_break",
+                        current_time=timestamp,
+                    ):
                         from cortex.libs.schemas.realtime import BreakRecommendation
 
                         recommendation = BreakRecommendation(
@@ -3973,6 +4100,16 @@ class CortexDaemon:
                             MessageType.BREAK_RECOMMENDATION.value,
                             recommendation.model_dump(mode="json"),
                         )
+                        # The shared gate's contract: a surface that presents
+                        # an interruption records it, so the cooldown and the
+                        # hourly cap count it like every other proposal. The
+                        # focus-break policy's own one-shot budget is consumed
+                        # here for the same reason -- ``evaluate`` used to
+                        # consume it before the gate was consulted, so a
+                        # reminder suppressed by quiet mode or cooldown was
+                        # spent rather than deferred.
+                        self._focus_break_policy.record_recommended()
+                        self._trigger_policy.record_intervention(timestamp=timestamp)
 
                     # P0 §3.9: feed the causal attributor at the same
                     # cadence so the per-signal sparkline buffers fill
@@ -4149,6 +4286,14 @@ class CortexDaemon:
                             mouse_velocity=telemetry.mouse_velocity_mean if telemetry else 0.0,
                             blink_rate=kinematics.blink_rate,
                             current_time=timestamp,
+                            # Keep accumulating while an interruption is
+                            # barred, so the dwell already served is deferred
+                            # rather than consumed and discarded.
+                            may_trigger=signal_ok
+                            and self._interruption_allowed(
+                                surface="zombie_reading",
+                                current_time=timestamp,
+                            ),
                         )
                         if signal_ok and zombie_detected:
                             logger.info("Zombie reading detected — triggering active recall")
@@ -4170,6 +4315,14 @@ class CortexDaemon:
                                 current_app=active_app,
                                 state=estimate.state,
                                 current_time=timestamp,
+                                # Let the detector keep tracking while an
+                                # interruption is barred, so a detection is
+                                # deferred rather than consumed and discarded.
+                                may_trigger=signal_ok
+                                and self._interruption_allowed(
+                                    surface="rabbit_hole",
+                                    current_time=timestamp,
+                                ),
                             )
                             if signal_ok and alert is not None:
                                 logger.info("Rabbit hole detected — goal drift intervention")
@@ -4229,8 +4382,12 @@ class CortexDaemon:
             # B6 (Phase 4.1): graceful state loop shutdown.
             logger.debug("state loop cancelled")
 
-    # Audit D15: set True to record every 2 Hz estimate (debug only); the
-    # default records label/status transitions.
+    # Audit D15: record every 2 Hz estimate rather than only label/status
+    # transitions. This is a class-level fallback; ``__init__`` binds the
+    # instance attribute from ``config.debug.record_full_state_stream`` and
+    # ``apply_settings`` can flip it live, so a replay capture no longer needs
+    # a source edit. The class default keeps the attribute defined for the
+    # test stubs that construct a partial daemon.
     _record_full_state_stream: bool = False
 
     def _record_state_estimate(self, estimate: Any) -> None:
@@ -5848,9 +6005,32 @@ class CortexDaemon:
                         failed += 1
                 except Exception:
                     failed += 1
-            current = self._pending_restore_results.get(restore_id)
-            if current is future:
-                self._pending_restore_results.pop(restore_id, None)
+                current = self._pending_restore_results.get(restore_id)
+                if current is future:
+                    self._pending_restore_results.pop(restore_id, None)
+                continue
+            # A future that has NOT resolved stays in the registry.
+            #
+            # This loop used to pop unconditionally, which orphaned two
+            # different things. First, the future may not be ours: the loop
+            # above adopts whatever is already registered for a reusable
+            # restore command, and that one belongs to a concurrent
+            # ``_dispatch_restore`` still awaiting it on a 10 s timeout with
+            # its own cleanup in ``finally``. Second,
+            # ``_record_intervention_receipts`` resolves restore waiters
+            # solely by looking them up in this dict, so a receipt arriving
+            # after our 3 s bound could never complete it — the transaction
+            # was durably RESTORED and the caller was told "unverified".
+            #
+            # Leaving it costs nothing: the dict is keyed by ``restore_id``,
+            # the command is retained in ``_pending_startup_restores`` for
+            # retry, and both writers replace a stale entry for the same id
+            # rather than adding to it.
+            logger.debug(
+                "Restore %s unresolved within the bound; leaving its waiter "
+                "registered so a later receipt can still complete it",
+                restore_id,
+            )
         pending = len(commands) - restored - failed
         return {
             "requested": len(commands),
@@ -6192,6 +6372,10 @@ class CortexDaemon:
                     return
                 if not self._pause_was_capturing:
                     return
+                if not self._capture_restart_permitted(surface="quiet_mode"):
+                    # Keep the latch: if the stop is somehow abandoned, the
+                    # next resume still knows capture was running.
+                    return
                 try:
                     await self._capture_pipeline.start()
                     self._capture_available = True
@@ -6212,9 +6396,13 @@ class CortexDaemon:
                 # still observable; only ``pause`` releases the camera.
                 await _resume_if_was_paused()
             elif kind == "pause":
-                # Long quiet window so dwell logic still suppresses
-                # triggers even if capture briefly resumes.
-                self._trigger_policy.activate_quiet_mode(duration_minutes=240)
+                # The dashboard documents this control as "Pause all sensing —
+                # releases the camera, indefinite", and the client sends no
+                # duration. A 240-minute window was substituted here, so
+                # browser-side triggers (rabbit-hole, zombie-tab) — which need
+                # no camera — resumed after four hours while the UI still read
+                # "Paused". Quiet now stays on until the user turns it off.
+                self._trigger_policy.activate_quiet_mode(indefinite=True)
                 # Phase-3 P0-N4: pause should also disarm any
                 # auto-armed focus session so the browser doesn't keep
                 # blocking sites while the user is on a call / away.
@@ -7556,7 +7744,11 @@ class CortexDaemon:
                 current_time=timestamp,
             )
 
-            submission_epoch = self._leetcode_submission_epoch_seconds(context)
+            # Monotonic, matching the amygdala path a few lines above. The
+            # epoch variant fed a wall-clock timestamp into a monotonic
+            # subtraction, so the 5-minute rebound window was measured across
+            # two different clocks.
+            submission_monotonic = self._leetcode_submission_monotonic(context)
             accepted = bool(context.accepted or last_result == "Accepted")
             rebound = self._rebound_detector.update(
                 accepted=accepted,
@@ -7564,7 +7756,8 @@ class CortexDaemon:
                 hr_baseline=float(baselines.hr_baseline),
                 hrv_current=None,
                 hrv_prev=None,
-                last_submission_ts=submission_epoch if accepted else None,
+                last_submission_ts=submission_monotonic if accepted else None,
+                current_time=timestamp,
             )
 
             mode_estimate = self._leetcode_mode_resolver.resolve(
@@ -8017,19 +8210,31 @@ class CortexDaemon:
         try:
             probe = getattr(client, "ping", None)
             if probe is None or not asyncio.iscoroutinefunction(probe):
-                # Lightweight fallback: a tiny ``generate_intervention_plan``
-                # cannot be invoked without context, so we try the SDK's
-                # raw ``messages.create`` if available. As a final fallback
-                # we report ``ok=True`` only when the SDK object exists
-                # (we successfully constructed credentials), with
-                # latency_ms = construction probe.
-                sdk = getattr(client, "_sdk", None)
-                if sdk is None:
+                # ``create_llm_client`` always returns a privacy wrapper
+                # (PrivacyAwarePlanner / NoContentPlanner / RuleBasedLLMClient),
+                # never a bare transport, so reading ``_sdk`` off the client
+                # found nothing and every healthy provider was reported as
+                # ``no_sdk``. The wrapper already publishes exactly the state
+                # this control needs, and it distinguishes "no credential yet"
+                # from "external planning is switched off".
+                transport_state = getattr(client, "transport_state", None)
+                if isinstance(transport_state, str) and transport_state != "ready":
                     return TestProviderResult(
                         provider=canonical,
                         ok=False,
                         latency_ms=None,
-                        error="no_sdk",
+                        error=transport_state,
+                    )
+                sdk = getattr(client, "_sdk", None)
+                if sdk is None and transport_state is None:
+                    # A wrapper with no transport_state and no SDK cannot be
+                    # probed (rule-based / no-content modes have nothing to
+                    # reach). Say so rather than implying a failed connection.
+                    return TestProviderResult(
+                        provider=canonical,
+                        ok=False,
+                        latency_ms=None,
+                        error="no_external_transport",
                     )
                 # If the SDK has a ``with_options`` / ``messages``
                 # attribute we treat construction-time success as a
@@ -8228,7 +8433,11 @@ class CortexDaemon:
         if "webcam_enabled" in settings:
             desired_capture = bool(settings["webcam_enabled"])
             self._capture_processing_enabled = desired_capture
-            if desired_capture and not self._capture_available:
+            if (
+                desired_capture
+                and not self._capture_available
+                and self._capture_restart_permitted(surface="apply_settings")
+            ):
                 try:
                     await self._capture_pipeline.start()
                     self._capture_available = True
@@ -8248,6 +8457,28 @@ class CortexDaemon:
             ):
                 await self._capture_pipeline.stop()
                 self._capture_available = False
+        # The four support switches surfaced in Settings as "<subsystem>
+        # debug logging". They reached this method and had no branch, so
+        # ticking one changed nothing at all — while the dialog above them
+        # reads "Verbose logging for support. Leave these off unless asked".
+        debug_flags = {
+            subsystem: bool(settings[f"debug_{subsystem}"])
+            for subsystem in DEBUG_SUBSYSTEM_LOGGERS
+            if f"debug_{subsystem}" in settings
+        }
+        if debug_flags:
+            for subsystem, enabled in debug_flags.items():
+                setattr(self.config.debug, subsystem, enabled)
+            # Named for what it is, and NOT ``applied`` — that name is
+            # reused later in this function for the re-broadcast payload,
+            # and mypy takes a local's type from its first assignment.
+            debug_levels = apply_debug_subsystems(debug_flags)
+            logger.info("Debug logging updated: %s", debug_levels)
+        if "record_full_state_stream" in settings:
+            # Flippable live so a replay capture can be armed mid-session
+            # without restarting the daemon and losing the session boundary.
+            self._record_full_state_stream = bool(settings["record_full_state_stream"])
+            self.config.debug.record_full_state_stream = self._record_full_state_stream
         if "input_telemetry_enabled" in settings:
             self._telemetry_enabled = bool(settings["input_telemetry_enabled"])
             if self._telemetry_enabled:
@@ -8283,6 +8514,20 @@ class CortexDaemon:
                     "snooze_15",
                     duration_minutes=duration if duration > 0 else None,
                     source=str(settings.get("source") or "settings_sync"),
+                )
+            elif self._quiet_mode_kind == "pause":
+                # The Settings dialog owns a plain "Quiet mode" checkbox and
+                # always includes it in the Apply payload, defaulting to
+                # unchecked. Pausing from the tray and then applying an
+                # unrelated setting therefore cancelled the pause, released
+                # the camera latch and resumed interventions with no
+                # indication. A bare boolean from a settings sync is not an
+                # instruction to undo an explicit indefinite pause; the
+                # dedicated quiet controls do that.
+                logger.info(
+                    "settings_sync quiet_mode=false ignored while paused "
+                    "(source=%s)",
+                    settings.get("source") or "settings_sync",
                 )
             else:
                 await self.set_quiet_mode(

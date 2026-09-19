@@ -419,7 +419,20 @@ def test_focus_break_policy_is_opt_in_monotonic_and_one_shot() -> None:
     assert not policy.evaluate(active=True, timestamp=3.0).should_recommend
     due = policy.evaluate(active=True, timestamp=6.0)
     assert due.should_recommend and due.active_elapsed_seconds == 6.0
-    assert policy.evaluate(active=True, timestamp=7.0).status == "already_recommended"
+
+    # ``evaluate`` is advisory and does NOT spend the one-shot budget itself.
+    # This assertion used to read ``already_recommended`` here, which encoded
+    # the defect: the caller still has to clear the shared interruption gate
+    # (quiet mode, pause, receptivity, cooldown, hourly cap) before anything is
+    # shown, so consuming the budget inside ``evaluate`` burned the reminder
+    # whenever that gate said no. The user then got nothing for the rest of the
+    # interval. A still-ungated reminder stays due.
+    assert policy.evaluate(active=True, timestamp=7.0).status == "due"
+
+    # It is the surface that presents the reminder which records it.
+    policy.record_recommended()
+    assert policy.evaluate(active=True, timestamp=7.5).status == "already_recommended"
+
     policy.snooze(0.1, timestamp=7.0)
     assert policy.evaluate(active=True, timestamp=8.0).status == "snoozed"
     assert policy.evaluate(active=True, timestamp=13.0).should_recommend

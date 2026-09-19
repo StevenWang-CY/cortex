@@ -300,19 +300,35 @@ if [ ! -f "${ICON_ICNS}" ]; then
         rm -rf "${ICONSET_DIR}" "${TEMP_PNG}"
     fi
 
-    # If both rendering paths failed (primary attempted + fallback
-    # attempted with no successful TEMP_PNG, or iconutil refused to
-    # package the iconset) we must NOT silently produce a brand-less
-    # build. A user-installed Cortex.app with the generic gear icon is
-    # the #1 cosmetic regression we ship; better to fail the build.
-    if [ "${PRIMARY_FAILED}" = "1" ] && [ "${FALLBACK_FAILED}" = "1" ]; then
-        echo "[FATAL] Could not render icon SVG via either rsvg-convert or qlmanage." >&2
+    # A user-installed Cortex.app with the generic gear icon is the #1
+    # cosmetic regression we ship, so a failed icon pipeline must fail the
+    # build. Neither guard that used to stand here could ever do that.
+    # ``PRIMARY_FAILED`` and ``FALLBACK_FAILED`` are set in the two mutually
+    # exclusive branches of ``if command -v rsvg-convert``, so requiring both
+    # was unsatisfiable. And when rendering failed, ``TEMP_PNG`` was cleared,
+    # which skips the sips/iconutil block that is the only writer of
+    # ``ICON_BUILD_FAILED=1`` — so the second guard was false as well. Both
+    # FATAL branches were unreachable in exactly the case they were written
+    # for, and the script exited 0 having produced no .icns at all.
+    #
+    # Test the artefact, not the bookkeeping. Whatever failed upstream, the
+    # only question here is whether the icon exists and is not empty; the
+    # flags survive as diagnostics that say which stage went wrong.
+    # cortex:icon-guard:begin
+    if [ ! -s "${ICON_ICNS}" ]; then
+        echo "[FATAL] Icon pipeline produced no ${ICON_ICNS}." >&2
+        if [ "${PRIMARY_FAILED}" = "1" ]; then
+            echo "        rsvg-convert could not render ${ICON_SVG}." >&2
+        fi
+        if [ "${FALLBACK_FAILED}" = "1" ]; then
+            echo "        qlmanage fallback could not render ${ICON_SVG}." >&2
+        fi
+        if [ "${ICON_BUILD_FAILED}" = "1" ]; then
+            echo "        sips or iconutil failed while packaging the iconset." >&2
+        fi
         exit 1
     fi
-    if [ "${ICON_BUILD_FAILED}" = "1" ] && [ ! -f "${ICON_ICNS}" ]; then
-        echo "[FATAL] Icon pipeline failed to produce ${ICON_ICNS}." >&2
-        exit 1
-    fi
+    # cortex:icon-guard:end
 else
     echo "→ .icns already exists"
 fi

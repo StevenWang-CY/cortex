@@ -378,10 +378,45 @@ export function injectInterventionPanel(
     if (undo && cta) {
         undo.addEventListener("click", () => {
             if (phase !== "applied" && phase !== "partial") return;
+            // Restored on failure, so a user who was told nothing was undone
+            // can still see the applied state and try again.
+            const priorPhase = phase;
             undo.disabled = true;
             undo.textContent = "Undoing…";
-            const finish = () => {
+            // The apply path above already settles honestly against
+            // `lastError` and the response; undo used to discard both and
+            // report "Changes undone" no matter what happened — including
+            // when the service worker never answered.
+            const settleUndo = (raw: unknown) => {
                 if (closed) return;
+                const response = raw as {
+                    ok?: unknown;
+                    attempted?: unknown;
+                    undone?: unknown;
+                    reason?: unknown;
+                } | undefined;
+                if (response?.ok !== true) {
+                    const undone = typeof response?.undone === "number"
+                        ? response.undone
+                        : 0;
+                    const attempted = typeof response?.attempted === "number"
+                        ? response.attempted
+                        : 0;
+                    const reason = typeof response?.reason === "string" && response.reason
+                        ? response.reason
+                        : "Cortex didn't respond";
+                    phase = priorPhase;
+                    cta.setAttribute("data-phase", priorPhase);
+                    undo.disabled = false;
+                    undo.textContent = "Undo";
+                    undo.hidden = false;
+                    setStatus(
+                        undone > 0
+                            ? `Undid ${undone} of ${attempted} — ${reason}.`
+                            : `Couldn't undo — ${reason}.`,
+                    );
+                    return;
+                }
                 phase = "restored";
                 cta.setAttribute("data-phase", "restored");
                 cta.textContent = "Restored";
@@ -395,13 +430,16 @@ export function injectInterventionPanel(
             try {
                 chrome.runtime.sendMessage(
                     { type: "UNDO_ALL_RECENT", intervention_id: model.interventionId },
-                    () => {
-                        void chrome.runtime.lastError;
-                        finish();
+                    (raw: unknown) => {
+                        if (chrome.runtime.lastError) {
+                            settleUndo({ ok: false, reason: "Cortex didn't respond" });
+                            return;
+                        }
+                        settleUndo(raw);
                     },
                 );
             } catch {
-                finish();
+                settleUndo({ ok: false, reason: "Cortex didn't respond" });
             }
         });
     }

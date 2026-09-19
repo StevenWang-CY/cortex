@@ -368,3 +368,56 @@ async def test_shutdown_without_token_is_ignored_over_loopback(
         await server.stop()
     with pytest.raises((ConnectionRefusedError, OSError)):
         socket.create_connection(("127.0.0.1", port), timeout=1).close()
+
+
+@pytest.mark.asyncio
+async def test_socket_that_never_authenticates_is_closed() -> None:
+    """An unauthenticated socket was retained for the daemon's lifetime.
+
+    AUTH is required as the first frame, but nothing enforced a deadline, so
+    any local process could hold connections open indefinitely and grow the
+    client registry without ever proving capability.
+    """
+    import asyncio
+
+    from cortex.services.api_gateway import websocket_server as ws
+
+    class _Socket:
+        def __init__(self) -> None:
+            self.closed_with: tuple[int, str] | None = None
+
+        async def close(self, code: int = 1000, reason: str = "") -> None:
+            self.closed_with = (code, reason)
+
+    server = ws.WebSocketServer()
+    socket = _Socket()
+    client = ws.WebSocketClient(
+        client_id="client_test",
+        websocket=socket,
+        connected_at=0.0,
+    )
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(ws, "AUTH_DEADLINE_SECONDS", 0.01)
+    try:
+        await server._disconnect_if_unauthenticated(client)
+    finally:
+        monkey.undo()
+    assert socket.closed_with is not None, "an unauthenticated socket must be closed"
+    assert socket.closed_with[0] == 1008
+
+    # An authenticated client is left alone.
+    socket2 = _Socket()
+    authed = ws.WebSocketClient(
+        client_id="client_ok", websocket=socket2, connected_at=0.0
+    )
+    authed.authenticated = True
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(ws, "AUTH_DEADLINE_SECONDS", 0.01)
+    try:
+        await server._disconnect_if_unauthenticated(authed)
+    finally:
+        monkey.undo()
+    assert socket2.closed_with is None
+    assert asyncio.get_running_loop() is not None
+

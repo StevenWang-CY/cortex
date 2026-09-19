@@ -307,3 +307,42 @@ def test_tray_status_reflects_evidence(qapp):
     tray.set_paused(True)
     assert "FLOW" not in tray.toolTip()
     assert "Paused" in tray.toolTip()
+
+
+def test_apply_omits_quiet_mode_the_user_did_not_touch(qapp):
+    """Quiet state is live and owned by the tray, capsule and extension.
+
+    The Apply payload always carried this dialog's "Quiet mode" checkbox,
+    which defaults to unchecked and never learns that another surface set
+    pause. Applying an unrelated setting therefore cancelled the pause and
+    the dismissal-driven quiet window, releasing the camera latch with no
+    indication.
+    """
+    from cortex.apps.desktop_shell.settings import SettingsDialog
+
+    dlg = SettingsDialog()
+    try:
+        emitted: list[dict] = []
+        dlg.settings_changed.connect(emitted.append)
+
+        dlg._apply_settings()
+        assert emitted, "Apply must emit a payload"
+        assert "quiet_mode" not in emitted[-1], (
+            "an untouched checkbox must not be restated as a live instruction"
+        )
+        assert "quiet_duration_minutes" not in emitted[-1]
+        # Unrelated settings still travel.
+        assert "sensitivity" in emitted[-1]
+
+        # Toggling it is a real instruction and must be sent.
+        dlg._quiet_mode.setChecked(not dlg._quiet_mode.isChecked())
+        dlg._apply_settings()
+        assert "quiet_mode" in emitted[-1]
+        assert emitted[-1]["quiet_mode"] is dlg._quiet_mode.isChecked()
+
+        # Applying again without touching it goes quiet once more.
+        dlg._apply_settings()
+        assert "quiet_mode" not in emitted[-1]
+    finally:
+        dlg.deleteLater()
+        QCoreApplication.processEvents()

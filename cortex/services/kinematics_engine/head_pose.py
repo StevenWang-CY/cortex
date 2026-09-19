@@ -49,6 +49,24 @@ _MODEL_POINTS_3D_CAMERA = _MODEL_POINTS_3D * np.array([1.0, -1.0, -1.0])
 _PNP_LANDMARK_INDICES = [1, 152, 33, 263, 61, 291]
 
 
+def _pinhole_matrix(frame_width: int, frame_height: int) -> NDArray[np.float64]:
+    """The usual webcam approximation: principal point at the frame centre,
+    focal length equal to the frame width (~53 degrees horizontal FOV).
+
+    Both terms are in pixels, so the matrix is only valid for the geometry
+    the landmarks are actually expressed in.
+    """
+    focal_length = float(frame_width)
+    return np.array(
+        [
+            [focal_length, 0.0, frame_width / 2.0],
+            [0.0, focal_length, frame_height / 2.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
 @dataclass(frozen=True)
 class HeadPoseResult:
     pitch: float
@@ -98,16 +116,9 @@ class HeadPoseEstimator:
         self._history_seconds = max(float(history_seconds), self._freeze_window_seconds)
         self._max_valid_gap_seconds = float(max_valid_gap_ms) / 1000.0
 
-        focal_length = float(frame_width)
-        center = (frame_width / 2.0, frame_height / 2.0)
-        self._camera_matrix = np.array(
-            [
-                [focal_length, 0.0, center[0]],
-                [0.0, focal_length, center[1]],
-                [0.0, 0.0, 1.0],
-            ],
-            dtype=np.float64,
-        )
+        self._frame_width = int(frame_width)
+        self._frame_height = int(frame_height)
+        self._camera_matrix = _pinhole_matrix(self._frame_width, self._frame_height)
         self._dist_coeffs = np.zeros((4, 1), dtype=np.float64)
         self._pose_history: deque[tuple[float, float, float, float]] = deque()
         self._previous: tuple[float, float, float, float] | None = None
@@ -117,6 +128,52 @@ class HeadPoseEstimator:
     @property
     def latest_result(self) -> HeadPoseResult | None:
         return self._latest_result
+
+    @property
+    def frame_geometry(self) -> tuple[int, int]:
+        """The frame size these intrinsics describe."""
+        return self._frame_width, self._frame_height
+
+    def rebind_geometry(self, *, frame_width: int, frame_height: int) -> bool:
+        """Rebuild the intrinsics for the size the camera actually delivers.
+
+        The pinhole approximation puts the principal point at the frame centre
+        and takes the focal length from the frame width, so both terms are
+        wrong the moment the delivered geometry differs from the configured
+        one — and it routinely does: a camera asked for 1280x720 may negotiate
+        640x480 and simply hand that back. Landmarks then arrive in 640-space
+        while the matrix says the centre is at (640, 360) and the focal length
+        is 1280, and ``solvePnP`` returns a systematically biased pitch, yaw
+        and roll that nothing downstream can tell apart from a real posture.
+        The capture service already rebinds the *camera identity* to the
+        delivered frame; this is the estimator half of the same reconciliation.
+
+        Returns whether anything changed. On a change the pose history and the
+        previous sample are dropped: poses solved under two different matrices
+        are not comparable, and differencing across the boundary would emit a
+        velocity spike that the jitter and freeze detectors would read as real
+        head movement. ``latest_result`` is kept, so a consumer polling it does
+        not momentarily see nothing.
+        """
+        width = int(frame_width)
+        height = int(frame_height)
+        if width <= 0 or height <= 0:
+            raise ValueError("head-pose frame dimensions must be positive")
+        if width == self._frame_width and height == self._frame_height:
+            return False
+        logger.info(
+            "Head-pose intrinsics rebound from %dx%d to the delivered %dx%d",
+            self._frame_width,
+            self._frame_height,
+            width,
+            height,
+        )
+        self._frame_width = width
+        self._frame_height = height
+        self._camera_matrix = _pinhole_matrix(width, height)
+        self._pose_history.clear()
+        self._previous = None
+        return True
 
     def update(
         self,

@@ -5571,11 +5571,29 @@ published by hand.
 | Independent review | No second reviewer exists | Recruit one to reach the independently-reviewed tier |
 | Physiological accuracy claims | Unchanged: pulse remains `EXPERIMENTAL`; HRV and respiration stay disabled | Reference-sensor study before any accuracy claim |
 | Dependency exceptions | Re-reviewed to 2026-10-15 | Upstream fixes or replacement before expiry |
-| Head-pose intrinsics | Camera identity now follows delivered geometry, but the pose estimator's intrinsics still come from the configured size | Rebuild the estimator when the delivered geometry changes |
-| `active_recall` template | Asks the model for `recall_*` fields the closed draft schema cannot carry (pre-existing; never reached a plan) | Model the fields in `PlanDraft` or retire the template |
+| Head-pose intrinsics | **Closed in v0.5.0.** `HeadPoseEstimator.rebind_geometry` reconciles to the delivered frame in both the runtime and calibration paths | — |
+| `active_recall` template | **Closed in v0.5.0**, by neither option. Tracing the surface showed a quiz cannot be presented at all; the template now asks for what the pipeline delivers | — |
 | VS Code marketplace identity | `publisher` is a placeholder and there is no marketplace icon | Choose a publisher and icon before any marketplace listing |
-| Session recorder stream | The recorder now writes state transitions only (`0600`, lazily created); the offline replay harness therefore sees fewer `state_estimate` events per session | Enable the daemon's full-stream debug flag when capturing a session for replay, or expose it as a setting |
-| Trigger and journal constants | The 10 s exit dwell, the 7-day/200-row terminal-transaction archive, and the dismissal-pause length are code constants derived from existing settings | Expose as configuration if operators need to tune them |
+| Session recorder stream | **Closed in v0.5.0.** `CORTEX_DEBUG__RECORD_FULL_STATE_STREAM`, also flippable live through `apply_settings` so a capture can be armed mid-session | — |
+| Trigger and journal constants | **Decided against in v0.5.0**, see below | — |
+
+Four of these were taken up in v0.5.0's second pass. The fourth was declined,
+and the reason is worth recording so it is not re-opened by default.
+
+**Trigger and journal constants stay constant.** The roadmap entry was
+conditional — "expose as configuration *if operators need to tune them*" — and
+no such need has been stated. Each of the three also has a reason to stay
+fixed. `EXIT_TO_UNKNOWN_DWELL_SECONDS` carries an invariant against another
+dwell ("it must exceed the RECOVERY dwell (5 s) so a genuine post-HYPER
+recovery still commits before the fallback fires"), so exposing it without a
+cross-field validator would let a configuration file break state inference
+silently. `terminal_retention_days` and `max_terminal_transactions` are already
+constructor parameters and bound a store the user never sees. The
+dismissal-pause length is already `quiet_mode_minutes × level`, driven by a
+setting the user does control; only the level cap is constant. Four new keys on
+a 198-key surface, each a permanent compatibility commitment, for a tuning need
+nobody has asked for, is not a trade worth making — and the entry can be
+reopened the moment someone does ask.
 
 ### 30.10 Definition of done for v0.4.0
 
@@ -5590,3 +5608,316 @@ published by hand.
       body carries the Assurance section.
 - [x] v0.4.0 is the public “Latest” release, and the wiki reflects the
       shipped behaviour.
+
+## 31. v0.5.0 — second audit cycle, and what re-verification found
+
+Section 30 recorded a re-audit of v0.3.15 and the coordinated implementation
+that followed. This section records the same exercise performed on the v0.4.0
+source, plus one thing Section 30 did not do: a second pass that re-verified
+every surviving finding against the **fixed** tree rather than the audited one.
+That pass is the most useful part of this cycle. It found that three fixes made
+earlier in the same cycle had closed only part of their defect, and that one of
+them had replaced its original harm with a new one.
+
+### 31.1 Method
+
+Thirteen read-only reviews ran in parallel, one per subsystem. Each finding was
+then handed to two independent skeptics with different jobs: one argued for
+refutation and was told to default to "refuted" under uncertainty; the other
+was required to reproduce the defect by execution rather than by reading. Only
+findings that survived both were carried forward. Seventy-eight findings were
+judged; sixty-seven survived.
+
+Three verification agents died on a provider safeguard error, leaving
+`browser-extension:399`, `physio-pulse:203` and `storage-migrations:947` with a
+single verdict each. That is recorded rather than glossed: all three were
+nonetheless *executable reproductions*, and all three were independently
+re-reproduced before being fixed.
+
+The re-verification pass was given the same seventy-eight findings, the list of
+commits made since, and one instruction that mattered: treat "believed fixed"
+as an unverified claim. It returned a verdict for sixty-five findings.
+
+### 31.2 Executive determination
+
+Forty-seven findings are fixed. One is recorded as a product decision rather
+than a defect. Seventeen remain, all medium or low severity. Two received no
+verdict in the re-verification pass and are unresolved either way. Every
+critical and every high-severity finding is closed.
+
+The most serious finding was that the pulse pipeline published a heart rate for
+video containing no cardiac signal at all — every window, not occasionally. It
+is worth stating why that survived the previous cycle's gates: the publication
+threshold was arithmetically unreachable. `compute_physio_sqi` is an additive
+blend in which the acquisition terms contribute 0.25 of a possible 1.0 on their
+own, so a still, fully visible face scored above the 0.30 gate before any
+cardiac evidence was considered. Every test that exercised the gate supplied a
+signal, so none of them could see it.
+
+### 31.3 Corrections to the audit itself
+
+Three of the audit's own conclusions were wrong, and measurement caught them.
+
+**The proposed fix for the flagship finding did not work.** The audit
+recommended gating on `nsqi >= nsqi_threshold` and restructuring the composite
+as `(0.6*nsqi + 0.4*snr_norm) * motion_term * face_term`. Measured over 200
+windows per condition against the packaged POS backend: `nsqi >= 0.293` passes
+93–97% of realistic 1/f and drift noise, and the multiplicative form scored
+*worse* than the additive one at equal specificity — at a 0.30 threshold it
+published 99% of drift noise. The discriminator that works is the raw in-band
+SNR in decibels; normalising it to [0,1] is precisely what destroys it, because
+the decision range compresses into the middle of the scale and averaging
+dilutes it further. `nsqi` is kept only because it costs no sensitivity and
+rejects 100% of white noise.
+
+**A proposed threshold was too strict by half.** The follow-up recommendation
+of a 0.50 peak-concentration floor more than halves sensitivity at a realistic
+0.3% modulation depth (0.340 → 0.160) to remove a 1.5% residual, and its
+"0/200" result is not distinguishable from 0.40's 0.005 at that sample size.
+0.40 was chosen instead: a threefold residual cut for a quarter of the
+sensitivity cost.
+
+**A concentration floor is wrong in kind as a signal-presence test.**
+Concentration answers "is the selected peak trustworthy?", not "is a cardiac
+signal present?" — and when the HR prior deliberately selects a non-dominant
+peak to hold continuity across windows, concentration at that peak is low even
+though the spectrum is unambiguous. The first implementation regressed an
+existing prior-ageing test whose window measures 21.3 dB SNR and 0.68 NSQI;
+calling that "no cardiac signal above the noise floor" would simply be false.
+The term is therefore waived above 6.0 dB, which signal-free nuisance cannot
+reach — the highest SNR observed across 600 signal-free windows was 3.05 dB.
+
+### 31.4 Corrections to this cycle's own fixes
+
+The re-verification pass exists because of these.
+
+* **`state-inference:270` was made worse, not fixed.** Publishing the coverage
+  of the label actually published closed the audited half. But the scorer has
+  no `RECOVERING` hypothesis — recovery is a temporal relation only the
+  smoother can see — so `state_coverage` carries a placeholder `0.0`, and the
+  smoother then published that. `TriggerPolicy.evaluate` applies its 0.45
+  coverage floor *before* dispatching to the per-state arms, so every RECOVERY
+  estimate failed with `evidence_coverage_below_floor_0.00` and the opt-in
+  recovery reinforcement arm became unreachable. The harm flipped from
+  bypassing the floor to permanently failing it.
+* **`state-inference:505` tested the wrong thing.** Abstaining at exactly zero
+  left the whole near-zero band saturating identically, because both scoring
+  paths floor the divisor. A keyboard-heavy calibration reaches that band by
+  ordinary means: windows with fewer than two mouse moves contribute a variance
+  of 0.0 and the baseline is their plain mean.
+* **`llm-planner:265` covered four fields of many.** Every nested text field
+  could still sink an entire plan; eight of ten probed cases did.
+* **`b689a72` introduced a defect of its own.** `liveAttemptCounterKeys`
+  derived expected keys from `operation.authorization_id`, but a restore
+  receipt is stamped with the *restore* id. The derived key never matched a
+  live restore counter, so the trim treated it as an orphan and reset that
+  restore's retry budget. Found by `transaction-restore:5396`.
+
+### 31.5 Residual findings
+
+**None.** All seventeen were closed in a second pass after §31.4 was written.
+The table is kept because the evidence is the useful part, and because two of
+the entries turned out to be larger than their summaries said.
+
+| Finding | Severity | What it was | How it closed |
+| --- | --- | --- | --- |
+| `api-security:1441` | medium | One process-global settings-version high-water mark, never reset per client | Per-socket, popped on disconnect; unusable versions refused; a dropped apply now replies |
+| `browser-extension:153` | medium | The focused tab resolved twice, from two differently-scoped queries | Resolved once, via `lastFocusedWindow`; both halves derive from it |
+| `build-release:308` | medium | The icon FATAL guard was unreachable in the case it was written for | Tests the artefact, not the bookkeeping |
+| `desktop-shell:311` | medium | A 1.5 s TCC poll started at construction and never stopped | `showEvent` owns the lifecycle |
+| `desktop-shell:751` | medium | The dashboard's close button quit Cortex | Close hides; quit is hooked at `QEvent.Quit` |
+| `desktop-shell:1596` | medium | The colour-blind palette applied live but persisted only on Apply | Persisted on change |
+| `desktop-shell:2353` | medium | A failed session export was logged and nowhere else | Dialog + `export_failed`; an empty output counts as failure |
+| `physio-pulse:100` | medium | POS fabricated the first sample and the last ~0.4 s of every window | Tail anchored, rectangular edge halves; backend bumped `pos/2.1.0` |
+| `runtime-lifecycle:1475` | low | A 1 s blocking enumeration on the Qt main thread at every launch | Probed off-thread on first show |
+| `runtime-lifecycle:2346` | medium | A late command could reopen the camera during shutdown | `_capture_restart_permitted` on both restart paths |
+| `tests-gates:144` | medium | The bundle guard lost a third of its measurement surface | Sources discovered, not listed; real bundle measured in CI |
+| `tests-gates:280` | medium | `fail_under = 85` was never executed; the real figure is 68.79 % | Coverage runs in the canonical gate at an enforceable floor |
+| `transaction-restore:5852` | medium | Still-pending restore futures were popped, orphaning a concurrent restore | Only resolved futures are removed |
+| `trigger-intervention:183` | medium | The interruption gate consulted in the wrong order | Already closed by the `record_recommended()` split; verified, not re-fixed |
+| `trigger-intervention:1564` | medium | Quiet-mode escalation only ever ratcheted up | An approval walks the ladder back one step |
+| `browser-extension:1876` | low | Badge state was module-only while the toolbar badge persists | Rides the existing session snapshot |
+| `build-release:372` | low | The published checksum command exits non-zero on a correct download | `--ignore-missing`, which still fails when nothing was verified |
+
+Two were worse than their summaries suggested, and both were found by fixing
+them rather than by reading them:
+
+* `tests-gates:280` was not only unenforced. Coverage searches the working
+  directory for its configuration, and the canonical gate runs from the
+  repository root while the settings live in `cortex/pyproject.toml` — so even
+  a run that did pass `--cov` would have read none of that block. That is also
+  why `omit` never excluded the test modules: roughly thirty thousand
+  statements of ~98 %-covered test code were sitting in the denominator,
+  reporting 83 % where the source figure is 68.79 %.
+
+* `physio-pulse:100`'s obvious fix is wrong. A strictly positive taper removes
+  every fabricated zero, and it was what this cycle wrote first — but it
+  perturbs the interior and cost measurable sensitivity for it: 0.2360 →
+  0.2260 at a realistic 0.3 % modulation depth, discordant 20/5, McNemar
+  p = 0.004 over 1,500 paired windows. Anchoring the tail and making only the
+  outward-facing halves of the first and last sub-window rectangular removes
+  the same zeros at no measurable cost (0.2360 → 0.2340, discordant 9/6,
+  p = 0.61). This is the second time in this cycle that the first fix for a
+  physiology finding was wrong in kind and measurement caught it; see §31.3.
+
+Recorded as a product decision rather than a defect:
+
+* `desktop-shell:748` — the suggestion card's action buttons are mouse-only.
+  The overlay is deliberately built so it can never take focus, and it is the
+  only surface rendering those buttons. An announced way in needs a system-wide
+  hotkey, a native event monitor and the macOS Accessibility permission. See
+  `docs/limitations.md`.
+
+**Every survivor is now accounted for.** Two of the sixty-seven received no
+verdict in the re-verification pass, and the pass's record does not say which
+two — it itemises the forty-six it found still live and reports the nineteen
+already-fixed only as a count. Rather than guess, all twenty-one survivors
+outside the still-live set were re-checked against the current tree by
+reading the code at each anchor. All twenty-one are closed:
+
+`api-security:62` (the `/api/launch` cap now matches via `_PREFIX_ROUTES`),
+`api-security:95` (docs mount only under `expose_api_docs`),
+`api-security:888` (`AUTH_DEADLINE_SECONDS` plus `_disconnect_if_unauthenticated`),
+`browser-extension:399` (the panel reports `undone` of `attempted` and the
+reason), `browser-extension:3135` (bounded counters with repair-on-read),
+`llm-planner:569` (a misordered budget pair clamps the warning to the ceiling
+instead of raising and dropping the tracker), `llm-planner:8026` (a real probe
+path), `physio-pulse:203` (the sub-harmonic audit), `physio-pulse:266` (per-
+window reference alignment instead of a whole-sequence mean),
+`state-inference:386` and `:433` (`_generate_reasons` filters to the published
+label's own rule), `state-inference:559` (scroll *bursts*, not raw callbacks),
+`storage-migrations:152` (`exports/` exempt from retention, removed by a full
+delete), `:374` (chronotype rollups included), `:404` (migration backups
+included), `:407` (unlink failures reported as `files_not_removed` rather than
+raised after the rows are gone), `:697` (`ON CONFLICT(decision_id,
+reward_version)`), `:947` (retention days bounded `ge=1, le=3650`),
+`tests-gates:1924` (`intervention_overlay_injection.spec.ts`),
+`trigger-intervention:6217` (`activate_quiet_mode(indefinite=True)`),
+`trigger-intervention:8276` (the quiet-mode baseline, so an unrelated Apply no
+longer cancels a dismissal-driven quiet window).
+
+### 31.6 The research phase did not complete
+
+Five research tracks were commissioned to ground the algorithm work. The rPPG
+track produced nothing — it hit a weekly usage limit — and every peer-review
+agent for the other four failed the same way. The four completed tracks
+(workload science, interruption science, calibration statistics, privacy
+architecture) are therefore **unreviewed**, and none of their proposals was
+implemented as validated. Implementing them would change scoring rules and trip
+the support-model provenance gate, which is exactly the check that should stop
+unvalidated changes.
+
+One defect was found among them — a second egress path around the privacy
+boundary in the activity summarizer — and it was verified from scratch before
+being fixed, not taken on the proposal's word.
+
+The failure had one useful consequence. Without a literature track to lean on,
+the physiology thresholds were derived by measurement against this pipeline,
+with this backend, which is how the three errors in §31.3 were caught. Numbers
+transplanted from a paper would have passed review and been wrong here.
+
+### 31.7 Verification program
+
+Every fix in this cycle was required to (a) reproduce the defect before the
+change, and (b) be covered by a test confirmed to fail against the previous
+code. Where a test could not be made to fail, that is recorded rather than
+waved through — the MV3 hydration test took three attempts, and the first two
+passed with and without the fix because they asserted the end state rather than
+the contract.
+
+Two tests in this cycle encoded a defect as contract and were rewritten rather
+than worked around. `test_permission_timer_started_on_construction` asserted
+the TCC poll was already running after `__init__`, on the stated grounds that
+it would otherwise start 1.5 s late — which `showEvent`'s immediate refresh
+disproves, while the contract it pinned kept the poll running for the app's
+whole life. `test_api_docs_are_not_served_without_an_explicit_opt_in` asserted
+a 404 where 401 is now also correct. A third,
+`test_continuity_callout_absent_when_no_iphone`, asserted a widget did not
+exist, which is no longer how absence is expressed.
+
+One regression was introduced and caught here rather than in review: the
+capture-restart gate broke four tests whose daemon stubs borrow
+`set_quiet_mode` from `CortexDaemon` and had to learn about the new method.
+The coverage run surfaced them.
+
+Gates at the close of the cycle: 3,215 Python tests, 69 isolated Qt tests, 336
+Vitest across 69 suites, 131 Jest across 13 suites, Ruff clean, mypy `--strict`
+clean over 563 files, `tsc --noEmit` clean for both extensions, repository
+contracts, configuration surfaces (197 settings), TypeScript schema codegen and
+support-model identity all synchronized, the eval replay baselines unchanged,
+and — for the first time — source coverage measured and enforced at 68.79 %
+against a floor of 68.
+
+### 31.8 Definition of done for v0.5.0
+
+- [x] Every critical and high-severity survivor is fixed.
+- [x] Every fix reproduces its defect first and ships a test that fails against
+      the previous code.
+- [x] Every survivor is re-verified against the fixed tree, not the audited one.
+- [x] Scoring-rule changes re-declare the support model (2.1.1 → 2.4.0) with a
+      model-card entry each time, rather than regenerating the hash.
+- [x] Residual findings are listed with their evidence rather than left to a
+      future re-audit.
+- [x] Measured limits — including the ones that are not zero — are in
+      `docs/limitations.md` with the measurement behind them.
+- [x] Every residual finding from §31.5 is closed, not carried.
+- [ ] Notarized build, manual validation record, and public release.
+
+The last item needs Developer ID signing credentials and a clean Mac, and
+cannot be completed from here.
+
+### 31.9 Roadmap items taken up in the same pass
+
+With the residual list empty, the deferred decisions in §30.9 were revisited.
+Four were implementable without a product decision; the rest need credentials
+(notarized release, reference-sensor study), hardware (Intel validation), a
+person (independent reviewer), a name (VS Code publisher identity), or a
+visual review pass this session cannot perform (desktop dark mode, 364 `CX_*`
+references that need screenshots).
+
+**The `active_recall` template asked for the impossible, and the roadmap's two
+options were both wrong.** It offered "model the fields in `PlanDraft` or
+retire the template". Tracing the surface showed neither. The template asked
+for `recall_question`, `recall_answer` and `recall_context_sentence` and told
+the model "the intervention will blur the screen and show the question; the
+user must answer correctly to unblur". `PlanDraft` sets `extra="forbid"` and
+the emitted structured-output schema closes every object, so the grammar
+cannot express those fields — the model could not have returned them if it
+tried. And `ACTIVE_RECALL` is a compatibility sink in `background.ts` with no
+page receiver, because blurring a page someone is reading is a mutation, and a
+mutation needs an exact authorization, an immutable manifest, a durable
+receipt and a receipt-backed escape path first. Modelling the fields would
+have produced a quiz for a surface that deliberately refuses to show one.
+
+So the trigger was never broken: it fired, the model returned a plan, and the
+plan was composed around an intervention that would never occur — the headline
+and steps the user actually saw were written for the wrong thing. The template
+now asks for a concrete way back into the material, grounded in the visible
+page text, with no quiz and no blocking. The detection was always sound; only
+the ask was wrong.
+
+**Head-pose intrinsics follow the camera.** The estimator built a pinhole
+matrix once from `config.capture`, while the capture service already rebinds
+the *camera identity* to the delivered frame — precisely because the two
+disagree in practice. Measured, configured 1280×720 against a delivered
+640×480: 13.4°–15.8° of total angular error across −20° to +20° of true pitch,
+of which ~12–15° is yaw that is not there at all, plus a **+5.4° pitch offset
+at the neutral pose**. That last number is the consequential one: calibration
+records a neutral head pitch and the posture proxy measures live flexion
+against it, so a constant offset at neutral lands directly in the head/neck
+claim. After rebinding, 0.000°.
+
+**The full state stream is a setting.** It was a class attribute a developer
+had to edit in source before capturing a session for replay. Without it the
+replay harness reruns a session with most of its estimates missing and reports
+different behaviour without saying why.
+
+**A defect found while doing the above: four dead support switches.** Settings
+renders "Capture / rPPG / State engine / LLM debug logging" under the line
+"Verbose logging for support. Leave these off unless asked." All four were
+persisted to `QSettings` and sent to the daemon, and `apply_settings` had no
+branch for any of them — a support engineer could ask a user to tick one and
+receive exactly the same log as before. Each now pins its subsystem's logger
+namespace to `DEBUG`, and clears the override rather than pinning `INFO` when
+switched off, so "off" means "like everything else" rather than "quieter than
+everything else".

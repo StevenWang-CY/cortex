@@ -193,3 +193,85 @@ def test_escalation_memory_survives_crash(tmp_path: Path) -> None:
     # A restart must rehydrate the saved level.
     revived = _make_policy(history, dismissal_path=dismissal)
     assert revived._quiet_mode_count == 3
+
+
+# ---------------------------------------------------------------------------
+# The ladder must be able to come back down
+# ---------------------------------------------------------------------------
+
+
+def test_approval_walks_the_escalation_ladder_back_one_step(tmp_path: Path) -> None:
+    """An accepted suggestion decays the escalation counter by one.
+
+    F26 made the counter persist and stop resetting on a timer, which was
+    right — the old silent 2-hour idle reset meant a user who dismissed
+    everything never escalated past level 1. But it left the ladder
+    monotonic: nothing decayed it, and only an explicit
+    ``reset_quiet_mode()`` zeroed it. A user who once reached level 3 stayed
+    there for the life of the install, so every later burst of dismissals
+    bought the maximum quiet window however long ago the bad patch was and
+    however many suggestions they had accepted since.
+
+    One step per approval, not a reset — the escalation should be hard to
+    unwind, just not impossible — and driven by behaviour rather than
+    elapsed time, so it does not reintroduce the reset F26 removed.
+    """
+    policy = _make_policy(
+        tmp_path / "quiet_mode_history.json",
+        dismissal_path=tmp_path / "dismissal.json",
+    )
+
+    for level in range(1, 4):
+        _trigger_escalation(policy, base_time=level * 1_000.0)
+    assert policy.quiet_mode_escalation_level == 3
+
+    policy.record_outcome(dismissed=False)
+    assert policy.quiet_mode_escalation_level == 2
+
+    policy.record_outcome(dismissed=False)
+    assert policy.quiet_mode_escalation_level == 1
+
+
+def test_the_ladder_does_not_go_below_zero(tmp_path: Path) -> None:
+    """Approvals on a user who never escalated must not underflow it."""
+    policy = _make_policy(
+        tmp_path / "quiet_mode_history.json",
+        dismissal_path=tmp_path / "dismissal.json",
+    )
+    assert policy.quiet_mode_escalation_level == 0
+
+    for _ in range(3):
+        policy.record_outcome(dismissed=False)
+
+    assert policy.quiet_mode_escalation_level == 0
+
+
+def test_the_walked_back_level_survives_a_restart(tmp_path: Path) -> None:
+    """The decay is persisted, like the escalation itself."""
+    history = tmp_path / "quiet_mode_history.json"
+    policy = _make_policy(history, dismissal_path=tmp_path / "dismissal.json")
+    for level in range(1, 3):
+        _trigger_escalation(policy, base_time=level * 1_000.0)
+    assert policy.quiet_mode_escalation_level == 2
+
+    policy.record_outcome(dismissed=False)
+
+    rehydrated = _make_policy(history, dismissal_path=tmp_path / "dismissal.json")
+    assert rehydrated.quiet_mode_escalation_level == 1
+
+
+def test_a_dismissal_still_escalates_after_a_walk_back(tmp_path: Path) -> None:
+    """The ladder still works in the direction it was built for."""
+    policy = _make_policy(
+        tmp_path / "quiet_mode_history.json",
+        dismissal_path=tmp_path / "dismissal.json",
+    )
+    _trigger_escalation(policy, base_time=1_000.0)
+    _trigger_escalation(policy, base_time=2_000.0)
+    assert policy.quiet_mode_escalation_level == 2
+
+    policy.record_outcome(dismissed=False)
+    assert policy.quiet_mode_escalation_level == 1
+
+    _trigger_escalation(policy, base_time=3_000.0)
+    assert policy.quiet_mode_escalation_level == 2

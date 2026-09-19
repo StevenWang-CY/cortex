@@ -503,6 +503,17 @@ async def _collect_live_calibration(
                 previous_valid_ns = mono_ns
                 previous_phase = phase
 
+                # Calibration measures the neutral head pitch this profile
+                # will be compared against forever, so it must be solved with
+                # the intrinsics of the frames actually delivered, not of the
+                # size the config asked for. See
+                # ``HeadPoseEstimator.rebind_geometry``.
+                if output.camera_identity is not None:
+                    components.head_pose.rebind_geometry(
+                        frame_width=output.camera_identity.width,
+                        frame_height=output.camera_identity.height,
+                    )
+
                 blink = components.blink.update(output.landmarks_px, mono_seconds)
                 pose = components.head_pose.update(output.landmarks_px, mono_seconds)
                 if phase in {"camera_quality_check", "physiological_rest"}:

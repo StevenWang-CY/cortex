@@ -11,6 +11,8 @@ Tests verify:
 
 from __future__ import annotations
 
+import pytest
+
 from cortex.libs.config.settings import InterventionConfig, StateConfig
 from cortex.libs.schemas.features import (
     FeatureVector,
@@ -379,6 +381,54 @@ class TestSubScores:
         scorer = self._make_scorer()
         score = scorer.score_window_switch(5.0)
         assert score == 0.0
+
+    def test_window_switch_is_continuous_and_saturates_where_documented(self):
+        """The piecewise map must not step, and must reach 1.0 at 40/min.
+
+        Both branches used the wrong divisor. The 10-20 band divided by 20
+        where continuity requires 10, so it topped out at 0.25 and the function
+        jumped 0.25 -> 0.50 across an infinitesimal change at exactly 20
+        switches/min; the upper branch also divided by 20 and saturated at 30,
+        contradicting the docstring's "1.0 = 40+ switches/min". The feature is
+        weighted 0.18, so that step moved the support score for two windows
+        that differed by nothing real.
+        """
+        scorer = self._make_scorer()
+
+        # Continuity at the band boundary.
+        assert scorer.score_window_switch(20.0) == pytest.approx(0.5)
+        just_below = scorer.score_window_switch(20.0 - 1e-6)
+        just_above = scorer.score_window_switch(20.0 + 1e-6)
+        assert abs(just_above - just_below) < 1e-3, (
+            f"step of {just_above - just_below:.4f} across 20 switches/min"
+        )
+
+        # Continuity at the lower edge, and the documented saturation point.
+        assert scorer.score_window_switch(10.0) == pytest.approx(0.0)
+        assert scorer.score_window_switch(40.0) == pytest.approx(1.0)
+        # Still monotonic, and 30 is no longer the saturation point.
+        assert scorer.score_window_switch(30.0) < scorer.score_window_switch(40.0)
+
+    def test_same_category_tabs_discount_the_switch_signal(self):
+        """The discount branch must be reachable.
+
+        ``set_tab_categories`` had no production caller, so
+        ``_same_category_ratio`` returned 0.0 on every tick and switching
+        between ten tabs of one topic scored exactly like switching between ten
+        unrelated ones. This pins the discount itself; the daemon now supplies
+        the categories it was always meant to.
+        """
+        scorer = self._make_scorer()
+        mixed = scorer._same_category_ratio()
+        assert mixed == 0.0, "no categories set means no discount"
+
+        scorer.set_tab_categories(["educational"] * 8)
+        assert scorer._same_category_ratio() > 0.6, (
+            "eight tabs of one category must register as topically coherent"
+        )
+
+        scorer.set_tab_categories(None)
+        assert scorer._same_category_ratio() == 0.0
 
 
 # =============================================================================

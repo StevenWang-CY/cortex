@@ -1,28 +1,44 @@
-"""audit Phase-I: browser-extension bundle size regression guard.
+"""Browser-extension size regression guard.
 
-The Cortex Chrome extension ships as a Plasmo MV3 bundle. The most recent
-measured production build (2026-08-25), after removing four unreferenced font
-files from ``assets/``, is:
+Two measurements, in order of authority:
 
-    Uncompressed total:  ~717 KB
-    Gzipped file sum:    ~236 KB  (target: < 250 KB)
-    Largest file:        popup.100f6462.js — 217 KB uncompressed
+1. **The shipped bundle**, when a production build is present
+   (``build/chrome-mv3-prod``). This is the real thing. CI builds the
+   extension, so the check runs there; it skips in a worktree without a
+   build rather than pretending a source proxy is the same measurement.
 
-Because the build step is not available everywhere this test runs
-(plasmo + pnpm + a network install), we cannot drive ``pnpm plasmo build``
-from pytest. Instead the regression guard pins per-source-file size
-budgets — every TypeScript entry point that contributes to the bundle
-must stay below its budget. The bundler ratio (~2:1 ratio of source to
-compressed) is stable enough that source budgets correlate with bundle
-budgets.
+2. **The shipping source tree**, always. A proxy, but one that is
+   *discovered* rather than listed, so it cannot erode.
 
-Per-file budgets are deliberately set ~20% above current sizes so
-ordinary feature work does not need to update them; a single TS file
-ballooning beyond the budget is the kind of regression worth flagging.
+Erosion is why this file was rewritten. The previous guard budgeted a
+hand-maintained list of top-level files plus ``contents/`` and ``tabs/``,
+and explicitly waved through every other subdirectory as a "non-entry
+utility". v0.4.0 then split ``background.ts`` and ``popup.tsx`` into
+``bg/surfaces/``, ``popup/components/``, ``popup/styles.ts`` and ``lib/``.
+That code is imported by the entry points and therefore bundled, but the
+guard stopped counting it: 243,158 bytes, 32 % of the shipping source,
+invisible. The per-file budgets appeared to *improve* (background.ts
+315 KB -> 265 KB) purely because code moved sideways, and the aggregate
+read 78 % of its 680 KB ceiling while the real total was 771,920 bytes —
+13 % over. The guard was green and its own stated budget was blown.
+
+Measured on 2026-09-19, ``plasmo build`` (chrome-mv3, Plasmo 0.90.5):
+
+    Shipping source:      771,920 bytes
+    Bundle, uncompressed: 820,399 bytes
+    Bundle, gzip sum:     263,803 bytes   (17 files)
+    Source : gzip ratio   2.93 : 1
+
+The 263,803 gzip figure exceeds the 250 KB aspiration this file used to
+quote. That aspiration was calibrated in 2026-08 against a bundle that has
+since grown, and the ceilings below are set against what is true today with
+headroom, not against a number the build has not met for a release. Lowering
+it is a size-reduction task, not a test edit; see ``docs/limitations.md``.
 """
 
 from __future__ import annotations
 
+import gzip
 from pathlib import Path
 
 import pytest
@@ -33,149 +49,213 @@ _EXTENSION_ROOT = (
     / "apps"
     / "browser_extension"
 )
+_BUNDLE_ROOT = _EXTENSION_ROOT / "build" / "chrome-mv3-prod"
 
-# Per-source-file budgets, in bytes. Each entry maps a path relative to
-# the extension root to its maximum allowed size. The budget is the
-# current size plus ~20% headroom so a refactor that moves a few
-# functions around does not force a constant churn of budget bumps;
-# a feature change that doubles a file's size will fail this test.
+# Directories that never ship: dependencies, build output, tests, mocks.
+_NON_SHIPPING_DIRS: frozenset[str] = frozenset({
+    ".git",
+    ".plasmo",
+    "__tests__",
+    "build",
+    "dist",
+    "node_modules",
+    "test",
+})
+
+# Files that live in the package but are not compiled into the bundle.
+_DEV_ONLY_FILES: frozenset[str] = frozenset({
+    "plasmo.config.ts",
+    "vitest.config.ts",
+})
+
+# ── Ceilings ────────────────────────────────────────────────────────────
+#
+# Each is the 2026-09-19 measurement plus headroom, so ordinary feature work
+# does not force a bump but a step change does. Raising one requires a fresh
+# production build and an updated measurement block in this docstring.
+
+_BUNDLE_GZIP_BUDGET_BYTES = 280_000       # measured 263,803  (+6 %)
+_BUNDLE_UNCOMPRESSED_BUDGET_BYTES = 900_000  # measured 820,399  (+10 %)
+_TOTAL_SOURCE_BUDGET_BYTES = 850_000      # measured 771,920  (+10 %)
+
+# Per-file ceilings for the largest sources. These exist to localise a
+# regression to one file; the aggregate above is what bounds the bundle.
+# A file not listed here is still counted in the aggregate — that is the
+# property the old table lacked.
 _SOURCE_BUDGETS: dict[str, int] = {
-    # Entry points (Plasmo discovers these by filename).
-    # P0 §3.1-§3.12 expanded the extension surface considerably (session
-    # history, trends rollup, recap card, micro-step toggle, why
-    # drilldown, rating row, biology break, auto-armed focus session,
-    # OS notification routing, quiet-mode kind picker). The budgets
-    # below are sized for the *post-P0* footprint + ~10-15% headroom
-    # so ordinary follow-up feature work does not need to bump them.
-    # WP-6 adds the exact authorization/receipt/recovery adapter. Its source
-    # is intentionally explicit and fail-closed; removing unused packaged
-    # fonts offsets the production-byte increase. 315.5 KB measured source,
-    # with ~11% regression headroom.
-    "background.ts": 350_000,
-    # Bumped 160_000 -> 176_000 when the audit added the INTERVENTION_FAILED
-    # error banner + INTERVENTION_PROMPT inline cross-surface sync consumers
-    # (previously the daemon broadcast both with zero popup consumers). Keeps
-    # the documented ~10% headroom over the post-feature footprint.
+    "background.ts": 300_000,
     "popup.tsx": 176_000,
     "newtab.tsx": 80_000,
     "tab-manager.ts": 60_000,
     "design-tokens.ts": 30_000,
-    # Shared constants (NATIVE_HOST_ID etc.) — small surface; sized to
-    # accommodate ports + a handful of identifiers without churn.
     "config.ts": 4_000,
-    # Content scripts under contents/ ship as separate bundles per Plasmo
-    # convention. leetcode-observer was moved here in audit Phase-I so
-    # its 25 KB never gets pulled into the background bundle.
     "contents/ambient.ts": 40_000,
     "contents/leetcode-observer.ts": 40_000,
-    # activity-tracker moved root -> contents/ in the audit so Plasmo
-    # registers it as a real injected content script (PlasmoCSConfig);
-    # previously it was never bundled/injected and emitted no telemetry.
     "contents/activity-tracker.ts": 40_000,
-    # Tabs are also separate bundles.
     "tabs/onboarding.tsx": 80_000,
 }
 
-# Combined entry-point source proxy, calibrated against the measured 234 KB
-# gzip file sum above. The 680 KB ceiling retains roughly 10% source headroom;
-# any increase still requires a fresh production-build measurement.
-_TOTAL_SOURCE_BUDGET_BYTES = 680_000
+# Per-directory ceilings. A refactor that moves code out of a budgeted
+# entry point has to land somewhere, and this is what notices where.
+_DIRECTORY_BUDGETS: dict[str, int] = {
+    "(root)": 500_000,   # measured 436,443
+    "lib": 170_000,      # measured 136,039
+    "contents": 90_000,  # measured  74,314
+    "bg": 70_000,        # measured  53,807
+    "popup": 70_000,     # measured  53,312
+    "tabs": 30_000,      # measured  18,005
+}
+
+
+def _shipping_sources() -> list[Path]:
+    """Every TypeScript source compiled into the extension bundle.
+
+    Discovered by walking the package, not read from a list: a list is
+    what eroded. Anything that is a ``.ts``/``.tsx``, is not a type-only
+    declaration, and does not sit under a non-shipping directory, ships.
+    """
+    found: list[Path] = []
+    for candidate in _EXTENSION_ROOT.rglob("*.ts*"):
+        if not candidate.is_file():
+            continue
+        relative = candidate.relative_to(_EXTENSION_ROOT)
+        if any(part in _NON_SHIPPING_DIRS for part in relative.parts[:-1]):
+            continue
+        if candidate.name.endswith(".d.ts"):
+            continue
+        if candidate.name in _DEV_ONLY_FILES:
+            continue
+        found.append(candidate)
+    return found
+
+
+def _top_level(relative: str) -> str:
+    return relative.split("/", 1)[0] if "/" in relative else "(root)"
 
 
 @pytest.fixture(scope="module")
-def extension_files() -> list[Path]:
-    """All TypeScript/TSX entry-point sources discovered in the extension
-    package. Excludes test/mock files (audit Phase-I focuses on the
-    shipped bundle)."""
-    files: list[Path] = []
-    for pattern in ("*.ts", "*.tsx"):
-        for candidate in _EXTENSION_ROOT.glob(pattern):
-            if candidate.name.endswith(".d.ts"):
-                continue
-            files.append(candidate)
-    for sub in ("contents", "tabs"):
-        for candidate in (_EXTENSION_ROOT / sub).glob("*.ts*"):
-            if candidate.name.endswith(".d.ts"):
-                continue
-            files.append(candidate)
-    return files
+def shipping_sources() -> list[Path]:
+    return _shipping_sources()
 
 
 def test_extension_root_exists() -> None:
-    """The browser extension lives where the budgets expect it to. If
-    this fails the audit-Phase-I budget table is referencing a stale
-    layout — fix the table, not the test."""
+    """The budgets reference a layout that still exists."""
     assert _EXTENSION_ROOT.is_dir(), (
-        f"browser extension not at {_EXTENSION_ROOT}; audit Phase-I budgets "
-        "are stale"
+        f"browser extension not at {_EXTENSION_ROOT}; the budgets here are "
+        "stale — fix the path, not the assertion"
     )
 
 
-def test_no_unexpected_top_level_sources(extension_files: list[Path]) -> None:
-    """Catch new top-level entry points that ship code without a budget.
+def test_every_shipping_directory_has_a_budget(
+    shipping_sources: list[Path],
+) -> None:
+    """A new directory cannot ship code without a ceiling.
 
-    Adding a new file requires (a) deciding whether it belongs at the
-    top level (entry point — Plasmo will bundle it) or under
-    ``contents/`` / ``tabs/`` (separate bundle) or ``lib/`` (utility,
-    not an entry point), and (b) adding an explicit budget line in
-    ``_SOURCE_BUDGETS`` if it ships as an entry. The test prevents the
-    common regression of dropping a 200 KB file at the top level and
-    not noticing it bloated the popup bundle."""
-    # Dev-time configuration files do not ship in the runtime bundle and
-    # are exempt from the per-file budget. Tests (``__tests__/*``), mocks
-    # (``test/*``), and generated types live in their own subtrees and
-    # are excluded by ``extension_files``.
-    _DEV_CONFIG_EXEMPT: frozenset[str] = frozenset({
-        "vitest.config.ts",
-        "plasmo.config.ts",
-        "tsconfig.json",
-    })
-
-    known = set(_SOURCE_BUDGETS.keys())
-    unknown: list[str] = []
-    for f in extension_files:
-        rel = f.relative_to(_EXTENSION_ROOT).as_posix()
-        if rel in known or rel in _DEV_CONFIG_EXEMPT:
-            continue
-        # Permit utility / lib files that are not entry points and
-        # show up only when imported. Plasmo entry-point files are
-        # all at the top level, under contents/, or under tabs/.
-        top = rel.split("/", 1)[0]
-        if top in {"contents", "tabs"} or "/" not in rel:
-            unknown.append(rel)
-    assert not unknown, (
-        f"new extension entry points without a size budget: {unknown}. "
-        "Either add a budget in _SOURCE_BUDGETS or move the file under "
-        "lib/ if it is a non-entry utility."
+    This is the assertion the old guard did not have. It explicitly
+    permitted any subdirectory other than ``contents/`` and ``tabs/`` as a
+    "non-entry utility", so the v0.4.0 split into ``bg/``, ``popup/`` and
+    ``lib/`` moved a third of the codebase outside every budget without
+    failing anything.
+    """
+    directories = {
+        _top_level(path.relative_to(_EXTENSION_ROOT).as_posix())
+        for path in shipping_sources
+    }
+    unbudgeted = sorted(directories - set(_DIRECTORY_BUDGETS))
+    assert not unbudgeted, (
+        f"shipping source in directories with no size budget: {unbudgeted}. "
+        "Add a line to _DIRECTORY_BUDGETS with a measurement, or move the "
+        "code somewhere already budgeted. Do not add an exemption."
     )
 
 
-@pytest.mark.parametrize("relpath,budget", list(_SOURCE_BUDGETS.items()))
+@pytest.mark.parametrize("relpath,budget", sorted(_SOURCE_BUDGETS.items()))
 def test_per_file_source_budget(relpath: str, budget: int) -> None:
-    """Each shipping source file stays inside its per-file budget."""
+    """Each named source file stays inside its ceiling."""
     path = _EXTENSION_ROOT / relpath
     if not path.exists():
         pytest.skip(f"{relpath} not present in this worktree")
     size = path.stat().st_size
     assert size <= budget, (
         f"{relpath} grew to {size:,} bytes — budget is {budget:,} "
-        f"({size / budget:.0%}). Either refactor the file or, if the "
-        "growth is justified, bump the budget with measurement notes."
+        f"({size / budget:.0%}). Refactor, or bump the budget with a fresh "
+        "production-build measurement."
     )
 
 
-def test_total_entry_point_source_budget() -> None:
-    """Total source across all shipping entry points stays inside the
-    aggregate budget. A surprise dependency dragging multiple files
-    above their individual budgets at once is the kind of regression
-    this catch-all guards against."""
-    total = 0
-    for relpath in _SOURCE_BUDGETS:
-        path = _EXTENSION_ROOT / relpath
-        if path.exists():
-            total += path.stat().st_size
+def test_per_directory_source_budget(shipping_sources: list[Path]) -> None:
+    """Each shipping directory stays inside its ceiling."""
+    totals: dict[str, int] = {}
+    for path in shipping_sources:
+        relative = path.relative_to(_EXTENSION_ROOT).as_posix()
+        top = _top_level(relative)
+        totals[top] = totals.get(top, 0) + path.stat().st_size
+
+    over = {
+        directory: (size, _DIRECTORY_BUDGETS[directory])
+        for directory, size in totals.items()
+        if directory in _DIRECTORY_BUDGETS
+        and size > _DIRECTORY_BUDGETS[directory]
+    }
+    assert not over, (
+        "extension directories over budget: "
+        + ", ".join(
+            f"{name} {size:,} > {budget:,}" for name, (size, budget) in over.items()
+        )
+    )
+
+
+def test_total_shipping_source_budget(shipping_sources: list[Path]) -> None:
+    """Every shipping source file counts toward one aggregate.
+
+    Not a curated subset: the point of the rewrite is that moving code
+    between files changes nothing here.
+    """
+    total = sum(path.stat().st_size for path in shipping_sources)
     assert total <= _TOTAL_SOURCE_BUDGET_BYTES, (
-        f"extension source totals {total:,} bytes — budget is "
-        f"{_TOTAL_SOURCE_BUDGET_BYTES:,}. Compressed bundle target "
-        "(250 KB) may have been blown."
+        f"extension source totals {total:,} bytes across "
+        f"{len(shipping_sources)} files — budget is "
+        f"{_TOTAL_SOURCE_BUDGET_BYTES:,}. At the measured 2.93:1 source-to-gzip "
+        "ratio this puts the shipped bundle near or past its own ceiling; "
+        "run `plasmo build` and check the bundle assertions directly."
+    )
+
+
+# ── The real measurement, when a build is available ─────────────────────
+
+
+def _bundle_files() -> list[Path]:
+    return [path for path in _BUNDLE_ROOT.rglob("*") if path.is_file()]
+
+
+@pytest.mark.skipif(
+    not _BUNDLE_ROOT.is_dir(),
+    reason=(
+        "no production build at build/chrome-mv3-prod — run `plasmo build`. "
+        "CI builds the extension, so this runs there."
+    ),
+)
+def test_shipped_bundle_gzip_budget() -> None:
+    """The gzipped bundle, which is what a user actually downloads."""
+    files = _bundle_files()
+    assert files, f"{_BUNDLE_ROOT} exists but is empty"
+    total = sum(len(gzip.compress(path.read_bytes(), 9)) for path in files)
+    assert total <= _BUNDLE_GZIP_BUDGET_BYTES, (
+        f"gzipped bundle is {total:,} bytes across {len(files)} files — "
+        f"budget is {_BUNDLE_GZIP_BUDGET_BYTES:,}."
+    )
+
+
+@pytest.mark.skipif(
+    not _BUNDLE_ROOT.is_dir(),
+    reason="no production build at build/chrome-mv3-prod",
+)
+def test_shipped_bundle_uncompressed_budget() -> None:
+    """Uncompressed size bounds install footprint and worker parse time."""
+    files = _bundle_files()
+    assert files, f"{_BUNDLE_ROOT} exists but is empty"
+    total = sum(path.stat().st_size for path in files)
+    assert total <= _BUNDLE_UNCOMPRESSED_BUDGET_BYTES, (
+        f"bundle is {total:,} bytes uncompressed — budget is "
+        f"{_BUNDLE_UNCOMPRESSED_BUDGET_BYTES:,}."
     )

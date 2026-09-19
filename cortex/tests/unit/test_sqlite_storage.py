@@ -417,6 +417,159 @@ async def test_legacy_intervention_import_is_backed_up_and_idempotent(
 
 
 @pytest.mark.asyncio
+async def test_delete_all_leaves_no_derived_rollups_or_migration_backups(
+    tmp_path: Path,
+) -> None:
+    """"Delete all Cortex data" must leave no copy of the user's records.
+
+    Chronotype rollups (per-day baselines and hourly/task patterns derived from
+    session history) are files, not rows, and sat outside every delete scope —
+    so the Trends panel kept serving deleted days from disk. Migration backups
+    are verbatim copies of the same records; only ledger-named legacy files
+    were removed, so a whole-database backup, or a legacy copy whose ledger row
+    had already gone, outlived a request to erase everything.
+    """
+
+    clock = _clock()
+    database = _database(tmp_path, clock=clock)
+    await database.start()
+
+    chronotype = tmp_path / "chronotype"
+    (chronotype / "daily").mkdir(parents=True)
+    (chronotype / "model.json").write_text('{"baselines": []}', encoding="utf-8")
+    (chronotype / "scheduler_state.json").write_text("{}", encoding="utf-8")
+    (chronotype / "daily" / "2026-09-05.json").write_text('{"hr": 61}', encoding="utf-8")
+
+    stale_backup = database.backup_dir / "legacy" / "session_report_json.deadbeef.json"
+    stale_backup.parent.mkdir(parents=True, exist_ok=True)
+    stale_backup.write_text('{"session_id": "s1"}', encoding="utf-8")
+    whole_db_backup = database.backup_dir / "pre-migration-0002.sqlite3"
+    whole_db_backup.write_bytes(b"SQLite format 3\x00")
+
+    maintenance = StorageMaintenance(
+        database,
+        storage_root=tmp_path,
+        analytics_writer=BoundedAnalyticsWriter(database),
+        clock=clock,
+        retention_days={"sessions": 7, "policy": 90, "interventions": 90},
+    )
+
+    await maintenance.delete(("all",))
+
+    survivors = [
+        path
+        for path in (
+            chronotype / "model.json",
+            chronotype / "scheduler_state.json",
+            chronotype / "daily" / "2026-09-05.json",
+            stale_backup,
+            whole_db_backup,
+        )
+        if path.exists()
+    ]
+    assert survivors == [], f"delete-all left user records on disk: {survivors}"
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_delete_reports_unremovable_files_instead_of_failing_the_request(
+    tmp_path: Path,
+) -> None:
+    """The rows are already gone by the time files are swept.
+
+    Letting one ``OSError`` escape answered the request with HTTP 500 after the
+    database had been erased: the operation looked failed while most of it had
+    succeeded, and the caller could not tell what remained on disk.
+    """
+
+    clock = _clock()
+    database = _database(tmp_path, clock=clock)
+    await database.start()
+
+    chronotype = tmp_path / "chronotype"
+    (chronotype / "daily").mkdir(parents=True)
+    (chronotype / "model.json").write_text("{}", encoding="utf-8")
+    stubborn = chronotype / "daily" / "2026-09-05.json"
+    stubborn.write_text('{"hr": 61}', encoding="utf-8")
+
+    maintenance = StorageMaintenance(
+        database,
+        storage_root=tmp_path,
+        analytics_writer=BoundedAnalyticsWriter(database),
+        clock=clock,
+        retention_days={"sessions": 7, "policy": 90, "interventions": 90},
+    )
+
+    real_unlink = Path.unlink
+
+    def refuse_one(self: Path, *args: object, **kwargs: object) -> None:
+        if self.name == "2026-09-05.json":
+            raise PermissionError(errno.EACCES, "Operation not permitted")
+        real_unlink(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(Path, "unlink", refuse_one)
+        deleted, _vacuumed = await maintenance.delete(("all",))
+
+    assert deleted.get("files_not_removed") == 1, "the survivor must be reported"
+    assert stubborn.exists(), "the unremovable file is genuinely still there"
+    assert not (chronotype / "model.json").exists(), "every other file still goes"
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_amip_rewards_import_against_the_composite_reward_key(
+    tmp_path: Path,
+) -> None:
+    """Migration 0002 replaced ``policy_rewards``' single-column primary key with
+    ``PRIMARY KEY(decision_id, reward_version)``. SQLite resolves an upsert target
+    against a real unique index, so an ``ON CONFLICT(decision_id)`` clause raises
+    ``OperationalError`` on every schema-v2 database and aborts the whole legacy
+    AMIP import transaction — decisions included."""
+
+    clock = _clock()
+    policy_dir = tmp_path / "policy_log"
+    policy_dir.mkdir(parents=True)
+    (policy_dir / "amip.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "decision_id": "legacy_d1",
+                        "action": "show_overlay",
+                        "probabilities": {"show_overlay": 0.5},
+                        "timestamp": 1_700_000_000.0,
+                    }
+                ),
+                json.dumps({"decision_id": "legacy_d1", "reward": 0.25}),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    database = _database(tmp_path, clock=clock)
+    migrator = LegacyDataMigrator(database, storage_root=tmp_path, clock=clock)
+
+    await migrator.migrate_all()
+
+    rewards = await database.read(
+        lambda connection: [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT decision_id, reward_version, reward_value FROM policy_rewards"
+            ).fetchall()
+        ]
+    )
+    assert rewards == [("legacy_d1", "legacy-latest-v1", 0.25)]
+    decisions = await database.read(
+        lambda connection: connection.execute(
+            "SELECT COUNT(*) FROM policy_decisions WHERE decision_id='legacy_d1'"
+        ).fetchone()[0]
+    )
+    assert decisions == 1
+    await database.close()
+
+
+@pytest.mark.asyncio
 async def test_legacy_key_value_migration_skips_opaque_secret_keys_and_merges_consent(
     tmp_path: Path,
 ) -> None:

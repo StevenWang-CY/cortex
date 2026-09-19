@@ -50,6 +50,14 @@ class PhysiologyEngineV2:
             high_hz=config.bandpass_high,
             filter_order=config.bandpass_order,
             max_head_jitter_deg=config.max_head_jitter_deg,
+            # Signal-presence thresholds. These existed on ``RPPGSignalConfig``
+            # from the start but were only ever read by the legacy shadow
+            # estimator, so the published v2 path ran with no test for whether
+            # a cardiac signal was present at all.
+            nsqi_threshold=config.nsqi_threshold,
+            min_cardiac_snr_db=config.min_cardiac_snr_db,
+            min_peak_concentration=config.min_peak_concentration,
+            minimum_window_quality=config.minimum_window_quality,
             experimental_hrv_enabled=config.experimental_hrv_enabled,
             hrv_min_window_seconds=float(config.hrv_min_window_seconds),
             hrv_min_valid_ibi=config.hrv_min_valid_ibi,

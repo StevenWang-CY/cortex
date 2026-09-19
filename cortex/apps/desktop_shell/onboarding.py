@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -41,7 +42,7 @@ try:
 except ImportError:  # pragma: no cover - older Qt fallback
     pass
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal, Slot
 
 try:
     from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
@@ -630,6 +631,10 @@ class OnboardingWindow(QWidget):
     # explicit Grant Access click.  The controller retries optional capture
     # immediately, so a successful TCC grant never requires an app relaunch.
     camera_permission_granted = Signal()
+    # Carries the off-thread Continuity Camera probe result back to the Qt
+    # main thread. The probe cannot run on it: the enumeration it calls
+    # sleeps a full second when AVFoundation has not warmed up yet.
+    _continuity_probed = Signal(bool)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -667,6 +672,10 @@ class OnboardingWindow(QWidget):
         self._extensions_skipped = "extensions" in self._onboarding_state.completed_steps
         self._extensions_verified = False
         self._permission_marks: dict[str, bool] = {}
+        self._continuity_callout: QLabel | None = None
+        self._continuity_probe_started = False
+        self._continuity_executor: ThreadPoolExecutor | None = None
+        self._continuity_probed.connect(self._on_continuity_probed)
         self._build_ui()
         self._sync_permission_step("camera", self._camera_permission_was_granted)
         try:
@@ -680,11 +689,60 @@ class OnboardingWindow(QWidget):
         # Permissions are granted in System Settings out-of-process — there's
         # no callback path back into the app. Poll every 1.5s while the
         # wizard is visible so the "Not granted" pills flip to "Granted"
-        # without a relaunch. Timer is paused on hide via showEvent below.
+        # without a relaunch.
+        #
+        # Started by ``showEvent``, stopped by ``hideEvent``, and NOT here.
+        # The controller constructs this window eagerly at startup whether or
+        # not onboarding was ever completed, and a widget that has never been
+        # shown never receives a ``hideEvent`` — so starting it here polled
+        # for the app's whole life on behalf of every user past their first
+        # run. ``showEvent`` starts it and forces an immediate refresh.
         self._permission_timer = QTimer(self)
         self._permission_timer.setInterval(1500)
         self._permission_timer.timeout.connect(self._refresh_permission_states)
-        self._permission_timer.start()
+
+    def _start_continuity_probe(self) -> None:
+        """Probe for a Continuity Camera off the Qt main thread, once.
+
+        Deliberately not called from ``__init__``: the controller builds this
+        window before the event loop starts, and the probe can block for a
+        second. Called from ``showEvent``, so the cost lands on the user who
+        is actually looking at the camera step.
+        """
+        if self._continuity_probe_started or self._continuity_callout is None:
+            return
+        self._continuity_probe_started = True
+        try:
+            self._continuity_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="cortex-continuity",
+            )
+            self._continuity_executor.submit(self._run_continuity_probe)
+        except Exception:
+            logger.debug("continuity probe submit failed", exc_info=True)
+
+    def _run_continuity_probe(self) -> None:
+        """Worker body. Never touches Qt state — it emits and returns."""
+        try:
+            found = _detect_continuity_camera()
+        except Exception:
+            logger.debug("continuity probe failed", exc_info=True)
+            found = False
+        try:
+            self._continuity_probed.emit(found)
+        except Exception:
+            logger.debug("continuity probe emit failed", exc_info=True)
+
+    @Slot(bool)
+    def _on_continuity_probed(self, found: bool) -> None:
+        """Reveal the skip notice on the Qt main thread."""
+        callout = self._continuity_callout
+        if callout is None:
+            return
+        try:
+            callout.setVisible(bool(found))
+        except RuntimeError:
+            # The wizard was torn down while the probe was in flight.
+            self._continuity_callout = None
 
     def _refresh_permission_states(self) -> None:
         try:
@@ -796,6 +854,7 @@ class OnboardingWindow(QWidget):
             self._refresh_permission_states()
         except Exception:
             pass
+        self._start_continuity_probe()
 
     def hideEvent(self, event: object) -> None:  # noqa: D401 - Qt override
         try:
@@ -813,6 +872,14 @@ class OnboardingWindow(QWidget):
             drain_pending_permission_procs(timeout=3.0)
         except Exception:
             pass
+        # The Continuity probe worker is one short-lived enumeration; do not
+        # wait on it, but do release the pool so it cannot outlive the wizard.
+        if self._continuity_executor is not None:
+            try:
+                self._continuity_executor.shutdown(wait=False)
+            except Exception:
+                logger.debug("continuity executor shutdown failed", exc_info=True)
+            self._continuity_executor = None
         super().closeEvent(event)
 
     def _build_ui(self) -> None:
@@ -1472,7 +1539,17 @@ class OnboardingWindow(QWidget):
         # iPhone/iPad cameras silently; this inline callout tells the
         # user explicitly so they aren't surprised when a paired iPhone
         # doesn't drive the biometrics.
-        if step_id == "camera" and _detect_continuity_camera():
+        if step_id == "camera":
+            # Built hidden and revealed by ``_probe_continuity_camera`` once a
+            # worker thread has answered. The probe used to run right here,
+            # inside ``_build_ui``, which the controller reaches before the Qt
+            # event loop starts — and ``_list_macos_video_devices`` does a
+            # bare, non-cancellable ``time.sleep(1.0)`` whenever the first
+            # AVFoundation enumeration comes back empty, a case the capture
+            # service itself documents as expected during early app startup.
+            # Every launch paid up to a second of frozen main thread for a
+            # cosmetic hint, including the launches of users who finished
+            # onboarding long ago and will never see this window.
             callout = QLabel(
                 "We will skip your iPhone camera and use the MacBook camera."
             )
@@ -1488,8 +1565,10 @@ class OnboardingWindow(QWidget):
             )
             wrap_capped(callout, 320)
             set_accessible_name(callout, "Continuity Camera skip notice")
+            callout.setVisible(False)
             layout.addWidget(callout)
             frame._cortex_continuity_callout = callout  # type: ignore[attr-defined]
+            self._continuity_callout = callout
 
         row = QHBoxLayout()
 

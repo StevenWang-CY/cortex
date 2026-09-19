@@ -11,6 +11,7 @@ export interface PersistedSessionState<TFocus, TUndo> {
     autoFocusEndsAt?: number | null;
     autoFocusPreset?: string;
     autoFocusCustomDomains?: string[];
+    badge?: { intervention: boolean; recap: boolean };
 }
 
 export interface DurableAutoFocusState {
@@ -23,7 +24,7 @@ const SESSION_KEYS = [
     "focusSession", "undoStack", "dismissedInterventions",
     "dismissedUrlPatterns", "quietMode", "tabLastActivated",
     "autoFocusArmed", "autoFocusEndsAt", "autoFocusPreset",
-    "autoFocusCustomDomains",
+    "autoFocusCustomDomains", "badge",
 ] as const;
 const AUTO_FOCUS_STATE_KEY = "cortex_auto_focus_state";
 const MAX_COLLECTION_SIZE = 512;
@@ -121,6 +122,18 @@ export class BrowserSessionStore {
             decoded.autoFocusCustomDomains = raw.autoFocusCustomDomains
                 .filter((value): value is string => boundedString(value, 253))
                 .slice(0, 100);
+        }
+        if (raw.badge && typeof raw.badge === "object") {
+            const badge = raw.badge as Record<string, unknown>;
+            if (
+                typeof badge.intervention === "boolean"
+                && typeof badge.recap === "boolean"
+            ) {
+                decoded.badge = {
+                    intervention: badge.intervention,
+                    recap: badge.recap,
+                };
+            }
         }
         return decoded;
     }

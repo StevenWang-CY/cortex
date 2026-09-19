@@ -83,6 +83,7 @@ from cortex.libs.schemas.context import TaskContext
 from cortex.libs.schemas.intervention import (
     InterventionPlan,
     SimplificationConstraints,
+    UIPlan,
 )
 from cortex.libs.schemas.privacy import ContextFieldDisclosure
 from cortex.libs.schemas.state import StateEstimate
@@ -179,6 +180,41 @@ def build_request_kwargs(
         "output_config": output_config,
         "timeout": float(timeout_seconds),
     }
+
+
+
+@dataclass(frozen=True, slots=True)
+class _IntBounds:
+    """Inclusive bounds read off a Pydantic field's own constraints."""
+
+    low: int
+    high: int
+
+    def clamp(self, value: int) -> int:
+        return min(self.high, max(self.low, value))
+
+
+@functools.lru_cache(maxsize=1)
+def _ui_plan_visible_line_bounds() -> _IntBounds:
+    """``UIPlan.max_visible_lines``'s declared range, from the schema.
+
+    Read rather than restated so the clamp cannot drift from the contract it
+    exists to satisfy. ``UIPlan`` has no ``validate_assignment``, so an
+    out-of-range assignment is stored and serialised silently instead of
+    raising -- which is how a value of 5 reached clients against a declared
+    floor of 10.
+    """
+
+    low, high = 10, 400
+    field = UIPlan.model_fields.get("max_visible_lines")
+    for item in getattr(field, "metadata", ()) or ():
+        candidate = getattr(item, "ge", None)
+        if isinstance(candidate, int):
+            low = candidate
+        candidate = getattr(item, "le", None)
+        if isinstance(candidate, int):
+            high = candidate
+    return _IntBounds(low=low, high=high)
 
 
 @dataclass(frozen=True, slots=True)
@@ -567,12 +603,14 @@ class AnthropicPlanner:
                     clock=self._clock,
                 )
             except (OSError, ValueError) as exc:
-                # Cost tracking is best-effort: a broken ledger path
-                # must not break the planner. The daemon logs the issue
-                # but continues; spend will be invisible until the path
-                # is made writable.
-                logger.warning(
-                    "cost_tracker: disabled (%s: %s)",
+                # Constructing the ledger is best-effort — a broken path must
+                # not stop the planner from loading — but "we cannot account
+                # for spend" must never resolve to "spend without limit". The
+                # planner therefore loads and then refuses paid calls, serving
+                # the deterministic fallback until the path is writable again.
+                logger.error(
+                    "cost_tracker: unavailable (%s: %s); refusing paid model "
+                    "calls until spend can be accounted for",
                     type(exc).__name__,
                     exc,
                 )
@@ -750,7 +788,16 @@ class AnthropicPlanner:
         # F20: hard kill-switch — once today's spend crosses the
         # configured ceiling, serve the deterministic fallback plan and
         # stamp the metadata so the dashboard banner can explain why.
-        if self._cost_tracker is not None and self._cost_tracker.check_budget() == "KILL":
+        if self._cost_tracker is None:
+            # Fail closed: an unavailable ledger cannot bound spend, so the
+            # only safe reading is that the budget is already exhausted.
+            logger.error(
+                "LLM spend accounting unavailable; serving deterministic "
+                "fallback (cid=%s)",
+                get_correlation_id() or "-",
+            )
+            return self._fallback(context, "budget_unaccountable", budget_killed=True)
+        if self._cost_tracker.check_budget() == "KILL":
             logger.error(
                 "LLM daily budget exceeded; serving deterministic fallback (cid=%s)",
                 get_correlation_id() or "-",
@@ -966,7 +1013,16 @@ class AnthropicPlanner:
             # of using the hard-coded ±20 line default.
             if constraints is not None and enriched.ui_plan is not None:
                 try:
-                    half = max(5, int(constraints.max_visible_lines) // 2)
+                    # Clamp into UIPlan's own contract, not to an invented
+                    # floor of 5. ``UIPlan.max_visible_lines`` declares
+                    # ``ge=10, le=400`` but the model has no
+                    # ``validate_assignment``, so assigning 5 stored and
+                    # serialised 5 — four below the field's floor — for any
+                    # client that requested 10-19 visible lines, which
+                    # ``SimplificationConstraints`` explicitly allows.
+                    half = _ui_plan_visible_line_bounds().clamp(
+                        int(constraints.max_visible_lines) // 2
+                    )
                     enriched.ui_plan.max_visible_lines = half
                 except Exception:
                     pass

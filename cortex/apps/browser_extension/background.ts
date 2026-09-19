@@ -457,6 +457,86 @@ function validateJournalReceiptBatch(value: unknown): InterventionReceiptBatch {
     return value as unknown as InterventionReceiptBatch;
 }
 
+// Write-side target for ``attempt_counters``. The read-side validator rejects
+// a journal holding more than MAX_TRANSACTION_COUNTERS keys, but nothing ever
+// bounded the key *count* on write — only each key's value (<= 100). Every
+// other collection in the journal is bounded where it grows: `receipt_outbox`
+// and `operations` refuse to exceed their cap, `consumed_authorizations` trims
+// to 256. `attempt_counters` was the one that was not, and counters were
+// reclaimed only for operations retired through `acknowledgeReceipts`. Once
+// the map passed 2048 keys the journal failed to load, and because
+// `readTransactionJournal` throws rather than repairing, every subsequent
+// apply and restore failed permanently with no way back.
+//
+// Pruning starts well below the hard cap so a burst between prunes cannot
+// reach it.
+const MAX_TRANSACTION_COUNTERS_SOFT = 1_536;
+
+/** Action ids of operations that are still live.
+ *
+ * A counter is keyed ``<authorization-or-restore-id>:<action-id>:<phase>``, and
+ * the first segment is NOT stable across phases: an apply receipt is stamped
+ * with the authorization id while a restore receipt is stamped with the
+ * *restore* id. Deriving expected keys from ``operation.authorization_id``
+ * therefore never matched a live restore counter, so the trim below treated it
+ * as an orphan and reset that restore's retry budget.
+ *
+ * Matching on the action id instead is coarser and cannot make that mistake.
+ * ``journal.operations`` only holds operations that have not retired, so
+ * anything it names is by definition still in play.
+ */
+function liveAttemptCounterActionIds(
+    operations: Record<string, BrowserOperationRecord>,
+): Set<string> {
+    const live = new Set<string>();
+    for (const operation of Object.values(operations)) {
+        live.add(operation.action_id);
+    }
+    return live;
+}
+
+/** The action id a counter key refers to, or null if the key is malformed.
+ *
+ * Parsed from the end because the phase is always last and the action id
+ * always second to last; the leading id may itself contain a colon.
+ */
+function counterKeyActionId(key: string): string | null {
+    const parts = key.split(":");
+    return parts.length >= 3 ? parts[parts.length - 2] : null;
+}
+
+/** Bound ``counters`` in place, discarding the least useful entries first.
+ *
+ * A counter only means anything while its operation is live, so orphans go
+ * first — that alone reclaims everything the old acknowledgement-driven GC
+ * missed. Anything still over the limit is dropped oldest-first; string keys
+ * iterate in insertion order, which makes `Object.keys` a FIFO queue. Dropping
+ * a counter at worst grants an action a fresh retry allowance, which is a far
+ * better failure than bricking the journal.
+ */
+function trimAttemptCounters(
+    counters: Record<string, number>,
+    operations: Record<string, BrowserOperationRecord>,
+    limit: number,
+): void {
+    if (Object.keys(counters).length <= limit) return;
+    const live = liveAttemptCounterActionIds(operations);
+    for (const key of Object.keys(counters)) {
+        const actionId = counterKeyActionId(key);
+        if (actionId === null || !live.has(actionId)) delete counters[key];
+    }
+    const remaining = Object.keys(counters);
+    if (remaining.length > limit) {
+        for (const key of remaining.slice(0, remaining.length - limit)) {
+            delete counters[key];
+        }
+    }
+}
+
+// Test seams: both paths are otherwise reachable only through
+// chrome.storage.local, following the `_resetWsParseErrorCounter` convention.
+export const _trimAttemptCounters = trimAttemptCounters;
+
 function validateBrowserTransactionJournal(raw: unknown): BrowserTransactionJournal {
     if (!isJournalRecord(raw) || raw.schema_version !== "1") {
         throw new Error("Cortex transaction journal is corrupt");
@@ -472,7 +552,12 @@ function validateBrowserTransactionJournal(raw: unknown): BrowserTransactionJour
         || !Array.isArray(outbox)
         || Object.keys(consumed).length > 256
         || Object.keys(operations).length > MAX_TRANSACTION_OPERATIONS
-        || Object.keys(counters).length > MAX_TRANSACTION_COUNTERS
+        // Only an absurd count is treated as corruption here, to bound the
+        // validation work below. A merely over-cap counter map is repaired
+        // after validation rather than rejected: these are a retry guard, not
+        // an integrity record, and refusing to load the journal over them
+        // disabled apply and restore for good.
+        || Object.keys(counters).length > MAX_TRANSACTION_COUNTERS * 8
         || outbox.length > MAX_RECEIPT_OUTBOX
     ) {
         throw new Error("Cortex transaction journal is corrupt");
@@ -532,6 +617,11 @@ function validateBrowserTransactionJournal(raw: unknown): BrowserTransactionJour
         ) throw new Error("receipt attempt counter is invalid");
         validatedCounters[key] = Number(value);
     }
+    // Repair a journal written before the write-side bound existed, so a user
+    // already past the cap recovers on next load instead of staying stuck.
+    trimAttemptCounters(
+        validatedCounters, validatedOperations, MAX_TRANSACTION_COUNTERS,
+    );
     const validatedOutbox = outbox.map(validateJournalReceiptBatch);
     const receiptIds = new Set<string>();
     for (const batch of validatedOutbox) {
@@ -551,6 +641,8 @@ function validateBrowserTransactionJournal(raw: unknown): BrowserTransactionJour
         receipt_outbox: validatedOutbox,
     };
 }
+
+export const _validateBrowserTransactionJournal = validateBrowserTransactionJournal;
 
 async function readTransactionJournal(): Promise<BrowserTransactionJournal> {
     const data = await chrome.storage.local.get(TRANSACTION_JOURNAL_KEY);
@@ -697,6 +789,23 @@ async function restoreAutoFocusStateLocal(): Promise<void> {
 
 function schedulePersist(): void {
     persistDirty = true;
+    if (!stateHydrated) {
+        // MV3 suspends the service worker aggressively, and a tab activation
+        // or removal wakes it and reaches this function directly. Writing here
+        // would flush `persistedSessionSnapshot()` built from module state
+        // that `restoreState()` has not filled yet — an EMPTY focus session,
+        // undo stack and cooldown set — straight over the stored session, so
+        // waking the worker destroyed the very state it exists to preserve.
+        // `handleMessage` had the only hydration barrier in the file.
+        //
+        // The write is deferred rather than dropped: `persistDirty` stays set
+        // and this re-enters once hydration lands, so the snapshot then
+        // carries both the restored state and whatever woke the worker.
+        void stateRestored.then(() => {
+            if (persistDirty) schedulePersist();
+        });
+        return;
+    }
     browserSessionStore.scheduleSession(persistedSessionSnapshot());
 }
 
@@ -713,6 +822,7 @@ function persistedSessionSnapshot(): PersistedSessionState<FocusSession, UndoEnt
         autoFocusEndsAt,
         autoFocusPreset: _activeFocusPresetName,
         autoFocusCustomDomains: activeFocusCustomDomains,
+        badge: badgeState.snapshot(),
     };
 }
 
@@ -754,6 +864,11 @@ async function restoreState(): Promise<void> {
         activeFocusCustomDomains = data.autoFocusCustomDomains
             .filter((d: unknown): d is string => typeof d === "string");
     }
+    // The toolbar badge outlives the worker; the record that decides what it
+    // should say did not. Restore it before anything can call
+    // `setInterventionBadge(false)` and clear a "✓" the user has not read.
+    badgeState.hydrate(data.badge);
+    paintBadge();
     // Auto-expire if a stale auto-armed session outlived its window.
     if (autoFocusArmed && autoFocusEndsAt !== null && Date.now() > autoFocusEndsAt) {
         stopAutoFocusSession("duration_elapsed_post_restore");
@@ -1876,6 +1991,7 @@ function paintBadge(): void {
 function setInterventionBadge(pending: boolean): void {
     badgeState.setIntervention(pending);
     paintBadge();
+    schedulePersist();
 }
 
 /**
@@ -2980,6 +3096,12 @@ async function prepareBrowserInverse(
             : undefined;
         return {
             priorActiveTabId: prior?.id ?? null,
+            // Chrome reuses tab ids after a tab closes, so the id alone does
+            // not identify the tab this restore is allowed to touch. The URL
+            // is recorded as proof of ownership, exactly as the
+            // ``close_created_tab`` inverse already does.
+            priorActiveUrl: prior?.url ?? "",
+            priorWindowId: prior?.windowId ?? null,
             targetTabId: target?.chromeTabId ?? null,
             noEffect: typeof prior?.id === "number"
                 && prior.id === target?.chromeTabId,
@@ -3133,6 +3255,14 @@ async function makeActionReceipt(args: {
             throw new Error("receipt retry limit exceeded");
         }
         journal.attempt_counters[counterKey] = next;
+        // Bound the key count here, where it grows. Pruning after the insert
+        // keeps this counter (its operation is live by construction) and
+        // reclaims orphans left by operations that never retired.
+        trimAttemptCounters(
+            journal.attempt_counters,
+            journal.operations,
+            MAX_TRANSACTION_COUNTERS_SOFT,
+        );
         return next;
     });
     const endedMonoNs = Math.max(args.startedMonoNs, monotonicNowNs());
@@ -4045,8 +4175,32 @@ async function performBrowserRestore(
                     detail: "User focus superseded the Cortex tab focus",
                 };
             }
-            const tab = await chrome.tabs.get(priorId);
+            let tab: chrome.tabs.Tab;
+            try {
+                tab = await chrome.tabs.get(priorId);
+            } catch {
+                return {
+                    status: "already_complete",
+                    detail: "Prior tab no longer exists",
+                };
+            }
             if (tab.active) return { status: "already_complete", detail: "Prior tab already active" };
+            // Prove ownership before focusing. Chrome reuses tab ids, so
+            // ``priorId`` may now belong to a tab Cortex never touched —
+            // activating it would yank the user to an unrelated page, and the
+            // verifier only checks that the Cortex target lost focus, so it
+            // would call that a success. The sibling ``close_created_tab``
+            // arm has always required this proof; this one did not.
+            const priorUrl = typeof inverse.priorActiveUrl === "string"
+                ? inverse.priorActiveUrl
+                : "";
+            if (priorUrl && !urlsMatch(tab.url, priorUrl)
+                && !urlsMatch(tab.pendingUrl, priorUrl)) {
+                return {
+                    status: "failed",
+                    detail: "Prior tab was reused or navigated",
+                };
+            }
             await chrome.tabs.update(priorId, { active: true });
             return { status: "succeeded", detail: "Prior active tab restored" };
         }
@@ -4850,21 +5004,37 @@ async function undoAction(actionId: string): Promise<boolean> {
     const idx = undoStack.findIndex((e) => e.action_id === actionId);
     if (idx === -1) return false;
     const entry = undoStack[idx];
-    undoStack.splice(idx, 1);
-    schedulePersist();
+    // The entry is NOT removed yet. It used to be spliced out (and the removal
+    // scheduled for persistence) before the reversal ran, so it was the only
+    // record of how to undo the action and it was destroyed first. An MV3
+    // worker eviction between the splice and `chrome.tabs.create({url})` lost
+    // the saved URL permanently: the user's closed tab was gone with nothing
+    // left to retry from. Unlike the transactional path, this stack has no
+    // write-ahead entry to recover from, so the record has to outlive the
+    // attempt. It is removed below, only once the reversal actually reached
+    // its desired end state.
 
+    // Every arm below used to swallow its own failure and fall through to
+    // `return true`, so a tab that could not be reopened was still reported as
+    // undone. Each arm now records whether the *desired end state* was
+    // actually reached — which is not the same as "no exception was thrown".
+    let restored = true;
     try {
         switch (entry.action_type) {
             case "close_tab":
             case "bookmark_and_close": {
-                // Reopen from saved URL
+                // Reopen from saved URL. Goal: the tab exists again. Without a
+                // saved URL, or if create() fails, it does not — the user's
+                // tab is gone and stays gone, so this is a real failure.
                 const url = entry.undo_data.url as string;
                 if (url) {
                     try {
                         await chrome.tabs.create({ url, active: false });
                     } catch {
-                        // Failed to reopen
+                        restored = false;
                     }
+                } else {
+                    restored = false;
                 }
                 break;
             }
@@ -4878,7 +5048,10 @@ async function undoAction(actionId: string): Promise<boolean> {
                             tabIds as [number, ...number[]],
                         );
                     } catch {
-                        // Some tabs may be gone
+                        // Some tabs may be gone, but we cannot tell that from
+                        // "they are still grouped" — report it as unreversed
+                        // rather than claim a result we did not observe.
+                        restored = false;
                     }
                 }
                 break;
@@ -4890,13 +5063,23 @@ async function undoAction(actionId: string): Promise<boolean> {
                     try {
                         await chrome.tabs.remove(tabId);
                     } catch {
-                        // Already closed
+                        // Goal: the tab we opened is no longer open. A throw
+                        // here means it was already closed, which *is* the
+                        // desired end state — not a failure.
                     }
                 }
                 break;
             }
         }
-        return true;
+        if (restored) {
+            // Reached the desired end state, so the record has done its job.
+            // A failed reversal keeps its entry, which is what makes a retry
+            // possible at all.
+            const current = undoStack.findIndex((e) => e.action_id === actionId);
+            if (current !== -1) undoStack.splice(current, 1);
+            schedulePersist();
+        }
+        return restored;
     } catch {
         return false;
     }
@@ -4970,13 +5153,33 @@ function executeAllRecommended(
     return run;
 }
 
-/** Undo all recent actions (used by the overlay's "Undo" button). */
-async function undoAllRecent(): Promise<void> {
+/** Undo all recent actions (used by the overlay's "Undo" button).
+ *
+ * Returns what actually happened. Previously `Promise<void>`: one rejecting
+ * `undoAction` aborted the loop, silently leaving the rest of the stack
+ * un-reversed, and the caller reported success either way. Every entry is now
+ * attempted regardless of its neighbours' outcome.
+ */
+async function undoAllRecent(): Promise<{
+    attempted: number;
+    undone: number;
+    failed: number;
+}> {
     // Undo in reverse order
     const toUndo = [...undoStack].reverse();
+    let undone = 0;
     for (const entry of toUndo) {
-        await undoAction(entry.action_id);
+        try {
+            if (await undoAction(entry.action_id)) undone += 1;
+        } catch {
+            // Counted as failed below; one bad entry must not strand the rest.
+        }
     }
+    return {
+        attempted: toUndo.length,
+        undone,
+        failed: toUndo.length - undone,
+    };
 }
 
 // --- Comfort Alerts (Head/Neck Proxy & Eye Strain) ---
@@ -5173,6 +5376,7 @@ function surfaceInterventionOSNotification(
 function setRecapBadge(on: boolean): void {
     badgeState.setRecap(on);
     paintBadge();
+    schedulePersist();
 }
 
 let lastAmbientBroadcast = 0;
@@ -5730,7 +5934,7 @@ chrome.runtime.onMessage.addListener(
                     ? message.intervention_id
                     : interventionPresentation.active?.plan.intervention_id;
                 undoAllRecent()
-                    .then(() => {
+                    .then((result) => {
                         if (typeof undoInterventionId === "string" && undoInterventionId) {
                             send({
                                 type: "USER_ACTION",
@@ -5744,7 +5948,28 @@ chrome.runtime.onMessage.addListener(
                                 correlation_id: interventionPresentation.active?.correlation_id,
                             });
                         }
-                        sendResponse({ ok: true });
+                        sendResponse({
+                            ok: result.failed === 0,
+                            attempted: result.attempted,
+                            undone: result.undone,
+                            failed: result.failed,
+                            reason: result.failed === 0
+                                ? null
+                                : `${result.failed} of ${result.attempted} could not be reversed`,
+                        });
+                    })
+                    .catch((error: unknown) => {
+                        // Without this the promise rejected, sendResponse was
+                        // never called, and the port closed — which the
+                        // surfaces read as success because they discarded
+                        // `chrome.runtime.lastError`.
+                        sendResponse({
+                            ok: false,
+                            attempted: 0,
+                            undone: 0,
+                            failed: 0,
+                            reason: String(error),
+                        });
                     });
                 return true; // async
             }

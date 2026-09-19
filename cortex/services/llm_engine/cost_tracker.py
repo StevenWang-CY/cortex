@@ -134,10 +134,22 @@ class CostTracker:
         # A negative is normalised to 0.0 (the canonical "disabled" sentinel).
         warn_usd = float(warn_usd) if warn_usd > 0 else 0.0
         kill_usd = float(kill_usd) if kill_usd > 0 else 0.0
-        # Only enforce the ordering invariant when BOTH caps are active;
-        # an unlimited kill (0) above any warn is always coherent.
+        # A misordered pair must never cost the user their spend cap. Raising
+        # here re-created the exact failure the block above fixed by another
+        # door: the planner's ``except (OSError, ValueError)`` dropped the
+        # tracker, so lowering ``daily_cost_budget_usd`` below the default
+        # ``cost_warn_usd`` turned "spend less" into "no accounting and no
+        # kill-switch". The only reading that respects the user's intent is to
+        # honour the lower ceiling and pull the warning down to meet it.
         if kill_usd > 0 and warn_usd > 0 and kill_usd < warn_usd:
-            raise ValueError("kill_usd must be >= warn_usd when both are set")
+            logger.warning(
+                "cost_tracker: warn threshold $%.2f exceeds the kill ceiling "
+                "$%.2f; clamping the warning to the ceiling so the kill-switch "
+                "stays armed",
+                warn_usd,
+                kill_usd,
+            )
+            warn_usd = kill_usd
         self._ledger_path = ledger_path
         self._clock = clock or SYSTEM_CLOCK
         self._warn_usd = float(warn_usd)

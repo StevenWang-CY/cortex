@@ -24,4 +24,14 @@ export QT_QPA_PLATFORM=offscreen
 # test_desktop_shell.py again here: without that wrapper's isolation flag it can
 # bind real PySide6/AppKit under the offscreen platform and crash in native
 # window decoration code.
-"${UV_RUN[@]}" pytest cortex/tests/ --ignore=cortex/tests/unit/test_desktop_shell.py
+#
+# ``--cov-config`` is explicit on purpose. Coverage looks for its config in
+# the working directory, which here is the repository root; the settings live
+# in ``cortex/pyproject.toml``, so without this the whole ``[tool.coverage]``
+# block — ``fail_under`` included — is silently ignored. That is how a
+# declared 85 % floor sat in the repository for releases without ever being
+# enforced, and without ``omit`` ever excluding the test modules from the
+# denominator.
+"${UV_RUN[@]}" pytest cortex/tests/ \
+    --ignore=cortex/tests/unit/test_desktop_shell.py \
+    --cov --cov-config=cortex/pyproject.toml --cov-report=term:skip-covered

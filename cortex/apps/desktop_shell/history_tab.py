@@ -1977,6 +1977,10 @@ class HistoryTab(QWidget):
     history_requested = Signal(object, int)  # since, limit
     detail_requested = Signal(str)
     trends_requested = Signal(str, bool)  # window, refresh
+    # Emitted when a session export did not produce the file the user asked
+    # for. Payload is a human-readable reason. The tab also raises its own
+    # dialog; the signal exists so the outcome is observable without one.
+    export_failed = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -2347,11 +2351,41 @@ class HistoryTab(QWidget):
         try:
             if fmt == "json":
                 import json as _json
-                target.write_text(_json.dumps(report, indent=2, default=str))
+                payload = _json.dumps(report, indent=2, default=str)
             else:
-                target.write_text(self._report_to_csv(report))
-        except Exception:
+                payload = self._report_to_csv(report)
+            target.write_text(payload)
+            # A write that reports success but leaves nothing behind is the
+            # same outcome as a raise, from the user's side.
+            if not target.exists() or target.stat().st_size == 0:
+                raise OSError(f"{target} is missing or empty after the write")
+        except Exception as exc:
+            # The user picked a destination and got no file. Logging at
+            # WARNING put that on a disk nobody reads and left a failed
+            # export indistinguishable from a successful one.
             logger.warning("session export to %s failed", target, exc_info=True)
+            self._report_export_failure(target, exc)
+
+    def _report_export_failure(self, target: object, exc: BaseException) -> None:
+        """Tell the user the export they asked for did not happen."""
+        reason = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+        try:
+            self.export_failed.emit(reason)
+        except Exception:
+            logger.debug("export_failed emit failed", exc_info=True)
+        try:
+            from PySide6.QtWidgets import QMessageBox
+
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("Export failed")
+            box.setText("Cortex could not write the session export.")
+            box.setInformativeText(f"{target}\n\n{reason}")
+            box.exec()
+        except Exception:
+            # A headless or stubbed Qt has no message box; the signal and
+            # the log line above are still the record.
+            logger.debug("export failure dialog unavailable", exc_info=True)
 
     @staticmethod
     def _report_to_csv(report: dict) -> str:

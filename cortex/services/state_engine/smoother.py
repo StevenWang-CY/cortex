@@ -82,6 +82,27 @@ _SUPPORT_TO_LEGACY = {
 _LEGACY_TO_SUPPORT = {value: key for key, value in _SUPPORT_TO_LEGACY.items()}
 
 
+def _recovery_coverage(evaluation: RuleEvaluation) -> float:
+    """Evidence coverage to publish beside a smoother-owned RECOVERING label.
+
+    The scorer has no RECOVERING hypothesis — recovery is a temporal relation
+    between windows, which only the smoother can see — so ``state_coverage``
+    carries a placeholder ``0.0`` for it. ``ScoreSmoother.update`` builds the
+    recovery score from the flow and under-engaged components, so the evidence
+    behind the label is theirs, and that is what gets reported.
+
+    Publishing the placeholder instead made ``TriggerPolicy.evaluate`` reject
+    every RECOVERY estimate at its 0.45 coverage floor, which runs before the
+    per-state arm dispatch — so the opt-in recovery reinforcement arm could
+    never be reached.
+    """
+
+    return max(
+        evaluation.state_coverage.get(SupportState.FLOW_LIKE, 0.0),
+        evaluation.state_coverage.get(SupportState.UNDER_ENGAGED, 0.0),
+    )
+
+
 class ScoreSmoother:
     """Apply EMA, Schmitt hysteresis, and elapsed-time dwell confirmation."""
 
@@ -105,6 +126,7 @@ class ScoreSmoother:
         self._exit_candidate_since: float | None = None
         self._last_update_at: float | None = None
         self._transitions: deque[StateTransition] = deque(maxlen=100)
+        self._last_contributions: list[FeatureContribution] = []
         self._latest: StateEstimate | None = None
 
     @property
@@ -147,6 +169,10 @@ class ScoreSmoother:
             self._state_entered_at = now
 
         evaluation = self._coerce_evaluation(raw_scores, signal_quality)
+        # Transitions are committed deeper in this cycle and previously
+        # received no contributions, so every persisted row carried the
+        # same placeholder reason.
+        self._last_contributions = evaluation.contributing_features
         if evaluation.status != EstimateStatus.ESTIMATED:
             self._decay_scores()
             self._candidate_state = None
@@ -267,7 +293,30 @@ class ScoreSmoother:
             confidence=confidence,
             scores=state_scores,
             support_scores=support_scores,
-            evidence_coverage=evaluation.evidence_coverage,
+            # ``RuleEvaluation.evidence_coverage`` is the coverage of the
+            # scorer's *instantaneous dominant* state. The smoother publishes a
+            # temporally smoothed label, which is frequently a different one —
+            # that is what smoothing is for — so the figure shown beside the
+            # label described a different hypothesis. (The 0.45 eligibility gate
+            # is unaffected: it is applied inside the scorer against the correct
+            # per-state coverage.) Report the coverage of the label actually
+            # published; ``state_coverage`` carries an entry for every state,
+            # including 0.0 for the smoother-owned RECOVERING -- which is why
+            # that one label cannot simply read the map. The scorer has no
+            # RECOVERING hypothesis to measure (recovery is a temporal
+            # relation), so it stores a placeholder 0.0, and publishing that
+            # verbatim made the number misdescribe the label a second way:
+            # ``TriggerPolicy.evaluate`` applies the 0.45 coverage floor before
+            # dispatching to the per-state arms, so a RECOVERY estimate failed
+            # the floor with ``evidence_coverage_below_floor_0.00`` and the
+            # opt-in recovery reinforcement arm became unreachable. Recovery's
+            # score is built from the flow and under-engaged evidence, so it
+            # reports that evidence.
+            evidence_coverage=_recovery_coverage(evaluation)
+            if support_state is SupportState.RECOVERING
+            else evaluation.state_coverage.get(
+                support_state, evaluation.evidence_coverage
+            ),
             contributing_features=evaluation.contributing_features,
             exclusions=evaluation.exclusions,
             model=evaluation.model,
@@ -275,7 +324,9 @@ class ScoreSmoother:
             calibrated_probabilities=None,
             classifier_source="rule",
             classifier_alpha=0.0,
-            reasons=self._generate_reasons(status, evaluation.contributing_features),
+            reasons=self._generate_reasons(
+                status, evaluation.contributing_features, support_state
+            ),
             signal_quality=signal_quality,
             timestamp=now,
             observed_at_unix_ms=(
@@ -383,7 +434,11 @@ class ScoreSmoother:
             from_confidence=self._get_state_score(old_state),
             to_confidence=max(0.0, min(1.0, score)),
             dwell_seconds=self._dwell_seconds,
-            trigger_reasons=self._generate_reasons(EstimateStatus.ESTIMATED, []),
+            trigger_reasons=self._generate_reasons(
+                EstimateStatus.ESTIMATED,
+                self._last_contributions,
+                _LEGACY_TO_SUPPORT.get(new_state),
+            ),
         )
         self._transitions.append(transition)
         STATE_TRANSITIONS_TOTAL.labels(
@@ -425,7 +480,15 @@ class ScoreSmoother:
         self,
         status: EstimateStatus,
         contributions: list[FeatureContribution],
+        support_state: SupportState | None = None,
     ) -> list[str]:
+        """Explain the published label using only that label's own evidence.
+
+        Every ``FeatureContribution`` records which rule produced it. The
+        reasons were previously ranked across all three rules at once, so a
+        "support may help" estimate could be explained by the features that
+        argued for steady activity — the opposite claim.
+        """
         if status == EstimateStatus.WARMING_UP:
             return ["Still gathering enough input-pattern evidence"]
         if status == EstimateStatus.INSUFFICIENT_EVIDENCE:
@@ -434,7 +497,9 @@ class ScoreSmoother:
             (
                 item
                 for item in contributions
-                if item.observed and item.direction == "positive"
+                if item.observed
+                and item.direction == "positive"
+                and (support_state is None or item.support_state == support_state)
             ),
             key=lambda item: abs(item.contribution),
             reverse=True,

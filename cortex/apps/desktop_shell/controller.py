@@ -25,7 +25,7 @@ from concurrent.futures import Future
 from pathlib import Path
 from typing import Any, Literal
 
-from PySide6.QtCore import QObject, QTimer, Signal, Slot
+from PySide6.QtCore import QEvent, QObject, QTimer, Signal, Slot
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from cortex.apps.desktop_shell import mac_native
@@ -336,6 +336,30 @@ class DaemonBridge(QObject):
 # ---------------------------------------------------------------------------
 # CortexAppController — single-process daemon + Qt UI
 # ---------------------------------------------------------------------------
+
+class _QuitEventFilter(QObject):
+    """Route the application's Quit event through the recap flow.
+
+    ``QEvent.Quit`` is what Cmd+Q and the macOS app menu's Quit deliver. It
+    is cancellable, unlike ``aboutToQuit``, so intercepting it here is what
+    lets the two-phase stop arm before Qt starts tearing down. The handler
+    decides whether to show the recap or quit directly; either way the
+    event is consumed, because letting Qt also quit would race the flow.
+    """
+
+    def __init__(self, on_quit: Callable[[], None]) -> None:
+        super().__init__()
+        self._on_quit = on_quit
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        try:
+            if event.type() == QEvent.Type.Quit:
+                self._on_quit()
+                return True
+        except Exception:
+            logger.debug("quit event filter failed", exc_info=True)
+        return False
+
 
 class CortexAppController:
     """Boots the CortexDaemon in-process and wires it to the PySide6 UI.
@@ -739,23 +763,30 @@ class CortexAppController:
 
         # -- Graceful shutdown ------------------------------------------------
         # Phase 4.B fix (#4): ``aboutToQuit`` is non-cancellable, so the
-        # recap routing has to happen BEFORE the quit decision. We hook
-        # ``lastWindowClosed`` (fires when the user clicks the macOS
-        # window close button on the dashboard while no other top-level
-        # window is open) and route it through ``_on_user_initiated_quit``
-        # which decides whether to arm the recap or quit directly.
-        # ``aboutToQuit`` keeps its existing role as the safety-net
-        # daemon shutdown — it fires AFTER ``_on_gui_quit_requested``
-        # → ``_quit`` → ``app.quit()``.
+        # recap routing has to happen BEFORE the quit decision.
+        #
+        # That routing used to hang off ``QApplication.lastWindowClosed``,
+        # which was wrong in kind. That signal fires on *any* close of the
+        # last visible primary window — the ordinary macOS red close button
+        # included, and regardless of ``setQuitOnLastWindowClosed(False)``.
+        # So closing the dashboard window armed a two-phase stop with
+        # ``quit_after=True`` and terminated Cortex, which both contradicts
+        # the ``setQuitOnLastWindowClosed(False)`` set at startup and makes
+        # the tray's own "Dashboard" item permanently unreachable — the tray
+        # is the whole point of a menu-bar app. On macOS the red button and
+        # Cmd+W are the same gesture, so there was no way to put the window
+        # away without ending the session.
+        #
+        # Close now hides the dashboard (see ``DashboardWindow.closeEvent``)
+        # and quit is hooked where quit actually happens: ``QEvent.Quit``,
+        # which is what Cmd+Q and the app menu's Quit deliver, and which
+        # arrives before ``aboutToQuit`` so the recap can still be armed.
+        self._quit_filter = _QuitEventFilter(self._on_user_initiated_quit)
         try:
-            self._app.lastWindowClosed.connect(self._on_user_initiated_quit)
+            self._app.installEventFilter(self._quit_filter)
         except Exception:
-            logger.debug("lastWindowClosed connect failed", exc_info=True)
+            logger.debug("quit event filter install failed", exc_info=True)
         self._app.aboutToQuit.connect(self._shutdown_daemon)
-        # ``setQuitOnLastWindowClosed`` was set to False above so the
-        # tray keeps Cortex alive when the user closes the dashboard.
-        # We re-enable the implicit quit chain via lastWindowClosed so
-        # Cmd+W on the dashboard still routes through the recap flow.
         signal.signal(signal.SIGINT, lambda *_: self._on_user_initiated_quit())
         signal.signal(signal.SIGTERM, lambda *_: self._on_user_initiated_quit())
         # Timer to allow Python signal handling inside Qt event loop
@@ -2358,15 +2389,22 @@ class CortexAppController:
     def _quit(self) -> None:
         if self._quitting:
             return
-        # Set the latch before closing any window: DashboardWindow.close()
-        # synchronously emits lastWindowClosed, which otherwise re-enters the
-        # user-quit path before QApplication.quit() is reached.
+        # Set the latch before closing any window, so that anything a close
+        # re-enters (the Quit event filter, a tray handler) finds the quit
+        # already in progress and returns instead of arming a second stop.
         self._quitting = True
         logger.info("Shutting down Cortex desktop shell")
         if self._overlay is not None:
             self._overlay.close()
         if self._dashboard is not None:
-            self._dashboard.close()
+            # An ordinary close is refused by design — it is how the window
+            # gets put away without ending the session. Teardown asks for the
+            # real one.
+            closer = getattr(self._dashboard, "close_for_quit", None)
+            if callable(closer):
+                closer()
+            else:
+                self._dashboard.close()
         if self._app is not None:
             self._app.quit()
 
