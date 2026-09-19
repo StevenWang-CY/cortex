@@ -4853,18 +4853,27 @@ async function undoAction(actionId: string): Promise<boolean> {
     undoStack.splice(idx, 1);
     schedulePersist();
 
+    // Every arm below used to swallow its own failure and fall through to
+    // `return true`, so a tab that could not be reopened was still reported as
+    // undone. Each arm now records whether the *desired end state* was
+    // actually reached — which is not the same as "no exception was thrown".
+    let restored = true;
     try {
         switch (entry.action_type) {
             case "close_tab":
             case "bookmark_and_close": {
-                // Reopen from saved URL
+                // Reopen from saved URL. Goal: the tab exists again. Without a
+                // saved URL, or if create() fails, it does not — the user's
+                // tab is gone and stays gone, so this is a real failure.
                 const url = entry.undo_data.url as string;
                 if (url) {
                     try {
                         await chrome.tabs.create({ url, active: false });
                     } catch {
-                        // Failed to reopen
+                        restored = false;
                     }
+                } else {
+                    restored = false;
                 }
                 break;
             }
@@ -4878,7 +4887,10 @@ async function undoAction(actionId: string): Promise<boolean> {
                             tabIds as [number, ...number[]],
                         );
                     } catch {
-                        // Some tabs may be gone
+                        // Some tabs may be gone, but we cannot tell that from
+                        // "they are still grouped" — report it as unreversed
+                        // rather than claim a result we did not observe.
+                        restored = false;
                     }
                 }
                 break;
@@ -4890,13 +4902,15 @@ async function undoAction(actionId: string): Promise<boolean> {
                     try {
                         await chrome.tabs.remove(tabId);
                     } catch {
-                        // Already closed
+                        // Goal: the tab we opened is no longer open. A throw
+                        // here means it was already closed, which *is* the
+                        // desired end state — not a failure.
                     }
                 }
                 break;
             }
         }
-        return true;
+        return restored;
     } catch {
         return false;
     }
@@ -4970,13 +4984,33 @@ function executeAllRecommended(
     return run;
 }
 
-/** Undo all recent actions (used by the overlay's "Undo" button). */
-async function undoAllRecent(): Promise<void> {
+/** Undo all recent actions (used by the overlay's "Undo" button).
+ *
+ * Returns what actually happened. Previously `Promise<void>`: one rejecting
+ * `undoAction` aborted the loop, silently leaving the rest of the stack
+ * un-reversed, and the caller reported success either way. Every entry is now
+ * attempted regardless of its neighbours' outcome.
+ */
+async function undoAllRecent(): Promise<{
+    attempted: number;
+    undone: number;
+    failed: number;
+}> {
     // Undo in reverse order
     const toUndo = [...undoStack].reverse();
+    let undone = 0;
     for (const entry of toUndo) {
-        await undoAction(entry.action_id);
+        try {
+            if (await undoAction(entry.action_id)) undone += 1;
+        } catch {
+            // Counted as failed below; one bad entry must not strand the rest.
+        }
     }
+    return {
+        attempted: toUndo.length,
+        undone,
+        failed: toUndo.length - undone,
+    };
 }
 
 // --- Comfort Alerts (Head/Neck Proxy & Eye Strain) ---
@@ -5730,7 +5764,7 @@ chrome.runtime.onMessage.addListener(
                     ? message.intervention_id
                     : interventionPresentation.active?.plan.intervention_id;
                 undoAllRecent()
-                    .then(() => {
+                    .then((result) => {
                         if (typeof undoInterventionId === "string" && undoInterventionId) {
                             send({
                                 type: "USER_ACTION",
@@ -5744,7 +5778,28 @@ chrome.runtime.onMessage.addListener(
                                 correlation_id: interventionPresentation.active?.correlation_id,
                             });
                         }
-                        sendResponse({ ok: true });
+                        sendResponse({
+                            ok: result.failed === 0,
+                            attempted: result.attempted,
+                            undone: result.undone,
+                            failed: result.failed,
+                            reason: result.failed === 0
+                                ? null
+                                : `${result.failed} of ${result.attempted} could not be reversed`,
+                        });
+                    })
+                    .catch((error: unknown) => {
+                        // Without this the promise rejected, sendResponse was
+                        // never called, and the port closed — which the
+                        // surfaces read as success because they discarded
+                        // `chrome.runtime.lastError`.
+                        sendResponse({
+                            ok: false,
+                            attempted: 0,
+                            undone: 0,
+                            failed: 0,
+                            reason: String(error),
+                        });
                     });
                 return true; // async
             }

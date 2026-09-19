@@ -83,6 +83,23 @@ export interface UndoAllRecentRequest {
     correlation_id?: string;
 }
 
+/** Outcome of an undo, so a surface can report what actually happened.
+ *
+ * Both undo surfaces previously reported "Changes undone" unconditionally —
+ * they discarded `chrome.runtime.lastError` and ignored the response — so a
+ * user whose tabs were never reopened was told they had been.
+ */
+export interface UndoAllRecentResponse {
+    ok: boolean;
+    /** Entries taken off the undo stack. */
+    attempted: number;
+    /** Entries whose reversal actually reached the desired end state. */
+    undone: number;
+    /** `attempted - undone`. */
+    failed: number;
+    reason?: string | null;
+}
+
 export interface UserActionRequest {
     type: "USER_ACTION";
     action: TerminalUserAction;
