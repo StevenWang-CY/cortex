@@ -4,7 +4,7 @@
 
 `CortexConfig` is the runtime source of truth. YAML uses dotted paths below; environment overrides use the corresponding `CORTEX_…` name and double underscores. Secrets are deliberately not fields on `CortexConfig`.
 
-This reference contains **197 runtime settings**.
+This reference contains **198 runtime settings**.
 
 | YAML path | Environment variable | Type | Default | Constraints | Description |
 | --- | --- | --- | --- | --- | --- |
@@ -174,6 +174,7 @@ This reference contains **197 runtime settings**.
 | `debug.rppg` | `CORTEX_DEBUG__RPPG` | `bool` | `false` | — | — |
 | `debug.state` | `CORTEX_DEBUG__STATE` | `bool` | `false` | — | — |
 | `debug.llm` | `CORTEX_DEBUG__LLM` | `bool` | `false` | — | — |
+| `debug.record_full_state_stream` | `CORTEX_DEBUG__RECORD_FULL_STATE_STREAM` | `bool` | `false` | — | — |
 | `logging.level` | `CORTEX_LOGGING__LEVEL` | `str` | `"INFO"` | — | — |
 | `logging.format` | `CORTEX_LOGGING__FORMAT` | `str` | `"json"` | — | — |
 | `logging.include_timestamp` | `CORTEX_LOGGING__INCLUDE_TIMESTAMP` | `bool` | `true` | — | — |

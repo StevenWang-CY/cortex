@@ -56,7 +56,9 @@ from cortex.application.task_supervisor import TaskFailure, TaskGroupName
 from cortex.libs.adapters.leetcode_adapter import LeetCodeAdapter
 from cortex.libs.config.settings import CortexConfig, get_config
 from cortex.libs.logging.structured import (
+    DEBUG_SUBSYSTEM_LOGGERS,
     EventType,
+    apply_debug_subsystems,
     configure_logging,
     get_logger,
 )
@@ -837,6 +839,21 @@ class CortexDaemon:
         self._intervention_callback_seq: int = 0
 
         self._recorder = SessionRecorder(self.config.storage.path, clock=self._clock)
+        # Audit D15 / roadmap: the recorder writes one state_estimate per
+        # change of (state, status). The offline replay harness needs every
+        # tick, so a rerun sees the input sequence the live run saw; without
+        # it the harness replays a session with most of its estimates missing
+        # and reports different behaviour without saying why. Configurable
+        # rather than a source edit — see DebugConfig.
+        self._record_full_state_stream = bool(
+            self.config.debug.record_full_state_stream
+        )
+        # Honour the configured support switches from the first frame, not
+        # only after the user re-applies settings.
+        apply_debug_subsystems({
+            subsystem: bool(getattr(self.config.debug, subsystem, False))
+            for subsystem in DEBUG_SUBSYSTEM_LOGGERS
+        })
         # Audit D15: the JSONL state stream records label/status transitions
         # only (see ``_record_state_estimate``).
         self._last_recorded_state_key: tuple[str, str] | None = None
@@ -4365,8 +4382,12 @@ class CortexDaemon:
             # B6 (Phase 4.1): graceful state loop shutdown.
             logger.debug("state loop cancelled")
 
-    # Audit D15: set True to record every 2 Hz estimate (debug only); the
-    # default records label/status transitions.
+    # Audit D15: record every 2 Hz estimate rather than only label/status
+    # transitions. This is a class-level fallback; ``__init__`` binds the
+    # instance attribute from ``config.debug.record_full_state_stream`` and
+    # ``apply_settings`` can flip it live, so a replay capture no longer needs
+    # a source edit. The class default keeps the attribute defined for the
+    # test stubs that construct a partial daemon.
     _record_full_state_stream: bool = False
 
     def _record_state_estimate(self, estimate: Any) -> None:
@@ -8436,6 +8457,28 @@ class CortexDaemon:
             ):
                 await self._capture_pipeline.stop()
                 self._capture_available = False
+        # The four support switches surfaced in Settings as "<subsystem>
+        # debug logging". They reached this method and had no branch, so
+        # ticking one changed nothing at all — while the dialog above them
+        # reads "Verbose logging for support. Leave these off unless asked".
+        debug_flags = {
+            subsystem: bool(settings[f"debug_{subsystem}"])
+            for subsystem in DEBUG_SUBSYSTEM_LOGGERS
+            if f"debug_{subsystem}" in settings
+        }
+        if debug_flags:
+            for subsystem, enabled in debug_flags.items():
+                setattr(self.config.debug, subsystem, enabled)
+            # Named for what it is, and NOT ``applied`` — that name is
+            # reused later in this function for the re-broadcast payload,
+            # and mypy takes a local's type from its first assignment.
+            debug_levels = apply_debug_subsystems(debug_flags)
+            logger.info("Debug logging updated: %s", debug_levels)
+        if "record_full_state_stream" in settings:
+            # Flippable live so a replay capture can be armed mid-session
+            # without restarting the daemon and losing the session boundary.
+            self._record_full_state_stream = bool(settings["record_full_state_stream"])
+            self.config.debug.record_full_state_stream = self._record_full_state_stream
         if "input_telemetry_enabled" in settings:
             self._telemetry_enabled = bool(settings["input_telemetry_enabled"])
             if self._telemetry_enabled:

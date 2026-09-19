@@ -1033,6 +1033,18 @@ class DebugConfig(BaseModel):
     rppg: bool = False
     state: bool = False
     llm: bool = False
+    # The session recorder writes one ``state_estimate`` record per *change*
+    # of (state, status), which is what History and the receipts need and is
+    # a tiny fraction of the tick rate. The offline replay harness wants the
+    # opposite: every tick, so a rerun sees the same input sequence the live
+    # run did. Without this the harness replays a session with most of its
+    # estimates missing and silently reports different behaviour.
+    #
+    # Off by default because a full stream is roughly two orders of magnitude
+    # more JSONL for a signal nobody reads outside a replay capture. Turn it
+    # on for the session you intend to replay:
+    # ``CORTEX_DEBUG__RECORD_FULL_STATE_STREAM=true``.
+    record_full_state_stream: bool = False
 
 
 class LoggingConfig(BaseModel):

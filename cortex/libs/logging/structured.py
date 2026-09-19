@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, cast
@@ -237,6 +238,46 @@ def add_service_context(
     if "service" not in event_dict:
         event_dict["service"] = "cortex"
     return event_dict
+
+
+# The four ``DebugConfig`` subsystem switches, and the logger namespace each
+# one turns up. They are surfaced in the desktop app as "Capture debug
+# logging", "rPPG debug logging", "State engine debug logging" and "LLM debug
+# logging", under the line "Verbose logging for support. Leave these off
+# unless asked" — so a support engineer asks a user to tick one and expects
+# more log. Until v0.5.0 nothing read them: the checkboxes were persisted to
+# QSettings and sent to the daemon, and the daemon's ``apply_settings`` had no
+# branch for any of them, so ticking one produced exactly nothing.
+DEBUG_SUBSYSTEM_LOGGERS: dict[str, str] = {
+    "capture": "cortex.services.capture_service",
+    "rppg": "cortex.services.physio_engine",
+    "state": "cortex.services.state_engine",
+    "llm": "cortex.services.llm_engine",
+}
+
+
+def apply_debug_subsystems(flags: Mapping[str, bool]) -> dict[str, str]:
+    """Raise or restore per-subsystem log levels for the support switches.
+
+    A switch that is on pins its namespace to ``DEBUG``; a switch that is off
+    clears the override so the namespace falls back to the root level, rather
+    than pinning it to ``INFO`` — otherwise turning a switch off would leave
+    the subsystem *quieter* than the rest of the app if the root were set to
+    DEBUG.
+
+    Returns the levels applied, keyed by subsystem, so a caller can log what
+    changed. Unknown keys are ignored: the mapping usually arrives from a
+    settings payload that carries many other keys.
+    """
+    applied: dict[str, str] = {}
+    for subsystem, namespace in DEBUG_SUBSYSTEM_LOGGERS.items():
+        if subsystem not in flags:
+            continue
+        enabled = bool(flags[subsystem])
+        logger = logging.getLogger(namespace)
+        logger.setLevel(logging.DEBUG if enabled else logging.NOTSET)
+        applied[subsystem] = "DEBUG" if enabled else "inherit"
+    return applied
 
 
 def configure_logging(

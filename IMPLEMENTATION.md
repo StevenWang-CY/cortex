@@ -5571,11 +5571,29 @@ published by hand.
 | Independent review | No second reviewer exists | Recruit one to reach the independently-reviewed tier |
 | Physiological accuracy claims | Unchanged: pulse remains `EXPERIMENTAL`; HRV and respiration stay disabled | Reference-sensor study before any accuracy claim |
 | Dependency exceptions | Re-reviewed to 2026-10-15 | Upstream fixes or replacement before expiry |
-| Head-pose intrinsics | Camera identity now follows delivered geometry, but the pose estimator's intrinsics still come from the configured size | Rebuild the estimator when the delivered geometry changes |
-| `active_recall` template | Asks the model for `recall_*` fields the closed draft schema cannot carry (pre-existing; never reached a plan) | Model the fields in `PlanDraft` or retire the template |
+| Head-pose intrinsics | **Closed in v0.5.0.** `HeadPoseEstimator.rebind_geometry` reconciles to the delivered frame in both the runtime and calibration paths | — |
+| `active_recall` template | **Closed in v0.5.0**, by neither option. Tracing the surface showed a quiz cannot be presented at all; the template now asks for what the pipeline delivers | — |
 | VS Code marketplace identity | `publisher` is a placeholder and there is no marketplace icon | Choose a publisher and icon before any marketplace listing |
-| Session recorder stream | The recorder now writes state transitions only (`0600`, lazily created); the offline replay harness therefore sees fewer `state_estimate` events per session | Enable the daemon's full-stream debug flag when capturing a session for replay, or expose it as a setting |
-| Trigger and journal constants | The 10 s exit dwell, the 7-day/200-row terminal-transaction archive, and the dismissal-pause length are code constants derived from existing settings | Expose as configuration if operators need to tune them |
+| Session recorder stream | **Closed in v0.5.0.** `CORTEX_DEBUG__RECORD_FULL_STATE_STREAM`, also flippable live through `apply_settings` so a capture can be armed mid-session | — |
+| Trigger and journal constants | **Decided against in v0.5.0**, see below | — |
+
+Four of these were taken up in v0.5.0's second pass. The fourth was declined,
+and the reason is worth recording so it is not re-opened by default.
+
+**Trigger and journal constants stay constant.** The roadmap entry was
+conditional — "expose as configuration *if operators need to tune them*" — and
+no such need has been stated. Each of the three also has a reason to stay
+fixed. `EXIT_TO_UNKNOWN_DWELL_SECONDS` carries an invariant against another
+dwell ("it must exceed the RECOVERY dwell (5 s) so a genuine post-HYPER
+recovery still commits before the fallback fires"), so exposing it without a
+cross-field validator would let a configuration file break state inference
+silently. `terminal_retention_days` and `max_terminal_transactions` are already
+constructor parameters and bound a store the user never sees. The
+dismissal-pause length is already `quiet_mode_minutes × level`, driven by a
+setting the user does control; only the level cap is constant. Four new keys on
+a 198-key surface, each a permanent compatibility commitment, for a tuning need
+nobody has asked for, is not a trade worth making — and the entry can be
+reopened the moment someone does ask.
 
 ### 30.10 Definition of done for v0.4.0
 
@@ -5822,3 +5840,59 @@ against a floor of 68.
 
 The last item needs Developer ID signing credentials and a clean Mac, and
 cannot be completed from here.
+
+### 31.9 Roadmap items taken up in the same pass
+
+With the residual list empty, the deferred decisions in §30.9 were revisited.
+Four were implementable without a product decision; the rest need credentials
+(notarized release, reference-sensor study), hardware (Intel validation), a
+person (independent reviewer), a name (VS Code publisher identity), or a
+visual review pass this session cannot perform (desktop dark mode, 364 `CX_*`
+references that need screenshots).
+
+**The `active_recall` template asked for the impossible, and the roadmap's two
+options were both wrong.** It offered "model the fields in `PlanDraft` or
+retire the template". Tracing the surface showed neither. The template asked
+for `recall_question`, `recall_answer` and `recall_context_sentence` and told
+the model "the intervention will blur the screen and show the question; the
+user must answer correctly to unblur". `PlanDraft` sets `extra="forbid"` and
+the emitted structured-output schema closes every object, so the grammar
+cannot express those fields — the model could not have returned them if it
+tried. And `ACTIVE_RECALL` is a compatibility sink in `background.ts` with no
+page receiver, because blurring a page someone is reading is a mutation, and a
+mutation needs an exact authorization, an immutable manifest, a durable
+receipt and a receipt-backed escape path first. Modelling the fields would
+have produced a quiz for a surface that deliberately refuses to show one.
+
+So the trigger was never broken: it fired, the model returned a plan, and the
+plan was composed around an intervention that would never occur — the headline
+and steps the user actually saw were written for the wrong thing. The template
+now asks for a concrete way back into the material, grounded in the visible
+page text, with no quiz and no blocking. The detection was always sound; only
+the ask was wrong.
+
+**Head-pose intrinsics follow the camera.** The estimator built a pinhole
+matrix once from `config.capture`, while the capture service already rebinds
+the *camera identity* to the delivered frame — precisely because the two
+disagree in practice. Measured, configured 1280×720 against a delivered
+640×480: 13.4°–15.8° of total angular error across −20° to +20° of true pitch,
+of which ~12–15° is yaw that is not there at all, plus a **+5.4° pitch offset
+at the neutral pose**. That last number is the consequential one: calibration
+records a neutral head pitch and the posture proxy measures live flexion
+against it, so a constant offset at neutral lands directly in the head/neck
+claim. After rebinding, 0.000°.
+
+**The full state stream is a setting.** It was a class attribute a developer
+had to edit in source before capturing a session for replay. Without it the
+replay harness reruns a session with most of its estimates missing and reports
+different behaviour without saying why.
+
+**A defect found while doing the above: four dead support switches.** Settings
+renders "Capture / rPPG / State engine / LLM debug logging" under the line
+"Verbose logging for support. Leave these off unless asked." All four were
+persisted to `QSettings` and sent to the daemon, and `apply_settings` had no
+branch for any of them — a support engineer could ask a user to tick one and
+receive exactly the same log as before. Each now pins its subsystem's logger
+namespace to `DEBUG`, and clears the override rather than pinning `INFO` when
+switched off, so "off" means "like everything else" rather than "quieter than
+everything else".

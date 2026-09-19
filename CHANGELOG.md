@@ -197,8 +197,41 @@ against this pipeline rather than from literature.
 * **The published checksum command works.** Downloaders were told to run a
   command that exits non-zero on a correct download.
 
+### Fixed — controls that did nothing
+
+* **The four "debug logging" checkboxes now produce debug logging.** Settings
+  renders them under "Verbose logging for support. Leave these off unless
+  asked." They were persisted and sent to the daemon, and the daemon had no
+  branch for any of them, so a support engineer could ask a user to tick one
+  and receive exactly the same log as before. Each now raises its subsystem's
+  logger to `DEBUG`, and switching one off restores inheritance rather than
+  pinning `INFO` — otherwise "off" would make a subsystem quieter than the
+  rest of the app.
+* **The zombie-reading intervention asks for something that can happen.** Its
+  template requested three fields the closed draft schema cannot express and
+  told the model the screen would blur until the user answered a question
+  correctly. Neither was ever possible: the structured-output grammar cannot
+  emit those fields, and the frame that would present a quiz is a
+  compatibility sink with no page receiver, because blocking a page is a
+  mutation and mutations need an authorization and a restore path first. The
+  plan the user actually saw was written for an intervention that never
+  occurred. It now proposes a concrete way back into the material they are
+  reading.
+* **Head-pose estimation follows the camera's real geometry.** The pinhole
+  intrinsics were built once from the configured frame size while the capture
+  service already rebinds the camera identity to the delivered one. Measured
+  at configured 1280×720 against a delivered 640×480: 13.4°–15.8° of total
+  angular error, including a +5.4° pitch offset at the neutral pose — the
+  pose calibration records and the posture proxy measures flexion against.
+  After the fix, 0.000°.
+
 ### Added
 
+* `CORTEX_DEBUG__RECORD_FULL_STATE_STREAM`, which makes the session recorder
+  write every state tick rather than only transitions. The offline replay
+  harness needs the full stream to rerun a session faithfully; it previously
+  required editing a class attribute in source. Also flippable live, so a
+  capture can be armed mid-session.
 * A pre-routing capability gate, a signal-presence gate and a sub-harmonic
   audit for the pulse pipeline, and a peak-concentration term — each with the
   measurement that chose its threshold recorded beside it.
