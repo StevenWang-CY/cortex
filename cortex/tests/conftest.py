@@ -74,6 +74,82 @@ def sandbox_home() -> Path:
     assert _SANDBOX_HOME is not None, "HOME sandbox disabled via CORTEX_TEST_REAL_HOME=1"
     return _SANDBOX_HOME
 
+
+@pytest.fixture(scope="session", autouse=True)
+def _sandbox_qsettings_store() -> Any:
+    """Keep ``QSettings`` reads inside the HOME sandbox.
+
+    The ``HOME`` redirection above does not fully contain ``QSettings`` on
+    macOS. ``QSettings.fileName()`` *does* follow ``$HOME`` into the sandbox,
+    which makes the leak easy to miss -- but the native backend is
+    CFPreferences, which answers reads from ``cfprefsd`` over XPC keyed on the
+    domain (``com.cortex.Desktop``), not from that file. Measured directly: in
+    a fresh sandbox where the plist does not exist, ``value("webcam_enabled")``
+    still returned the signed-in developer's real ``False``.
+
+    ``SettingsDialog.__init__`` opens ``QSettings("Cortex", "Desktop")`` and
+    real-Qt suites (``test_a11y_coverage``, ``test_settings_apply_race``)
+    construct that dialog, so the suite was reading the developer's own
+    preferences -- the leak CLAUDE.md rule 36 exists to prevent. It also made
+    results machine-dependent: ``test_get_default_settings`` asserts
+    ``webcam_enabled is True`` and fails wherever the real preference is off.
+
+    ``QSettings.setDefaultFormat`` does **not** fix this: the two-argument
+    constructor was measured still reporting ``NativeFormat`` afterwards. Only
+    the explicit ``QSettings(format, scope, org, app)`` form escapes
+    CFPreferences, so the module symbol is swapped for a factory that uses it.
+    The organisation is renamed too, so nothing can resolve to the real domain
+    even if a backend ignores the requested format.
+
+    Best-effort by design: the legacy stubbed Qt suite replaces ``PySide6``
+    with doubles, and a non-Qt environment has no PySide6 -- neither can reach
+    the real preference store in the first place.
+    """
+    module = sys.modules.get("cortex.apps.desktop_shell.settings")
+    if _SANDBOX_HOME is None or module is None:
+        yield
+        return
+    try:
+        from PySide6.QtCore import QSettings as _RealQSettings
+
+        ini = _RealQSettings.Format.IniFormat
+        scope = _RealQSettings.Scope.UserScope
+    except Exception:
+        yield
+        return
+    if getattr(module, "QSettings", None) is not _RealQSettings:
+        # Stubbed or already replaced; nothing here can reach cfprefsd.
+        yield
+        return
+
+    target = _SANDBOX_HOME / "Library" / "Preferences"
+    target.mkdir(parents=True, exist_ok=True)
+    _RealQSettings.setPath(ini, scope, str(target))
+
+    class _SandboxedQSettings:
+        """Callable stand-in that also proxies the real class's attributes.
+
+        ``settings.py`` uses the module symbol two ways: as a constructor, and
+        as a namespace for the enums (``QSettings.Status.NoError``,
+        ``QSettings.Format``). A bare function covers only the first, and the
+        resulting ``AttributeError`` is swallowed by the defensive ``except
+        Exception`` around the status check -- which silently disabled the
+        save-failure signal that ``test_settings_sync_failure`` exists to pin.
+        Proxying attribute access keeps both uses intact.
+        """
+
+        def __call__(self, *_args: Any, **_kwargs: Any) -> Any:
+            return _RealQSettings(ini, scope, "CortexTestSandbox", "Desktop")
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(_RealQSettings, name)
+
+    module.QSettings = _SandboxedQSettings()
+    try:
+        yield
+    finally:
+        module.QSettings = _RealQSettings
+
 # ``test_desktop_shell.py`` is a legacy, deliberately stubbed Qt suite. Its
 # stubs replace process-global PySide6 modules and therefore must never be
 # collected in the same interpreter as the real-Qt tests. A dedicated wrapper

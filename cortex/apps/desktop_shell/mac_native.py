@@ -115,13 +115,47 @@ def _objc() -> Any | None:
         return None
 
 
+def _qt_platform_is_cocoa() -> bool:
+    """True only while Qt draws through the native macOS platform plugin.
+
+    ``winId()`` is an ``NSView`` pointer **only** under the ``cocoa`` plugin.
+    Under ``offscreen`` or ``minimal`` -- CI, headless probes, some remote
+    sessions -- it is an opaque non-zero handle, and passing that to
+    ``objc_object(c_void_p=...)`` dereferences an address that was never an
+    Objective-C object. That is a segmentation fault, which no ``try``/
+    ``except`` can catch: the ``if wid == 0`` guard below does not help
+    because the handle is not zero, merely meaningless.
+
+    ``is_macos()`` already honours ``CORTEX_HEADLESS_STARTUP=1``, but that is
+    an opt-in flag a caller must remember to set; running the Qt suite with
+    ``QT_QPA_PLATFORM=offscreen`` and no flag crashed the interpreter outright
+    (``test_show_intervention`` -> ``showEvent`` -> ``apply_unified_titlebar``).
+    The platform name is authoritative, so it is checked instead of trusted.
+
+    Deliberately uncached: the plugin is not known until a ``QGuiApplication``
+    exists, and caching a pre-application ``False`` would disable native
+    decoration for the whole process.
+    """
+    try:
+        from PySide6.QtGui import QGuiApplication
+
+        if QGuiApplication.instance() is None:
+            return False
+        return str(QGuiApplication.platformName()).strip().lower() == "cocoa"
+    except Exception:
+        return False
+
+
 def _ns_window_for(widget: Any) -> Any | None:
     """Resolve the ``NSWindow`` backing a Qt widget via its ``winId``.
 
-    Returns ``None`` on non-mac or when the widget is not yet realized.
+    Returns ``None`` on non-mac, under a non-native Qt platform plugin, or
+    when the widget is not yet realized.
     """
     AppKit = _appkit()
     if AppKit is None:
+        return None
+    if not _qt_platform_is_cocoa():
         return None
     try:
         wid = int(widget.winId())

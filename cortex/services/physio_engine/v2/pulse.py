@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from uuid import UUID
 
 import numpy as np
@@ -46,6 +46,57 @@ from cortex.services.physio_engine.v2.uncertainty import heuristic_interval
 PRIOR_PENALTY_SCALE_BPM = 18.0
 PRIOR_HALF_LIFE_SECONDS = 10.0
 PRIOR_MAX_AGE_SECONDS = 30.0
+
+# --- Sub-harmonic audit (bradycardia doubling) -----------------------------
+# The publication band starts at ``low_hz`` (0.7 Hz = 42 BPM by default), so
+# a genuine cardiac fundamental below that edge is removed by the bandpass
+# while its second harmonic survives inside the band.  The spectral selector
+# already prefers a fundamental over its harmonic, but only when the
+# sub-harmonic is itself inside the analysed band -- see the ``half >= low_hz``
+# guard in :func:`_spectral_hr`.  Below ``2 * low_hz`` it never asks, because
+# the evidence it would need no longer exists in the filtered waveform.
+#
+# The evidence does still exist *before* the bandpass.  Re-filtering the same
+# backend waveform with a lower edge recovers the fundamental, and the ratio
+# of its power to the published peak's power separates the two populations by
+# roughly two orders of magnitude.  Measured on the packaged POS backend over
+# 40 synthetic windows per case (10 s, 30 fps, harmonic-rich BVP, 1% noise):
+#
+#   true rate   published   power(f/2) / power(f)
+#   32 BPM      64.1        3.29
+#   35 BPM      70.0        4.15
+#   40 BPM      79.9        5.46
+#   42 BPM      83.8        5.08
+#   >= 45 BPM   correct     0.002 - 0.018
+#
+# ``SUBHARMONIC_RATIO_THRESHOLD`` sits ~17x above the largest observed
+# false-positive ratio and ~11x below the smallest true-positive one.
+# Respiration cannot forge this evidence: it modulates ROI brightness in
+# common mode across R/G/B, which is precisely the component the POS
+# projection cancels.  Driving respiration at exactly f/2 with three times a
+# realistic amplitude moved the ratio only from 0.017 to 0.018.
+# The audit runs when the sub-harmonic falls below
+# ``SUBHARMONIC_AUDIT_MARGIN * low_hz``, not merely below ``low_hz``. A
+# 4th-order Butterworth is -3 dB at its corner and rolls off gradually, so a
+# fundamental a little *above* the edge is still attenuated enough to lose to
+# its own second harmonic: at exactly the corner (42 BPM with the default
+# 0.7 Hz band) 17 of 40 windows published a doubled rate while the strict
+# ``< low_hz`` trigger stayed silent. 1.30 covers the transition region.
+# Widening it is close to free because the ratio separates the populations by
+# two orders of magnitude -- genuine rates in the newly audited span
+# (84-109 BPM published) measure 0.002-0.018 against a 0.30 threshold.
+SUBHARMONIC_AUDIT_LOW_HZ = 0.40
+SUBHARMONIC_AUDIT_MARGIN = 1.30
+# Which harmonics a removed fundamental can surface as. A real BVP upstroke
+# carries appreciable 2nd *and* 3rd harmonic energy, so a 42 BPM fundamental
+# can appear at 84 or at 126 BPM; checking only the octave left the triple
+# published (measured: true 42 BPM -> 124.8 BPM). The 4th harmonic is not
+# audited -- its amplitude is negligible and f/4 falls below the audit band
+# for every rate the pipeline will publish.
+SUBHARMONIC_AUDIT_DIVISORS = (2, 3)
+SUBHARMONIC_RATIO_THRESHOLD = 0.30
+SUBHARMONIC_PEAK_TOLERANCE_HZ = 0.06
+
 
 # --- Legacy motion proxy (deprecated) --------------------------------------
 # ``head_jitter_deg`` was ``nose displacement_px * 45 / frame_width`` and was
@@ -103,6 +154,62 @@ def motion_penalty_from_face_widths(
     return float(np.clip(value / max_motion_face_widths_per_second, 0.0, 1.0))
 
 
+def subharmonic_power_ratio(
+    waveform: NDArray[np.float64],
+    *,
+    fs: float,
+    published_hz: float,
+    high_hz: float,
+    audit_low_hz: float = SUBHARMONIC_AUDIT_LOW_HZ,
+    divisors: tuple[int, ...] = SUBHARMONIC_AUDIT_DIVISORS,
+) -> float:
+    """Strongest sub-harmonic power relative to the published peak's power.
+
+    For each ``k`` in *divisors* the power at ``published_hz / k`` is compared
+    with the power at ``published_hz``; the largest ratio is returned. A value
+    at or above :data:`SUBHARMONIC_RATIO_THRESHOLD` means the published peak
+    is very likely the ``k``-th harmonic of a fundamental the publication
+    band cannot represent.
+
+    The ratio is measured on *waveform* -- the backend output before the
+    publication bandpass -- re-filtered with ``audit_low_hz`` as the lower
+    edge, so a fundamental the publication band removed is still present.
+    Returns ``0.0`` when the window is too short to analyse or no sub-harmonic
+    falls inside the audit band, i.e. when the question cannot be answered
+    rather than when the answer is negative.
+    """
+
+    if published_hz >= high_hz or published_hz <= 0.0:
+        return 0.0
+    count = len(waveform)
+    if count < max(8, int(fs * 4.0)):
+        return 0.0
+    targets = [
+        published_hz / float(k)
+        for k in divisors
+        if published_hz / float(k) > audit_low_hz
+    ]
+    if not targets:
+        return 0.0
+    audited = bandpass_filter(
+        waveform, low_hz=audit_low_hz, high_hz=high_hz, fs=fs, order=4
+    )
+    nfft = max(count, 2 ** int(np.ceil(np.log2(count * 4))))
+    frequencies, power = welch(
+        audited, fs=fs, window="hann", nperseg=count, noverlap=0,
+        nfft=nfft, detrend="constant",
+    )
+
+    def _peak_near(target: float) -> float:
+        selected = np.abs(frequencies - target) <= SUBHARMONIC_PEAK_TOLERANCE_HZ
+        return float(np.max(power[selected])) if bool(selected.any()) else 0.0
+
+    at_published = _peak_near(published_hz)
+    if at_published <= 1e-18:
+        return 0.0
+    return max(float(_peak_near(target) / at_published) for target in targets)
+
+
 @dataclass(frozen=True)
 class SpectralPeak:
     """Harmonic-aware spectral HR selection over one whole window."""
@@ -129,6 +236,13 @@ class PulseProcessingResult:
     spectral_native_resolution_hz: float = float("inf")
     motion_penalty: float = 0.0
     prior_weight: float = 0.0
+    # Gate evidence. ``sqi_components`` are the raw, un-normalised terms
+    # behind ``summary.quality``; ``signal_present`` records whether this
+    # window carried a cardiac signal at all, independently of how clean
+    # the acquisition was. Process-local so the schema surface is unchanged.
+    sqi_components: dict[str, float] = field(default_factory=dict)
+    signal_present: bool = False
+    subharmonic_ratio: float = 0.0
 
 
 def _quadratic_peak_offset(signal: NDArray[np.float64], index: int) -> float:
@@ -240,6 +354,8 @@ class PulsePipelineV2:
         max_head_jitter_deg: float = 7.5,
         max_motion_face_widths_per_second: float = 0.75,
         minimum_window_quality: float = 0.30,
+        nsqi_threshold: float = 0.293,
+        min_cardiac_snr_db: float = 2.0,
         experimental_hrv_enabled: bool = False,
         hrv_min_window_seconds: float = 180.0,
         hrv_min_valid_ibi: int = 120,
@@ -255,6 +371,8 @@ class PulsePipelineV2:
         self._max_head_jitter_deg = float(max_head_jitter_deg)
         self._max_motion_fw_s = float(max_motion_face_widths_per_second)
         self._minimum_window_quality = float(minimum_window_quality)
+        self._nsqi_threshold = float(nsqi_threshold)
+        self._min_cardiac_snr_db = float(min_cardiac_snr_db)
         self._experimental_hrv_enabled = bool(experimental_hrv_enabled)
         self._hrv_min_window_seconds = float(hrv_min_window_seconds)
         self._hrv_min_valid_ibi = int(hrv_min_valid_ibi)
@@ -270,6 +388,14 @@ class PulsePipelineV2:
             "max_head_jitter_deg": self._max_head_jitter_deg,
             "max_motion_face_widths_per_second": self._max_motion_fw_s,
             "minimum_window_quality": self._minimum_window_quality,
+            "nsqi_threshold": self._nsqi_threshold,
+            "min_cardiac_snr_db": self._min_cardiac_snr_db,
+            "subharmonic_audit_low_hz": SUBHARMONIC_AUDIT_LOW_HZ,
+            "subharmonic_audit_margin": SUBHARMONIC_AUDIT_MARGIN,
+            "subharmonic_audit_divisors": ",".join(
+                str(k) for k in SUBHARMONIC_AUDIT_DIVISORS
+            ),
+            "subharmonic_ratio_threshold": SUBHARMONIC_RATIO_THRESHOLD,
             "prior_half_life_seconds": PRIOR_HALF_LIFE_SECONDS,
             "prior_max_age_seconds": PRIOR_MAX_AGE_SECONDS,
             "experimental_hrv_enabled": self._experimental_hrv_enabled,
@@ -278,12 +404,13 @@ class PulsePipelineV2:
         }
         self._algorithm_identity = SignalAlgorithmIdentity(
             name=f"pulse-v2:{backend.identity.name}",
-            version="pulse-v2/2.1.0",
+            version="pulse-v2/2.2.0",
             implementation_sha256=code_sha256(
                 (
                     PulsePipelineV2.process_window,
                     PulsePipelineV2._beat_candidates,
                     _spectral_hr,
+                    subharmonic_power_ratio,
                     _quadratic_peak_offset,
                     prior_weight,
                     motion_penalty_from_face_widths,
@@ -326,6 +453,11 @@ class PulsePipelineV2:
         if self._prior_hr_bpm is None or self._prior_set_at_mono_ns is None:
             return None
         return max(0.0, (int(at_mono_ns) - self._prior_set_at_mono_ns) / 1_000_000_000.0)
+
+    @property
+    def algorithm_identity(self) -> SignalAlgorithmIdentity:
+        """Provenance for every estimate this pipeline publishes."""
+        return self._algorithm_identity
 
     def reset(self) -> None:
         self._ledger.reset()
@@ -396,7 +528,7 @@ class PulsePipelineV2:
             motion_gate_exceeded = head_jitter_deg > self._max_head_jitter_deg
         else:
             motion_penalty = 0.0
-        physio_sqi, _components = compute_physio_sqi(
+        physio_sqi, sqi_components = compute_physio_sqi(
             waveform,
             fs=sample_rate_hz,
             low_hz=self._low_hz,
@@ -424,13 +556,75 @@ class PulsePipelineV2:
         hr_bpm = peak.hr_bpm
         hr_confidence = peak.concentration
         bin_width_hz = peak.bin_width_hz
+
+        # Signal presence is tested on the raw, un-normalised spectrum terms,
+        # NOT on ``quality``. ``compute_physio_sqi`` is an additive blend in
+        # which the acquisition terms alone contribute 0.25 of a possible
+        # 1.0 (``0.15 * motion_term + 0.10 * face_term``), so a still, fully
+        # visible face scores above the 0.30 publication gate before any
+        # cardiac evidence is considered at all. Measured over 200 windows
+        # per condition on the packaged POS backend, signal-free input scored
+        # 0.334-0.449 (white noise) and 0.443-0.684 (1/f and drift noise):
+        # every single signal-free window cleared the gate, and the pipeline
+        # published a fabricated rate for all of them.
+        #
+        # Normalising SNR to [0, 1] is what destroys the discrimination --
+        # ``(snr_db + 10) / 20`` compresses the whole decision range into the
+        # middle of the scale, where averaging dilutes it further. Thresholding
+        # the raw decibel value keeps it: ``snr_db >= 2.0`` rejected 98.5-100%
+        # of signal-free windows across all three noise models. ``nsqi`` adds
+        # no discrimination against 1/f noise (it passes ~94% of it) but costs
+        # no sensitivity either and rejects 100% of white noise, so it is kept
+        # as a cheap guard on the degenerate flat-spectrum case.
+        nsqi = float(sqi_components.get("nsqi", 0.0))
+        snr_db = float(sqi_components.get("snr_db", -99.0))
+        signal_present = (
+            nsqi >= self._nsqi_threshold and snr_db >= self._min_cardiac_snr_db
+        )
+
+        # A peak whose own sub-harmonic sits below the publication band may be
+        # the second harmonic of a bradycardic fundamental the bandpass
+        # removed. ``_spectral_hr`` cannot tell -- its evidence was filtered
+        # away -- so the question is re-asked against a wider view of the same
+        # backend waveform. Only computed when it can change the answer.
+        subharmonic_ratio = 0.0
+        audit_below_bpm = self._low_hz * 60.0 * SUBHARMONIC_AUDIT_MARGIN
+        if hr_bpm is not None and any(
+            (hr_bpm / float(k)) < audit_below_bpm for k in SUBHARMONIC_AUDIT_DIVISORS
+        ):
+            subharmonic_ratio = subharmonic_power_ratio(
+                waveform,
+                fs=sample_rate_hz,
+                published_hz=hr_bpm / 60.0,
+                high_hz=self._high_hz,
+            )
+
         if hr_bpm is None or not self._min_hr_bpm <= hr_bpm <= self._max_hr_bpm:
             hr = self._unavailable_hr(
                 boot_id, start_ns, end_ns, quality, "no plausible cardiac spectral peak"
             )
+        elif not signal_present:
+            hr = self._unavailable_hr(
+                boot_id,
+                start_ns,
+                end_ns,
+                quality,
+                "no cardiac signal above the noise floor",
+            )
         elif quality < self._minimum_window_quality:
             hr = self._unavailable_hr(
                 boot_id, start_ns, end_ns, quality, "window quality below publication gate"
+            )
+        elif subharmonic_ratio >= SUBHARMONIC_RATIO_THRESHOLD:
+            # Publishing the peak would double a real bradycardic rate; the
+            # fundamental itself is not measurable in the publication band,
+            # so neither value can be stated.
+            hr = self._unavailable_hr(
+                boot_id,
+                start_ns,
+                end_ns,
+                quality,
+                "cardiac fundamental below the analysis band",
             )
         else:
             half_width = max(
@@ -518,6 +712,9 @@ class PulsePipelineV2:
             spectral_native_resolution_hz=peak.native_resolution_hz,
             motion_penalty=motion_penalty,
             prior_weight=weight,
+            sqi_components=dict(sqi_components),
+            signal_present=signal_present,
+            subharmonic_ratio=subharmonic_ratio,
         )
 
     def _unavailable_hr(

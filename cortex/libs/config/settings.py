@@ -656,8 +656,32 @@ class RPPGSignalConfig(BaseModel):
     bandpass_low: float = Field(0.7, gt=0.0)
     bandpass_high: float = Field(3.5, gt=0.0)
     bandpass_order: int = Field(4, ge=1, le=8)
-    nsqi_threshold: float = 0.293
-    min_cardiac_snr_db: float = 2.0
+    nsqi_threshold: float = Field(
+        0.293,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum normalized spectral quality index for a window to count "
+            "as carrying a cardiac signal"
+        ),
+    )
+    min_cardiac_snr_db: float = Field(
+        2.0,
+        description=(
+            "Minimum in-band to out-of-band SNR in dB for a window to count as "
+            "carrying a cardiac signal; the dominant guard against publishing a "
+            "heart rate read out of noise"
+        ),
+    )
+    minimum_window_quality: float = Field(
+        0.30,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum composite acquisition quality (motion, face coverage and "
+            "spectrum) for a pulse window to be published"
+        ),
+    )
     max_head_jitter_deg: float = Field(7.5, gt=0.0)
     min_valid_coverage: float = Field(0.80, ge=0.0, le=1.0)
     max_interpolation_gap_ms: float = Field(250.0, gt=0.0)
@@ -955,9 +979,14 @@ class StorageConfig(BaseModel):
     analytics_queue_capacity: int = Field(256, ge=16, le=16_384)
     # v0.4.0: session reports are the History feature's data; the size budget
     # below bounds growth, so retention is generous rather than a week.
-    session_retention_days: int = 180
-    feature_retention_days: int = 7
-    error_retention_days: int = 90
+    # Bounded like every other field in this class. These were bare ints, so a
+    # negative value made the janitor's ``retention_seconds`` negative, putting
+    # its cutoff in the future — every file counted as older than the cutoff
+    # and the sweep deleted the lot. A config typo could erase the user's
+    # history; one day is the floor, and zero is not a sentinel anywhere.
+    session_retention_days: int = Field(180, ge=1, le=3_650)
+    feature_retention_days: int = Field(7, ge=1, le=3_650)
+    error_retention_days: int = Field(90, ge=1, le=3_650)
     # F36: hard ceiling on the cumulative size of ``storage/sessions/*.json``.
     # When writing a new session report would push the total over budget,
     # oldest sessions (lowest mtime) are evicted first until the total

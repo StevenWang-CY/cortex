@@ -487,3 +487,305 @@ def test_replay_reference_follows_the_window_not_the_sequence_mean() -> None:
         )
         is None
     )
+
+
+# ---------------------------------------------------------------------------
+# Fabricated heart rate and bradycardia doubling
+#
+# Two defects in the published v2 gate, both reproduced before they were
+# fixed and both pinned here:
+#
+# * the publication gate tested only the composite ``quality``, whose
+#   acquisition terms alone contribute 0.25 of 1.0, so a still, fully visible
+#   face cleared the 0.30 threshold with no cardiac evidence whatsoever and
+#   every signal-free window published a rate read out of noise;
+# * the sub-harmonic correction in ``_spectral_hr`` is guarded by
+#   ``half >= low_hz``, so for any peak below ``2 * low_hz`` it never ran --
+#   a genuine bradycardic fundamental removed by the bandpass was published
+#   as its surviving second harmonic, i.e. at exactly double the true rate.
+# ---------------------------------------------------------------------------
+
+
+def _pos_backend() -> object:
+    return RPPGBackendRegistry.with_packaged_backends().resolve(
+        "pos", expected_implementation_sha256=None
+    )
+
+
+def _pink_noise(rng: np.random.Generator, count: int, fs: float = FS) -> np.ndarray:
+    """1/f noise -- illumination drift and AGC hunting, not white sensor noise.
+
+    White noise is the easy case; the additive SQI scored it lowest. Realistic
+    webcam nuisance is 1/f, which scored *higher* than the publication gate.
+    """
+    spectrum = rng.normal(size=count) + 1j * rng.normal(size=count)
+    frequencies = np.fft.fftfreq(count, d=1.0 / fs)
+    scale = np.ones(count)
+    nonzero = frequencies != 0
+    scale[nonzero] = 1.0 / np.sqrt(np.abs(frequencies[nonzero]))
+    shaped = np.real(np.fft.ifft(spectrum * scale))
+    return shaped / (float(np.std(shaped)) + 1e-12)
+
+
+def _skin_window(
+    rng: np.random.Generator,
+    *,
+    hr_bpm: float | None,
+    amplitude: float,
+    seconds: float = 10.0,
+) -> np.ndarray:
+    """An ROI-mean RGB window with 1/f nuisance and an optional real pulse.
+
+    The pulse is harmonic-rich (a sharp systolic upstroke, not a sine) because
+    that harmonic content is exactly what makes the doubling failure possible.
+    """
+    count = int(round(seconds * FS))
+    t = np.arange(count) / FS
+    base = np.array([0.42, 0.38, 0.33])
+    shared = _pink_noise(rng, count)
+    nuisance = (
+        np.stack([_pink_noise(rng, count) for _ in range(3)], axis=1) * 0.5
+        + shared[:, None]
+    )
+    rgb = base + 0.01 * nuisance * base
+    if hr_bpm is not None and amplitude > 0.0:
+        f0 = hr_bpm / 60.0
+        wave = (
+            np.sin(2 * np.pi * f0 * t)
+            + 0.45 * np.sin(2 * np.pi * 2.0 * f0 * t + 0.6)
+            + 0.15 * np.sin(2 * np.pi * 3.0 * f0 * t + 1.1)
+        )
+        wave /= float(np.std(wave))
+        projection = np.array([-0.3, 1.0, -0.2])
+        rgb = rgb + amplitude * wave[:, None] * projection[None, :] * base[None, :]
+    return rgb
+
+
+def _run_windows(
+    *,
+    hr_bpm: float | None,
+    amplitude: float,
+    trials: int,
+    seed: int,
+) -> tuple[list[float], dict[str, int]]:
+    """Process independent windows through a real pipeline; split the outcomes."""
+    pipeline = PulsePipelineV2(_pos_backend())
+    rng = np.random.default_rng(seed)
+    published: list[float] = []
+    withheld: dict[str, int] = {}
+    for index in range(trials):
+        pipeline.reset()
+        rgb = _skin_window(rng, hr_bpm=hr_bpm, amplitude=amplitude)
+        times = _mono(_times(10.0), offset_s=float(index) * 10.0)
+        result = pipeline.process_window(
+            rgb,
+            times,
+            sample_rate_hz=FS,
+            boot_id=_BOOT,
+            observation_quality=1.0,
+            face_presence_ratio=1.0,
+        )
+        value = result.summary.hr.value
+        if value is None:
+            reason = result.summary.hr.unavailable_reason or "?"
+            withheld[reason] = withheld.get(reason, 0) + 1
+        else:
+            published.append(float(value))
+    return published, withheld
+
+
+# Residual single-window false-positive rate on signal-free input, measured
+# over 2400 windows spanning white, 1/f and drift nuisance: 8 published, i.e.
+# 0.33%, against 100% before the fix. It is not zero and cannot be driven to
+# zero by this gate alone -- pushing ``min_cardiac_snr_db`` past 2.0 dB starts
+# discarding genuine low-amplitude pulses (measured: 2.5 dB halves sensitivity
+# at a realistic 0.3% modulation depth for a specificity gain of 0.5 points).
+# The remainder is a job for temporal hysteresis, not for a per-window
+# threshold: an isolated window surviving the gate should not be able to move
+# a displayed rate. The legacy estimator already has that stabilizer; porting
+# it to v2 is tracked as a residual risk rather than papered over here.
+MAX_SIGNAL_FREE_PUBLICATION_RATE = 0.01
+
+
+def test_signal_free_windows_almost_never_publish_a_heart_rate() -> None:
+    """Pure nuisance with a perfect face must essentially never yield a rate.
+
+    Before the fix this published 100% of windows. The acquisition evidence is
+    deliberately flawless here -- ``observation_quality`` and
+    ``face_presence_ratio`` are both 1.0 and there is no motion -- so the only
+    thing that can withhold the estimate is the absence of a cardiac signal.
+    That is the whole point: clean acquisition must not substitute for signal.
+
+    The bound is a rate rather than zero because the residual is real; see
+    ``MAX_SIGNAL_FREE_PUBLICATION_RATE``. Several seeds are pooled so the
+    result does not depend on a lucky draw.
+    """
+    published: list[float] = []
+    withheld: dict[str, int] = {}
+    trials = 0
+    for seed in (4242, 99, 1009, 20260918):
+        batch, reasons = _run_windows(
+            hr_bpm=None, amplitude=0.0, trials=60, seed=seed
+        )
+        published.extend(batch)
+        trials += 60
+        for reason, count in reasons.items():
+            withheld[reason] = withheld.get(reason, 0) + count
+
+    rate = len(published) / trials
+    assert rate <= MAX_SIGNAL_FREE_PUBLICATION_RATE, (
+        f"{len(published)} of {trials} signal-free windows published a "
+        f"fabricated rate ({rate:.1%}, e.g. {published[:5]})"
+    )
+    assert withheld, "windows must be withheld with an explicit reason"
+    assert "no cardiac signal above the noise floor" in withheld
+
+
+def test_signal_free_windows_are_withheld_for_absent_signal_not_bad_acquisition() -> None:
+    """The reason must name the real cause, so the dashboard can explain it.
+
+    A window withheld as "low quality" would send the user to fix their
+    lighting or sit still, when in fact the acquisition was perfect and there
+    was simply no pulse in the signal.
+    """
+    _published, withheld = _run_windows(
+        hr_bpm=None, amplitude=0.0, trials=60, seed=99
+    )
+    dominant = max(withheld, key=lambda key: withheld[key])
+    assert dominant == "no cardiac signal above the noise floor", withheld
+    # The composite-quality gate is the *acquisition* gate; with flawless
+    # acquisition it must not be the one firing.
+    assert "window quality below publication gate" not in withheld
+
+
+@pytest.mark.parametrize("true_bpm", [32.0, 35.0, 38.0, 40.0, 42.0])
+def test_bradycardia_is_never_published_as_a_harmonic_of_the_true_rate(
+    true_bpm: float,
+) -> None:
+    """A fundamental below the passband must never surface as a harmonic.
+
+    The default band starts at 0.7 Hz = 42 BPM, so every rate here is at or
+    below the edge. Before the fix each one published at almost exactly
+    ``2 * true_bpm`` (35 -> 69.9, 40 -> 80.1, 42 -> 84.0). Auditing only the
+    octave then let the *third* harmonic through instead (42 -> 124.8), which
+    is why both divisors are checked. Withholding is an acceptable outcome;
+    reporting an integer multiple is not.
+    """
+    published, _withheld = _run_windows(
+        hr_bpm=true_bpm, amplitude=0.01, trials=25, seed=int(true_bpm) * 17
+    )
+    for multiple in (2.0, 3.0):
+        aliased = [
+            value for value in published if abs(value - multiple * true_bpm) < 4.0
+        ]
+        assert not aliased, (
+            f"{len(aliased)} of {len(published)} windows published ~{multiple:.0f}x "
+            f"the true {true_bpm} BPM (e.g. {aliased[:5]})"
+        )
+    # Whatever does survive must centre on the true rate. The median rather
+    # than every value, because at the band edge the fundamental is attenuated
+    # enough that a noise peak occasionally wins the selection once the
+    # harmonic has been rejected -- the same residual bounded by
+    # ``MAX_SIGNAL_FREE_PUBLICATION_RATE``, not a second aliasing defect.
+    if len(published) >= 3:
+        centre = float(np.median(published))
+        assert abs(centre - true_bpm) < 4.0, (
+            f"published rates centre on {centre:.1f}, not {true_bpm}: {published}"
+        )
+
+
+@pytest.mark.parametrize("true_bpm", [48.0, 55.0, 70.0, 85.0, 100.0, 130.0])
+def test_normal_rates_still_publish_accurately_through_both_gates(true_bpm: float) -> None:
+    """The gates must not buy specificity by destroying real measurements.
+
+    This is the counterweight to the two tests above: a gate that withholds
+    everything would pass them and be useless. 100 BPM in particular sits
+    inside the widened sub-harmonic audit span (published < 109 BPM), so it
+    pins that widening as safe.
+    """
+    published, withheld = _run_windows(
+        hr_bpm=true_bpm, amplitude=0.01, trials=20, seed=int(true_bpm) * 31
+    )
+    assert len(published) == 20, f"real signal was withheld: {withheld}"
+    error = float(np.median([abs(value - true_bpm) for value in published]))
+    assert error < 2.0, f"median error {error:.2f} BPM at {true_bpm} BPM"
+
+
+def test_composite_quality_alone_cannot_clear_the_publication_gate() -> None:
+    """Pin the arithmetic that made the old gate unreachable.
+
+    ``compute_physio_sqi`` is additive: ``0.15 * motion_term + 0.10 *
+    face_term`` is 0.25 of a possible 1.0 before any spectral term. With the
+    default 0.30 ``minimum_window_quality`` that left almost no headroom, so
+    the gate could not express "no signal". This asserts the composite still
+    scores a signal-free window well above the gate -- i.e. that the fix had
+    to come from a separate signal-presence test, not from retuning this
+    threshold.
+    """
+    from cortex.libs.signal.peak_detection import compute_physio_sqi
+
+    rng = np.random.default_rng(2026)
+    backend = _pos_backend()
+    scores = []
+    for _ in range(40):
+        rgb = _skin_window(rng, hr_bpm=None, amplitude=0.0)
+        waveform = backend.extract(rgb, fs=FS)
+        sqi, _components = compute_physio_sqi(
+            waveform, fs=FS, low_hz=0.7, high_hz=3.5,
+            motion_penalty=0.0, face_presence_ratio=1.0,
+        )
+        scores.append(sqi)
+    assert min(scores) > 0.30, (
+        "signal-free windows should still clear the acquisition gate; if this "
+        "fails the composite was changed and the gate comments need revisiting"
+    )
+
+
+def test_subharmonic_ratio_separates_doubled_from_genuine_rates() -> None:
+    """The discriminator itself, measured rather than assumed.
+
+    Two orders of magnitude of separation is what justifies the 0.30
+    threshold; if a backend change collapses it, this fails before the
+    behavioural tests start flapping.
+    """
+    from cortex.services.physio_engine.v2.pulse import (
+        SUBHARMONIC_RATIO_THRESHOLD,
+        subharmonic_power_ratio,
+    )
+
+    backend = _pos_backend()
+    rng = np.random.default_rng(31337)
+
+    def _ratio_for(true_bpm: float, published_bpm: float) -> float:
+        rgb = _skin_window(rng, hr_bpm=true_bpm, amplitude=0.01)
+        waveform = backend.extract(rgb, fs=FS)
+        return subharmonic_power_ratio(
+            waveform, fs=FS, published_hz=published_bpm / 60.0, high_hz=3.5
+        )
+
+    doubled = [_ratio_for(40.0, 80.0) for _ in range(12)]
+    genuine = [_ratio_for(70.0, 70.0) for _ in range(12)]
+    assert min(doubled) > SUBHARMONIC_RATIO_THRESHOLD, doubled
+    assert max(genuine) < SUBHARMONIC_RATIO_THRESHOLD, genuine
+    assert min(doubled) > 10.0 * max(genuine), (
+        f"separation collapsed: doubled>={min(doubled):.3f} "
+        f"genuine<={max(genuine):.3f}"
+    )
+
+
+def test_signal_presence_thresholds_reach_the_pipeline_from_config() -> None:
+    """``nsqi_threshold`` and ``min_cardiac_snr_db`` were dead config.
+
+    Both fields have been on ``RPPGSignalConfig`` since it was written, but
+    only the legacy shadow estimator ever read them; the published v2 path
+    was constructed without them. Assert the composition root forwards them,
+    so they cannot silently become decorative again.
+    """
+    from cortex.libs.config.settings import RPPGSignalConfig
+    from cortex.services.physio_engine.v2.engine import PhysiologyEngineV2
+
+    config = RPPGSignalConfig(nsqi_threshold=0.51, min_cardiac_snr_db=7.5)
+    engine = PhysiologyEngineV2(config)
+    parameters = engine.pulse.algorithm_identity.parameters
+    assert parameters["nsqi_threshold"] == pytest.approx(0.51)
+    assert parameters["min_cardiac_snr_db"] == pytest.approx(7.5)

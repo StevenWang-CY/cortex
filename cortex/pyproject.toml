@@ -99,7 +99,15 @@ dependencies = [
     # interface, per ADR-0004-style provider routing).
     # The 1.x SDK removed request parameters used by the reviewed planner.
     # Migrate deliberately with transport fixtures before lifting this bound.
-    "anthropic[bedrock,vertex]>=0.39.0,<1",
+    #
+    # The floor is 0.91.0, not 0.39.0: ``cortex.libs.llm.anthropic_client``
+    # imports ``AsyncAnthropicBedrockMantle`` at module scope, and
+    # ``anthropic/lib/bedrock/_mantle.py`` first shipped in 0.91.0 (verified
+    # by installing 0.90.0 and 0.91.0 and importing the symbol). Every
+    # release from 0.39.0 to 0.90.0 satisfied the old specifier and then
+    # failed at import, taking the planner down with it -- including for
+    # users on the ``direct`` provider who never touch Bedrock.
+    "anthropic[bedrock,vertex]>=0.91.0,<1",
     "boto3>=1.34.0",
 
     # ML Inference

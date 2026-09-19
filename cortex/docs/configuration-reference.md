@@ -4,7 +4,7 @@
 
 `CortexConfig` is the runtime source of truth. YAML uses dotted paths below; environment overrides use the corresponding `CORTEX_…` name and double underscores. Secrets are deliberately not fields on `CortexConfig`.
 
-This reference contains **195 runtime settings**.
+This reference contains **196 runtime settings**.
 
 | YAML path | Environment variable | Type | Default | Constraints | Description |
 | --- | --- | --- | --- | --- | --- |
@@ -116,8 +116,9 @@ This reference contains **195 runtime settings**.
 | `signal.rppg.bandpass_low` | `CORTEX_SIGNAL__RPPG__BANDPASS_LOW` | `float` | `0.7` | > 0.0 | — |
 | `signal.rppg.bandpass_high` | `CORTEX_SIGNAL__RPPG__BANDPASS_HIGH` | `float` | `3.5` | > 0.0 | — |
 | `signal.rppg.bandpass_order` | `CORTEX_SIGNAL__RPPG__BANDPASS_ORDER` | `int` | `4` | ≥ 1; ≤ 8 | — |
-| `signal.rppg.nsqi_threshold` | `CORTEX_SIGNAL__RPPG__NSQI_THRESHOLD` | `float` | `0.293` | — | — |
-| `signal.rppg.min_cardiac_snr_db` | `CORTEX_SIGNAL__RPPG__MIN_CARDIAC_SNR_DB` | `float` | `2.0` | — | — |
+| `signal.rppg.nsqi_threshold` | `CORTEX_SIGNAL__RPPG__NSQI_THRESHOLD` | `float` | `0.293` | ≥ 0.0; ≤ 1.0 | Minimum normalized spectral quality index for a window to count as carrying a cardiac signal |
+| `signal.rppg.min_cardiac_snr_db` | `CORTEX_SIGNAL__RPPG__MIN_CARDIAC_SNR_DB` | `float` | `2.0` | — | Minimum in-band to out-of-band SNR in dB for a window to count as carrying a cardiac signal; the dominant guard against publishing a heart rate read out of noise |
+| `signal.rppg.minimum_window_quality` | `CORTEX_SIGNAL__RPPG__MINIMUM_WINDOW_QUALITY` | `float` | `0.3` | ≥ 0.0; ≤ 1.0 | Minimum composite acquisition quality (motion, face coverage and spectrum) for a pulse window to be published |
 | `signal.rppg.max_head_jitter_deg` | `CORTEX_SIGNAL__RPPG__MAX_HEAD_JITTER_DEG` | `float` | `7.5` | > 0.0 | — |
 | `signal.rppg.min_valid_coverage` | `CORTEX_SIGNAL__RPPG__MIN_VALID_COVERAGE` | `float` | `0.8` | ≥ 0.0; ≤ 1.0 | — |
 | `signal.rppg.max_interpolation_gap_ms` | `CORTEX_SIGNAL__RPPG__MAX_INTERPOLATION_GAP_MS` | `float` | `250.0` | > 0.0 | — |
@@ -161,9 +162,9 @@ This reference contains **195 runtime settings**.
 | `storage.sqlite_busy_timeout_ms` | `CORTEX_STORAGE__SQLITE_BUSY_TIMEOUT_MS` | `int` | `5000` | ≥ 1; ≤ 60000 | — |
 | `storage.backup_retention_count` | `CORTEX_STORAGE__BACKUP_RETENTION_COUNT` | `int` | `3` | ≥ 1; ≤ 20 | — |
 | `storage.analytics_queue_capacity` | `CORTEX_STORAGE__ANALYTICS_QUEUE_CAPACITY` | `int` | `256` | ≥ 16; ≤ 16384 | — |
-| `storage.session_retention_days` | `CORTEX_STORAGE__SESSION_RETENTION_DAYS` | `int` | `180` | — | — |
-| `storage.feature_retention_days` | `CORTEX_STORAGE__FEATURE_RETENTION_DAYS` | `int` | `7` | — | — |
-| `storage.error_retention_days` | `CORTEX_STORAGE__ERROR_RETENTION_DAYS` | `int` | `90` | — | — |
+| `storage.session_retention_days` | `CORTEX_STORAGE__SESSION_RETENTION_DAYS` | `int` | `180` | ≥ 1; ≤ 3650 | — |
+| `storage.feature_retention_days` | `CORTEX_STORAGE__FEATURE_RETENTION_DAYS` | `int` | `7` | ≥ 1; ≤ 3650 | — |
+| `storage.error_retention_days` | `CORTEX_STORAGE__ERROR_RETENTION_DAYS` | `int` | `90` | ≥ 1; ≤ 3650 | — |
 | `storage.max_total_size_mb` | `CORTEX_STORAGE__MAX_TOTAL_SIZE_MB` | `int` | `500` | — | — |
 | `storage.session_checkpoint_seconds` | `CORTEX_STORAGE__SESSION_CHECKPOINT_SECONDS` | `float` | `90.0` | — | — |
 | `storage.session_checkpoint_min_seconds` | `CORTEX_STORAGE__SESSION_CHECKPOINT_MIN_SECONDS` | `float` | `30.0` | — | — |
