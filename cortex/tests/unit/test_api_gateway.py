@@ -1356,7 +1356,14 @@ def test_api_docs_are_not_served_without_an_explicit_opt_in() -> None:
 
     with TestClient(create_app(config=APIConfig())) as client:
         for path in ("/openapi.json", "/docs", "/redoc"):
-            assert client.get(path).status_code == 404, f"{path} must not be served"
+            # 401 rather than 404 since the pre-routing capability gate now
+            # answers before the router is consulted — it refuses an
+            # unauthenticated request without reading its body, so it cannot
+            # know the path does not exist. Either way the surface is not
+            # served, which is what this test is for; asserting "not 200"
+            # keeps that contract without pinning which layer refuses.
+            status = client.get(path).status_code
+            assert status in (401, 404), f"{path} must not be served (got {status})"
 
     with TestClient(create_app(config=APIConfig(expose_api_docs=True))) as client:
         assert client.get("/openapi.json").status_code == 200
