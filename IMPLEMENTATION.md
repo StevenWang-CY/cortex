@@ -5768,8 +5768,33 @@ Recorded as a product decision rather than a defect:
   hotkey, a native event monitor and the macOS Accessibility permission. See
   `docs/limitations.md`.
 
-Two of the sixty-seven survivors received no verdict in the re-verification
-pass and are neither fixed nor confirmed live.
+**Every survivor is now accounted for.** Two of the sixty-seven received no
+verdict in the re-verification pass, and the pass's record does not say which
+two — it itemises the forty-six it found still live and reports the nineteen
+already-fixed only as a count. Rather than guess, all twenty-one survivors
+outside the still-live set were re-checked against the current tree by
+reading the code at each anchor. All twenty-one are closed:
+
+`api-security:62` (the `/api/launch` cap now matches via `_PREFIX_ROUTES`),
+`api-security:95` (docs mount only under `expose_api_docs`),
+`api-security:888` (`AUTH_DEADLINE_SECONDS` plus `_disconnect_if_unauthenticated`),
+`browser-extension:399` (the panel reports `undone` of `attempted` and the
+reason), `browser-extension:3135` (bounded counters with repair-on-read),
+`llm-planner:569` (a misordered budget pair clamps the warning to the ceiling
+instead of raising and dropping the tracker), `llm-planner:8026` (a real probe
+path), `physio-pulse:203` (the sub-harmonic audit), `physio-pulse:266` (per-
+window reference alignment instead of a whole-sequence mean),
+`state-inference:386` and `:433` (`_generate_reasons` filters to the published
+label's own rule), `state-inference:559` (scroll *bursts*, not raw callbacks),
+`storage-migrations:152` (`exports/` exempt from retention, removed by a full
+delete), `:374` (chronotype rollups included), `:404` (migration backups
+included), `:407` (unlink failures reported as `files_not_removed` rather than
+raised after the rows are gone), `:697` (`ON CONFLICT(decision_id,
+reward_version)`), `:947` (retention days bounded `ge=1, le=3650`),
+`tests-gates:1924` (`intervention_overlay_injection.spec.ts`),
+`trigger-intervention:6217` (`activate_quiet_mode(indefinite=True)`),
+`trigger-intervention:8276` (the quiet-mode baseline, so an unrelated Apply no
+longer cancels a dismissal-driven quiet window).
 
 ### 31.6 The research phase did not complete
 

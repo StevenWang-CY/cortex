@@ -15,8 +15,11 @@ A second pass then re-verified every survivor against the *fixed* tree rather
 than the audited one, and returned a verdict for sixty-five of them. Of those,
 forty-seven are fixed here, one is recorded as a product decision rather than a
 defect, and the remaining seventeen — all medium or low severity — were closed
-in a second pass. Every survivor with a verdict is now either fixed or recorded
-as a decision; the evidence for each is in Section 31 of `IMPLEMENTATION.md`.
+in a second pass. Two survivors had received no verdict at all; since the
+re-verification record does not say which two, all twenty-one outside its
+still-live set were re-checked against the tree and every one is closed. So all
+sixty-seven are now accounted for, with the evidence for each in Section 31 of
+`IMPLEMENTATION.md`.
 
 Three things are worth stating plainly before the list. The audit's own
 proposed fix for the most serious finding was measured and found wrong, and the
@@ -266,8 +269,6 @@ against this pipeline rather than from literature.
 * The shipped extension bundle is 263,803 bytes gzipped, above the 250 KB
   figure earlier documentation quoted. That figure was calibrated in 2026-08
   against a smaller bundle; the ceiling now reflects what is measured.
-* Two of the sixty-seven survivors received no verdict in the re-verification
-  pass and are recorded as unresolved rather than counted either way.
 * The four completed research tracks are **unreviewed**: the peer-review stage
   hit a usage limit. Their proposals are recorded but none were implemented as
   validated, and the one defect found among them was verified from scratch
