@@ -4,7 +4,7 @@
 
 `CortexConfig` is the runtime source of truth. YAML uses dotted paths below; environment overrides use the corresponding `CORTEX_…` name and double underscores. Secrets are deliberately not fields on `CortexConfig`.
 
-This reference contains **194 runtime settings**.
+This reference contains **195 runtime settings**.
 
 | YAML path | Environment variable | Type | Default | Constraints | Description |
 | --- | --- | --- | --- | --- | --- |
@@ -105,6 +105,7 @@ This reference contains **194 runtime settings**.
 | `api.port` | `CORTEX_API__PORT` | `int` | `9472` | — | — |
 | `api.ws_port` | `CORTEX_API__WS_PORT` | `int` | `9473` | — | — |
 | `api.cors_allow_origins` | `CORTEX_API__CORS_ALLOW_ORIGINS` | `list[str]` | `["http://localhost", "http://127.0.0.1"]` | — | Static CORS allowlist for the HTTP API. The dynamic extension/webview regex is still applied in app.py via ``allow_origin_regex``; this list is the simple-match fallback for browser tabs that aren't extensions. |
+| `api.expose_api_docs` | `CORTEX_API__EXPOSE_API_DOCS` | `bool` | `false` | — | Serve FastAPI's /docs, /redoc and /openapi.json. These are mounted by FastAPI itself, outside the public-liveness and capability-gated routers, so they published the whole local API surface — every mutating route, its parameters and its response shapes — to any local process without a capability token. Off by default; enable only for local development. |
 | `telemetry.mouse_sample_hz` | `CORTEX_TELEMETRY__MOUSE_SAMPLE_HZ` | `int` | `60` | — | — |
 | `telemetry.window_seconds` | `CORTEX_TELEMETRY__WINDOW_SECONDS` | `int` | `15` | — | — |
 | `signal.rppg.window_seconds` | `CORTEX_SIGNAL__RPPG__WINDOW_SECONDS` | `int` | `10` | ≥ 8; ≤ 60 | — |

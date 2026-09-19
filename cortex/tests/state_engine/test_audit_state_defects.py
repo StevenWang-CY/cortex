@@ -714,3 +714,30 @@ def test_reasons_explain_the_published_label_only() -> None:
     # The persisted transition carries real evidence, not a placeholder.
     transition_reasons = " ".join(smoother.transitions[-1].trigger_reasons)
     assert "stable but not diagnostic" not in transition_reasons
+
+
+def test_quiet_escalation_can_be_reset(tmp_path: Path) -> None:
+    """The escalation was a one-way ratchet with no production caller.
+
+    Repeated dismissals escalate the quiet window and the level is persisted,
+    but nothing in the shipped product ever called ``reset_quiet_mode``, so a
+    user who dismissed a run of suggestions months ago stayed at the longest
+    window permanently. The explicit control the design always intended is now
+    reachable over the API.
+    """
+
+    policy = _policy(tmp_path)
+    assert policy.quiet_mode_escalation_level == 0
+
+    policy._quiet_mode_count = 3  # noqa: SLF001 - simulate an escalated user
+    policy.activate_quiet_mode(duration_minutes=60)
+    assert policy.quiet_mode_escalation_level == 3
+    assert policy.is_quiet_mode is True
+
+    policy.reset_quiet_mode()
+
+    assert policy.quiet_mode_escalation_level == 0
+    assert policy.is_quiet_mode is False
+    # The reset is durable: a restart must not resurrect the old level.
+    assert _policy(tmp_path).quiet_mode_escalation_level == 0
+

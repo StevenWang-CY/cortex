@@ -190,6 +190,17 @@ class ConsentResetResponse(DualClockModel):
     levels: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
+class SuggestionPacingResetResponse(DualClockModel):
+    """Result of clearing the dismissal-driven quiet escalation."""
+
+    reset: bool = False
+    previous_level: int = Field(
+        default=0,
+        ge=0,
+        description="Escalation level before the reset (0 when none was held).",
+    )
+
+
 class ProjectListResponse(DualClockModel):
     projects: list[dict[str, Any]] = Field(default_factory=list)
 

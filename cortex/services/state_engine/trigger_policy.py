@@ -1583,6 +1583,12 @@ class TriggerPolicy:
         self._quiet_mode_deadline = None
         self._quiet_mode_indefinite = False
 
+    @property
+    def quiet_mode_escalation_level(self) -> int:
+        """Current dismissal-driven escalation level (0 when none is held)."""
+
+        return int(self._quiet_mode_count)
+
     def reset_quiet_mode(self) -> None:
         """User-driven quiet-mode reset (F26).
 

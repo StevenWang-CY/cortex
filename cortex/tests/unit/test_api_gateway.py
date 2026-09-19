@@ -1339,3 +1339,25 @@ class TestAPIGatewayImports:
 
         assert WSMessage is not None
         assert WebSocketServer is not None
+
+
+def test_api_docs_are_not_served_without_an_explicit_opt_in() -> None:
+    """FastAPI mounts /docs, /redoc and /openapi.json itself.
+
+    They sit outside both the public-liveness router and the capability-gated
+    one, so the structural split in routes.py never covered them and the whole
+    local API surface — every mutating route, its parameters and its response
+    shapes — was readable by any local process without a token.
+    """
+    from fastapi.testclient import TestClient
+
+    from cortex.libs.config.settings import APIConfig
+    from cortex.services.api_gateway.app import create_app
+
+    with TestClient(create_app(config=APIConfig())) as client:
+        for path in ("/openapi.json", "/docs", "/redoc"):
+            assert client.get(path).status_code == 404, f"{path} must not be served"
+
+    with TestClient(create_app(config=APIConfig(expose_api_docs=True))) as client:
+        assert client.get("/openapi.json").status_code == 200
+

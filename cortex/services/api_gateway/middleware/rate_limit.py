@@ -61,6 +61,7 @@ DEFAULT_LIMITS: dict[str, int] = {
     # 30/min in legitimate use.
     "/api/launch": 10,
     "/consent/reset": 5,
+    "/suggestions/pacing/reset": 5,
     "/intervention/restore": 30,
     "/shutdown": 5,
 }

@@ -618,6 +618,17 @@ class APIConfig(BaseModel):
             "fallback for browser tabs that aren't extensions."
         ),
     )
+    expose_api_docs: bool = Field(
+        default=False,
+        description=(
+            "Serve FastAPI's /docs, /redoc and /openapi.json. These are "
+            "mounted by FastAPI itself, outside the public-liveness and "
+            "capability-gated routers, so they published the whole local API "
+            "surface — every mutating route, its parameters and its response "
+            "shapes — to any local process without a capability token. Off by "
+            "default; enable only for local development."
+        ),
+    )
 
 
 class TelemetryConfig(BaseModel):

@@ -73,6 +73,7 @@ from cortex.libs.schemas.api import (
     StateInferResponse,
     StatusResponse,
     StressIntegralResponse,
+    SuggestionPacingResetResponse,
 )
 from cortex.libs.schemas.context import TaskContext
 from cortex.libs.schemas.features import (
@@ -1517,6 +1518,41 @@ async def get_consent_level(request: Request) -> ConsentLevelResponse:
             levels=states,
         )
     return ConsentLevelResponse.from_clock(_get_clock(request))
+
+
+@router.post(
+    "/suggestions/pacing/reset",
+    response_model=SuggestionPacingResetResponse,
+)
+async def reset_suggestion_pacing(request: Request) -> SuggestionPacingResetResponse:
+    """Clear the dismissal-driven quiet escalation.
+
+    Repeated dismissals escalate the quiet window (15 -> 30 -> 60 minutes) and
+    the level is persisted. ``TriggerPolicy.reset_quiet_mode`` was written to
+    undo that, but nothing in the shipped product ever called it, so the
+    escalation was a one-way ratchet: a user who dismissed a run of
+    suggestions months ago stayed at the longest window permanently with no
+    way back. An automatic reset was deliberately removed earlier for being
+    silent, so this exposes the explicit control that was always intended
+    rather than reinstating a hidden one.
+    """
+
+    reg = _get_registry(request)
+    policy = reg.get("trigger_policy")
+    previous = int(getattr(policy, "quiet_mode_escalation_level", 0) or 0)
+    logger.info(
+        "suggestion pacing reset requested cid=%s previous_level=%d",
+        get_correlation_id() or "-",
+        previous,
+    )
+    if policy is None or not hasattr(policy, "reset_quiet_mode"):
+        return SuggestionPacingResetResponse.from_clock(
+            _get_clock(request), reset=False, previous_level=previous
+        )
+    policy.reset_quiet_mode()
+    return SuggestionPacingResetResponse.from_clock(
+        _get_clock(request), reset=True, previous_level=previous
+    )
 
 
 @router.post("/consent/reset", response_model=ConsentResetResponse)

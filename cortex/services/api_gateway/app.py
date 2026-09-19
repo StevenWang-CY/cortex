@@ -92,11 +92,18 @@ def create_app(
     app_clock = clock or SYSTEM_CLOCK
     app_services = services if services is not None else registry
 
+    # FastAPI mounts /docs, /redoc and /openapi.json itself, outside both the
+    # public-liveness router and the capability-gated one, so the structural
+    # split in routes.py did not cover them and the full local API surface was
+    # readable without a token. Off unless explicitly enabled for development.
     app = FastAPI(
         title="Cortex API Gateway",
         description="Somatic Workspace Engine — Internal Service API",
         version=__version__,
         lifespan=lifespan,
+        docs_url="/docs" if cfg.expose_api_docs else None,
+        redoc_url="/redoc" if cfg.expose_api_docs else None,
+        openapi_url="/openapi.json" if cfg.expose_api_docs else None,
     )
 
     # F13: per-route rate limiting. Registered BEFORE the correlation
