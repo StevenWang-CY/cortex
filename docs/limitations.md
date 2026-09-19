@@ -106,6 +106,20 @@ attest those external settings. See the [privacy disclosure](../cortex/docs/priv
 
 ## Platform, reliability, and release scope
 
+- **The suggestion card's action buttons are mouse-only.** The overlay is a
+  notification-style window: it is created with `WA_ShowWithoutActivating` and
+  is shown with `raise_()` but deliberately never `activateWindow()`, so that a
+  suggestion cannot steal focus from whatever the user is actually doing. The
+  consequence is that the window can never receive keyboard focus, and it is
+  the only surface that renders the action buttons — so a keyboard-only user
+  cannot reach them. Giving it an explicit, announced way in requires a
+  system-wide hotkey (the card is not focusable from the app that owns the
+  keyboard), which needs a native event monitor and the macOS Accessibility
+  permission. That is a product decision with a privacy cost, not a defect fix,
+  so it is recorded here rather than implemented unilaterally. The dashboard
+  itself is keyboard-navigable and every control in it carries an accessible
+  name.
+
 - Supported release target: macOS 13 or later, arm64 and x86_64 artifacts.
   MediaPipe no longer publishes current Intel wheels, so the locked Intel
   artifact uses the last compatible 0.10.21/NumPy 1.x branch. Architecture
