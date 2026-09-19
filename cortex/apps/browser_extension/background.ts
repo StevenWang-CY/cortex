@@ -770,6 +770,23 @@ async function restoreAutoFocusStateLocal(): Promise<void> {
 
 function schedulePersist(): void {
     persistDirty = true;
+    if (!stateHydrated) {
+        // MV3 suspends the service worker aggressively, and a tab activation
+        // or removal wakes it and reaches this function directly. Writing here
+        // would flush `persistedSessionSnapshot()` built from module state
+        // that `restoreState()` has not filled yet — an EMPTY focus session,
+        // undo stack and cooldown set — straight over the stored session, so
+        // waking the worker destroyed the very state it exists to preserve.
+        // `handleMessage` had the only hydration barrier in the file.
+        //
+        // The write is deferred rather than dropped: `persistDirty` stays set
+        // and this re-enters once hydration lands, so the snapshot then
+        // carries both the restored state and whatever woke the worker.
+        void stateRestored.then(() => {
+            if (persistDirty) schedulePersist();
+        });
+        return;
+    }
     browserSessionStore.scheduleSession(persistedSessionSnapshot());
 }
 

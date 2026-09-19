@@ -163,9 +163,16 @@ def _bundled_env_files() -> tuple[str, ...]:
     if _is_bundled():
         app_support = Path.home() / "Library" / "Application Support" / "Cortex"
         meipass = Path(sys._MEIPASS)  # type: ignore[attr-defined]
+        # LAST file wins. pydantic-settings reads the tuple in order and each
+        # file updates the accumulated mapping, so the final entry has the
+        # highest precedence -- which is why the dev branch below puts
+        # ``.env.local`` last. The bundled branch had the two the other way
+        # round while its comment claimed the user file was "highest
+        # priority", so inside the .app the shipped defaults silently
+        # overrode anything the user had set in Application Support.
         return (
-            str(app_support / ".env"),  # User overrides (highest priority)
-            str(meipass / ".env"),  # Bundled defaults
+            str(meipass / ".env"),  # Bundled defaults (lowest precedence)
+            str(app_support / ".env"),  # User overrides — last file wins
         )
     return (".env", ".env.local")
 
