@@ -150,18 +150,43 @@ export class BrowserContextCollector {
     async collect(options: TabCollectionOptions = {}): Promise<CollectedBrowserContext> {
         const rawTabs = await chrome.tabs.query({});
         const tabs = normalizeTabs(rawTabs, options);
-        const activeTab = tabs.find((tab) => tab.is_active);
+
+        // Resolve the focused tab ONCE and use it for both halves of the
+        // context. `chrome.tabs.query({})` returns the active tab of EVERY
+        // window, so `is_active` is true for N entries and
+        // `tabs.find((t) => t.is_active)` picked whichever window Chrome
+        // happened to enumerate first — not the focused one. The excerpt was
+        // then taken from a separate, correctly-scoped query, so with more
+        // than one window open the daemon could be sent a title and URL from
+        // one window and a page excerpt from another, and the prompt builder
+        // would describe them as the same page.
+        //
+        // `lastFocusedWindow` rather than `currentWindow`: this runs in a
+        // service worker, which has no window of its own, so `currentWindow`
+        // is only defined by fallback.
+        let focusedTab: chrome.tabs.Tab | undefined;
+        try {
+            [focusedTab] = await chrome.tabs.query({
+                active: true,
+                lastFocusedWindow: true,
+            });
+        } catch {
+            focusedTab = undefined;
+        }
+        const focusedTabId = focusedTab?.id;
+        // An incognito focused tab is filtered out of `tabs` by
+        // `normalizeTabs`, so it correctly resolves to no active tab and no
+        // excerpt rather than reporting a tab we are not allowed to report.
+        const activeTab = focusedTabId === undefined
+            ? undefined
+            : tabs.find((tab) => tab.tab_id === focusedTabId);
         let contentExcerpt = "";
 
-        if (activeTab) {
+        if (activeTab && focusedTab && focusedTabId !== undefined) {
             try {
-                const [tab] = await chrome.tabs.query({
-                    active: true,
-                    currentWindow: true,
-                });
-                if (tab?.id && await mayExtractPageContent(tab)) {
+                if (await mayExtractPageContent(focusedTab)) {
                     const results = await chrome.scripting.executeScript({
-                        target: { tabId: tab.id },
+                        target: { tabId: focusedTabId },
                         func: extractVisiblePageText,
                     });
                     if (results?.[0]?.result) {

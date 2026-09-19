@@ -822,6 +822,7 @@ function persistedSessionSnapshot(): PersistedSessionState<FocusSession, UndoEnt
         autoFocusEndsAt,
         autoFocusPreset: _activeFocusPresetName,
         autoFocusCustomDomains: activeFocusCustomDomains,
+        badge: badgeState.snapshot(),
     };
 }
 
@@ -863,6 +864,11 @@ async function restoreState(): Promise<void> {
         activeFocusCustomDomains = data.autoFocusCustomDomains
             .filter((d: unknown): d is string => typeof d === "string");
     }
+    // The toolbar badge outlives the worker; the record that decides what it
+    // should say did not. Restore it before anything can call
+    // `setInterventionBadge(false)` and clear a "✓" the user has not read.
+    badgeState.hydrate(data.badge);
+    paintBadge();
     // Auto-expire if a stale auto-armed session outlived its window.
     if (autoFocusArmed && autoFocusEndsAt !== null && Date.now() > autoFocusEndsAt) {
         stopAutoFocusSession("duration_elapsed_post_restore");
@@ -1985,6 +1991,7 @@ function paintBadge(): void {
 function setInterventionBadge(pending: boolean): void {
     badgeState.setIntervention(pending);
     paintBadge();
+    schedulePersist();
 }
 
 /**
@@ -5369,6 +5376,7 @@ function surfaceInterventionOSNotification(
 function setRecapBadge(on: boolean): void {
     badgeState.setRecap(on);
     paintBadge();
+    schedulePersist();
 }
 
 let lastAmbientBroadcast = 0;
