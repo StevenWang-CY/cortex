@@ -472,19 +472,37 @@ function validateJournalReceiptBatch(value: unknown): InterventionReceiptBatch {
 // reach it.
 const MAX_TRANSACTION_COUNTERS_SOFT = 1_536;
 
-/** Counter keys a live operation could still consult. */
-function liveAttemptCounterKeys(
+/** Action ids of operations that are still live.
+ *
+ * A counter is keyed ``<authorization-or-restore-id>:<action-id>:<phase>``, and
+ * the first segment is NOT stable across phases: an apply receipt is stamped
+ * with the authorization id while a restore receipt is stamped with the
+ * *restore* id. Deriving expected keys from ``operation.authorization_id``
+ * therefore never matched a live restore counter, so the trim below treated it
+ * as an orphan and reset that restore's retry budget.
+ *
+ * Matching on the action id instead is coarser and cannot make that mistake.
+ * ``journal.operations`` only holds operations that have not retired, so
+ * anything it names is by definition still in play.
+ */
+function liveAttemptCounterActionIds(
     operations: Record<string, BrowserOperationRecord>,
 ): Set<string> {
     const live = new Set<string>();
     for (const operation of Object.values(operations)) {
-        for (const phase of ["apply", "restore", "compensate"]) {
-            live.add(
-                [operation.authorization_id, operation.action_id, phase].join(":"),
-            );
-        }
+        live.add(operation.action_id);
     }
     return live;
+}
+
+/** The action id a counter key refers to, or null if the key is malformed.
+ *
+ * Parsed from the end because the phase is always last and the action id
+ * always second to last; the leading id may itself contain a colon.
+ */
+function counterKeyActionId(key: string): string | null {
+    const parts = key.split(":");
+    return parts.length >= 3 ? parts[parts.length - 2] : null;
 }
 
 /** Bound ``counters`` in place, discarding the least useful entries first.
@@ -502,9 +520,10 @@ function trimAttemptCounters(
     limit: number,
 ): void {
     if (Object.keys(counters).length <= limit) return;
-    const live = liveAttemptCounterKeys(operations);
+    const live = liveAttemptCounterActionIds(operations);
     for (const key of Object.keys(counters)) {
-        if (!live.has(key)) delete counters[key];
+        const actionId = counterKeyActionId(key);
+        if (actionId === null || !live.has(actionId)) delete counters[key];
     }
     const remaining = Object.keys(counters);
     if (remaining.length > limit) {
@@ -3070,6 +3089,12 @@ async function prepareBrowserInverse(
             : undefined;
         return {
             priorActiveTabId: prior?.id ?? null,
+            // Chrome reuses tab ids after a tab closes, so the id alone does
+            // not identify the tab this restore is allowed to touch. The URL
+            // is recorded as proof of ownership, exactly as the
+            // ``close_created_tab`` inverse already does.
+            priorActiveUrl: prior?.url ?? "",
+            priorWindowId: prior?.windowId ?? null,
             targetTabId: target?.chromeTabId ?? null,
             noEffect: typeof prior?.id === "number"
                 && prior.id === target?.chromeTabId,
@@ -4143,8 +4168,32 @@ async function performBrowserRestore(
                     detail: "User focus superseded the Cortex tab focus",
                 };
             }
-            const tab = await chrome.tabs.get(priorId);
+            let tab: chrome.tabs.Tab;
+            try {
+                tab = await chrome.tabs.get(priorId);
+            } catch {
+                return {
+                    status: "already_complete",
+                    detail: "Prior tab no longer exists",
+                };
+            }
             if (tab.active) return { status: "already_complete", detail: "Prior tab already active" };
+            // Prove ownership before focusing. Chrome reuses tab ids, so
+            // ``priorId`` may now belong to a tab Cortex never touched —
+            // activating it would yank the user to an unrelated page, and the
+            // verifier only checks that the Cortex target lost focus, so it
+            // would call that a success. The sibling ``close_created_tab``
+            // arm has always required this proof; this one did not.
+            const priorUrl = typeof inverse.priorActiveUrl === "string"
+                ? inverse.priorActiveUrl
+                : "";
+            if (priorUrl && !urlsMatch(tab.url, priorUrl)
+                && !urlsMatch(tab.pendingUrl, priorUrl)) {
+                return {
+                    status: "failed",
+                    detail: "Prior tab was reused or navigated",
+                };
+            }
             await chrome.tabs.update(priorId, { active: true });
             return { status: "succeeded", detail: "Prior active tab restored" };
         }
@@ -4948,8 +4997,15 @@ async function undoAction(actionId: string): Promise<boolean> {
     const idx = undoStack.findIndex((e) => e.action_id === actionId);
     if (idx === -1) return false;
     const entry = undoStack[idx];
-    undoStack.splice(idx, 1);
-    schedulePersist();
+    // The entry is NOT removed yet. It used to be spliced out (and the removal
+    // scheduled for persistence) before the reversal ran, so it was the only
+    // record of how to undo the action and it was destroyed first. An MV3
+    // worker eviction between the splice and `chrome.tabs.create({url})` lost
+    // the saved URL permanently: the user's closed tab was gone with nothing
+    // left to retry from. Unlike the transactional path, this stack has no
+    // write-ahead entry to recover from, so the record has to outlive the
+    // attempt. It is removed below, only once the reversal actually reached
+    // its desired end state.
 
     // Every arm below used to swallow its own failure and fall through to
     // `return true`, so a tab that could not be reopened was still reported as
@@ -5007,6 +5063,14 @@ async function undoAction(actionId: string): Promise<boolean> {
                 }
                 break;
             }
+        }
+        if (restored) {
+            // Reached the desired end state, so the record has done its job.
+            // A failed reversal keeps its entry, which is what makes a retry
+            // possible at all.
+            const current = undoStack.findIndex((e) => e.action_id === actionId);
+            if (current !== -1) undoStack.splice(current, 1);
+            schedulePersist();
         }
         return restored;
     } catch {

@@ -101,6 +101,37 @@ describe("attempt_counters is bounded", () => {
         ]);
     });
 
+    it("keeps a restore counter, which is keyed by restore id not authorization id", () => {
+        // An apply receipt is stamped with the authorization id; a RESTORE
+        // receipt is stamped with the restore id (`authorizationId:
+        // verified.command.restore_id`). Deriving expected keys from
+        // `operation.authorization_id` therefore never matched a live restore
+        // counter, so the trim treated it as an orphan and silently reset that
+        // restore's retry budget. Liveness is matched on the action id, which
+        // is stable across every phase.
+        const counters: Record<string, number> = {
+            "auth-live:action-live:apply": 2,
+            "restore-abc:action-live:restore": 5,
+            "restore-abc:action-live:compensate": 1,
+            "auth-dead:action-dead:apply": 9,
+        };
+        const operations = {
+            "int-action-live:action-live": operation("auth-live", "action-live"),
+        } as unknown as Parameters<typeof _trimAttemptCounters>[1];
+
+        // Limit 3: enough to force the orphan out, not enough to trigger the
+        // oldest-first fallback on the three live counters.
+        _trimAttemptCounters(counters, operations, 3);
+
+        expect(Object.keys(counters).sort()).toEqual([
+            "auth-live:action-live:apply",
+            "restore-abc:action-live:compensate",
+            "restore-abc:action-live:restore",
+        ]);
+        // Retry budgets survive intact — that is the point of keeping them.
+        expect(counters["restore-abc:action-live:restore"]).toBe(5);
+    });
+
     it("leaves a journal under the limit untouched", () => {
         const counters: Record<string, number> = { "a:b:apply": 4 };
         _trimAttemptCounters(

@@ -172,19 +172,37 @@ function validateEditorReceiptBatch(value: unknown): InterventionReceiptBatch {
 // Pruning starts below the hard cap so a burst between prunes cannot reach it.
 const MAX_EDITOR_COUNTERS_SOFT = 1_536;
 
-/** Counter keys a live operation could still consult. */
-function liveAttemptCounterKeys(
+/** Action ids of operations that are still live.
+ *
+ * A counter is keyed ``<authorization-or-restore-id>:<action-id>:<phase>``, and
+ * the first segment is NOT stable across phases: an apply receipt is stamped
+ * with the authorization id while a restore receipt is stamped with the
+ * *restore* id. Deriving expected keys from ``operation.authorization_id``
+ * therefore never matched a live restore counter, so the trim below treated it
+ * as an orphan and reset that restore's retry budget.
+ *
+ * Matching on the action id instead is coarser and cannot make that mistake.
+ * ``journal.operations`` only holds operations that have not retired, so
+ * anything it names is by definition still in play.
+ */
+function liveAttemptCounterActionIds(
     operations: Record<string, EditorOperation>,
 ): Set<string> {
     const live = new Set<string>();
     for (const operation of Object.values(operations)) {
-        for (const phase of ["apply", "restore", "compensate"]) {
-            live.add(
-                [operation.authorization_id, operation.action_id, phase].join(":"),
-            );
-        }
+        live.add(operation.action_id);
     }
     return live;
+}
+
+/** The action id a counter key refers to, or null if the key is malformed.
+ *
+ * Parsed from the end because the phase is always last and the action id
+ * always second to last; the leading id may itself contain a colon.
+ */
+function counterKeyActionId(key: string): string | null {
+    const parts = key.split(":");
+    return parts.length >= 3 ? parts[parts.length - 2] : null;
 }
 
 /** Bound ``counters`` in place, discarding the least useful entries first.
@@ -202,9 +220,10 @@ function trimAttemptCounters(
     limit: number,
 ): void {
     if (Object.keys(counters).length <= limit) return;
-    const live = liveAttemptCounterKeys(operations);
+    const live = liveAttemptCounterActionIds(operations);
     for (const key of Object.keys(counters)) {
-        if (!live.has(key)) delete counters[key];
+        const actionId = counterKeyActionId(key);
+        if (actionId === null || !live.has(actionId)) delete counters[key];
     }
     const remaining = Object.keys(counters);
     if (remaining.length > limit) {
