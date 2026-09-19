@@ -20,7 +20,8 @@ Detection conditions (all must be true simultaneously):
 from __future__ import annotations
 
 import logging
-import time
+
+from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +43,9 @@ class ParasympatheticReboundDetector:
             show_reflection_prompt()
     """
 
-    def __init__(self) -> None:
+    def __init__(self, clock: Clock | None = None) -> None:
         self._latest_rebound: bool = False
+        self._clock: Clock = clock or SYSTEM_CLOCK
 
     # ------------------------------------------------------------------
     # Public API
@@ -57,6 +59,7 @@ class ParasympatheticReboundDetector:
         hrv_current: float | None,
         hrv_prev: float | None,
         last_submission_ts: float | None = None,
+        current_time: float | None = None,
     ) -> bool:
         """
         Evaluate whether parasympathetic rebound conditions are met.
@@ -69,8 +72,11 @@ class ParasympatheticReboundDetector:
                          unavailable.
             hrv_prev: Previous HRV RMSSD sample in milliseconds.  ``None``
                       if unavailable.
-            last_submission_ts: Timestamp of the last accepted submission
-                (epoch seconds).  ``None`` to skip the temporal check.
+            last_submission_ts: Monotonic timestamp of the last accepted
+                submission, on the same clock as *current_time*.  ``None`` to
+                skip the temporal check.
+            current_time: Monotonic "now".  ``None`` reads the detector's
+                clock.
 
         Returns:
             ``True`` if all rebound conditions are satisfied.
@@ -80,9 +86,20 @@ class ParasympatheticReboundDetector:
             self._latest_rebound = False
             return False
 
-        # Temporal guard: only detect rebound within 5 min of last acceptance
+        # Temporal guard: only detect rebound within 5 min of last acceptance.
+        # Measured on the monotonic clock, like every sibling detector in this
+        # package. This was the last wall-clock timing decision in the state
+        # engine: an NTP step or a DST change could make ``elapsed`` negative
+        # (the window never closes, so a stale acceptance keeps qualifying) or
+        # hours long (the window closes instantly), and the two clocks were
+        # mixed -- the caller passed an epoch timestamp into a subtraction the
+        # sibling paths performed in monotonic time.
         if last_submission_ts is not None:
-            elapsed = time.time() - last_submission_ts
+            now = (
+                monotonic_seconds(self._clock) if current_time is None
+                else current_time
+            )
+            elapsed = now - last_submission_ts
             if elapsed > _REBOUND_WINDOW_SECONDS:
                 self._latest_rebound = False
                 return False

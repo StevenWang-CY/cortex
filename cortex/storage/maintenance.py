@@ -433,6 +433,11 @@ class StorageMaintenance:
             candidates.update((self._root / "baselines").glob("baseline_*.json"))
         if "policy" in selected:
             candidates.update((self._root / "policy_log").glob("*.jsonl"))
+            # Nightly policy diagnostics are derived from the policy log, so
+            # erasing the log without them left the conclusions behind.
+            reports = self._root / "reports"
+            candidates.update(reports.glob("policy_diagnostics_*.md"))
+            candidates.update(reports.glob("legacy_policy_diagnostics_*.md"))
         if "interventions" in selected:
             candidates.add(self._root / "intervention_transactions.json")
         if "consent" in selected:
@@ -468,6 +473,17 @@ class StorageMaintenance:
         # ledger row had already gone — outlived a request to erase everything.
         # A delete covering every scope must leave no copy behind.
         if selected.issuperset(_ALL_DELETE_SCOPES):
+            # Exports are user-owned -- the retention sweep deliberately never
+            # touches them -- but "delete everything" must still mean
+            # everything, and nothing else reached them. A full dump of the
+            # user's records outliving a request to erase all of it is exactly
+            # the outcome the erase path exists to prevent.
+            exports = self._root / "exports"
+            if exports.exists():
+                for path in sorted(exports.glob("cortex-export-*.json"), key=str):
+                    if path.is_symlink() or path.is_file():
+                        if self._unlink_best_effort(path):
+                            removed += 1
             backup_root = self._database.backup_dir
             if backup_root.exists():
                 for path in sorted(backup_root.rglob("*"), key=str, reverse=True):

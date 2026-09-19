@@ -1584,6 +1584,20 @@ class TriggerPolicy:
         self._quiet_mode_indefinite = False
 
     @property
+    def quiet_mode_indefinite(self) -> bool:
+        """Is an indefinite pause held?
+
+        Public so the daemon can reconcile its own quiet-mode state at startup
+        without reaching into a private attribute. An indefinite pause is a
+        standing user decision that outlives the process: the policy persists
+        and rehydrates it, but the daemon used to rebuild ``_quiet_mode_kind``
+        as "off" on every construction and restart the camera anyway, so
+        "Pause all sensing" was silently broken by a restart.
+        """
+
+        return bool(self._quiet_mode_indefinite)
+
+    @property
     def quiet_mode_escalation_level(self) -> int:
         """Current dismissal-driven escalation level (0 when none is held)."""
 

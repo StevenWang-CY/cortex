@@ -1820,6 +1820,35 @@ class CortexDaemon:
                 exc_info=True,
             )
 
+    def _restore_quiet_mode_from_policy(self) -> None:
+        """Adopt an indefinite pause the trigger policy rehydrated from disk.
+
+        ``TriggerPolicy`` persists ``quiet_mode_indefinite`` and reloads it in
+        ``__init__`` precisely because an indefinite pause is a standing user
+        decision. The daemon's own mirror of that state was rebuilt as "off" on
+        every construction, so after a restart the UI, the WS envelope and the
+        tray all reported "off" while the policy still suppressed triggers --
+        and the camera was started again regardless. The two halves are
+        reconciled here, before anything reads the daemon's quiet state.
+
+        Only the indefinite case is restored. A timed window is measured
+        against a monotonic clock, which does not survive the process, so a
+        snooze or quiet session legitimately lapses on restart.
+        """
+
+        try:
+            indefinite = self._trigger_policy.quiet_mode_indefinite
+        except AttributeError:  # pragma: no cover - older policy doubles
+            return
+        if not indefinite:
+            return
+        self._quiet_mode_kind = "pause"
+        self._quiet_mode_ends_at = None
+        self._quiet_mode_deadline = None
+        self._quiet_mode_source = "restored"
+        self._pause_was_capturing = True
+        logger.info("Quiet mode restored from policy: kind=pause (indefinite)")
+
     async def _start_optional_hardware(self) -> None:
         """Start capture without gating core daemon readiness.
 
@@ -2049,6 +2078,7 @@ class CortexDaemon:
         # native extension call it can lead to a segfault on resume.
         self._install_loop_signal_handlers()
         self._register_services()
+        self._restore_quiet_mode_from_policy()
         ws_started = await self._ws_server.start()
         if not ws_started:
             raise RuntimeError(
@@ -2068,6 +2098,15 @@ class CortexDaemon:
         await self._wait_for_api_server_ready()
 
         hardware_probe_enabled = os.environ.get("CORTEX_HEADLESS_STARTUP") != "1"
+        if self._quiet_mode_kind == "pause":
+            # A restored indefinite pause means the user asked for sensing to
+            # stop and has not resumed. Starting the camera here would honour
+            # the UI label while contradicting it in hardware -- the camera
+            # light would come back on by itself after a restart.
+            logger.info(
+                "Restored indefinite pause: capture stays stopped until resumed"
+            )
+            hardware_probe_enabled = False
         if hardware_probe_enabled:
             # Input/window hooks are fast and independently useful when the
             # camera is unavailable.  Capture itself is supervised in the
@@ -7611,7 +7650,11 @@ class CortexDaemon:
                 current_time=timestamp,
             )
 
-            submission_epoch = self._leetcode_submission_epoch_seconds(context)
+            # Monotonic, matching the amygdala path a few lines above. The
+            # epoch variant fed a wall-clock timestamp into a monotonic
+            # subtraction, so the 5-minute rebound window was measured across
+            # two different clocks.
+            submission_monotonic = self._leetcode_submission_monotonic(context)
             accepted = bool(context.accepted or last_result == "Accepted")
             rebound = self._rebound_detector.update(
                 accepted=accepted,
@@ -7619,7 +7662,8 @@ class CortexDaemon:
                 hr_baseline=float(baselines.hr_baseline),
                 hrv_current=None,
                 hrv_prev=None,
-                last_submission_ts=submission_epoch if accepted else None,
+                last_submission_ts=submission_monotonic if accepted else None,
+                current_time=timestamp,
             )
 
             mode_estimate = self._leetcode_mode_resolver.resolve(

@@ -157,6 +157,12 @@ def sweep_once(
         ("sessions", config.session_retention_days * day),
         ("cache", config.feature_retention_days * day),
         ("logs", config.error_retention_days * day),
+        # ``reports/`` holds the nightly policy diagnostics. One markdown file
+        # is written per day, forever, and no deletion path reached them --
+        # unlike ``exports/`` these are operational output rather than
+        # something the user asked for, so they age out on the same schedule
+        # as logs.
+        ("reports", config.error_retention_days * day),
     ]
 
     for name, retention_seconds in targets:
@@ -302,6 +308,12 @@ async def sweep_once_async(
         ("sessions", config.session_retention_days * day),
         ("cache", config.feature_retention_days * day),
         ("logs", config.error_retention_days * day),
+        # ``reports/`` holds the nightly policy diagnostics. One markdown file
+        # is written per day, forever, and no deletion path reached them --
+        # unlike ``exports/`` these are operational output rather than
+        # something the user asked for, so they age out on the same schedule
+        # as logs.
+        ("reports", config.error_retention_days * day),
     ]
 
     for name, retention_seconds in targets:
