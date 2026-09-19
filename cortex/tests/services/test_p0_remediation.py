@@ -113,6 +113,10 @@ class _MinimalDaemon:
         self._quiet_mode_source = "daemon"
         self._quiet_mode_lock = asyncio.Lock()
         self._quiet_mode_decay_task = None
+        # The shutdown latch that ``_capture_restart_permitted`` reads. A
+        # capture restart arriving during teardown must not reopen a camera
+        # the stop chain has already released.
+        self._stop_started = False
         self._auto_focus_armed = False
         self._auto_focus_dwell_started_at = 0.0
         self._auto_focus_recovery_started_at = 0.0
@@ -136,6 +140,7 @@ class _MinimalDaemon:
             "_emit_stop_focus_auto",
             "disarm_auto_focus",
             "_reset_auto_focus_timers",
+            "_capture_restart_permitted",
         ):
             setattr(
                 self,

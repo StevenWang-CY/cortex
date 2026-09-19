@@ -220,6 +220,14 @@ jobs:
         run: |
           pnpm exec plasmo build
           pnpm exec plasmo build --target=edge-mv3
+      # The source-size proxy runs in the Python gate; the real bundle can
+      # only be measured where it has just been built. Without this step the
+      # bundle assertions skip everywhere and only the proxy is ever enforced.
+      - name: Bundle size budget
+        working-directory: ${{ github.workspace }}
+        run: |
+          uv run --project . pytest \
+            cortex/tests/performance/test_bundle_size.py -q
 
   extension-vscode:
     name: vscode-compile-test-package

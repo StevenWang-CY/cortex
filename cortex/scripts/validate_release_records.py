@@ -368,8 +368,20 @@ def render_assurance_notes(report: dict[str, Any], *, workflow_run_url: str | No
             "native-host probes); not exercised on hardware for this release."
         )
     lines.append("")
+    # ``--ignore-missing`` is load-bearing, not tidiness. This manifest
+    # carries a line for every file in the evidence directory — SBOMs,
+    # verifier output, release metadata — and those ship only inside the
+    # separate evidence ZIP. A reader who downloads the DMG and the checksum
+    # file, which is the natural reading of the instruction, gets a "No such
+    # file or directory" for each of them and a non-zero exit on a perfectly
+    # good download. With the flag, macOS `shasum` verifies what is present
+    # and still fails with "no file was verified" if the DMG is absent or
+    # misnamed, so nothing passes silently.
     lines.append(
-        "Verify a download with `shasum -a 256 -c SHA256SUMS-<arch>`, "
+        "Verify a download with "
+        "`shasum -a 256 --ignore-missing -c SHA256SUMS-<arch>` "
+        "(the manifest also covers the files inside the evidence ZIP, so "
+        "without `--ignore-missing` it reports those as missing), "
         "`gh attestation verify <dmg> --repo StevenWang-CY/cortex`, and "
         "`xcrun stapler validate <dmg>`."
     )

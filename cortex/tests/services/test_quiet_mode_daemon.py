@@ -100,6 +100,8 @@ class _MinimalDaemon:
         # Phase-3 P0-4: ``set_quiet_mode`` is now lock-protected to
         # serialise concurrent dashboard / tray / overlay calls.
         self._quiet_mode_lock = asyncio.Lock()
+        # The shutdown latch that ``_capture_restart_permitted`` reads.
+        self._stop_started = False
         # Auto-decay task ref; tests drop their reference immediately
         # by stubbing _spawn_background_task to a no-op.
         self._quiet_mode_decay_task = None
@@ -133,6 +135,7 @@ class _MinimalDaemon:
     _decay_quiet_mode_after = CortexDaemon._decay_quiet_mode_after
     _emit_stop_focus_auto = CortexDaemon._emit_stop_focus_auto
     _reset_auto_focus_timers = CortexDaemon._reset_auto_focus_timers
+    _capture_restart_permitted = CortexDaemon._capture_restart_permitted
 
 
 @pytest.mark.asyncio

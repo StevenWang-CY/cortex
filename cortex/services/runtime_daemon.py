@@ -1849,6 +1849,37 @@ class CortexDaemon:
         self._pause_was_capturing = True
         logger.info("Quiet mode restored from policy: kind=pause (indefinite)")
 
+    def _capture_restart_permitted(self, *, surface: str) -> bool:
+        """Whether a live command may (re)open the camera right now.
+
+        ``_stop_once`` stops the capture pipeline early but does not stop the
+        WebSocket command surface until much later, and between the two it can
+        await roughly eleven seconds of bounded waits — the session-report
+        persist, the recap broadcast and dismissal timeouts, the midnight
+        scheduler, the copilot re-enable. ``_handle_client`` dispatches frames
+        inline, so a ``QUIET_MODE_TOGGLE`` or a ``SETTINGS_SYNC`` arriving in
+        that window reached a restart path with no readiness or stop gate and
+        reopened the camera *after* teardown had released it. The camera light
+        came back on while Cortex was quitting, and the handle outlived the
+        daemon's own release.
+
+        ``_stop_started`` is set at the very top of ``_stop_once``, before any
+        service is touched, so it covers the whole window. Callers check it
+        after taking whatever lock they hold, because the flag can flip while
+        they wait for it.
+
+        Only the camera is gated here. The rest of what those commands do —
+        broadcasting state, updating the trigger policy, persisting a
+        preference — is idempotent and has no hardware to leak.
+        """
+        if self._stop_started:
+            logger.info(
+                "Refusing capture restart from %s: the daemon is stopping",
+                surface,
+            )
+            return False
+        return True
+
     async def _start_optional_hardware(self) -> None:
         """Start capture without gating core daemon readiness.
 
@@ -5938,9 +5969,32 @@ class CortexDaemon:
                         failed += 1
                 except Exception:
                     failed += 1
-            current = self._pending_restore_results.get(restore_id)
-            if current is future:
-                self._pending_restore_results.pop(restore_id, None)
+                current = self._pending_restore_results.get(restore_id)
+                if current is future:
+                    self._pending_restore_results.pop(restore_id, None)
+                continue
+            # A future that has NOT resolved stays in the registry.
+            #
+            # This loop used to pop unconditionally, which orphaned two
+            # different things. First, the future may not be ours: the loop
+            # above adopts whatever is already registered for a reusable
+            # restore command, and that one belongs to a concurrent
+            # ``_dispatch_restore`` still awaiting it on a 10 s timeout with
+            # its own cleanup in ``finally``. Second,
+            # ``_record_intervention_receipts`` resolves restore waiters
+            # solely by looking them up in this dict, so a receipt arriving
+            # after our 3 s bound could never complete it — the transaction
+            # was durably RESTORED and the caller was told "unverified".
+            #
+            # Leaving it costs nothing: the dict is keyed by ``restore_id``,
+            # the command is retained in ``_pending_startup_restores`` for
+            # retry, and both writers replace a stale entry for the same id
+            # rather than adding to it.
+            logger.debug(
+                "Restore %s unresolved within the bound; leaving its waiter "
+                "registered so a later receipt can still complete it",
+                restore_id,
+            )
         pending = len(commands) - restored - failed
         return {
             "requested": len(commands),
@@ -6281,6 +6335,10 @@ class CortexDaemon:
                 if prev_kind != "pause":
                     return
                 if not self._pause_was_capturing:
+                    return
+                if not self._capture_restart_permitted(surface="quiet_mode"):
+                    # Keep the latch: if the stop is somehow abandoned, the
+                    # next resume still knows capture was running.
                     return
                 try:
                     await self._capture_pipeline.start()
@@ -8339,7 +8397,11 @@ class CortexDaemon:
         if "webcam_enabled" in settings:
             desired_capture = bool(settings["webcam_enabled"])
             self._capture_processing_enabled = desired_capture
-            if desired_capture and not self._capture_available:
+            if (
+                desired_capture
+                and not self._capture_available
+                and self._capture_restart_permitted(surface="apply_settings")
+            ):
                 try:
                     await self._capture_pipeline.start()
                     self._capture_available = True

@@ -17,6 +17,7 @@ Covers, against the REAL :class:`CortexDaemon` (no capture/WS boot):
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -551,3 +552,141 @@ async def test_engage_without_manifest_never_creates_generic_approval(daemon) ->
     await daemon._handle_user_action({"intervention_id": iid, "action": "engaged"})
 
     daemon._consent_ladder.record_approval.assert_not_awaited()
+
+
+# ─── transaction-restore:5852 / runtime-lifecycle:2346 ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_global_restore_leaves_an_unresolved_waiter_registered(
+    daemon,  # type: ignore[no-untyped-def]
+) -> None:
+    """A concurrent restore must not be orphaned by the shutdown sweep.
+
+    ``restore_all_transactional_effects`` adopts whatever future is already
+    registered for a reusable restore command, waits at most
+    ``timeout_seconds``, and used to remove it unconditionally.
+    ``_record_intervention_receipts`` resolves restore waiters solely by
+    looking them up in ``_pending_restore_results``, so a future popped while
+    pending could never be completed — the caller that owned it was left
+    waiting on its own 10 s timeout and reported "unverified" to the user
+    even though the transaction was durably RESTORED.
+    """
+    command = SimpleNamespace(restore_id="restore-still-pending")
+
+    class _Coordinator:
+        async def request_restore_all(self, *, reason: str) -> list[Any]:
+            return [command]
+
+    class _WS:
+        async def send_restore_command(self, candidate: Any) -> int:
+            return 1
+
+    daemon._transaction_coordinator = _Coordinator()
+    daemon._ws_server = _WS()
+    daemon._pending_startup_restores = {}
+
+    # A concurrent ``_dispatch_restore`` already owns a waiter for this id.
+    loop = asyncio.get_running_loop()
+    owner_future: asyncio.Future[bool] = loop.create_future()
+    daemon._pending_restore_results = {command.restore_id: owner_future}
+
+    summary = await daemon.restore_all_transactional_effects(
+        timeout_seconds=0.01,
+    )
+
+    assert summary["restored"] == 0
+    assert summary["pending"] == 1
+    assert daemon._pending_restore_results.get(command.restore_id) is owner_future, (
+        "the adopted waiter belongs to its creator and must stay registered"
+    )
+
+    # The late receipt still completes it, which is the whole point.
+    resolved = daemon._pending_restore_results.pop(command.restore_id)
+    resolved.set_result(True)
+    assert await owner_future is True
+
+
+@pytest.mark.asyncio
+async def test_global_restore_still_clears_a_resolved_waiter(
+    daemon,  # type: ignore[no-untyped-def]
+) -> None:
+    """Done futures are removed, so the registry does not grow."""
+    command = SimpleNamespace(restore_id="restore-resolved")
+
+    class _Coordinator:
+        async def request_restore_all(self, *, reason: str) -> list[Any]:
+            return [command]
+
+    class _WS:
+        async def send_restore_command(self, candidate: Any) -> int:
+            daemon._pending_restore_results[candidate.restore_id].set_result(True)
+            return 1
+
+    daemon._transaction_coordinator = _Coordinator()
+    daemon._ws_server = _WS()
+    daemon._pending_restore_results = {}
+    daemon._pending_startup_restores = {}
+
+    summary = await daemon.restore_all_transactional_effects(timeout_seconds=0.1)
+
+    assert summary["restored"] == 1
+    assert daemon._pending_restore_results == {}
+
+
+@pytest.mark.asyncio
+async def test_quiet_mode_cannot_reopen_the_camera_during_shutdown(
+    daemon,  # type: ignore[no-untyped-def]
+) -> None:
+    """A late QUIET_MODE_TOGGLE must not undo the camera release.
+
+    ``_stop_once`` stops capture early but keeps the WebSocket command
+    surface up for up to ~11 s of bounded waits (session-report persist,
+    recap broadcast and dismissal timeouts, midnight scheduler, copilot
+    re-enable). ``_handle_client`` dispatches frames inline and
+    ``QUIET_MODE_TOGGLE`` routes straight to ``set_quiet_mode``, which had no
+    readiness or stop gate — so "off" arriving in that window called
+    ``_capture_pipeline.start()`` after teardown had released the camera.
+    """
+    daemon._capture_pipeline.start = AsyncMock(return_value=None)
+    daemon._quiet_mode_kind = "pause"
+    daemon._pause_was_capturing = True
+    daemon._stop_started = True
+
+    await daemon.set_quiet_mode("off")
+
+    daemon._capture_pipeline.start.assert_not_awaited()
+    assert daemon._pause_was_capturing is True, (
+        "the latch must survive so a resume after an abandoned stop still works"
+    )
+
+
+@pytest.mark.asyncio
+async def test_quiet_mode_still_resumes_the_camera_when_not_stopping(
+    daemon,  # type: ignore[no-untyped-def]
+) -> None:
+    """The gate is the stop latch, not a blanket refusal."""
+    daemon._capture_pipeline.start = AsyncMock(return_value=None)
+    daemon._quiet_mode_kind = "pause"
+    daemon._pause_was_capturing = True
+    daemon._stop_started = False
+
+    await daemon.set_quiet_mode("off")
+
+    daemon._capture_pipeline.start.assert_awaited_once()
+    assert daemon._pause_was_capturing is False
+
+
+@pytest.mark.asyncio
+async def test_apply_settings_cannot_reopen_the_camera_during_shutdown(
+    daemon,  # type: ignore[no-untyped-def]
+) -> None:
+    """The same window is reachable through SETTINGS_SYNC."""
+    daemon._capture_pipeline.start = AsyncMock(return_value=None)
+    daemon._capture_available = False
+    daemon._stop_started = True
+
+    await daemon.apply_settings({"webcam_enabled": True})
+
+    daemon._capture_pipeline.start.assert_not_awaited()
+    assert daemon._capture_available is False
