@@ -87,22 +87,58 @@ class ActivitySummarizer:
         We don't go through ``AnthropicPlanner`` because that path forces
         a typed ``InterventionPlan`` tool-use output; for a 1-3 sentence
         recap we just want raw text.
+
+        Not going through the planner also means not inheriting the privacy
+        boundary that wraps it, so this method has to enforce the same two
+        rules itself. It previously enforced neither: it interpolated the raw
+        window title, position and a 200-character workspace ``context_snapshot``
+        into a prompt and sent it to the provider, whatever the user's consent
+        state. ``external_transport_enabled`` is False by default and only
+        becomes true under ``planner_mode == "external_redacted"`` with the
+        current disclosure acknowledged, so the old path egressed workspace
+        content from installs that had never enabled external context at all.
+
+        The SDK factory is reached from exactly two places: the planner, and
+        here. ``test_context_privacy_egress.py`` pins that.
         """
         from cortex.libs.config.settings import LLMConfig
         from cortex.libs.llm.anthropic_client import (
             build_anthropic_sdk_client,
             resolve_anthropic_model_id,
         )
+        from cortex.services.llm_engine.context_broker import redact_text
 
         config = self._llm_config
         if not isinstance(config, LLMConfig):
             raise ValueError("LLM config not available")
+        if not config.privacy.external_transport_enabled:
+            # Same gate, and the same message prefix, as
+            # ``PrivacyAwarePlanner._require_transport``. ``_generate_recap``
+            # catches this and falls back to the local template.
+            raise ValueError(
+                "external_context_disabled: activity recaps do not leave the "
+                "device until the current context disclosure is acknowledged"
+            )
+
+        # Every interpolated field is attacker- or workspace-controlled free
+        # text. ``redact_text`` is the same normaliser the broker applies:
+        # NFKC, bidi/zero-width stripping, embedded paths reduced to
+        # basenames, URI credentials, known secret shapes and high-entropy
+        # tokens replaced, then a hard length cap.
+        title = redact_text(activity.title, max_chars=160).value
+        platform = redact_text(activity.platform, max_chars=64).value
+        position = redact_text(
+            activity.position_description or "unknown position", max_chars=64,
+        ).value
+        context = redact_text(
+            activity.context_snapshot or "N/A", max_chars=200,
+        ).value
 
         prompt = _RECAP_PROMPT.format(
-            title=activity.title,
-            platform=activity.platform,
-            position=activity.position_description or "unknown position",
-            context=activity.context_snapshot[:200] if activity.context_snapshot else "N/A",
+            title=title,
+            platform=platform,
+            position=position,
+            context=context,
         )
 
         try:

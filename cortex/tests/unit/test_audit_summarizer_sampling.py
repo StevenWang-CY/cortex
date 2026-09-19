@@ -35,7 +35,18 @@ async def test_recap_request_has_no_sampling_parameters(monkeypatch: pytest.Monk
         "cortex.libs.llm.anthropic_client.resolve_anthropic_model_id",
         lambda _model, provider=None: "model-under-test",
     )
-    summarizer = ActivitySummarizer(store=InMemoryStore(), llm_config=LLMConfig())
+    # Egress now requires the acknowledged disclosure, so the config has to
+    # grant it explicitly; a default LLMConfig refuses to call out at all.
+    summarizer = ActivitySummarizer(
+        store=InMemoryStore(),
+        llm_config=LLMConfig(
+            privacy={
+                "planner_mode": "external_redacted",
+                "external_context_enabled": True,
+                "consent_revision": "context-disclosure-v1",
+            },
+        ),
+    )
     activity = ActivitySummary(
         content_id="https://youtube.com/watch?v=abc123",
         platform="youtube",

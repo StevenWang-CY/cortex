@@ -42,6 +42,39 @@ committed. A future report must publish abstention coverage, error and agreement
 by preregistered condition/subgroup, reference hardware and alignment, sealed
 participant splits, exclusions, and uncertainty.
 
+### Measured limits of the pulse publication gate
+
+Two failure modes were measured directly against the packaged POS backend and
+are bounded, not eliminated. Both are stated here because the honest number
+matters more than a clean claim.
+
+**A heart rate can still, rarely, be read out of noise.** Before v0.5.0 the
+publication gate tested only a composite quality score whose acquisition terms
+(motion and face coverage) alone contributed 0.25 of a possible 1.0, so a
+still, fully visible face cleared the 0.30 threshold with no cardiac evidence
+at all: every signal-free window published a rate. The gate now tests signal
+presence on the raw spectrum — in-band SNR in decibels and a normalised
+spectral quality index — and over 2,400 signal-free windows spanning white,
+1/f and drift nuisance, 8 published a rate (0.33%, from 100%). That residual
+cannot be driven to zero by a per-window threshold: raising the SNR floor past
+2.0 dB begins discarding genuine low-amplitude pulses, halving sensitivity at a
+realistic 0.3% modulation depth for half a point of specificity. Closing it
+properly needs temporal hysteresis, so that one surviving window cannot move a
+displayed rate. The legacy estimator has such a stabilizer; porting it to the
+published v2 path is deferred because v2 publishes one estimate per window
+with its own provenance, and a held or smoothed value is not measured in the
+window it is attributed to. That is a design decision, not an oversight.
+
+**Rates at or below the passband edge are withheld, not measured.** The
+analysis band starts at 0.7 Hz (42 BPM), so a slower fundamental is removed by
+the bandpass while its harmonics survive; before v0.5.0 such rates published at
+exactly double or triple the truth (35 BPM as 69.9, 40 as 80.1, 42 as 124.8).
+These are now detected by re-examining the pre-bandpass waveform and withheld
+with an explicit reason. The consequence is that genuine bradycardia — trained
+endurance athletes at rest, or bradyarrhythmia — yields no reading rather than
+a wrong one. Widening the band instead would admit respiration and drift into
+the cardiac band for every user, which is the worse trade.
+
 ## Suggestions, effects, and efficacy
 
 The default mode is `suggest_only`; a proposal is not permission to close,
