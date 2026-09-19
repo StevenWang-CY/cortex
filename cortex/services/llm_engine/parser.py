@@ -25,7 +25,7 @@ from pydantic import ValidationError
 
 from cortex.libs.logging.correlation import get_correlation_id
 from cortex.libs.logging.structured import EventType
-from cortex.libs.schemas.context import TaskContext
+from cortex.libs.schemas.context import TaskContext, llm_visible_tab_indices
 from cortex.libs.schemas.intervention import InterventionPlan, SuggestedAction
 from cortex.services.context_engine.tab_classifier import classify_tab
 
@@ -45,6 +45,7 @@ def filter_unsafe_actions(
     plan: InterventionPlan,
     *,
     tab_count: int,
+    shown_tab_indices: frozenset[int] | None = None,
 ) -> InterventionPlan:
     """Drop ``SuggestedAction`` entries the executor must not run (audit F10).
 
@@ -68,7 +69,9 @@ def filter_unsafe_actions(
     """
     kept: list[SuggestedAction] = []
     for action in plan.suggested_actions:
-        reason = _action_rejection_reason(action, tab_count=tab_count)
+        reason = _action_rejection_reason(
+            action, tab_count=tab_count, shown_tab_indices=shown_tab_indices,
+        )
         if reason is None:
             kept.append(action)
             continue
@@ -88,11 +91,21 @@ def _action_rejection_reason(
     action: SuggestedAction,
     *,
     tab_count: int,
+    shown_tab_indices: frozenset[int] | None = None,
 ) -> str | None:
     """Return a short reason if the action should be dropped, else None."""
     if action.action_type in _TAB_INDEX_ACTIONS:
         if action.tab_index is None:
             return "tab_action_missing_tab_index"
+        # The rendered tab list is a prioritised subset carrying ORIGINAL
+        # indices, so "in range" is not the same as "was shown". An index the
+        # model never saw points at a real tab it knows nothing about --
+        # historically because the prompt told it indices ran [0, N-1] and it
+        # dutifully renumbered a "Tab 39:" line onto a lower index belonging to
+        # a different tab. Checked before the range test so the reason is
+        # specific.
+        if shown_tab_indices is not None and action.tab_index not in shown_tab_indices:
+            return f"tab_index_not_shown:{action.tab_index}"
         if action.tab_index >= tab_count:
             return f"tab_index_out_of_range:{action.tab_index}>={tab_count}"
     if action.action_type == "open_url":
@@ -352,7 +365,14 @@ def enrich_plan_with_context(
     # tab_index, ``open_url`` with a non-http(s) scheme, etc. Runs
     # AFTER enrichment so labels/titles are already up to date and we
     # can log meaningful telemetry.
-    plan = filter_unsafe_actions(plan, tab_count=len(tabs))
+    # Pass the indices actually rendered, not just the count: the rendered
+    # list is a prioritised subset carrying original indices, so an action can
+    # be "in range" and still name a tab the model never saw.
+    plan = filter_unsafe_actions(
+        plan,
+        tab_count=len(tabs),
+        shown_tab_indices=llm_visible_tab_indices(tabs),
+    )
 
     return plan
 

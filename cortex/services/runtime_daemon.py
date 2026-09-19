@@ -3883,6 +3883,22 @@ class CortexDaemon:
                     vector.hrv_sdnn = None
                     vector.respiration_rate = None
 
+                    # Same-category tab switching is topically coherent and
+                    # is meant to discount the window-switch support signal.
+                    # Nothing in production ever called ``set_tab_categories``,
+                    # so ``_same_category_ratio`` returned 0.0 on every tick
+                    # and the discount branch could not be reached. The data
+                    # was already assembled -- ``BrowserAdapter`` classifies
+                    # every tab and ``TabInfo.tab_type`` is populated -- it
+                    # simply never reached the scorer.
+                    browser_context = getattr(
+                        self._latest_context, "browser_context", None
+                    )
+                    self._scorer.set_tab_categories(
+                        [tab.tab_type for tab in browser_context.all_tabs]
+                        if browser_context is not None
+                        else None
+                    )
                     evaluation = self._support_inference.evaluate(vector)
                     estimate = self._smoother.update(
                         evaluation,

@@ -10,8 +10,8 @@ from __future__ import annotations
 SUPPORT_MODEL_MANIFEST_SCHEMA_VERSION = "1.0"
 SUPPORT_MODEL_COMPONENT_SHA256: tuple[tuple[str, str], ...] = (
     ("services/state_engine/feature_schema.py", "f39ce3edd890e527d5f5cbee61b75234044cf35ff21ae8cd0ae2a4c0b9cee169"),
-    ("services/state_engine/model_registry.py", "d03e0a066e731caeccadfedb2ff132a0688ae82fe37a5967b2ee367d0a774bbf"),
-    ("services/state_engine/rule_scorer.py", "bb9529a056bcb23d65cef8a8e0a9066aa735f83bdb515eb2e198c33c5b3df65d"),
+    ("services/state_engine/model_registry.py", "5903749b56fd18396dc29de849599c40bd9bb42c7c8f8c77073df154830ea0b3"),
+    ("services/state_engine/rule_scorer.py", "750e58deff2a1795f3ae6609fcff9a226cf17bf0827e0bd9fa86adda89cdbf83"),
     ("services/state_engine/support_inference.py", "ece651792ebb197b722521430f5f5e8b8b3a48d8d3d458b716ad84db2004aa42"),
 )
-DETERMINISTIC_SUPPORT_IMPLEMENTATION_SHA256 = "57632459bf4cb292bb689c9cf5a643003fb8f993dbb41d142655221c9896c310"
+DETERMINISTIC_SUPPORT_IMPLEMENTATION_SHA256 = "eb430811c1c014f38660f2e902d700de95fca369f942006a1c66cae1bf9ced19"

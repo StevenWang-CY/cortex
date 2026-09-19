@@ -226,7 +226,10 @@ Rules:
 do one thing, what would it be? Lead with that. The headline should name this action.
 - Generate suggested_actions: specific executable actions referencing REAL data from the context.
 - For tab actions, use the integer tab_index from the "Tab N:" lines in the context. NEVER fabricate indices.
-- tab_index must be within range [0, N-1] where N = number of tabs shown.
+- Use ONLY an index that literally appears on a "Tab N:" line above. The list is \
+a prioritised subset of the open tabs and its indices are the ORIGINAL ones, so \
+they are often non-contiguous and can exceed the number of lines shown. Never \
+renumber them and never invent an index for a tab that is not listed.
 - Keep the headline under 15 words.
 - Never recommend destructive actions (deleting files, closing unsaved buffers).
 - ALWAYS include a "causal_explanation" field: 1-2 sentences explaining WHY you are \

@@ -580,13 +580,23 @@ class RuleScorer:
         Score window switching: > 20 switches/min.
 
         Returns 0-1, where 1.0 = 40+ switches/min.
+
+        Both branches used the wrong divisor. The 10-20 band divided by 20
+        where continuity requires 10, so it reached only 0.25 at its top and
+        the function stepped 0.25 -> 0.50 across an infinitesimal change at
+        exactly 20 switches/min. The upper branch divided by 20 as well, so it
+        saturated at 30 rather than the 40 this docstring promises. Feeding an
+        0.18-weighted support feature, that step meant two windows a hair
+        either side of 20 switches/min produced materially different support
+        scores for no real difference in behaviour.
         """
         if switch_rate <= 10.0:
             return 0.0
 
+        # 10 -> 0.0, 20 -> 0.5, continuous at both ends.
         if switch_rate <= 20.0:
-            return float((switch_rate - 10.0) / 20.0 * 0.5)
+            return float((switch_rate - 10.0) / 10.0 * 0.5)
 
-        # Above 20: 0.5 → 1.0
-        score = 0.5 + min(0.5, (switch_rate - 20.0) / 20.0)
+        # 20 -> 0.5, 40 -> 1.0, matching the documented saturation point.
+        score = 0.5 + min(0.5, (switch_rate - 20.0) / 40.0)
         return float(np.clip(score, 0.0, 1.0))

@@ -1,11 +1,11 @@
-# Model card: deterministic support rules v2.3.0
+# Model card: deterministic support rules v2.4.0
 
 ## Status and ownership
 
 | Field | Value |
 | --- | --- |
 | Registry name | `deterministic-support` |
-| Version | `2.3.0` |
+| Version | `2.4.0` |
 | Feature schema | `support-features-v2.1.0` |
 | Implementation | `cortex/services/state_engine/rule_scorer.py` |
 | Operational wrapper | `cortex/services/state_engine/support_inference.py` |
@@ -177,6 +177,24 @@ user's preferred elapsed active-work interval. Pulse, HRV, camera features,
 state labels, and the research stress integral are not inputs.
 
 ## Change log
+
+**2.4.0** — `score_window_switch` is continuous and matches its own
+documentation. Both branches used the wrong divisor: the 10-20 switches/min
+band divided by 20 where continuity requires 10, so it reached only 0.25 at its
+top and the function stepped 0.25 -> 0.50 across an infinitesimal change at
+exactly 20 switches/min; the upper branch also divided by 20, saturating at 30
+rather than the 40 the docstring states. Feeding a feature weighted 0.18, that
+step meant two windows a hair either side of 20 switches/min produced
+materially different support scores for no real difference in behaviour. The
+map is now 10 -> 0.0, 20 -> 0.5, 40 -> 1.0.
+
+Also in this release, tab categories reach the scorer. `set_tab_categories`
+had no production caller, so `_same_category_ratio` returned 0.0 on every tick
+and the same-category discount in `_support_transform` could never be applied —
+switching between ten tabs of one topic scored exactly like switching between
+ten unrelated ones. The data was already assembled upstream; it simply never
+reached the scorer. Because this activates a previously dead discount, support
+scores fall for topically coherent switching.
 
 **2.3.0** — the `mouse_velocity_variance` abstention threshold is a magnitude,
 not `> 0.0`. Both scoring paths floor the divisor, so *any* baseline below

@@ -83,6 +83,7 @@ from cortex.libs.schemas.context import TaskContext
 from cortex.libs.schemas.intervention import (
     InterventionPlan,
     SimplificationConstraints,
+    UIPlan,
 )
 from cortex.libs.schemas.privacy import ContextFieldDisclosure
 from cortex.libs.schemas.state import StateEstimate
@@ -179,6 +180,41 @@ def build_request_kwargs(
         "output_config": output_config,
         "timeout": float(timeout_seconds),
     }
+
+
+
+@dataclass(frozen=True, slots=True)
+class _IntBounds:
+    """Inclusive bounds read off a Pydantic field's own constraints."""
+
+    low: int
+    high: int
+
+    def clamp(self, value: int) -> int:
+        return min(self.high, max(self.low, value))
+
+
+@functools.lru_cache(maxsize=1)
+def _ui_plan_visible_line_bounds() -> _IntBounds:
+    """``UIPlan.max_visible_lines``'s declared range, from the schema.
+
+    Read rather than restated so the clamp cannot drift from the contract it
+    exists to satisfy. ``UIPlan`` has no ``validate_assignment``, so an
+    out-of-range assignment is stored and serialised silently instead of
+    raising -- which is how a value of 5 reached clients against a declared
+    floor of 10.
+    """
+
+    low, high = 10, 400
+    field = UIPlan.model_fields.get("max_visible_lines")
+    for item in getattr(field, "metadata", ()) or ():
+        candidate = getattr(item, "ge", None)
+        if isinstance(candidate, int):
+            low = candidate
+        candidate = getattr(item, "le", None)
+        if isinstance(candidate, int):
+            high = candidate
+    return _IntBounds(low=low, high=high)
 
 
 @dataclass(frozen=True, slots=True)
@@ -977,7 +1013,16 @@ class AnthropicPlanner:
             # of using the hard-coded ±20 line default.
             if constraints is not None and enriched.ui_plan is not None:
                 try:
-                    half = max(5, int(constraints.max_visible_lines) // 2)
+                    # Clamp into UIPlan's own contract, not to an invented
+                    # floor of 5. ``UIPlan.max_visible_lines`` declares
+                    # ``ge=10, le=400`` but the model has no
+                    # ``validate_assignment``, so assigning 5 stored and
+                    # serialised 5 — four below the field's floor — for any
+                    # client that requested 10-19 visible lines, which
+                    # ``SimplificationConstraints`` explicitly allows.
+                    half = _ui_plan_visible_line_bounds().clamp(
+                        int(constraints.max_visible_lines) // 2
+                    )
                     enriched.ui_plan.max_visible_lines = half
                 except Exception:
                     pass
