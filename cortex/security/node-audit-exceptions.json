@@ -108,6 +108,33 @@
       "expires_on": "2026-11-22",
       "reason": "Svelte is a dormant Plasmo transformer dependency; Cortex is React-only and performs no Svelte server-side rendering.",
       "mitigation": "No .svelte source exists in the extension and the release artifact contains no Svelte runtime. Track a compatible Plasmo upgrade."
+    },
+    {
+      "ecosystem": "pnpm",
+      "advisory_id": "GHSA-ch52-4w7c-c8xp",
+      "package": "http-cache-semantics",
+      "max_severity": "high",
+      "path_prefixes": [
+        ".>plasmo>@plasmohq/parcel-config>@plasmohq/parcel-resolver>got>cacheable-request>http-cache-semantics",
+        ".>plasmo>got>cacheable-request>http-cache-semantics"
+      ],
+      "expires_on": "2026-11-22",
+      "reason": "The advisory has no patched release. The flaw is cross-user disclosure from a shared HTTP cache; here the package sits under Plasmo's got client on a single build machine and serves no other user.",
+      "mitigation": "Build-time only; the extension bundle does not contain it and the extension source has no remote URL imports for the resolver to fetch. Track a patched release or a Plasmo upgrade that drops got."
+    },
+    {
+      "ecosystem": "pnpm",
+      "advisory_id": "GHSA-vfj7-8cjw-p6xm",
+      "package": "braces",
+      "max_severity": "high",
+      "path_prefixes": [
+        ".>plasmo>",
+        ".>vite>",
+        ".>vitest>"
+      ],
+      "expires_on": "2026-11-22",
+      "reason": "The advisory has no patched release. Stack exhaustion needs attacker-controlled, deeply nested glob patterns; braces is reached only through build and test tooling (Plasmo's Parcel watcher, fast-glob and chokidar, and Sass under Vite and Vitest), which expand patterns from repository configuration.",
+      "mitigation": "Build and test tooling only, never bundled into the extension; the worst case is a failed build or test run. Track a patched braces or micromatch release."
     }
   ]
 }

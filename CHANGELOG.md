@@ -4,9 +4,28 @@ All notable changes to Cortex. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [v0.5.0] — 2026-10-09
 
-### Correctness and reliability
+Version 0.5.0 carries two passes over the v0.4.0 source. The October
+refinement, listed first, makes behavioral evidence honest about missing input
+and missing time, and makes Stop, Review and the browser surfaces report what
+actually happened. The September audit cycle that follows re-verified the
+sixty-seven findings that survived adversarial review.
+
+### Security — advisories published before the release
+
+- Pin patched releases: `sharp` 0.35.5 (GHSA-wq5f-xc86-pv6w), `source-map-js`
+  1.2.2 (GHSA-68fv-2mgg-jv7q), Vue 3.5.42 for Plasmo's dormant Vue transformer
+  (GHSA-g2v6-rqmx-r4w6), and `handlebars` 4.7.10 (GHSA-8r5x-fm3f-whwj,
+  GHSA-p8wg-vrv2-v86f, GHSA-xw65-4hp5-5hc7).
+- Move the editor packager to `@vscode/vsce` 4.0.0, which globs with
+  `tinyglobby` and so no longer reaches `braces`.
+- `braces` (GHSA-vfj7-8cjw-p6xm) and `http-cache-semantics`
+  (GHSA-ch52-4w7c-c8xp) have no patched release. Both are reached only through
+  browser build and test tooling and never ship; they are carried as reviewed
+  exceptions that expire on 2026-11-22.
+
+### October refinement — correctness and reliability
 
 - Qualify behavioral telemetry by actual mouse/keyboard source availability;
   restart exposure after acquisition gaps and require observed typing intervals.
@@ -26,7 +45,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Patch audited Python and VS Code dependency vulnerabilities within supported
   major versions; preserve reviewed browser build-tool exceptions explicitly.
 
-### Interaction and visual refinement
+### October refinement — interaction and visual refinement
 
 - Share fresh, finite signal presentation across popup and Pulse Room, including
   newly opened surfaces; clear stale and disconnected measurements.
@@ -37,7 +56,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Add an explicit dashboard Review suggestion route with bounded lifetime and
   keyboard focus while preserving non-interruptive arrival.
 
-### Documentation
+### October refinement — documentation
 
 - Align both READMEs, architecture, model cards, calibration, APIs, privacy,
   security, setup, UI and release guides with the implemented behavior.
@@ -49,7 +68,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 See the [implementation and verification record](docs/implementation-2026-10.md)
 for demonstrated defects, research decisions, acceptance evidence and limits.
 
-## [v0.5.0] — 2026-09-19
+### September audit cycle
 
 A second full audit cycle over the v0.4.0 source. Thirteen review dimensions
 produced findings that were each judged by two independent skeptics — one

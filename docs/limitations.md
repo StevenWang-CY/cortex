@@ -210,7 +210,8 @@ attest those external settings. See the [privacy disclosure](../cortex/docs/priv
   change or adopt a compatible patched backend before it lapses.
 - **Dependency audit results are scoped snapshots.** The October local arm64
   Python and VS Code audits reported no known findings. The browser build
-  chain retains nine reviewed low/moderate exceptions in
+  chain retains eleven reviewed exceptions (nine low/moderate, two high
+  build-tool advisories with no patched release) in
   [`node-audit-exceptions.json`](../cortex/security/node-audit-exceptions.json),
   with advisory, path, mitigation, and expiry checks. The Intel-only Protobuf
   exception above is separate and high severity. A passing policy gate is not

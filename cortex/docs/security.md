@@ -145,7 +145,9 @@ deletion verification.
 
 The current local arm64 build passed dependency policy and mounted-artifact
 verification. Local arm64 Python and editor audits returned zero findings; the browser
-graph retains nine explicitly reviewed low/moderate exceptions. Those results
+graph retains eleven explicitly reviewed exceptions: nine low/moderate, and two
+high build-tool advisories (`braces`, `http-cache-semantics`) with no patched
+release, which never ship in the extension. Those results
 are a dated snapshot, not a claim that dependencies remain vulnerability-free.
 The Intel dependency branch retains its separate reviewed Protobuf exception,
 described in the [release guide](../../docs/release/README.md).

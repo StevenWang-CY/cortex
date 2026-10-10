@@ -71,11 +71,12 @@ explains the reproduced defects, alternatives considered, and final checks.
 - **Release boundary:** this run produced an ad-hoc arm64 development build.
   It did not publish a release, notarize the app, validate Intel hardware, or
   establish physical camera/TCC/VoiceOver or physiological accuracy results.
-  The release badge and download link describe published tags, not these
-  uncommitted changes.
+  The release badge and download link describe published tags, not unpublished
+  builds.
 - **Dependency status:** local arm64 Python and VS Code audits passed with no
-  findings at review time; the browser build chain retains nine reviewed
-  low/moderate exceptions. See [limitations](docs/limitations.md) and the
+  findings at review time; the browser build chain retains eleven reviewed
+  exceptions: nine low/moderate, and two high build-tool advisories with no
+  patched release. See [limitations](docs/limitations.md) and the
   [release requirements](docs/release/README.md).
 
 ---
