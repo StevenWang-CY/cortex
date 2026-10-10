@@ -1,6 +1,6 @@
 # Privacy and context disclosure
 
-Last implementation review: 2026-08-25. Disclosure contract:
+Last implementation review: 2026-10-02. Disclosure contract:
 `context-disclosure-v1`.
 
 Cortex is local-first and network-off by default. Camera frames, face
@@ -10,6 +10,9 @@ separate, fail-closed mode in which the user previews one exact, redacted
 payload and confirms that payload once. Previewing does not contact a model
 provider, and a model response is a proposal—not authority to change the
 workspace.
+
+See the [current implementation record](../../docs/implementation-2026-10.md)
+for the evidence-continuity, interaction and verification scope.
 
 ## Planner modes
 
@@ -31,10 +34,18 @@ Changing the required disclosure revision invalidates an older
 acknowledgement. Every source selector defaults to false. Enabling external
 mode does not create standing permission to send future context.
 
+The desktop Settings flow implements this activation: select the external
+planner mode, acknowledge the current disclosure and save. The daemon applies
+the privacy configuration, clears any old prepared previews and rebuilds the
+planner. Provider credentials are a separate requirement. The **Review external
+context** sheet then selects sources, displays the exact preview and confirms
+one request; enabling the mode alone sends no workspace content. Returning to a
+local mode disables external context and clears the acknowledgement.
+
 ## Data flow
 
 ```text
-local sensors and workspace clients
+local workspace clients
               |
               v
      current in-memory TaskContext
@@ -63,6 +74,20 @@ shows the exact outbound `TaskContext`, generated prompt, byte count, field
 dispositions, redaction count, destination, model, and provider-retention
 caveat.
 
+## Local editor collection
+
+The connected VS Code extension sends the current file's full local path,
+visible range, symbol and diagnostics to the local daemon. Its
+`cortex.shareEditorContent` setting defaults to **true** and includes at most
+8,000 characters of visible code; turn it off in VS Code Settings to omit that
+code excerpt. Untitled documents require the separate
+`cortex.shareUntitledDocuments` opt-in. The extension reads no terminal output
+or command history.
+
+Local collection does not authorize an external request. External selectors
+still default to false, file paths are reduced to basenames, and selected text
+passes through the exact redacted preview and one-time confirmation below.
+
 ## Field catalog and selection
 
 `CONTEXT_FIELD_CATALOG` in
@@ -77,7 +102,7 @@ These are the selectable groups:
 | User goal | current goal and browser focus goal | bounded and secret-redacted |
 | Editor metadata | file basename, symbol, diagnostic severity/line | absolute path, visible range, diagnostic source/code |
 | Editor content | visible code and diagnostic messages | recent-edit history; bounded content only |
-| Terminal content | detected error summaries | command history, running command, and raw terminal lines |
+| Terminal content | detected error summaries if explicitly supplied; no shipping terminal producer | command history, running command, and raw terminal lines |
 | Browser metadata | bounded titles, URL origins, tab type, topic hint, aggregate counts | tab IDs and URL paths/query/fragment/userinfo |
 | Browser content | active-page excerpt | only after an exact per-origin browser grant; capped and redacted |
 | Learned preferences | bounded relevance preferences | no policy/research event ledger |
@@ -86,6 +111,12 @@ These are the selectable groups:
 The broker also preserves each field's origin and classification in the
 disclosure manifest. Text remains untrusted even after redaction; prompt
 instructions cannot grant a capability.
+
+The separately selected support estimate comes from behavioral inference,
+currently model `2.5.0` / `support-features-v2.2.0`. Camera pulse, blink and
+head/neck proxies cannot contribute to that score. Unavailable input channels
+remain missing evidence and may yield `unknown`; a disconnected input source
+must not be presented or disclosed as measured inactivity.
 
 ## Minimization and redaction
 

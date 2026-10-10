@@ -1,10 +1,15 @@
 # Troubleshooting
 
-Cortex ships as a macOS app (`Cortex.app` from the release DMG) whose daemon
+Cortex can be packaged as a macOS app (`Cortex.app` in a DMG) whose daemon
 runs in-process. Most people never need a terminal. The first half of this
 page is for the installed app; the second half is for developers running the
 source checkout. When a symptom looks the same in both, the installed-app
 guidance comes first.
+
+Check the build's provenance before applying release guidance. The October
+review built and verified a local ad-hoc arm64 artifact; that does not establish
+a public notarized release. The source checkout's `docs/implementation-2026-10.md`
+records what was verified and what still requires physical/release validation.
 
 ---
 
@@ -36,8 +41,15 @@ the camera.
 Cortex is a normal foreground app: it has a Dock icon, appears in Cmd-Tab,
 and its windows accept keyboard focus. If you see the menu-bar icon but no
 window, click the icon and choose **Dashboard**. If a window is visible but
-typing does nothing, you are running a pre-0.4.0 build that was packaged as a
-background-only process; update to the current release.
+typing does nothing, check the app version and bundle flags. Older builds were
+packaged as a background-only process; current builds require both
+`LSBackgroundOnly` and `LSUIElement` to be false. That historical bug is one
+possible cause, not a diagnosis of every focus failure.
+
+An arriving suggestion intentionally does not steal focus. Open the dashboard
+and choose **Review suggestion** to focus its available actions with the
+keyboard. That explicit review path is distinct from a dashboard window that
+cannot accept focus.
 
 ### Camera permission
 
@@ -82,28 +94,33 @@ dashboard states why a pulse is unavailable rather than showing a permanent
 warm-up: the window is still filling, coverage is below the gate, the light
 is too low, there is too much motion, or the face was lost. Sit facing the
 camera at arm's length with even light and no strong backlight. A steady
-low-frame-rate camera (for example in low light) is supported; the estimate
-just takes longer to become available.
+low-frame-rate camera may need a longer window, and pulse still remains
+unavailable if the quality/coverage gates cannot be met.
 
 ### Status stays "Still gathering" or "Not enough evidence"
 
 Support estimates come from input and window telemetry (mouse, keyboard,
 focus transitions), not from the camera. They require:
 
-- **Input Monitoring / Accessibility** permission for Cortex, otherwise
-  mouse and keyboard aggregates are unavailable and the estimate stays
-  `unknown`. Grant both in `System Settings → Privacy & Security`.
-- **Enough evidence coverage**: at least three input channels with fresh
-  data. A quiet stretch of reading or watching legitimately yields
-  "Not enough evidence".
+- **Observable input sources**: inspect Input Monitoring/Accessibility and
+  the acquisition status. A stopped or denied keyboard/mouse/window source is
+  missing evidence, not measured inactivity. Partial availability can still
+  yield a result only if the remaining evidence meets the model's gates.
+- **Enough fresh evidence and exposure**: each feature has readiness and
+  coverage requirements. A quiet stretch of reading or watching can legitimately
+  yield “Not enough evidence.” Restoring a source starts a new exposure window.
+- **Continuity**: observations must continue. The smoother ignores duplicate
+  or regressed times and resets accumulated evidence/dwell after gaps above
+  three seconds; time spent disconnected does not satisfy a waiting period.
 
 There is no camera-only mode and the camera cannot raise or lower a support
-score. Calibration only sets your personal mouse-variance baseline.
+score. The scorer uses the personal mouse-variance baseline; calibration can
+also record camera/acquisition diagnostics, which do not validate support labels.
 
 ### Too many or too few suggestions
 
-- Adjust the **suggestion threshold** in Settings. Cortex 0.4.0 honours the
-  configured value; earlier builds silently clamped anything below 0.75.
+- Adjust the **suggestion threshold** in Settings. Current builds honor the
+  configured value; historical builds silently clamped anything below 0.75.
 - Use **Snooze**, **Quiet for this session**, or **Pause** from the menu bar
   or dashboard. Weekly schedule "quiet" slots are honoured.
 - Dismissing several suggestions in a row pauses suggestions for a bounded
@@ -142,6 +159,29 @@ camera and the app. It then asks the app to stop gracefully with the local
 capability token, waits for the app to finish its bounded shutdown, and only
 signals the Cortex process itself if the app has not exited. Browser and
 editor processes are never signalled.
+
+“Stopping…” remains pending until the worker gets a verified helper result.
+A missing endpoint, sticky Stop intent or elapsed two seconds is not success.
+The browser first drains a launch already in progress, then runs the ordered
+graceful/native path. The popup's 150-second watchdog covers that sequence;
+reopening the popup also has the same bound. An error offers **Retry stop**
+without claiming the camera is off. Start/Open is rejected while Stop is active.
+See [Browser extension](Browser-Extension) for the exact stages and budgets.
+
+### Pulse Room shows an old value, no motion or a short-window layout
+
+The popup and Pulse Room clear values on disconnect and expire the state after
+ten seconds without a new update. “Waiting for fresh signals” means the page is
+waiting for new evidence; rereading the cache does not renew the sample.
+Capture/face failure and explicit pulse-unavailable reasons hide affected values
+even while behavioral support is available.
+
+Check **Pause motion**, the system Reduced Motion preference and whether the tab
+is visible. All three intentionally stop the canvas loop. The pause choice
+persists until **Resume motion**; it does not pause acquisition. If new-tab
+override is disabled, restore it from the page or popup settings. Short windows
+scroll vertically and resume cards scroll within their row; controls are not
+anchored outside the viewport.
 
 ### History is empty
 
@@ -186,16 +226,19 @@ The locked environment is not active:
 
 ```bash
 uv sync --project cortex --locked --extra dev --extra codegen
-uv run --project cortex --locked --extra dev python -m cortex.scripts.run_dev
+uv run --project cortex --locked --extra dev --extra codegen python -m cortex.scripts.run_dev
 ```
 
 ### Daemon starts then exits
 
 Check the log output for the specific error. Common causes:
 
-- Missing `.env`: `cp cortex/.env.example .env`
-- Missing storage directory: `python -m cortex.scripts.seed_config --root .`
-- A hard-coded `CORTEX_CAPTURE__DEVICE_ID` in `.env`; leave it unset.
+- Conflicting runtime hosts: use either `make dev` plus the unflagged desktop
+  client, or desktop `--in-process`, not both daemon owners on the same ports.
+- An unwritable/configured storage path; `make setup` seeds the source layout.
+- A hard-coded `CORTEX_CAPTURE__DEVICE_ID` or other override in `.env`, the
+  environment or configuration. The optional `.env` template is not required
+  for default startup; missing it alone is not a failure.
 
 ### Camera permission for a source run
 
@@ -208,7 +251,7 @@ camera access for that path.
 ### Enumerate cameras without opening any
 
 ```bash
-uv run --project cortex --locked --extra dev python - <<'PY'
+uv run --project cortex --locked --extra dev --extra codegen python - <<'PY'
 from cortex.services.capture_service.webcam import _list_macos_video_devices
 
 for device in _list_macos_video_devices():
@@ -227,21 +270,30 @@ wake Continuity Camera. `system_profiler` order does not match AVFoundation.
 
 ### Camera light stays on after a source daemon exits
 
-```bash
-pkill -f "cortex.scripts.run_dev"
-```
-
-If a listener is still bound, find only the listening process (never both
-socket ends):
+First stop the process from its terminal with Ctrl+C. For an orphaned source
+daemon, use the project's bounded, authenticated stop helper from the checkout:
 
 ```bash
-lsof -ti tcp:9473 -sTCP:LISTEN | xargs kill
+uv run --project cortex --locked --extra dev --extra codegen python -c 'from cortex.scripts.launcher_agent import stop_daemon; print(stop_daemon())'
 ```
+
+Read its result: `error` means exit was not confirmed. The helper checks the
+daemon pidfile, listening sockets and anchored executable identity, excludes
+its own process/parent and verifies exit after escalation. For read-only
+inspection of a remaining WebSocket listener:
+
+```bash
+lsof -nP -iTCP:9473 -sTCP:LISTEN
+```
+
+Do not turn an unverified port listing into a kill command: connected browser
+and editor processes also have socket entries, and a listener alone does not
+prove the intended executable's identity.
 
 ### Native host for a source checkout
 
 ```bash
-uv run --project cortex --locked --extra dev python -m cortex.scripts.install_native_host
+uv run --project cortex --locked --extra dev --extra codegen python -m cortex.scripts.install_native_host
 ```
 
 The installer patches the host's shebang to the absolute virtual-environment
@@ -257,20 +309,24 @@ Verify you are running native ARM Python, not Rosetta:
 python3 -c "import platform; print(platform.machine())"   # arm64
 ```
 
-Then re-run `uv sync --locked`; MediaPipe's capped OpenCV dependency is the
+Then re-run `uv sync --project cortex --locked --extra dev --extra codegen`;
+MediaPipe's capped OpenCV dependency is the
 sole `cv2` provider in the lock, so mixing a separately installed OpenCV
 breaks imports.
 
 ### pynput / Accessibility errors
 
 Add your terminal app to `System Settings → Privacy & Security → Input
-Monitoring`. Without it the daemon starts, but input telemetry is unavailable
-and the support estimate stays `unknown`; there is no camera-only fallback.
+Monitoring` and check Accessibility as needed for the active input source.
+The daemon can start when a source is unavailable, but that source contributes
+no behavioral evidence. Insufficient coverage produces `unknown`; there is no
+camera-only inference fallback. After granting permission, restart the affected
+source host so its listeners can initialize.
 
 ### Verbose logs
 
 ```bash
-CORTEX_LOGGING__LEVEL=DEBUG uv run --project cortex --locked --extra dev python -m cortex.scripts.run_dev 2>&1 | tee ~/cortex.log
+CORTEX_LOGGING__LEVEL=DEBUG uv run --project cortex --locked --extra dev --extra codegen python -m cortex.scripts.run_dev 2>&1 | tee ~/cortex.log
 ```
 
 ---

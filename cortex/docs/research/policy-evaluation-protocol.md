@@ -3,6 +3,14 @@
 Status: implementation contract for policy lifecycle v2. This is not a claim
 that Cortex improves cognition, health, productivity, or any distal outcome.
 
+The [current implementation record](../../../docs/implementation-2026-10.md)
+and [support model card](../../../docs/model-cards/deterministic-support-v2.md)
+define the shipping measurement and eligibility boundary. Research assignment
+does not relax input-source availability, temporal continuity, quiet mode or
+authorization requirements. Freeze the application revision, behavioral model,
+configuration and calibration with the epoch; the behavioral code digest alone
+does not identify the entire policy or proposal path.
+
 ## Evidence boundary
 
 Cortex has two deliberately separate policy modes:

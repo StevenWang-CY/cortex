@@ -15,6 +15,12 @@ Unsupported HRV, LF/HF, respiration, breath-pause, stress-integral, and
 physiology-triggered-break fields remain unavailable regardless of calibration.
 Camera features remain excluded from the production support score.
 
+Mouse samples enter the measured baseline only while the mouse source is
+available. A stationary, observed mouse can legitimately contribute zero;
+unstarted hooks, denied permissions and failed listeners cannot. This rule
+matches production feature fusion, which distinguishes missing evidence from
+observed inactivity.
+
 ## Validity contract
 
 A profile records schema/algorithm version, source device identity, measured
@@ -22,6 +28,12 @@ duration, missing fraction, quality summaries, clock provenance, and creation
 time. Synthetic/simulated fallback cannot be saved as a measured profile. A
 new profile is committed atomically only after review; cancel/failure preserves
 the previous profile. Reload verifies the exact committed profile ID.
+
+Acquisition/profile versions and the production behavioral model version are
+separate. Model `2.5.0` uses feature schema `support-features-v2.2.0`; calibrating
+does not train that model or validate its labels. The production scorer uses
+the calibrated mouse-variance baseline where applicable; measured camera
+diagnostics do not gain authority over support or reading-check-in eligibility.
 
 Camera opening follows macOS-specific safeguards: automatic selection unless a
 device override is explicit, live re-enumeration after open to reject a

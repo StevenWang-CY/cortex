@@ -436,7 +436,8 @@ class OverlayWindow(QWidget):
         _set_accessible_description(
             self,
             "A non-blocking suggestion from Cortex. It does not take focus; "
-            "press Escape after clicking into it, or use the × button, to dismiss.",
+            "choose Review suggestion in the dashboard to use the keyboard, "
+            "then press Escape or use the close button to dismiss.",
         )
 
         # Notification width: the popup token (380 px). Height follows the
@@ -486,6 +487,14 @@ class OverlayWindow(QWidget):
         self._stop_presentation_timers()
         super().hideEvent(event)
 
+    def focus_for_review(self) -> None:
+        """Focus only after an explicit user Review gesture, never on arrival."""
+        if not self.isVisible() or self._dismissed or not self._intervention_id:
+            return
+        self.raise_()
+        self.activateWindow()
+        self._dismiss_btn.setFocus(Qt.FocusReason.OtherFocusReason)
+
     def suppress(self) -> None:
         """Hide without recording a user decision (pause / restore).
 
@@ -496,6 +505,12 @@ class OverlayWindow(QWidget):
         """
         self._stop_presentation_timers()
         self.hide()
+
+    def retire_suggestion(self) -> None:
+        """Remove a finished/expired proposal and invalidate queued gestures."""
+        self.suppress()
+        self._dismissed = True
+        self._intervention_id = ""
 
     def _stop_presentation_timers(self) -> None:
         for timer_name in ("_timeout_timer", "_feedback_reveal_timer"):

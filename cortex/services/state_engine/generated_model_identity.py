@@ -9,9 +9,16 @@ from __future__ import annotations
 
 SUPPORT_MODEL_MANIFEST_SCHEMA_VERSION = "1.0"
 SUPPORT_MODEL_COMPONENT_SHA256: tuple[tuple[str, str], ...] = (
-    ("services/state_engine/feature_schema.py", "f39ce3edd890e527d5f5cbee61b75234044cf35ff21ae8cd0ae2a4c0b9cee169"),
-    ("services/state_engine/model_registry.py", "5903749b56fd18396dc29de849599c40bd9bb42c7c8f8c77073df154830ea0b3"),
+    ("libs/schemas/features.py", "cc4e5bf2c26a8e488489fb932be28777bc3861e5b30f42f6a3f3fe58b5f9487c"),
+    ("services/telemetry_engine/input_hooks.py", "bc910d386a9ba4facf6022e17c8cf9670fc8954fb2748ef21e0b97a3558ebc7e"),
+    ("services/telemetry_engine/window_tracker.py", "da69f332964ba5858b5395e7f1f437fb7f313ae964f1ca9bc2d916bfe851ada1"),
+    ("services/telemetry_engine/feature_aggregator.py", "6cd0529a7a13ffa5922381b19b1383e17cf13c3828f83352b773ceda7de9eb6f"),
+    ("services/telemetry_engine/focus_graph.py", "48554223aa7dc7cb297b59faf7024a79c1e8321b2c78269488c6763157181796"),
+    ("services/state_engine/feature_fusion.py", "d1b7a38068e5f74ee0b1a085f62bfd59581e9311d74763b695318b4716c52a21"),
+    ("services/state_engine/smoother.py", "67d374eb332a49aac4c718ab766e516fc9f148e3ba1eb888209a88b9a05ccc21"),
+    ("services/state_engine/feature_schema.py", "2210669bd41268c3ab6085c58cb5ab377e70ed6e68a886415f23f24a2c693e3b"),
+    ("services/state_engine/model_registry.py", "5e8efbd0950254a05145ae7d07151b5c8c9d22b296d27a3a58b70aea9ccf37e3"),
     ("services/state_engine/rule_scorer.py", "750e58deff2a1795f3ae6609fcff9a226cf17bf0827e0bd9fa86adda89cdbf83"),
     ("services/state_engine/support_inference.py", "ece651792ebb197b722521430f5f5e8b8b3a48d8d3d458b716ad84db2004aa42"),
 )
-DETERMINISTIC_SUPPORT_IMPLEMENTATION_SHA256 = "eb430811c1c014f38660f2e902d700de95fca369f942006a1c66cae1bf9ced19"
+DETERMINISTIC_SUPPORT_IMPLEMENTATION_SHA256 = "813005f67b7bd789bf89f17d2b86ac9c611e55b3dbf46037a0e3c007da4a13d8"

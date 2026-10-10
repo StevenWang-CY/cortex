@@ -479,10 +479,11 @@ Respiration: {extra_context}
 # plan, and the plan was shaped around a quiz that would never appear — so
 # the headline and the steps the user actually saw were written for the
 # wrong intervention. Asking for what this pipeline can deliver is what
-# makes the detection useful, and the detection itself is sound.
+# keeps the suggestion aligned with the observed evidence.
 _ACTIVE_RECALL = """\
-The user has been passively reading for an extended period (zombie-reading detected). \
-They are scrolling slowly with minimal interaction — likely not absorbing the content.
+Recent observed input has been quiet while a browser is foreground. \
+This does not establish whether the user is reading, understanding, or needs help. \
+Offer an optional reading check-in without judging attention or comprehension.
 
 Do NOT quiz them and do NOT propose blocking, blurring, or hiding the page. \
 Propose a way back into active engagement with THIS material, grounded in the \
@@ -504,8 +505,9 @@ State: {state} (confidence {confidence:.0%}, dwelling {dwell:.0f}s)
 """
 
 _RABBIT_HOLE_PROMPT = """\
-The user has drifted from their session goal. They set out to work on one thing \
-but have been deep in unrelated code/content for an extended period.
+The foreground file or active page title has had little keyword overlap with \
+the session goal for an extended period. Keyword overlap cannot establish intent \
+or relevance; offer an optional goal check-in without asserting the user is off-task.
 
 Goal: {goal_hint}
 Current context (what they're actually doing):

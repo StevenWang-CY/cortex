@@ -331,9 +331,14 @@ def stop_daemon() -> dict:
 
     result = launcher_agent.stop_daemon(log=log)
     log(f"stop chain finished: {result}")
-    # A daemon that was never running is "stopped" from the extension's
-    # point of view; only an exception maps to ``error`` (see ``main``).
-    return {"status": "stopped"}
+    # Preserve unsuccessful verification, including denied OS signals. A
+    # requested stop must never become a success merely by crossing transports.
+    if result.get("status") in {"stopped", "not_running"}:
+        return {"status": "stopped"}
+    return {
+        "status": "error",
+        "error": str(result.get("error") or "Could not confirm daemon exit.")[:4096],
+    }
 
 
 def _get_auth_token_response() -> dict[str, object]:

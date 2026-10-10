@@ -10,10 +10,15 @@ telemetry, browser and editor context, and schema-validated planning. Its
 shipping authority boundary is deliberately narrow: proposals may be shown,
 but the default product does not restructure the workspace.
 
-The authoritative redesign and evidence audit is
-[`../IMPLEMENTATION.md`](../IMPLEMENTATION.md). That document distinguishes
-observed behavior, design decisions, research constraints, open risks, and
-promotion gates. This README describes the current product boundary.
+The current [implementation and verification record](../docs/implementation-2026-10.md)
+covers the completed evidence-continuity, runtime and interface refinement.
+[Earlier implementation history](../IMPLEMENTATION.md) remains available.
+This README describes the current package and product boundary.
+
+Application version remains `0.5.0`; behavioral model `2.5.0` uses
+`support-features-v2.2.0`. The October local arm64 build passed mounted-artifact
+startup/shutdown and same-profile restart checks. It is an ad-hoc development
+artifact, not a new published or notarized release.
 
 ## Safety and evidence status
 
@@ -47,28 +52,31 @@ or validated estimator of a person's cognitive state.
 ## Current runtime
 
 ```text
-camera + local activity + client context
-                 |
-                 v
-        quality-gated observations
-                 |
-                 v
-       heuristic support estimates
-                 |
-                 v
-      deterministic eligibility gates
-                 |
-                 v
-      schema-validated LLM/rule plan
-                 |
-                 v
-        non-mutating proposal UI
+observed input/window activity → availability + exposure + aggregation
+                                             |
+                                             v
+                             behavioral scoring + continuous dwell
+                                             |
+                                             v
+                                deterministic eligibility gates
+                                             |
+current workspace context ────────────────→ local plan
+                               or exact-preview external request
+                                             |
+                                             v
+                                  suggestion for user review
+
+optional camera → signal-quality gates → experimental diagnostic display
 ```
 
 The daemon runs FastAPI on `127.0.0.1:9472` and WebSocket on
 `127.0.0.1:9473`. An optional launcher listens on `127.0.0.1:9471`. The
-PySide6 desktop shell can host the daemon in-process. Chrome/Edge and VS Code
-clients connect over authenticated local transports.
+packaged PySide6 desktop shell hosts the daemon in-process and receives queued
+UI callbacks. The development shell can also connect as a WebSocket client.
+Chrome/Edge and VS Code connect over authenticated local transports. Internal
+services use the application kernel and ports; they do not require a network
+hop between every layer. Camera observations are excluded from production
+behavioral inference and cannot drive reading-reminder eligibility.
 
 ### Main components
 
@@ -77,11 +85,11 @@ clients connect over authenticated local transports.
 | `services/capture_service` | camera selection, timestamped frames, face/ROI and quality observations |
 | `services/physio_engine` | experimental rPPG pulse estimation; unsupported derived physiology is contained |
 | `services/kinematics_engine` | blink and head/neck proxy features |
-| `services/telemetry_engine` | local input/window and focus-transition telemetry |
-| `application` | typed kernel, command/event ports, bounded coordinators, and task ownership |
+| `services/telemetry_engine` | per-source availability, input exposure/intervals, current foreground window and focus transitions |
+| `application` | typed kernel/ports, deadline-bounded cancellation, live task ownership and bounded value-only diagnostic history |
 | `services/state_engine` | deterministic evidence-aware scoring, smoothing, eligibility, and compatibility decoders |
 | `services/context_engine` | browser/editor/terminal context assembly |
-| `services/llm_engine` | Anthropic transport, prompt construction, parsing, and deterministic fallback |
+| `services/llm_engine` | default local planner, privacy broker, preview-gated Anthropic transport, validation and deterministic fallback |
 | `services/intervention_engine` | manifest validation, exact authorization, receipts, verification, compensation, and restore |
 | `services/api_gateway` | authenticated HTTP/WebSocket boundary |
 | `apps/browser_extension` | Plasmo MV3 client and proposal UI |
@@ -104,9 +112,9 @@ requires an exact checksummed study epoch.
 | Surface | Product status |
 |---|---|
 | camera pulse/BPM | experimental, quality-gated wellness estimate |
-| blink rate and PERCLOS | time-based heuristic local feature; not externally validated |
-| head/neck pose proxy | heuristic local feature; not a shoulder/posture diagnosis |
-| input/window telemetry | local behavioral context |
+| blink rate and PERCLOS | local diagnostics only; not support-inference inputs or externally validated |
+| head/neck pose proxy | local diagnostics only; not support-inference inputs or a posture diagnosis |
+| input/window telemetry | observed local behavioral evidence; unavailable channels abstain |
 | HRV/RMSSD/SDNN/pNN50/LF-HF/entropy | unavailable in product mode |
 | respiration or “screen apnea” | unavailable in product mode |
 | stress integral / biology-driven break | unavailable and cannot trigger an action |
@@ -115,6 +123,33 @@ requires an exact checksummed study epoch.
 Compatibility fields and messages may remain decodable for one migration
 window. They are emitted as unavailable or ignored, never silently
 reinterpreted as evidence.
+
+Input silence is evidence only while the corresponding listener is available.
+Typing variance requires at least two positive regular-key intervals;
+backspaces do not satisfy that count. Nonincreasing timestamps are ignored by
+smoothing; gaps above three seconds reset scores and dwell. The model identity
+includes eleven telemetry/schema/fusion/smoothing/scoring components; it does
+not hash the entire runtime, configuration or intervention policy. See the
+[model card](../docs/model-cards/deterministic-support-v2.md) for precise scope.
+
+## Interface behavior
+
+- Dashboard, History and Advanced separate everyday controls from diagnostics.
+  Status rows wrap, compact content scrolls, and session controls stay reachable.
+- A pending suggestion offers **Review suggestion** from the dashboard. It
+  activates the exact current card only after the gesture, expires within its
+  original bounded lifetime, and clears on terminal lifecycle events.
+- Popup and Pulse Room share normalized fields and sample age; invalid values,
+  disconnects and ten seconds without updates clear current signal display.
+  This is a UI continuity bound, not physiological validation.
+- Pulse Room motion is decorative, with persisted pause and hidden/reduced-motion
+  cleanup. It is neither an ECG nor a heartbeat-paced breathing instruction.
+- Closing the dashboard keeps the menu-bar app running. **End session** stops
+  sensing and leaves Cortex open; explicit **Quit Cortex** completes cleanup
+  and exits. Browser **Stop Cortex** reports the verified helper outcome.
+
+The [UI contract](docs/ui-design.md) records tokens, keyboard/focus behavior,
+motion preferences and the application of Emil Kowalski's design principles.
 
 ## Workspace proposals and authority
 
@@ -136,13 +171,16 @@ the implemented manifest-bound transaction and explicit release enablement.
 ## LLM configuration and privacy
 
 Planning supports the Anthropic SDK through AWS Bedrock, Google Vertex AI, or
-the direct Anthropic API. `CORTEX_LLM__PROVIDER` selects the transport. The
-default fallback is deterministic rule-based planning.
+the direct Anthropic API. `CORTEX_LLM__PROVIDER` selects the transport, while
+the default planning mode remains local and makes no model-network call.
+Credentials do not grant permission to send workspace context. Deterministic
+rule-based planning is also the configured provider-failure fallback.
 
-LLM requests may contain selected workspace material such as file paths,
-diagnostics, terminal excerpts, tab titles/URLs, page excerpts, and the focus
-goal. They do not intentionally include raw camera frames or biometric feature
-values. Treat workspace text as potentially sensitive. Provider credentials
+Confirmed external requests may contain selected and minimized workspace
+material, such as file basenames, diagnostic summaries, selected code/page excerpts,
+tab titles and the focus goal. The exact redacted preview is authoritative;
+raw camera frames and biometric measurements are excluded. Treat workspace
+text as potentially sensitive. Provider credentials
 belong in environment configuration or macOS Keychain; never commit or bundle
 them.
 
@@ -165,32 +203,32 @@ cp cortex/.env.example .env  # optional overrides; generated lines are commented
 uv run --project cortex --locked --extra dev --extra codegen python -m cortex.scripts.run_dev
 ```
 
-Desktop shell:
+Choose one desktop arrangement; do not run two daemons on the same ports:
 
 ```bash
-uv run --project cortex --locked python -m cortex.apps.desktop_shell.main
-uv run --project cortex --locked python -m cortex.apps.desktop_shell.main --in-process
+# Attach to the daemon already running above.
+uv run --project cortex --locked --extra dev --extra codegen python -m cortex.apps.desktop_shell.main
+
+# Or stop that daemon first, then start a desktop app that owns its daemon.
+uv run --project cortex --locked --extra dev --extra codegen python -m cortex.apps.desktop_shell.main --in-process
 ```
 
 Browser extension:
 
+Run each integration block from the repository root:
+
 ```bash
-cd cortex/apps/browser_extension
-pnpm install --frozen-lockfile
-pnpm exec plasmo build
+(cd cortex/apps/browser_extension && pnpm install --frozen-lockfile && pnpm exec plasmo build)
 ```
 
-Load `build/chrome-mv3-prod/` from `chrome://extensions`. For Edge, run
-`pnpm exec plasmo build --target=edge-mv3` and load the Edge output directory.
+Load `cortex/apps/browser_extension/build/chrome-mv3-prod/` from
+`chrome://extensions`. For Edge, run `make ext-edge` from the repository root
+and load `cortex/apps/browser_extension/build/edge-mv3-prod/`.
 
 VS Code extension:
 
 ```bash
-cd cortex/apps/vscode_extension
-npm ci
-npm run compile
-npm test
-npm run package:vsix
+(cd cortex/apps/vscode_extension && npm ci && npm run compile && npm test && npm run package:vsix)
 ```
 
 ### Native messaging on macOS
@@ -204,7 +242,7 @@ installation is required.
 For a source checkout:
 
 ```bash
-uv run --project cortex --locked python -m cortex.scripts.install_native_host
+uv run --project cortex --locked --extra dev --extra codegen python -m cortex.scripts.install_native_host
 ```
 
 Fully quit the Chromium browser with Cmd+Q and relaunch it after installing or
@@ -241,18 +279,27 @@ See [`docs/apis.md`](docs/apis.md) for payloads and compatibility notes.
 
 ## Camera and lifecycle constraints
 
-- Leave `CORTEX_CAPTURE__DEVICE_ID` unset to use smart camera selection. A
-  configured value bypasses it.
+- Leave `CORTEX_CAPTURE__DEVICE_ID` unset for automatic camera preference and
+  ordering. An explicit index still requires live identity and post-open
+  verification; it cannot bypass Continuity Camera rejection.
 - AVFoundation indices can change when Continuity Camera appears. The runtime
   re-enumerates after open and rejects iPhone/iPad devices.
 - Built-in cameras can need roughly two seconds of warm-up; capture retries
   failed initial reads.
 - Shutdown releases the camera regardless of internal running flags and uses a
   bounded WebSocket → HTTP → native-host → SIGTERM → SIGKILL chain.
+- Stop drains an already-issued launch request, coalesces duplicate requests,
+  retains the authenticated WebSocket through graceful receipt/restore work,
+  and confirms success only after process verification. Native timeout remains
+  uncertain rather than starting an overlapping signal fallback. Recovery
+  snapshots persist even when stale suggestion presentation is cleared.
+- The desktop Quit filter is removed before final programmatic quit; Qt event
+  interception must never keep a stopped app alive.
 
 ## Schema and version governance
 
 Pydantic models in `libs/schemas` are canonical for daemon/client payloads.
+The generator updates declarations in both browser and VS Code integrations.
 
 ```bash
 uv run --project cortex --locked --extra codegen python -m cortex.scripts.generate_ts_schemas
@@ -263,24 +310,28 @@ uv run --project cortex --locked --extra codegen python -m cortex.scripts.genera
 surfaces are synchronized and checked with:
 
 ```bash
-uv run --project cortex --locked python -m cortex.scripts.sync_versions
-uv run --project cortex --locked python -m cortex.scripts.sync_versions --check
+uv run --project cortex --locked --extra dev --extra codegen python -m cortex.scripts.sync_versions --apply
+uv run --project cortex --locked --extra dev --extra codegen python -m cortex.scripts.sync_versions --check
 ```
 
 ## Verification
 
+The canonical Python gate includes coverage, wheel verification and isolated
+Qt tests. `make ci` is a useful subset of the hosted workflow; it does not run
+the browser/editor suites, packaging or all release checks.
+
 ```bash
-make lint
-make typecheck
-make test
+./cortex/scripts/run_python_gate.sh
 make codegen-check
 make version-check
+make contracts
 make audit
 
 cd cortex/apps/browser_extension
 pnpm exec tsc --noEmit
 pnpm test
 pnpm exec plasmo build
+pnpm exec plasmo build --target=edge-mv3
 
 cd ../vscode_extension
 npm ci
@@ -293,6 +344,12 @@ CI uses frozen Node dependency inputs, produces dependency-audit artifacts,
 checks schema/version drift, and packages both clients. Security exceptions
 must identify an exact advisory and dependency path, include mitigation, and
 expire; path drift or severity escalation fails the gate.
+
+The 2026-10-02 implementation run passed 3,305 Python tests, 360 browser tests
+and 131 VS Code tests, with 69.32% Python coverage. UBFC/PURE replay needs
+separately supplied datasets; physical camera/TCC/VoiceOver validation and
+notarization remain separate. Full commands and evidence are in the
+[current implementation record](../docs/implementation-2026-10.md).
 
 ## Build the macOS application
 
@@ -309,12 +366,12 @@ are never bundled.
 
 ## Documentation
 
-- [`../IMPLEMENTATION.md`](../IMPLEMENTATION.md) — full audit, target design,
-  evidence basis, work packages, risks, and definition of done
+- [Current implementation](../docs/implementation-2026-10.md) — research decisions,
+  completed work, exact bounds, verification and remaining external requirements
+- [Implementation history](../IMPLEMENTATION.md) — earlier audit and milestone records
 - [`docs/setup.md`](docs/setup.md) — source and app setup
 - [`docs/apis.md`](docs/apis.md) — HTTP/WebSocket contracts
-- [`docs/architecture.md`](docs/architecture.md) — current and target
-  architecture boundary
+- [`docs/architecture.md`](docs/architecture.md) — current ownership and architecture boundaries
 - [`docs/calibration.md`](docs/calibration.md) — current calibration limits
 - [`docs/adapters.md`](docs/adapters.md) — adapter development and authority
   constraints

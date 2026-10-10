@@ -4,6 +4,51 @@ All notable changes to Cortex. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Correctness and reliability
+
+- Qualify behavioral telemetry by actual mouse/keyboard source availability;
+  restart exposure after acquisition gaps and require observed typing intervals.
+- Reset temporal inference across discontinuities and ignore nonincreasing
+  observations. Version the expanded measurement/fusion/smoothing provenance.
+- Keep reading reminders behavior-only; use actual current editor/browser
+  context for goal-drift evaluation and abstain when it is absent.
+- Bound completed task diagnostics without retaining task results/tracebacks;
+  bound cancellation waits while keeping unfinished children owned.
+- Confirm browser Stop from the native process outcome, preserve the graceful
+  receipt/restore window, serialize repeated requests, and expose retryable
+  failure instead of declaring success after a fixed delay.
+- Drain interrupted launch requests before stopping; prevent stale camera-enable
+  callbacks and clear proposal presentation while retaining recovery records.
+- Let the committed Quit event reach Qt after the recap flow; keep ordinary
+  dashboard close distinct from Quit in both desktop hosts.
+- Patch audited Python and VS Code dependency vulnerabilities within supported
+  major versions; preserve reviewed browser build-tool exceptions explicitly.
+
+### Interaction and visual refinement
+
+- Share fresh, finite signal presentation across popup and Pulse Room, including
+  newly opened surfaces; clear stale and disconnected measurements.
+- Add persisted ambient-motion pause, complete hidden/reduced-motion/restore
+  lifecycle, responsive resume cards, and keyboard-operable quiet-mode radios.
+- Wrap desktop status/connection groups, preserve compact scrolling and pinned
+  session/onboarding controls, and repair settings permission/schedule layouts.
+- Add an explicit dashboard Review suggestion route with bounded lifetime and
+  keyboard focus while preserving non-interruptive arrival.
+
+### Documentation
+
+- Align both READMEs, architecture, model cards, calibration, APIs, privacy,
+  security, setup, UI and release guides with the implemented behavior.
+- Refresh the local wiki, contributor guidance and documentation index; preserve
+  commit-bound audit results and historical plans as historical evidence.
+- Replace outdated README examples with inspected current UI captures, explicitly
+  labeling synthetic fixtures and the limits of local build verification.
+
+See the [implementation and verification record](docs/implementation-2026-10.md)
+for demonstrated defects, research decisions, acceptance evidence and limits.
+
 ## [v0.5.0] — 2026-09-19
 
 A second full audit cycle over the v0.4.0 source. Thirteen review dimensions

@@ -2,7 +2,13 @@
 
 ## Install a published release
 
-1. Choose the arm64 or x86_64 DMG for your Mac from the GitHub release.
+Use this path for a release that actually includes the matching artifact and
+verification records. A source checkout or locally built DMG is not evidence
+that a signed release was published. The October review produced a verified
+local ad-hoc arm64 build; notarization and Intel release validation remain
+separate requirements.
+
+1. Choose the available arm64 or x86_64 DMG matching your Mac from the GitHub release.
 2. Verify its matching `SHA256SUMS-<arch>` line and GitHub attestation; optionally run `stapler`
    and `spctl` as shown in the [release guide](https://github.com/StevenWang-CY/cortex/blob/main/docs/release/README.md).
 3. Mount the DMG and drag Cortex to `/Applications`.
@@ -39,27 +45,43 @@ cd cortex
 make setup
 make precommit
 cp cortex/.env.example .env  # optional; every generated setting is commented
-make dev
 ```
 
 `make setup` uses `uv sync --locked`, `pnpm install --frozen-lockfile`, and
 `npm ci`. Do not replace them with unconstrained installs when diagnosing a
 release issue.
 
-Desktop shell:
+Choose one runtime arrangement. For the same in-process daemon ownership used
+by the packaged app:
 
 ```bash
-uv run --project cortex --locked python -m cortex.apps.desktop_shell.main
-uv run --project cortex --locked python -m cortex.apps.desktop_shell.main --in-process
+uv run --project cortex --locked --extra dev --extra codegen python -m cortex.apps.desktop_shell.main --in-process
 ```
+
+Alternatively, start the daemon with `make dev`, then run its desktop client in
+a second terminal:
+
+```bash
+uv run --project cortex --locked --extra dev --extra codegen python -m cortex.apps.desktop_shell.main
+```
+
+The unflagged desktop command connects over WebSocket; it does not own a second
+daemon. Do not run `make dev` alongside the in-process host on the same ports.
+Close hides the dashboard while the session continues; explicit Quit performs
+shutdown. Ending a focus session leaves the app running.
 
 Browser and native host:
 
 ```bash
 make ext
 make ext-edge
-uv run --project cortex --locked python -m cortex.scripts.install_native_host
+uv run --project cortex --locked --extra dev --extra codegen python -m cortex.scripts.install_native_host
 ```
+
+Load the corresponding `cortex/apps/browser_extension/build/chrome-mv3-prod`
+or `edge-mv3-prod` directory with **Load unpacked** on the browser's extensions
+page. After installing/updating the native host, fully quit that browser with
+Cmd+Q and reopen it; an extension reload is insufficient.
 
 ## Configuration
 
@@ -98,10 +120,15 @@ target only `com.cortex.daemon`.
 ```bash
 make contracts
 make ci
-cd cortex/apps/browser_extension && pnpm exec tsc --noEmit && pnpm test
-cd ../vscode_extension && npm run compile && npm test
+(cd cortex/apps/browser_extension && pnpm exec tsc --noEmit && pnpm test)
+(cd cortex/apps/vscode_extension && npm run lint && npm run compile && npm test)
 ```
 
 The Python gate isolates the Qt desktop test process because loading PySide6
 after other native scientific/macOS libraries can crash the interpreter during
 collection. See [Troubleshooting](Troubleshooting) for lifecycle issues.
+
+Tests use an isolated HOME before importing Cortex; keep that isolation intact.
+They must not overwrite a real profile, calibration or native-host registration.
+Build locally with `make dmg`; the release guide governs Developer ID signing,
+notarization, provenance and publication separately.

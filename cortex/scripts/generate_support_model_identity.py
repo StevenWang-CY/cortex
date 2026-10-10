@@ -28,6 +28,13 @@ _OUTPUT = _PROJECT / "services" / "state_engine" / "generated_model_identity.py"
 # Paths are relative to the distributable Python project so the resulting
 # manifest is independent of checkout location, username, and build machine.
 IMPLEMENTATION_COMPONENTS: tuple[str, ...] = (
+    "libs/schemas/features.py",
+    "services/telemetry_engine/input_hooks.py",
+    "services/telemetry_engine/window_tracker.py",
+    "services/telemetry_engine/feature_aggregator.py",
+    "services/telemetry_engine/focus_graph.py",
+    "services/state_engine/feature_fusion.py",
+    "services/state_engine/smoother.py",
     "services/state_engine/feature_schema.py",
     "services/state_engine/model_registry.py",
     "services/state_engine/rule_scorer.py",

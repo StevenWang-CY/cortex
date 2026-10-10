@@ -9,6 +9,8 @@
 
 import { reduceApplyResults, type ApplyOutcome } from "./lib/apply-state";
 import { BadgeState } from "./lib/badge-state";
+import { stopDaemon, NATIVE_STOP_TIMEOUT_MS, type StopResult, type StopStatus } from "./lib/daemon-stop";
+import { statePresentationFields } from "./lib/state-presentation";
 import {
     isDistractionBlockedRequest,
     isTerminalUserAction,
@@ -246,6 +248,11 @@ let sequence = 0;
 // again (or a launch succeeds). While set, neither the keepalive alarm nor a
 // worker restart reconnects, so a stop cannot be undone by the reconnect loop.
 let stopRequested = false;
+let stopStatus: StopStatus = "idle";
+let stopError: string | null = null;
+let stopInFlight: Promise<StopResult> | null = null;
+let launchInFlight: Promise<LaunchResult> | null = null;
+let lifecycleGeneration = 0;
 const STOP_REQUESTED_KEY = "cortex_stop_requested";
 // Close bookkeeping for the connectivity diagnostic: a socket that opened and
 // was then closed by the daemon with a policy code is a handshake failure; a
@@ -297,6 +304,11 @@ function withWireMetadata(msg: WSMessage): WSMessage {
 // DAEMON_WS_URL, DAEMON_HTTP_URL, LAUNCHER_HTTP_URL — imported from "./config"
 
 let currentState: CortexState | null = null;
+let currentStateReceivedAt: number | null = null;
+
+function currentStateAgeMs(): number | null {
+    return currentStateReceivedAt === null ? null : Math.max(0, performance.now() - currentStateReceivedAt);
+}
 
 /**
  * F16: active intervention is now an atomic swap by correlation_id.
@@ -1065,6 +1077,8 @@ function connect(): void {
 
 function disconnect(): void {
     intentionalDisconnect = true;
+    currentState = null;
+    currentStateReceivedAt = null;
     if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
@@ -1089,14 +1103,121 @@ async function setStopIntent(): Promise<void> {
     broadcastToPopup({ type: "STOP_INTENT", stopRequested: true });
 }
 
+function publishStopStatus(status: StopStatus, error: string | null = null): void {
+    stopStatus = status;
+    stopError = error;
+    broadcastToPopup({ type: "STOP_STATUS", status, error });
+}
+
+function stopCortex(correlationId?: string): Promise<StopResult> {
+    if (stopInFlight) return stopInFlight;
+    lifecycleGeneration++;
+    const pendingLaunch = launchInFlight;
+    publishStopStatus("stopping");
+    stopInFlight = (async () => {
+        await setStopIntent();
+        // A launch request already handed to a helper can still create the
+        // process. Observe its bounded result before discovering/stopping that
+        // process; the generation guard prevents further launch stages.
+        if (pendingLaunch) await pendingLaunch;
+        stopFocusSession();
+        let authToken: string | null = null;
+        try { authToken = await getAuthToken(); } catch { /* helper reads local token */ }
+        const headers: Record<string, string> = authToken
+            ? { "X-Cortex-Auth-Token": authToken } : {};
+        const result = await stopDaemon({
+            graceful: async () => {
+                if (ws && connected) {
+                    send({
+                        type: "SHUTDOWN",
+                        payload: authToken ? { auth_token: authToken } : {},
+                        timestamp: Date.now() / 1000,
+                        sequence: ++sequence,
+                        correlation_id: correlationId,
+                    });
+                    await new Promise((resolve) => setTimeout(resolve, 300));
+                }
+                // Keep the authenticated socket available for the daemon's
+                // receipt-backed restoration until it finishes shutting down.
+                await fetch(`${DAEMON_HTTP_URL}/shutdown`, {
+                    method: "POST", headers, signal: AbortSignal.timeout(3_000),
+                });
+            },
+            health: async () => {
+                try {
+                    await fetch(`${DAEMON_HTTP_URL}/health`, {
+                        cache: "no-store", signal: AbortSignal.timeout(1_000),
+                    });
+                    return true; // 401/503 also mean a listener is still there.
+                } catch (error) {
+                    // Fetch cannot prove process exit. A missing endpoint only
+                    // ends polling; the native/launcher path still verifies it.
+                    return !(error instanceof TypeError);
+                }
+            },
+            nativeStop: async () => {
+                const result = await sendNativeHostMessage(
+                    { command: "stop" }, { timeoutMs: NATIVE_STOP_TIMEOUT_MS },
+                );
+                if (result.command !== "stop") throw new Error("unexpected_stop_response");
+                return result;
+            },
+            launcherStop: async () => {
+                const response = await fetch(`${LAUNCHER_HTTP_URL}/stop`, {
+                    method: "POST", headers,
+                    signal: AbortSignal.timeout(NATIVE_STOP_TIMEOUT_MS),
+                });
+                if (!response.ok) throw new Error(`launcher_stop_${response.status}`);
+                const result = await response.json() as { status?: unknown; error?: unknown };
+                return {
+                    status: typeof result.status === "string" ? result.status : "error",
+                    error: typeof result.error === "string" ? result.error : undefined,
+                };
+            },
+            now: () => performance.now(),
+            sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+        });
+        publishStopStatus(result.ok ? "stopped" : "error", result.ok ? null : result.error);
+        return result;
+    })().catch((): StopResult => {
+        const error = "Could not confirm shutdown. Open Cortex to check, or retry.";
+        publishStopStatus("error", error);
+        return { ok: false, error };
+    }).finally(async () => {
+        disconnect();
+        currentState = null;
+        interventionPresentation.clear();
+        setInterventionBadge(false);
+        broadcastToPopup({ type: "OVERLAY_DISMISSED", intervention_id: null });
+        // Removing an injected panel is presentation cleanup, not a workspace
+        // restore; tab mutations still require their durable inverse receipts.
+        void removeOverlaysEverywhere().catch(() => undefined);
+        try {
+            // A proposal is presentation, not a recovery receipt. Do not let
+            // GET_STATE resurrect it after a forced or unconfirmed shutdown.
+            await chrome.storage.session.remove([
+                "cortex_active_intervention",
+                "cortex_active_intervention_cid",
+                "cortex_active_intervention_mounted_at",
+            ]);
+        } catch { /* hydration also respects the sticky stop intent */ }
+        // Preserve durable tab/transaction snapshots for restart restoration.
+        stopInFlight = null;
+    });
+    return stopInFlight;
+}
+
 /** The user pressed Start: reconnects may resume. */
 async function clearStopIntent(): Promise<void> {
     if (!stopRequested) return;
     stopRequested = false;
+    publishStopStatus("idle");
     try {
         await chrome.storage.session.remove(STOP_REQUESTED_KEY);
     } catch { /* session storage unavailable */ }
-    broadcastToPopup({ type: "STOP_INTENT", stopRequested: false });
+    // A newer Stop may have arrived while storage removal was pending.
+    // Never publish that older Start as the current lifecycle intent.
+    if (!stopRequested) broadcastToPopup({ type: "STOP_INTENT", stopRequested: false });
 }
 
 function send(msg: WSMessage): void {
@@ -1141,6 +1262,8 @@ function sendInterventionApplied(
 
 function handleDisconnect(closeCode: number | null = null): void {
     ws = null;
+    currentState = null;
+    currentStateReceivedAt = null;
     const wasOpen = socketWasOpen;
     socketWasOpen = false;
     lastCloseCode = closeCode;
@@ -1445,12 +1568,15 @@ async function handleMessage(raw: string): Promise<void> {
                 signal_quality: msg.payload.signal_quality,
                 dwell_seconds: msg.payload.dwell_seconds,
                 reasons: msg.payload.reasons,
+                ...statePresentationFields(msg.payload),
             };
+            currentStateReceivedAt = performance.now();
             updateFocusSession(msg.payload);
             checkHealthAlerts(msg.payload);
             broadcastToPopup({
                 type: "STATE_UPDATE",
-                payload: msg.payload,
+                payload: currentState,
+                stateAgeMs: 0,
                 focusSession: focusSession ? getFocusSessionSnapshot() : null,
             });
             // Forward to all content scripts for ambient effects
@@ -2150,20 +2276,38 @@ interface LaunchResult {
  * dispatch to the same SW's onMessage listener, so the previous
  * "Open" button was a no-op.
  */
-async function runLaunchCortex(): Promise<LaunchResult> {
+function runLaunchCortex(): Promise<LaunchResult> {
+    // Notifications invoke this helper directly, bypassing onMessage guards.
+    if (stopInFlight) {
+        return Promise.resolve({ ok: false, status: "error", error: "Cortex is still stopping. Wait for shutdown to finish." });
+    }
+    if (launchInFlight) return launchInFlight;
+    launchInFlight = performLaunchCortex(lifecycleGeneration).finally(() => {
+        launchInFlight = null;
+    });
+    return launchInFlight;
+}
+
+async function performLaunchCortex(generation: number): Promise<LaunchResult> {
+    const interrupted = (): boolean => generation !== lifecycleGeneration || stopRequested;
+    const cancelled = (): LaunchResult => ({
+        ok: false, status: "cancelled", error: "Launch cancelled because Cortex was stopped.",
+    });
     let lastError = "";
     // A launch is the user pressing Start: it clears any sticky stop intent
     // before the reconnect paths below run.
     await clearStopIntent();
+    if (interrupted()) return cancelled();
 
     const waitAndEnableCamera = async (maxAttempts: number): Promise<boolean> => {
+        if (interrupted()) return false;
         if (!connected) connect();
         let attempts = 0;
-        while (!connected && attempts < maxAttempts) {
+        while (!connected && attempts < maxAttempts && !interrupted()) {
             await new Promise((r) => setTimeout(r, 500));
             attempts++;
         }
-        if (connected && ws) {
+        if (!interrupted() && connected && ws) {
             send({
                 type: "SETTINGS_SYNC",
                 payload: { webcam_enabled: true },
@@ -2184,6 +2328,7 @@ async function runLaunchCortex(): Promise<LaunchResult> {
             } catch {
                 launchAuthToken = null;
             }
+            if (interrupted()) return cancelled();
             const resp = await fetch(`${LAUNCHER_HTTP_URL}/launch`, {
                 method: "POST",
                 signal: AbortSignal.timeout(12000),
@@ -2192,6 +2337,7 @@ async function runLaunchCortex(): Promise<LaunchResult> {
                     : undefined,
             });
             const data = await resp.json();
+            if (interrupted()) return cancelled();
             if (data.status === "starting" || data.status === "already_running") {
                 if (await waitAndEnableCamera(16)) {
                     return { ok: true, status: "camera_enabled" };
@@ -2201,6 +2347,7 @@ async function runLaunchCortex(): Promise<LaunchResult> {
         } catch {
             // Launcher not running — try next path
         }
+        if (interrupted()) return cancelled();
 
         // Path 2: Native messaging
         let nativeResult: { status: string; error?: string };
@@ -2218,6 +2365,7 @@ async function runLaunchCortex(): Promise<LaunchResult> {
                 error: error instanceof Error ? error.message : String(error),
             };
         }
+        if (interrupted()) return cancelled();
 
         if (nativeResult.status === "launched" || nativeResult.status === "already_running") {
             if (await waitAndEnableCamera(10)) {
@@ -2227,11 +2375,13 @@ async function runLaunchCortex(): Promise<LaunchResult> {
         } else {
             lastError = nativeResult.error || "Native messaging failed";
         }
+        if (interrupted()) return cancelled();
 
         // Path 3: Direct WebSocket — daemon may already be running
         if (await waitAndEnableCamera(4)) {
             return { ok: true, status: "camera_enabled" };
         }
+        if (interrupted()) return cancelled();
 
         // ``lastError`` stays in the log; the popup shows consumer copy.
         if (DEBUG && lastError) console.debug("[cortex.bg] launch failed:", lastError);
@@ -5444,7 +5594,7 @@ chrome.runtime.onMessage.addListener(
                         ],
                         (data) => {
                             const stored = data?.cortex_active_intervention || null;
-                            if (stored) {
+                            if (stored && !stopRequested) {
                                 interventionPresentation.mount(
                                     stored as Record<string, unknown>,
                                     (data?.cortex_active_intervention_cid as string)
@@ -5456,7 +5606,10 @@ chrome.runtime.onMessage.addListener(
                             sendResponse({
                                 connected,
                                 stopRequested,
+                                stopStatus,
+                                stopError,
                                 state: currentState,
+                                stateAgeMs: currentStateAgeMs(),
                                 intervention: interventionPresentation.active?.plan ?? null,
                                 focusSession: focusSession ? getFocusSessionSnapshot() : null,
                             });
@@ -5467,7 +5620,10 @@ chrome.runtime.onMessage.addListener(
                 sendResponse({
                     connected,
                     stopRequested,
+                    stopStatus,
+                    stopError,
                     state: currentState,
+                    stateAgeMs: currentStateAgeMs(),
                     intervention: interventionPresentation.active.plan,
                     focusSession: focusSession ? getFocusSessionSnapshot() : null,
                 });
@@ -5499,6 +5655,10 @@ chrome.runtime.onMessage.addListener(
                 break;
 
             case "CONNECT":
+                if (stopInFlight) {
+                    sendResponse({ ok: false, error: "Cortex is still stopping." });
+                    break;
+                }
                 // Start: lift any sticky stop intent, then reconnect.
                 void clearStopIntent().then(() => connect());
                 sendResponse({ ok: true });
@@ -5510,102 +5670,8 @@ chrome.runtime.onMessage.addListener(
                 break;
 
             case "STOP_CORTEX":
-                // Sticky until the user presses Start: the keepalive alarm
-                // and a worker restart must not quietly reconnect.
-                void setStopIntent();
-                // End any active focus session
-                stopFocusSession();
-                // Clear state
-                currentState = null;
-                interventionPresentation.clear();
-                (async () => {
-                    // Clear persisted intervention/snapshot state so popup does not
-                    // resurrect stale UI after service-worker restart.
-                    try {
-                        await chrome.storage.session.remove([
-                            "cortex_active_intervention",
-                            "cortex_tab_snapshot",
-                            "cortex_tab_mgr_snapshots",
-                        ]);
-                    } catch { /* storage.session may be unavailable */ }
-
-                    // F07b/F08b: fetch the local capability token (cached in
-                    // chrome.storage.session after the first call) so the
-                    // gated SHUTDOWN/`/stop` endpoints accept this client.
-                    // A token-fetch failure is non-fatal: the steps below
-                    // still get tried, the auth-gated ones will 401 cleanly.
-                    let authToken: string | null = null;
-                    try {
-                        authToken = await getAuthToken();
-                    } catch (e) {
-                        // Audit-2 fix: gate this with DEBUG so production
-                        // builds don't logspam Chrome's console on every
-                        // stop attempt that lacks a token (the path-2
-                        // native-messaging fallback is correct and silent).
-                        if (DEBUG) {
-                            console.warn(`cortex.auth.token_unavailable err=${String(e)}`);
-                        }
-                    }
-
-                    // Step 1: Send SHUTDOWN over WebSocket (graceful — triggers daemon stop chain)
-                    if (ws && connected) {
-                        try {
-                            send({
-                                type: "SHUTDOWN",
-                                payload: authToken ? { auth_token: authToken } : {},
-                                timestamp: Date.now() / 1000,
-                                sequence: ++sequence,
-                                // F19b: carry the popup's cid through so the
-                                // daemon can correlate the SHUTDOWN with the
-                                // upstream user click.
-                                correlation_id: __cid ?? undefined,
-                            });
-                            await new Promise((r) => setTimeout(r, 500));
-                        } catch { /* ws may already be closing */ }
-                    }
-                    // Step 2: Disconnect our WebSocket
-                    disconnect();
-                    // Step 3: HTTP shutdown via daemon API (backup)
-                    try {
-                        await fetch(`${DAEMON_HTTP_URL}/shutdown`, {
-                            method: "POST",
-                            signal: AbortSignal.timeout(3000),
-                            headers: authToken ? { "X-Cortex-Auth-Token": authToken } : undefined,
-                        });
-                    } catch { /* daemon may already be dead */ }
-                    // Step 4: Wait briefly for graceful shutdown to complete
-                    await new Promise((r) => setTimeout(r, 1000));
-                    // Step 5: Nuclear kill via native messaging — sends SIGTERM to the
-                    // daemon process by PID. This is the most reliable kill mechanism
-                    // because it works even when HTTP/WebSocket are unresponsive.
-                    try {
-                        await sendNativeHostMessage(
-                            { command: "stop" },
-                            { timeoutMs: 15_000 },
-                        );
-                    } catch { /* native messaging may not be available */ }
-                    // Step 6: HTTP stop via launcher agent (port 9471) as final backup
-                    try {
-                        await fetch(`${LAUNCHER_HTTP_URL}/stop`, {
-                            method: "POST",
-                            signal: AbortSignal.timeout(3000),
-                            headers: authToken ? { "X-Cortex-Auth-Token": authToken } : undefined,
-                        });
-                    } catch { /* launcher may not be running */ }
-                    // Close any onboarding tabs
-                    try {
-                        const onboardingUrl = chrome.runtime.getURL("tabs/onboarding.html");
-                        chrome.tabs.query({}, (tabs) => {
-                            for (const tab of tabs) {
-                                if (tab.id && tab.url && tab.url.startsWith(onboardingUrl)) {
-                                    chrome.tabs.remove(tab.id);
-                                }
-                            }
-                        });
-                    } catch { /* ignore */ }
-                    sendResponse({ ok: true });
-                })();
-                return true; // async response
+                void stopCortex(__cid ?? undefined).then(sendResponse);
+                return true;
 
             case "QUIET_MODE_TOGGLE":
                 // P0 §3.11: the popup surfaces the three-kind quiet
@@ -5652,6 +5718,10 @@ chrome.runtime.onMessage.addListener(
                 break;
 
             case "LAUNCH_CORTEX":
+                if (stopInFlight) {
+                    sendResponse({ ok: false, status: "error", error: "Cortex is still stopping. Wait for shutdown to finish." });
+                    break;
+                }
                 // Try three launch paths in order:
                 // 1. HTTP launcher agent (port 9471) — works if user started launcher manually
                 // 2. Native messaging — Chrome invokes native_host.py directly

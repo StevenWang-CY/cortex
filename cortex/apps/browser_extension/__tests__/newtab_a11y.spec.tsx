@@ -1,14 +1,4 @@
-/**
- * P2-7 — newtab canvas accessibility.
- *
- * The PulseRoom canvas MUST:
- *   - carry ``role="img"`` (WCAG SC 1.1.1 non-text content),
- *   - carry ``aria-label="Cortex breathing pacer visualization"``
- *     (human-readable description of the visualisation),
- *   - be accompanied by an ``aria-live="polite"`` region
- *     (``data-testid="pacer-phase-announcement"``) that announces the
- *     current breathing phase to screen reader users.
- */
+/** Decorative pulse art must not invent a breathing instruction. */
 
 import React, { act } from "react";
 import { createRoot } from "react-dom/client";
@@ -51,40 +41,15 @@ describe("newtab canvas accessibility (P2-7)", () => {
             );
     });
 
-    it("canvas has role='img'", async () => {
+    it("keeps decorative pulse art out of the accessibility tree", async () => {
         const { container, cleanup } = await renderNewtab();
         try {
             const canvas = container.querySelector("canvas");
-            expect(canvas).not.toBeNull();
-            expect(canvas?.getAttribute("role")).toBe("img");
-        } finally {
-            await cleanup();
-        }
-    });
-
-    it("canvas has aria-label describing the visualisation", async () => {
-        const { container, cleanup } = await renderNewtab();
-        try {
-            const canvas = container.querySelector("canvas");
-            expect(canvas?.getAttribute("aria-label")).toBe(
-                "Cortex breathing pacer visualization",
-            );
-        } finally {
-            await cleanup();
-        }
-    });
-
-    it("aria-live region for pacer phase is present", async () => {
-        const { container, cleanup } = await renderNewtab();
-        try {
-            const liveRegion = container.querySelector(
-                '[data-testid="pacer-phase-announcement"]',
-            );
-            expect(liveRegion).not.toBeNull();
-            expect(liveRegion?.getAttribute("aria-live")).toBe("polite");
-        } finally {
-            await cleanup();
-        }
+            expect(canvas?.getAttribute("aria-hidden")).toBe("true");
+            expect(canvas?.hasAttribute("role")).toBe(false);
+            expect(container.querySelector('[data-testid="pacer-phase-announcement"]')).toBeNull();
+            expect(container.querySelector('[role="status"]')?.textContent).toBe("Cortex is resting");
+        } finally { await cleanup(); }
     });
 
     it("exposes recent activities as a real list of navigable links", async () => {

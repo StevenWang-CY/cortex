@@ -2,6 +2,10 @@
 
 **Status:** protocol template; no study has yet established product validity
 
+The [current implementation record](../implementation-2026-10.md) describes the
+candidate software and automated evidence. Completion of those software checks
+does not complete this participant-level validation protocol.
+
 **Decision target:** whether a specific, reversible workspace-support proposal
 would be helpful at a specific eligible decision point. This protocol does not
 label or diagnose an internal cognitive, emotional, neurological, or medical
@@ -95,11 +99,23 @@ analyses.
 
 ## 5. Feature and measurement plan
 
-Freeze `support-features-v2.1.0` before the first confirmatory participant. For
+The current candidate is `support-features-v2.2.0` with deterministic support
+model `2.5.0`; freeze its exact identity before the first confirmatory
+participant. Earlier schema data must retain its original version and cannot
+be silently pooled across changed availability/typing-interval semantics. For
 every feature, publish unit, source, aggregation window, minimum observation
 count/exposure, transform, valid range, quality algorithm, age limit, missing
 reasons, and code digest. Verify raw-event-to-aggregate calculations with
 synthetic and replay fixtures.
+
+Preserve the current candidate's measurement semantics in collection and replay:
+unavailable mouse/keyboard sources are missing evidence, inactivity requires both
+channels with continuous exposure, and typing variance requires two positive
+regular-key intervals. Gaps above 3 seconds reset exposure and inference dwell;
+duplicate/regressed inference observations cannot create additional evidence.
+Record these bounds with the frozen configuration. The behavioral implementation
+digest does not include intervention helpers or personal calibration, so preserve
+the application revision, configuration and calibration identities separately.
 
 Primary production-candidate inputs are behavior aggregates only. Camera pulse,
 blink, and head/neck proxies remain diagnostic-only and excluded from the

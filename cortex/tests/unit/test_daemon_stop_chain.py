@@ -433,6 +433,37 @@ def test_native_host_stop_maps_result_onto_closed_schema(
     assert seen, "native host must delegate to the shared chain"
 
 
+def test_stop_does_not_report_success_when_signals_are_denied(world_factory, monkeypatch):
+    world = world_factory(_World(accept_shutdown=True, pids={4242}))
+
+    def denied(_pid, _signal):
+        raise PermissionError("not permitted")
+
+    monkeypatch.setattr(os, "kill", denied)
+    result = launcher_agent.stop_daemon()
+    assert result["status"] == "error"
+    assert world.find_pids() == {4242}
+    assert "exit" in result["error"].lower()
+
+
+def test_stop_without_identified_pid_does_not_claim_a_live_endpoint_stopped(
+    world_factory, monkeypatch,
+):
+    world_factory(_World(accept_shutdown=False, pids=set()))
+    monkeypatch.setattr(launcher_agent, "_daemon_http_alive", lambda: True)
+    assert launcher_agent.stop_daemon()["status"] == "error"
+
+
+def test_native_host_preserves_stop_failure(monkeypatch):
+    monkeypatch.setattr(
+        launcher_agent, "stop_daemon",
+        lambda **_kwargs: {"status": "error", "error": "Could not confirm daemon exit."},
+    )
+    result = native_host.stop_daemon()
+    assert result == {"status": "error", "error": "Could not confirm daemon exit."}
+    assert validate_native_response({"command": "stop", **result}).status == "error"
+
+
 # ---------------------------------------------------------------------------
 # D16 — /status must not leak the checkout or interpreter location
 # ---------------------------------------------------------------------------

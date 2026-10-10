@@ -25,6 +25,7 @@ from typing import Any
 
 from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 from cortex.libs.config.settings import TelemetryConfig
+from cortex.libs.utils.platform import check_accessibility_permission
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +172,30 @@ class InputHooks:
     def is_running(self) -> bool:
         return self._running
 
+    @staticmethod
+    def _listener_alive(listener: Any | None) -> bool:
+        """Thread creation is not proof that the native event tap is alive."""
+        return bool(
+            listener is not None
+            and listener.is_alive()
+            and listener.running
+        )
+
+    @property
+    def mouse_source_available(self) -> bool:
+        return self._running and self._listener_alive(self._mouse_listener)
+
+    @property
+    def keyboard_source_available(self) -> bool:
+        # IS_TRUSTED is sampled by pynput at startup. Recheck the OS without
+        # prompting so permission revocation cannot become observed silence.
+        return bool(
+            self._running
+            and self._listener_alive(self._keyboard_listener)
+            and getattr(self._keyboard_listener, "IS_TRUSTED", True)
+            and check_accessibility_permission()
+        )
+
     @property
     def last_input_timestamp(self) -> float | None:
         """Monotonic timestamp of the latest recorded input, or ``None``."""
@@ -203,7 +228,9 @@ class InputHooks:
             True if listeners started successfully, False on permission error.
         """
         if self._running:
-            return True
+            if self.mouse_source_available and self.keyboard_source_available:
+                return True
+            self.stop()
 
         try:
             from pynput import keyboard, mouse
@@ -228,25 +255,28 @@ class InputHooks:
 
         except ImportError:
             logger.warning("pynput not installed — input hooks disabled")
+            self.stop()
             return False
         except Exception as e:
             logger.warning(f"Failed to start input hooks: {e}")
+            self.stop()
             return False
 
     def stop(self) -> None:
-        """Stop input listeners."""
-        if not self._running:
-            return
-
-        if self._mouse_listener is not None:
-            self._mouse_listener.stop()
-            self._mouse_listener = None
-
-        if self._keyboard_listener is not None:
-            self._keyboard_listener.stop()
-            self._keyboard_listener = None
-
+        """Release even a partially started pair of listeners."""
         self._running = False
+        listeners = (self._mouse_listener, self._keyboard_listener)
+        self._mouse_listener = self._keyboard_listener = None
+        for listener in listeners:
+            if listener is None:
+                continue
+            try:
+                listener.stop()
+                if listener is not threading.current_thread() and listener.is_alive():
+                    listener.join(timeout=0.25)
+            except Exception:
+                logger.debug("Input listener cleanup failed", exc_info=True)
+        self.reset()
         logger.info("Input hooks stopped")
 
     def record_mouse_move(self, x: int, y: int, timestamp: float | None = None) -> None:

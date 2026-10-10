@@ -1,17 +1,22 @@
 # Data flow and deletion map
 
-This document names the implemented flows in Cortex 0.4.0. The canonical
+This document names the implemented flows in Cortex 0.5.0. The canonical
 external-context disclosure is [cortex/docs/privacy.md](../cortex/docs/privacy.md);
 security controls are in [cortex/docs/security.md](../cortex/docs/security.md).
+The [current implementation record](implementation-2026-10.md) documents the
+reviewed evidence-continuity and interaction changes.
 
 ```mermaid
 flowchart LR
-  Camera["Camera frames\nprocess memory only"] --> Obs["Typed observations\nquality + missingness"]
-  Input["Mouse/keyboard/window\naggregate events"] --> Obs
+  Camera["Camera frames\nprocess memory only"] --> CameraObs["Camera observations\nquality + missingness"]
+  CameraObs --> Diagnostics["Experimental pulse and\ndiagnostic blink/pose"]
+  Input["Mouse/keyboard/window\naggregate events"] --> Obs["Behavioral windows\navailability + missingness"]
   Browser["Browser metadata\noptional origin content"] --> Context["Local task context"]
   Editor["Editor metadata\noptional selected content"] --> Context
   Obs --> Estimate["Heuristic support estimate\nor unknown"]
   Estimate --> Policy["Deterministic eligibility"]
+  Policy --> Local
+  Policy --> Broker
   Context --> Local["Local rule planner"]
   Context --> Broker["Minimize + redact + exact preview"]
   Broker -->|"one-time confirmation only"| Provider["Configured external provider"]
@@ -24,6 +29,21 @@ flowchart LR
   Effect --> SQLite
 ```
 
+Camera diagnostics have no edge into production support scoring or automatic
+state-driven eligibility. The behavioral model is `deterministic-support@2.5.0`
+with `support-features-v2.2.0`. Missing input sources contribute no evidence;
+healthy observed zero rates remain usable. Source loss or an acquisition gap
+above 3 seconds restarts inactivity exposure. Duplicate/regressed inference
+timestamps are ignored; a gap above 3 seconds clears prior scores and dwell.
+See the [model card](model-cards/deterministic-support-v2.md) for the distinct
+measurement, smoothing and intervention gates.
+
+Local goal check-ins consume the foreground editor file or active browser title;
+they do not interpret absent metadata as a mismatch. A stationary foreground app
+remains current while tracking is live. Reading check-ins use behavioral evidence
+only. These local checks do not themselves authorize external disclosure or
+workspace changes.
+
 ## Source-by-source handling
 
 | Source | Collected form | Ordinary persistence | External egress |
@@ -33,19 +53,26 @@ flowchart LR
 | Window/app | Active app and transition aggregates | Bounded events | Optional aggregate category after preview |
 | Browser activity | Sanitized title/origin/path, tab type, dwell/resume metadata | Browser local storage capped at 200 records | Metadata only when selected and previewed |
 | Browser page content | Bounded active-page excerpt after exact origin permission | Current snapshot only; revocation scrubs content fields | Only when selected, redacted, previewed, and confirmed once |
-| Editor | Basename/symbol/diagnostic metadata; optional bounded visible code | Current snapshot; no repository mirror | Selected fields only through broker |
-| Terminal | Not collected: the editor extension reads no terminal output or command history, and the daemon's terminal adapter has no producer | — | Never |
+| Editor | Full local path, range, symbol and diagnostics; up to 8,000 visible code characters when `cortex.shareEditorContent` is on (default) | Current snapshot; no repository mirror | Basename/minimized metadata and separately selected redacted content through broker |
+| Terminal | No shipping collection: the editor extension reads no terminal output or history; the parser has no live producer | No terminal transcript | Explicitly supplied detected-error summaries can pass selected preview/confirmation; transcript lines are excluded |
 | User goal/note | User-entered bounded text | Current session/settings as applicable | Only when selected and previewed |
 | Credentials | Provider-standard environment during construction or macOS Keychain | Keychain/provider store | Only to the selected provider's authentication endpoint |
 
 ## Local authority and stores
 
 SQLite under the configured storage root is authoritative for intervention
-transactions, policy decision/delivery/outcome/reward lifecycles, migrations,
+transactions, active runtime calibration, policy decision/delivery/outcome/reward lifecycles, migrations,
 and bounded operational events. It uses a single owner, rollback journaling,
 `synchronous=FULL`, integrity checks, verified pre-migration backups, retention,
 and recovery. Receipts store only the inverse state needed to verify/restore a
 Cortex-owned effect; they should not contain file or page bodies.
+
+Calibration stores immutable measured profiles and a checksummed active-pointer
+projection under `calibration/`; demo profiles have a separate inactive
+namespace. Applying a live profile requires explicit approval, compatibility
+validation, persistence and a complete estimator swap. The CLI's offline
+activation takes effect on the next daemon start. See
+[calibration](../cortex/docs/calibration.md).
 
 Legacy JSON/JSONL is imported only through checksummed migration or retained as
 descriptive diagnostics. Redis/in-memory stores are compatibility or ephemeral

@@ -5,8 +5,8 @@
 Please **do not** open a public GitHub issue for security reports.
 
 Use **[GitHub Security Advisories](https://github.com/StevenWang-CY/cortex/security/advisories/new)**
-to file a private report. You will receive an acknowledgement within a
-few days. Private advisories are the only supported reporting channel;
+to file a private report. Reports are reviewed on a best-effort basis.
+Private advisories are the only supported reporting channel;
 the project does not publish a maintainer email address.
 
 ## Supported versions
@@ -42,10 +42,17 @@ regressions:
    WebSocket handshake require a 256-bit token written to
    `~/Library/Application Support/Cortex/auth.token` at mode `0600`
    and rotatable from the desktop UI.
-5. **Consent ladder.** Workspace mutations require earned trust through
-   a 5-level consent system (OBSERVE → SUGGEST → PREVIEW →
-   REVERSIBLE_ACT → AUTONOMOUS_ACT). Destructive actions are
-   reversible via the undo stack.
+5. **Exact action authority.** The default is `suggest_only`. Enabled
+   workspace effects require the allowed ceiling in the
+   five-level consent system (OBSERVE → SUGGEST → PREVIEW →
+   REVERSIBLE_ACT → AUTONOMOUS_ACT), an exact unexpired action manifest and
+   one-time authorization. Effects use durable receipts, postcondition checks
+   and scoped restoration; a model response, consent level or generic undo
+   stack alone is insufficient authority.
+6. **Lifecycle authority.** Stop targets only the identified daemon, never
+   browser/editor client sockets. The UI does not report stopped until a helper
+   verifies exit. Pending launches cannot re-enable sensing after Stop;
+   unresolved restoration records survive presentation cleanup.
 
 If you believe any of these invariants is violated by current code,
 please file a security advisory.
@@ -57,10 +64,22 @@ this project:
 
 - Bugs that require root, physical machine access, or a malicious
   app already running on the user's Mac.
-- LLM output content (the LLM is a third-party service; Cortex
-  validates output against a strict schema and degrades gracefully).
+- Ordinary LLM output quality. A prompt injection that bypasses context
+  disclosure, action authorization or target validation is in scope.
 - Issues caused by user-supplied API keys leaking outside the
   Cortex runtime (Keychain storage is the documented path).
-- Issues in macOS, Chrome, Edge, MediaPipe, OpenCV, or other
-  upstream dependencies — please report those to their respective
-  maintainers.
+- Upstream product defects should also be reported to the relevant maintainer.
+  A vulnerable bundled dependency or unsafe Cortex integration remains relevant
+  to Cortex's dependency and release review.
+
+## Dependency and release evidence
+
+`make audit` checks Python, browser and editor dependency reports. Browser
+exceptions identify advisory, dependency path, maximum severity, mitigation and
+expiry; they are reviewed exceptions, not evidence of zero vulnerabilities.
+The [implementation record](docs/implementation-2026-10.md) records the latest
+local results. An ad-hoc development build does not establish notarization,
+Intel parity, hardware validation or independent security certification.
+
+See the [security model](cortex/docs/security.md),
+[privacy contract](cortex/docs/privacy.md) and [release guide](docs/release/README.md).

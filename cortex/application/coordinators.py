@@ -37,7 +37,9 @@ class FlowCoordinator:
 
     def start(self) -> tuple[Any, ...]:
         if self._started:
-            return self._supervisor.tasks(self.group)
+            owned = self._supervisor.tasks(self.group)
+            if owned:
+                return owned
         # Mark ownership before constructing children. If a later factory
         # raises, RuntimeCoordinatorSet can still stop this coordinator and
         # drain the already-created prefix.
@@ -55,7 +57,9 @@ class FlowCoordinator:
     async def stop(self, *, timeout: float = 5.0) -> None:
         await self._supervisor.cancel(self.group, timeout=timeout)
         self._supervisor.forget_finished()
-        self._started = False
+        # Timed-out children remain supervised. A subsequent Start must not
+        # create another camera/telemetry loop while old cleanup is still live.
+        self._started = bool(self._supervisor.tasks(self.group))
 
     @property
     def task_names(self) -> tuple[str, ...]:

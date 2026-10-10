@@ -228,7 +228,7 @@ except ImportError:  # pragma: no cover
     pass
 
 from cortex.apps.desktop_shell import mac_native
-from cortex.apps.desktop_shell.components import SegmentedControl, status_dot_qss
+from cortex.apps.desktop_shell.components import SegmentedControl, WrappingLayout, status_dot_qss
 from cortex.apps.desktop_shell.palette_runtime import active_state_color
 from cortex.apps.desktop_shell.tokens import (
     BIO_BLINK,
@@ -237,6 +237,7 @@ from cortex.apps.desktop_shell.tokens import (
     BRAND_ACCENT_DARK,
     BRAND_ACCENT_TEXT,
     BRAND_DISPLAY_FONT,
+    BTN_ACCENT_QSS,
     BTN_DESTRUCTIVE_QSS,
     BTN_FOCUS_RING,
     BTN_GHOST_QSS,
@@ -601,6 +602,7 @@ class _ConsumerTab(QWidget):
     # The "Recalibrate" chip is a real control: hosts route it to the same
     # calibration runner Settings uses.
     recalibrate_requested = Signal()
+    review_suggestion_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -646,9 +648,27 @@ class _ConsumerTab(QWidget):
         # The "This session" stats reveal only once a real estimate exists.
         self._has_estimate: bool = False
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(SP6, SP5, SP6, SP6)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setStyleSheet(
+            "QScrollArea { border: none; background: transparent; }"
+            "QScrollBar:vertical { background: transparent; width: 8px; }"
+            f"QScrollBar::handle:vertical {{ background: {CX_BORDER_DEFAULT};"
+            "border-radius: 4px; min-height: 24px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+        )
+        content = QWidget()
+        content.setStyleSheet("background: transparent;")
+        root = QVBoxLayout(content)
+        root.setContentsMargins(SP6, SP3, SP6, SP4)
         root.setSpacing(0)
+        self._scroll.setWidget(content)
+        outer.addWidget(self._scroll, stretch=1)
 
         # ── Header ────────────────────────────────────────────────────
         header = QHBoxLayout()
@@ -667,6 +687,16 @@ class _ConsumerTab(QWidget):
         _set_accessible_name(brand, "Cortex")
         header.addWidget(brand)
         header.addStretch()
+        self._settings_btn = QPushButton("Settings")
+        self._settings_btn.setStyleSheet(BTN_LINK_QSS)
+        self._settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._settings_btn.setAccessibleName("Open Cortex settings")
+        self._settings_btn.clicked.connect(self.open_settings_requested.emit)
+        header.addWidget(self._settings_btn)
+        root.addLayout(header)
+        status_row = QHBoxLayout()
+        status_row.setContentsMargins(0, 0, 0, SP4)
+        status_row.setSpacing(SP2)
 
         # Status pill — capsule with dot + label, sits on the grouped background.
         self._state_badge = QWidget()
@@ -695,7 +725,8 @@ class _ConsumerTab(QWidget):
         self._state_badge.setStyleSheet(
             f"background: {CX_BG_SECONDARY}; border-radius: {RADIUS_PILL}px;"
         )
-        header.addWidget(self._state_badge, alignment=Qt.AlignmentFlag.AlignVCenter)
+        status_row.addWidget(self._state_badge, alignment=Qt.AlignmentFlag.AlignVCenter)
+        status_row.addStretch()
 
         # P0 §3.11: Pause/Quiet capsule — one-click access to the quiet
         # modes. The label mirrors the active mode (e.g. "Quiet · 28m").
@@ -718,7 +749,7 @@ class _ConsumerTab(QWidget):
             "Shortcut: Command + Shift + Slash.",
         )
         self._quiet_capsule.clicked.connect(self._on_quiet_capsule_clicked)
-        header.addWidget(
+        status_row.addWidget(
             self._quiet_capsule, alignment=Qt.AlignmentFlag.AlignVCenter,
         )
 
@@ -869,10 +900,9 @@ class _ConsumerTab(QWidget):
         except Exception:
             logger.debug("restore pill connect failed", exc_info=True)
 
-        self._meta_strip = QHBoxLayout()
+        self._meta_strip = WrappingLayout()
         self._meta_strip.setContentsMargins(0, 0, 0, SP3)
         self._meta_strip.setSpacing(SP2)
-        self._meta_strip.addStretch()
         for chip in (
             self._restore_pill,
             self._focus_protection_pill,
@@ -880,9 +910,9 @@ class _ConsumerTab(QWidget):
             self._baseline_pill,
             self._cost_pill,
         ):
-            self._meta_strip.addWidget(chip, alignment=Qt.AlignmentFlag.AlignVCenter)
+            self._meta_strip.addWidget(chip)
 
-        root.addLayout(header)
+        root.addLayout(status_row)
         # Run an initial freshness check so the chip is correct on first
         # paint. The controller / main app also calls refresh on a
         # completed calibration.
@@ -1012,7 +1042,7 @@ class _ConsumerTab(QWidget):
         bio_inner.setContentsMargins(SP5, SP4, SP5, SP4)
         bio_inner.setSpacing(SP3)
 
-        bio_heading = QLabel("Biometrics")
+        bio_heading = QLabel("Camera estimates")
         bio_heading.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
         bio_heading.setStyleSheet(SECTION_HEADING_QSS)
         bio_inner.addWidget(bio_heading)
@@ -1045,8 +1075,8 @@ class _ConsumerTab(QWidget):
         # Channel tints stay as 6 px dots (data identity); the caption itself
         # uses the secondary text token so it clears AA at 11 px.
         bio_specs = [
-            (self._bpm_label, "BPM", BIO_HR, "hr"),
-            (self._blk_label, "BLK", BIO_BLINK, "blink"),
+            (self._bpm_label, "Pulse · bpm", BIO_HR, "hr"),
+            (self._blk_label, "Blinks / min", BIO_BLINK, "blink"),
         ]
         for val_widget, title, color, glossary_key in bio_specs:
             col = QVBoxLayout()
@@ -1074,7 +1104,7 @@ class _ConsumerTab(QWidget):
             heading = QLabel(title)
             heading.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
             heading.setStyleSheet(
-                f"color: {CX_TEXT_SECONDARY}; background: transparent; border: none;"
+                f"font-size: {FS_CAPTION}px; color: {CX_TEXT_SECONDARY}; background: transparent; border: none;"
             )
             if tip:
                 try:
@@ -1117,9 +1147,40 @@ class _ConsumerTab(QWidget):
         root.addWidget(bio_card)
         root.addSpacing(SP4)
 
+        self._suggestion_card = QFrame()
+        self._suggestion_card.setObjectName("CortexPendingSuggestion")
+        self._suggestion_card.setStyleSheet(f"QFrame#CortexPendingSuggestion {{ {CARD_QSS} }}")
+        suggestion_layout = QVBoxLayout(self._suggestion_card)
+        suggestion_layout.setContentsMargins(SP4, SP4, SP4, SP4)
+        suggestion_layout.setSpacing(SP2)
+        suggestion_heading = QLabel("A suggestion for you")
+        suggestion_heading.setStyleSheet(SECTION_HEADING_QSS)
+        suggestion_layout.addWidget(suggestion_heading)
+        self._suggestion_summary = QLabel("")
+        self._suggestion_summary.setWordWrap(True)
+        self._suggestion_summary.setTextFormat(Qt.TextFormat.PlainText)
+        self._suggestion_summary.setFont(mac_native.system_font(FS_FOOTNOTE))
+        suggestion_layout.addWidget(self._suggestion_summary)
+        self._review_suggestion_btn = QPushButton("Review suggestion")
+        self._review_suggestion_btn.setStyleSheet(BTN_ACCENT_QSS)
+        self._review_suggestion_btn.setMinimumHeight(32)
+        self._review_suggestion_btn.setAccessibleName("Review current suggestion")
+        self._review_suggestion_btn.setAccessibleDescription(
+            "Opens and focuses the current suggestion. Reviewing applies no workspace changes."
+        )
+        self._review_suggestion_btn.clicked.connect(self.review_suggestion_requested.emit)
+        suggestion_layout.addWidget(self._review_suggestion_btn)
+        self._suggestion_card.hide()
+        root.addWidget(self._suggestion_card)
+        root.addSpacing(SP2)
+
         # ── Connections row — dot + "Chrome · Off" text, never colour alone ──
-        conn_row = QHBoxLayout()
-        conn_row.setContentsMargins(SP2, 0, SP2, 0)
+        connection_header = QHBoxLayout()
+        connection_title = QLabel("Extensions")
+        connection_title.setStyleSheet(SECTION_HEADING_QSS)
+        connection_header.addWidget(connection_title)
+        connection_header.addStretch()
+        conn_row = WrappingLayout()
         conn_row.setSpacing(SP3)
 
         self._conn_dots: dict[str, QLabel] = {}
@@ -1132,12 +1193,15 @@ class _ConsumerTab(QWidget):
             lbl.setFont(mac_native.system_font(FS_CAPTION, "regular"))
             lbl.setStyleSheet(f"color: {CX_TEXT_SECONDARY}; background: transparent;")
             _set_accessible_name(lbl, f"{name} extension: off")
-            conn_row.addWidget(dot, alignment=Qt.AlignmentFlag.AlignVCenter)
-            conn_row.addWidget(lbl, alignment=Qt.AlignmentFlag.AlignVCenter)
+            item = QWidget()
+            item_layout = QHBoxLayout(item)
+            item_layout.setContentsMargins(0, 0, 0, 0)
+            item_layout.setSpacing(SP1)
+            item_layout.addWidget(dot, alignment=Qt.AlignmentFlag.AlignVCenter)
+            item_layout.addWidget(lbl, alignment=Qt.AlignmentFlag.AlignVCenter)
+            conn_row.addWidget(item)
             self._conn_dots[name] = dot
             self._conn_labels[name] = lbl
-
-        conn_row.addStretch()
 
         self._connect_btn = QPushButton("Connect…")
         self._connect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1151,7 +1215,9 @@ class _ConsumerTab(QWidget):
             pass
         self._connect_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
         self._connect_btn.setStyleSheet(BTN_LINK_QSS)
-        conn_row.addWidget(self._connect_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
+        connection_header.addWidget(self._connect_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
+        root.addLayout(connection_header)
+        root.addSpacing(SP2)
         root.addLayout(conn_row)
         root.addSpacing(SP5)
 
@@ -1178,7 +1244,7 @@ class _ConsumerTab(QWidget):
         stats_col.addWidget(today_label)
 
         today_row = QHBoxLayout()
-        today_row.setSpacing(0)
+        today_row.setSpacing(SP2)
 
         self._today_focus = QLabel("0m")
         self._today_best = QLabel("0s")
@@ -1197,9 +1263,10 @@ class _ConsumerTab(QWidget):
             val_widget.setStyleSheet(f"color: {CX_TEXT}; background: transparent;")
             _set_accessible_name(val_widget, title)
             heading = QLabel(title)
+            heading.setWordWrap(True)
             heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
             heading.setFont(mac_native.system_font(FS_CAPTION, "regular"))
-            heading.setStyleSheet(f"color: {CX_TEXT_SECONDARY}; background: transparent;")
+            heading.setStyleSheet(f"font-size: {FS_CAPTION}px; color: {CX_TEXT_SECONDARY}; background: transparent;")
             col.addWidget(val_widget)
             col.addWidget(heading)
             today_row.addLayout(col, stretch=1)
@@ -1217,9 +1284,8 @@ class _ConsumerTab(QWidget):
         # open. "Quit Cortex" appears only once the session has ended and
         # names its consequence. Cmd+Q belongs to Quit alone (app menu /
         # tray), never to this button.
-        root.addSpacing(SP4)
         footer = QHBoxLayout()
-        footer.setContentsMargins(0, 0, 0, 0)
+        footer.setContentsMargins(SP6, SP3, SP6, SP5)
         footer.setSpacing(SP2)
 
         self._quit_btn = QPushButton("Quit Cortex")
@@ -1260,15 +1326,25 @@ class _ConsumerTab(QWidget):
         self._stop_safety_timer.timeout.connect(self._stop_safety_expired)
         self._stop_btn.clicked.connect(self._on_primary_clicked)
         footer.addWidget(self._stop_btn, stretch=1)
-        root.addLayout(footer)
+        outer.addLayout(footer)
         self._enter_phase(_PHASE_DISCONNECTED)
 
-        # F55: explicit tab-order chain: Goal → Connect → Quit → session control.
-        _set_tab_order(self._goal_input, self._connect_btn)
+        # Keep the common actions reachable in reading order.
+        _set_tab_order(self._settings_btn, self._quiet_capsule)
+        _set_tab_order(self._quiet_capsule, self._goal_input)
+        _set_tab_order(self._goal_input, self._review_suggestion_btn)
+        _set_tab_order(self._review_suggestion_btn, self._connect_btn)
         _set_tab_order(self._connect_btn, self._quit_btn)
         _set_tab_order(self._quit_btn, self._stop_btn)
 
     # -- Public update methods (preserved byte-identical) ----------------
+
+    def set_pending_suggestion(self, payload: dict | None) -> None:
+        """Display the current proposal without authorizing or executing it."""
+        self._suggestion_summary.setText(
+            str((payload or {}).get("headline") or "Review your next step")[:300]
+        )
+        self._suggestion_card.setVisible(payload is not None)
 
     def _set_text_if_changed(self, widget: QLabel, text: str) -> bool:
         """Call ``widget.setText`` only when the value differs from the
@@ -1865,10 +1941,8 @@ class _ConsumerTab(QWidget):
 
     def update_state(self, payload: dict) -> None:
         view = consumer_state_view(payload)
-        # Phase J-3: first frame retires the empty state. The flag is
-        # sticky so a transient WS disconnect doesn't collapse the UI
-        # back to "no data yet" — the rendered numerics carry the last
-        # known reading, which is more useful than a placeholder.
+        # A received update retires the initial instructions. Reconnecting
+        # requires a fresh update before measurements are shown again.
         if not self._has_received_state:
             self._has_received_state = True
             try:
@@ -2228,6 +2302,24 @@ class _ConsumerTab(QWidget):
                     btn, "Cortex is not connected to its daemon.",
                 )
             _pill("Disconnected")
+        if phase != _PHASE_LIVE or previous != _PHASE_LIVE:
+            messages = {
+                _PHASE_DISCONNECTED: "Session offline · Start a session to see live biometrics.",
+                _PHASE_STARTING: "Starting sensors… Readings appear when evidence is ready.",
+                _PHASE_STOPPING: "Ending session… Live readings are paused.",
+                _PHASE_ENDED: "Session ended · Sensing is off.",
+                _PHASE_LIVE: "Waiting for fresh camera readings…",
+            }
+            message = messages.get(phase, "Live readings unavailable")
+            self._set_text_if_changed(self._bpm_label, "--")
+            self._set_text_if_changed(self._blk_label, "--")
+            self._set_text_if_changed(self._bio_status_label, message)
+            self._bio_numerics.setVisible(False)
+            self._bio_status_label.setVisible(self._has_received_state)
+            if not self._has_received_state:
+                self._bio_empty_state.setText(message)
+            if phase != _PHASE_LIVE:
+                self._health_banner.hide()
         if quit_btn is not None:
             try:
                 quit_btn.setVisible(show_quit)
@@ -2699,7 +2791,7 @@ class _AdvancedTab(QWidget):
             self._score_labels[name] = val_lbl
         layout.addLayout(scores_grid)
 
-        meta_row = QHBoxLayout()
+        meta_row = QVBoxLayout()
         self._confidence_lbl = QLabel("Evidence strength: --")
         self._confidence_lbl.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
         self._confidence_lbl.setStyleSheet(
@@ -2964,6 +3056,7 @@ class DashboardWindow(QWidget):
     # Session lifecycle re-emits (see ``_ConsumerTab``).
     session_start_requested = Signal()
     recalibrate_requested = Signal()
+    review_suggestion_requested = Signal()
 
     def closeEvent(self, event: object) -> None:  # noqa: D401 - Qt override
         """Put the dashboard away; do not end the session.
@@ -3010,6 +3103,8 @@ class DashboardWindow(QWidget):
         self.setMinimumWidth(DASHBOARD_WIDTH)
         self.setMaximumWidth(DASHBOARD_WIDTH + 60)
         self.setMaximumHeight(DASHBOARD_MAX_HEIGHT)
+        self.setMinimumHeight(500)
+        self.resize(DASHBOARD_WIDTH + 20, 680)
         self.setStyleSheet(_GLOBAL_QSS)
 
         layout = QVBoxLayout(self)
@@ -3068,7 +3163,13 @@ class DashboardWindow(QWidget):
         self._stack.addWidget(self._consumer)
         if self._history_tab is not None:
             self._stack.addWidget(self._history_tab)
-        self._stack.addWidget(self._advanced)
+        advanced_scroll = QScrollArea()
+        advanced_scroll.setWidgetResizable(True)
+        advanced_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        advanced_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        advanced_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        advanced_scroll.setWidget(self._advanced)
+        self._stack.addWidget(advanced_scroll)
         layout.addWidget(self._stack, stretch=1)
 
         self._seg.selection_changed.connect(self._stack.setCurrentIndex)
@@ -3082,6 +3183,7 @@ class DashboardWindow(QWidget):
         self._consumer.gui_quit_requested.connect(self.gui_quit_requested.emit)
         self._consumer.stop_requested.connect(self.stop_requested.emit)
         self._consumer.goal_set.connect(self.goal_set.emit)
+        self._consumer.review_suggestion_requested.connect(self.review_suggestion_requested.emit)
         # P0 §3.11 / §3.10: bubble pause/quiet menu + auto-focus disarm
         # picks to the controller so the daemon's set_quiet_mode /
         # disarm_auto_focus are invoked.
@@ -3193,6 +3295,9 @@ class DashboardWindow(QWidget):
                 self._consumer.refresh_baseline_freshness()
             except Exception:
                 logger.debug("baseline freshness refresh failed", exc_info=True)
+
+    def set_pending_suggestion(self, payload: dict | None) -> None:
+        self._consumer.set_pending_suggestion(payload)
 
     def set_connected(self, connected: bool) -> None:
         self._connected = connected

@@ -59,6 +59,7 @@ class WebSocketBridge(QObject):
     intervention_triggered = Signal(dict)
     intervention_restored = Signal(dict)
     intervention_transaction_state = Signal(dict)
+    quiet_mode_state_received = Signal(dict)
     settings_synced = Signal(dict)
     connection_changed = Signal(bool)
     # P1-FC-INTERVENTION-FAILED: daemon broadcast of a total mutation
@@ -132,6 +133,7 @@ class WebSocketBridge(QObject):
                     self.intervention_prompt.emit(payload)
                 ),
                 "SETTINGS_SYNC": lambda payload: self.settings_synced.emit(payload),
+                "QUIET_MODE_STATE": lambda payload: self.quiet_mode_state_received.emit(payload),
                 "CALIBRATION_UPDATED": lambda payload: (
                     self.calibration_updated.emit(payload)
                 ),
@@ -397,7 +399,7 @@ class WebSocketBridge(QObject):
         return True
 
     def send_quiet_mode_toggle(
-        self, kind: str, *, source: str = "settings_sync",
+        self, kind: str, duration_minutes: int = 0, *, source: str = "settings_sync",
     ) -> None:
         """P0 §3.4: ask the daemon to enter/leave a quiet/pause mode.
 
@@ -411,7 +413,11 @@ class WebSocketBridge(QObject):
             return
         msg = json.dumps({
             "type": "QUIET_MODE_TOGGLE",
-            "payload": {"kind": str(kind), "source": str(source)},
+            "payload": {
+                "kind": str(kind),
+                "duration_minutes": max(0, int(duration_minutes)),
+                "source": str(source),
+            },
             "timestamp": 0,
             "sequence": 0,
         })
@@ -577,6 +583,8 @@ class CortexApp:
         self._onboarding: OnboardingWindow | None = None
         self._bridge: WebSocketBridge | None = None
         self._paused = False
+        self._quitting = False
+        self._quit_filter: QObject | None = None
         self._active_intervention_id: str | None = None
         self._active_action_manifest: ActionManifest | None = None
         # P0 §3.4: in-flight CalibrationRunner. None when idle.
@@ -609,6 +617,8 @@ class CortexApp:
         # Create UI components
         self._dashboard = DashboardWindow()
         self._overlay = OverlayWindow()
+        from cortex.apps.desktop_shell.suggestion_review import SuggestionReview
+        self._suggestion_review = SuggestionReview(self._dashboard, self._overlay)
         self._settings = SettingsDialog()
         self._context_privacy_controller = ContextPrivacyController(self._settings)
         self._onboarding = OnboardingWindow()
@@ -697,6 +707,12 @@ class CortexApp:
         )
         self._bridge.state_updated.connect(self._on_state_update)
         self._bridge.intervention_triggered.connect(self._on_intervention)
+        self._bridge.intervention_transaction_state.connect(
+            self._suggestion_review.transaction_updated,
+        )
+        self._bridge.quiet_mode_state_received.connect(self._suggestion_review.quiet_updated)
+        self._bridge.quiet_mode_state_received.connect(self._dashboard.apply_quiet_mode_state)
+        self._dashboard.quiet_mode_requested.connect(self._bridge.send_quiet_mode_toggle)
         self._bridge.intervention_restored.connect(self._on_restore)
         if self._dashboard is not None and hasattr(
             self._dashboard, "apply_intervention_transaction_state",
@@ -832,17 +848,20 @@ class CortexApp:
         # Start WebSocket connection
         self._bridge.start()
 
-        # Phase 4.B fix (#4): route Cmd+W on the dashboard (which fires
-        # ``lastWindowClosed`` with our ``setQuitOnLastWindowClosed(False)``
-        # tray-resident config) through the two-phase recap when a
-        # session is active.
+        # Closing a window keeps this menu-bar app running. Intercept only
+        # an actual Quit request, while it is still cancellable, so the
+        # recap can finish before Qt exits (same contract as bundled mode).
+        from cortex.apps.desktop_shell.controller import _QuitEventFilter
+
+        self._quit_filter = _QuitEventFilter(self._on_user_initiated_quit)
         try:
-            self._app.lastWindowClosed.connect(self._on_user_initiated_quit)
+            self._app.installEventFilter(self._quit_filter)
         except Exception:
-            logger.debug("lastWindowClosed connect failed", exc_info=True)
+            logger.debug("quit event filter install failed", exc_info=True)
         # Handle SIGINT gracefully — route via user-initiated quit so a
         # Ctrl+C from a dev terminal also gets the recap when applicable.
         signal.signal(signal.SIGINT, lambda *_: self._on_user_initiated_quit())
+        signal.signal(signal.SIGTERM, lambda *_: self._on_user_initiated_quit())
         # Timer to allow Python signal handling
         timer = QTimer()
         timer.timeout.connect(lambda: None)
@@ -940,7 +959,11 @@ class CortexApp:
             )
         except Exception:
             self._active_action_manifest = None
-        if self._overlay is not None:
+        review = getattr(self, "_suggestion_review", None)
+        if review is not None:
+            review.present(payload, show_immediately=payload.get("desktop_not_focused") is not True)
+            return
+        elif self._overlay is not None:
             self._overlay.show_intervention(payload)
         # Audit-2 fix: bump the Today/Blocked counter so the dashboard
         # numeric reflects reality instead of staying at the "--" placeholder.
@@ -959,6 +982,8 @@ class CortexApp:
             self._tray.set_connected(connected)
         if self._dashboard is not None:
             self._dashboard.set_connected(connected)
+        if not connected and (review := getattr(self, "_suggestion_review", None)):
+            review.clear()
         if not connected and self._pending_calibration_profile_id is not None:
             self._on_calibration_update_failed(
                 {
@@ -1186,7 +1211,7 @@ class CortexApp:
         self._quit()
 
     def _on_user_initiated_quit(self) -> None:
-        """Phase 4.B fix (#4): tray Quit / Cmd+W / SIGINT entry point.
+        """Phase 4.B fix (#4): tray Quit / Cmd+Q / signal entry point.
 
         Routes through the dashboard's two-phase recap when a session is
         active so the user always sees their recap before the WS-mode
@@ -1197,6 +1222,8 @@ class CortexApp:
         bridge's connection state plus the dashboard's stop-state as
         proxies for "is there an active session?".
         """
+        if self._quitting:
+            return
         bridge = self._bridge
         dashboard = self._dashboard
         if dashboard is None:
@@ -1758,6 +1785,9 @@ class CortexApp:
 
     def _dismiss_overlay(self) -> None:
         """Single overlay dismissal path: stops its timers, then hides."""
+        review = getattr(self, "_suggestion_review", None)
+        if review is not None:
+            review.clear()
         overlay = self._overlay
         if overlay is None:
             return
@@ -1822,13 +1852,19 @@ class CortexApp:
 
     def _quit(self) -> None:
         """Quit the application."""
+        if self._quitting:
+            return
+        self._quitting = True
         logger.info("Shutting down Cortex desktop shell")
+        quit_filter = getattr(self, "_quit_filter", None)
+        if self._app is not None and quit_filter is not None:
+            self._app.removeEventFilter(quit_filter)
         if self._bridge is not None:
             self._bridge.stop()
         if self._overlay is not None:
             self._overlay.close()
         if self._dashboard is not None:
-            self._dashboard.close()
+            self._dashboard.close_for_quit()
         if self._app is not None:
             self._app.quit()
 

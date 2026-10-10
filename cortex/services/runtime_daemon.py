@@ -2159,7 +2159,8 @@ class CortexDaemon:
             # Input/window hooks are fast and independently useful when the
             # camera is unavailable.  Capture itself is supervised in the
             # background because TCC/OpenCV/MediaPipe are optional hardware.
-            self._input_hooks.start()
+            if not self._input_hooks.start():
+                logger.info("Input acquisition unavailable; behavioral features will abstain")
             self._window_tracker.start()
             self._spawn_background_task(
                 self._start_optional_hardware(),
@@ -2828,10 +2829,8 @@ class CortexDaemon:
             await asyncio.sleep(0.02)
 
     def _current_app_name(self) -> str:
-        events = self._window_tracker.get_events_in_window(window_seconds=60.0)
-        if not events:
-            return "other"
-        return events[-1].app_name
+        focus = self._window_tracker.current_focus
+        return focus.app_name if focus is not None else "other"
 
     def _load_baselines(self) -> UserBaselines:
         """Return the one startup/live-applied immutable profile view."""
@@ -4258,22 +4257,22 @@ class CortexDaemon:
 
                         # v2.0: Check zombie reading
                         active_app = self._current_app_name()
-                        telemetry = self._current_telemetry()
                         kinematics = self._latest_kinematics
-                        self._zombie_detector.update_baseline(
-                            self._scorer.baselines.blink_rate_baseline
+                        # Blink remains diagnostic-only: reading reminders
+                        # cannot change with camera values or camera freshness.
+                        # Click availability certifies the mouse source even
+                        # when no moves occurred (velocity variance needs two
+                        # moves, but measured silence is a valid quiet window).
+                        mouse_feature = vector.features.get(FeatureName.CLICK_FREQUENCY)
+                        observed_mouse_velocity = (
+                            vector.mouse_velocity_mean
+                            if mouse_feature is not None and mouse_feature.valid else None
                         )
-                        # audit P2: zombie-reading + rabbit-hole detection feed
-                        # off ``estimate.state`` and ``blink_rate`` — the SAME
-                        # evidence pipeline the standard intervention trigger
-                        # gates on. Without the floor a low-quality frame
-                        # produces an unreliable HYPER/blink reading that
-                        # fired a spurious active-recall / goal-drift overlay.
-                        # Apply the same floor here so all HYPER-derived
-                        # interventions share one evidence gate. (The shared
-                        # *interruption* gate — receptivity, quiet mode,
-                        # cooldown, hourly cap — is applied inside
-                        # ``_trigger_special_intervention``; audit D5.)
+                        # Behavioral check-ins share the support estimate's
+                        # evidence gate. Camera quality and blink measurements
+                        # are diagnostic-only and cannot make them eligible.
+                        # Receptivity, quiet mode, cooldown and hourly limits
+                        # are also checked by _trigger_special_intervention.
                         signal_ok = bool(
                             estimate.status == "estimated" and estimate.evidence_coverage >= 0.45
                         )
@@ -4283,8 +4282,8 @@ class CortexDaemon:
                         zombie_detected = self._zombie_detector.update(
                             state=estimate.state,
                             active_app=active_app,
-                            mouse_velocity=telemetry.mouse_velocity_mean if telemetry else 0.0,
-                            blink_rate=kinematics.blink_rate,
+                            mouse_velocity=observed_mouse_velocity,
+                            blink_rate=None,
                             current_time=timestamp,
                             # Keep accumulating while an interruption is
                             # barred, so the dwell already served is deferred
@@ -4296,7 +4295,7 @@ class CortexDaemon:
                             ),
                         )
                         if signal_ok and zombie_detected:
-                            logger.info("Zombie reading detected — triggering active recall")
+                            logger.info("Reading check-in eligible — offering active recall")
                             await self._trigger_special_intervention(
                                 context,
                                 estimate,
@@ -4306,33 +4305,26 @@ class CortexDaemon:
                             )
 
                         # v2.0: Check rabbit hole drift
-                        goal = context.current_goal_hint or ""
-                        if goal:
-                            current_file = getattr(context, "file_path", "") or ""
-                            alert = self._rabbit_hole.check(
-                                goal=goal,
-                                current_file=current_file,
-                                current_app=active_app,
-                                state=estimate.state,
+                        alert = self._rabbit_hole.check_context(
+                            context,
+                            active_app=active_app,
+                            state=estimate.state,
+                            current_time=timestamp,
+                            may_trigger=signal_ok
+                            and self._interruption_allowed(
+                                surface="rabbit_hole",
                                 current_time=timestamp,
-                                # Let the detector keep tracking while an
-                                # interruption is barred, so a detection is
-                                # deferred rather than consumed and discarded.
-                                may_trigger=signal_ok
-                                and self._interruption_allowed(
-                                    surface="rabbit_hole",
-                                    current_time=timestamp,
-                                ),
+                            ),
+                        )
+                        if signal_ok and alert is not None:
+                            logger.info("Goal check-in eligible")
+                            await self._trigger_special_intervention(
+                                context,
+                                estimate,
+                                template_name="rabbit_hole",
+                                ws_type="INTERVENTION_TRIGGER",
+                                current_time=timestamp,
                             )
-                            if signal_ok and alert is not None:
-                                logger.info("Rabbit hole detected — goal drift intervention")
-                                await self._trigger_special_intervention(
-                                    context,
-                                    estimate,
-                                    template_name="rabbit_hole",
-                                    ws_type="INTERVENTION_TRIGGER",
-                                    current_time=timestamp,
-                                )
 
                         # HRV-derived stress warnings and break triggers are
                         # intentionally unavailable. Reintroduction requires

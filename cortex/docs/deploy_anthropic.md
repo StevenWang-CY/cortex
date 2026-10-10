@@ -1,6 +1,10 @@
 ## Anthropic SDK Deployment Checklist
 
-Use this flow to experience Cortex as a real product on macOS. Cortex talks to Claude exclusively through the Anthropic SDK (`anthropic` 0.125.x, locked); pick one of three transports.
+Use this flow to configure Cortex's optional external planner on macOS. Cortex
+uses the Anthropic SDK (`anthropic` 0.125.0 in the lockfile) with one of three
+transports. This page describes the repository's integration and model catalog;
+provider availability, account access and billing terms require separate
+verification. See the [current implementation record](../../docs/implementation-2026-10.md).
 
 ### 1. Install and configure
 
@@ -83,10 +87,11 @@ CORTEX_LLM__MODEL_DEEP=claude-opus-5
 CORTEX_LLM__FALLBACK_MODE=rule_based   # default — deterministic plan if all else fails
 ```
 
-Valid logical ids are `claude-opus-5`, `claude-sonnet-5`, `claude-haiku-4-5`
-and the still-served legacy tiers `claude-opus-4-7`, `claude-sonnet-4-6`.
-`cortex/libs/llm/anthropic_client.resolve_anthropic_model_id` maps each logical
-id to the provider-specific identifier:
+The repository catalog includes `claude-opus-5`, `claude-sonnet-5`,
+`claude-haiku-4-5`, `claude-opus-4-7` and `claude-sonnet-4-6`.
+[`resolve_anthropic_model_id`](../libs/llm/anthropic_client.py) maps each logical
+id to the configured provider's identifier. A mapping does not establish that
+the account or region can serve that model:
 
 | Logical id          | Bedrock (Mantle)              | Vertex                     | Direct              |
 | ------------------- | ----------------------------- | -------------------------- | ------------------- |
@@ -96,10 +101,10 @@ id to the provider-specific identifier:
 | `claude-opus-4-7`   | `anthropic.claude-opus-4-7`   | `claude-opus-4-7`          | `claude-opus-4-7`   |
 | `claude-sonnet-4-6` | `anthropic.claude-sonnet-4-6` | `claude-sonnet-4-6`        | `claude-sonnet-4-6` |
 
-Pricing (`cortex/libs/llm/pricing.py`, USD per million tokens, input/output):
-Opus 5 and Opus 4.7 $5/$25, Sonnet 5 $2/$10, Sonnet 4.6 $3/$15, Haiku 4.5
-$1/$5; cache reads bill at 0.1x input, five-minute cache writes at 1.25x. The
-daily cost ledger also keeps per-day prompt/completion token counters.
+The daily ledger estimates USD cost using the local
+[`pricing.py`](../libs/llm/pricing.py) table and records prompt/completion token
+counters, including provider-reported cache usage when available. Its totals
+are estimates, not invoices or live provider price quotes.
 
 #### Request shape, effort, and `max_tokens`
 
@@ -109,8 +114,9 @@ Every planner call is a structured-output request:
 narrative and proposal fields; daemon-owned fields (`intervention_id`,
 `metadata`, `consent_level`, `trigger_url`, `causal_signals`, `plan_warnings`,
 `action_id`, `catalog_id`) are not in the schema and are stamped locally. No
-tools, no forced `tool_choice`, and no sampling parameters are sent —
-`temperature` / `top_p` / `top_k` return HTTP 400 on Opus 4.7/5 and Sonnet 5.
+tools, forced `tool_choice`, sampling parameters (`temperature`, `top_p`,
+`top_k`) or explicit `thinking` configuration are sent. This is the planner's
+request policy across its supported transports.
 
 ```bash
 CORTEX_LLM__EFFORT=medium        # low | medium | high | xhigh | max
@@ -118,20 +124,16 @@ CORTEX_LLM__MAX_TOKENS=8192      # minimum 1024
 CORTEX_LLM__TIMEOUT_SECONDS=30   # per attempt
 ```
 
-- `effort` is sent as `output_config.effort` only to models that accept it
-  (Opus 4.7/5, Sonnet 5, Sonnet 4.6); it is omitted for Haiku 4.5, which
-  rejects it. `medium` balances latency and depth for interventions; raise it
-  for the deep tier via a per-template override if diagnoses feel shallow.
-- Opus 5 and Sonnet 5 run adaptive thinking by default when `thinking` is
-  omitted, so `max_tokens` caps thinking **plus** the JSON plan. Plans carry
-  per-tab recommendations for up to 30 tabs and an error analysis; 8192 is the
-  floor that avoids `stop_reason == "max_tokens"` truncation. A truncated or
-  refused response (`stop_reason == "refusal"`, HTTP 200 from the safety
-  classifiers) falls back to the deterministic plan immediately — neither is
-  retried.
-- The system prompt is marked `cache_control: ephemeral`; it caches on models
-  whose minimum cacheable prefix it exceeds (Opus 5: 512 tokens, Sonnet 5 /
-  Sonnet 4.6: 1024, Opus 4.7: 2048) and silently does not on Haiku 4.5 (4096).
+- `effort` is a global planner setting. It is sent as `output_config.effort`
+  only when the local capability catalog enables it: Opus 4.7/5, Sonnet 5 and
+  Sonnet 4.6. It is omitted for Haiku 4.5 and unknown model overrides.
+  `template_tier_overrides` selects a model tier, not a separate effort value.
+- `max_tokens` defaults to 8192 and accepts values of at least 1024. It is an
+  output budget, not a guarantee that a plan will fit. A response ending with
+  `stop_reason == "max_tokens"` or `"refusal"` is terminal for that call;
+  the configured fallback runs without retrying the same response.
+- The system prompt requests `cache_control: ephemeral`. A cache request does
+  not prove a hit; accounting uses cache token counts from the response.
 
 #### Worst-case timing
 
@@ -140,12 +142,15 @@ only retry policy: 3 attempts × `timeout_seconds`, plus capped jittered
 backoff (2 s + 3 s), retrying only `RateLimitError`, `APITimeoutError`,
 `APIConnectionError`, and HTTP 408/409/429/5xx. 401/403 (`auth_error`),
 400/422 (`bad_request`), and 404 (`model_unavailable`) are not retried and
-trip the affected tier's circuit breaker. With the defaults the bound is
-`LLMConfig.planner_worst_case_seconds` = 3 × 30 s + 5 s = 95 s; the daemon
-should size any outer `wait_for` from that value (also exposed as
-`llm_client.worst_case_seconds`), not from `timeout_seconds` alone. A caller
-that stops waiting does not orphan the HTTP call: it completes in the
-background, its real usage is billed, and its concurrency slot is released.
+trip the affected tier's circuit breaker. With the defaults the retry envelope
+is `LLMConfig.planner_worst_case_seconds` = 3 × 30 s + 5 s = 95 s, also exposed
+as `llm_client.worst_case_seconds`. An outer deadline must account for that
+budget rather than only one `timeout_seconds`; waiting for a concurrency slot
+and any fallback work are additional to this calculated envelope. A caller
+that stops waiting leaves the shielded SDK call with a completion callback,
+which records returned usage and releases its concurrency slot. If event-loop
+teardown cancels it before a response, the ledger records an input-token
+estimate with zero output tokens; it cannot establish actual provider billing.
 
 ### 2. Optional research calibration
 
@@ -153,7 +158,12 @@ background, its real usage is billed, and its concurrency slot is released.
 uv run --project cortex --locked cortex-calibrate --duration 120
 ```
 
-This writes the active baseline to `storage/baselines/default.json`.
+This captures a measured profile and presents it for explicit review and
+approval. Approved CLI profiles are considered on the next daemon start;
+the desktop calibration flow can apply an approved profile live. Immutable
+profiles and the active-calibration store are authoritative; the legacy
+`baselines/default.json` is a compatibility projection. See
+[Calibration](calibration.md) for storage, identity checks and measurement limits.
 
 ### 3. Install clients
 
@@ -197,15 +207,18 @@ uv run --project cortex --locked python -m cortex.apps.desktop_shell.main
 ### 5. Experience the product
 
 For coding recovery:
+
 - open VS Code with a real assignment or debugging task
 - keep the VS Code extension connected
-- let Cortex see diagnostics and terminal output
+- provide the current editor context and diagnostic summaries; the shipping
+  extension does not collect terminal output
 
 For research recovery:
+
 - keep Chrome open with docs, PDFs, and paper tabs
 - let the browser extension classify the active research context
 
-When the legacy heuristic support gate is reached, Cortex can show a focused
+When the behavioral support and policy gates are reached, Cortex can show a focused
 proposal with 1–3 next steps. The shipping `suggest_only` mode does not fold
 code, hide tabs, or otherwise restructure the workspace. Do not interpret the
 gate as a diagnosis of overwhelm.

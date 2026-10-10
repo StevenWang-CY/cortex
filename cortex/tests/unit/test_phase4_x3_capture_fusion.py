@@ -471,6 +471,8 @@ class TestFeatureFusionTimestampOrdering:
     def test_telemetry_timestamp_assigned_before_features(self) -> None:
         fusion = FeatureFusion()
         tel = TelemetryFeatures(
+            mouse_source_available=True, keyboard_source_available=True,
+            keystroke_interval_count=20,
             mouse_velocity_mean=100.0,
             mouse_velocity_variance=10.0,
             click_frequency=0.1,

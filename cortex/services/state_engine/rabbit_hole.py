@@ -15,6 +15,9 @@ import logging
 import time
 from dataclasses import dataclass
 
+from cortex.libs.schemas.context import TaskContext
+from cortex.services.context_engine.app_classifier import classify_app
+
 logger = logging.getLogger(__name__)
 
 # Detection thresholds
@@ -76,6 +79,7 @@ class RabbitHoleDetector:
     def set_goal(self, goal: str) -> None:
         """Set or update the session goal."""
         self._last_goal = goal
+        self._goal_files.clear()
         self._goal_keywords = self._extract_keywords(goal)
         self._drift_start = None
 
@@ -115,6 +119,35 @@ class RabbitHoleDetector:
             if len(self._goal_files) > 10:
                 self._goal_files = self._goal_files[-10:]
 
+    def check_context(
+        self,
+        context: TaskContext,
+        *,
+        active_app: str,
+        state: str,
+        current_time: float,
+        may_trigger: bool,
+    ) -> RabbitHoleAlert | None:
+        """Use only metadata belonging to the foreground application."""
+        app_kind = classify_app(active_app)
+        current_file = (
+            context.editor_context.file_path
+            if app_kind == "vscode" and context.editor_context is not None else ""
+        )
+        titles = (
+            [context.browser_context.active_tab_title]
+            if app_kind == "chrome" and context.browser_context is not None else []
+        )
+        return self.check(
+            goal=context.current_goal_hint or "",
+            current_file=current_file,
+            current_app=active_app,
+            tab_titles=titles,
+            state=state,
+            current_time=current_time,
+            may_trigger=may_trigger,
+        )
+
     def check(
         self,
         goal: str,
@@ -151,6 +184,7 @@ class RabbitHoleDetector:
 
         # Need a goal to detect drift
         if not goal:
+            self._drift_start = None
             return None
 
         # Update goal if changed
@@ -163,6 +197,12 @@ class RabbitHoleDetector:
 
         # Only trigger in FLOW or HYPO (in HYPER, user is already struggling)
         if state not in ("FLOW", "HYPO"):
+            self._drift_start = None
+            return None
+
+        # An app name alone says nothing about the current task. Missing
+        # editor/browser metadata cannot establish that a goal was abandoned.
+        if not current_file.strip() and not any(title.strip() for title in tab_titles or []):
             self._drift_start = None
             return None
 
@@ -199,7 +239,10 @@ class RabbitHoleDetector:
         # Suggest the most recently recorded on-task file
         suggested = self._goal_files[-1] if self._goal_files else None
 
-        current_name = current_file.split("/")[-1] if "/" in current_file else current_file
+        current_name = (
+            current_file.rsplit("/", 1)[-1]
+            if current_file else next((title for title in tab_titles or [] if title.strip()), current_app)
+        )
 
         alert = RabbitHoleAlert(
             goal=goal,
@@ -209,15 +252,15 @@ class RabbitHoleDetector:
             alignment_score=alignment,
             suggested_file=suggested,
             summary=(
-                f"You've been in {current_name} for {drift_minutes:.0f} minutes, "
-                f"but your goal is \"{goal}\". "
-                f"Alignment score: {alignment:.0%}."
+                f"Your goal is \"{goal}\". "
+                f"You have been viewing {current_name} for {drift_minutes:.0f} minutes. "
+                "Would a goal check-in help?"
             ),
         )
 
         logger.info(
-            "Rabbit hole detected: goal=%r, current=%s, drift=%.1fmin, alignment=%.2f",
-            goal, current_file, drift_minutes, alignment,
+            "Goal check-in eligible: drift=%.1fmin, keyword_overlap=%.2f",
+            drift_minutes, alignment,
         )
         return alert
 

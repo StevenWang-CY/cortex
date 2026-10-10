@@ -70,6 +70,8 @@ def _flow_kinematics() -> KinematicFeatures:
 
 def _flow_telemetry() -> TelemetryFeatures:
     return TelemetryFeatures(
+        mouse_source_available=True, keyboard_source_available=True,
+        keystroke_interval_count=20,
         mouse_velocity_mean=400.0, mouse_velocity_variance=5000.0,
         mouse_jerk_score=0.1, click_burst_score=0.1, click_frequency=0.5,
         keyboard_burst_score=0.2, keystroke_interval_variance=500.0,

@@ -33,7 +33,7 @@ class FeatureDefinition:
     exclusion_reason: str | None = None
 
 
-FEATURE_SCHEMA_VERSION = "support-features-v2.1.0"
+FEATURE_SCHEMA_VERSION = "support-features-v2.2.0"
 
 ORDERED_FEATURES: tuple[FeatureDefinition, ...] = (
     FeatureDefinition(

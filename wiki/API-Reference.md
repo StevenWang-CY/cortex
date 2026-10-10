@@ -16,7 +16,11 @@ declarations are generated and rejected by CI when stale.
 The capability token is a local 256-bit secret stored mode `0600` under the
 user's Cortex application-support directory. Loopback location is not treated
 as authentication. Mutating HTTP requests carry `Authorization: Bearer …` and
-may receive an `X-Cortex-Request-ID` for correlation.
+may receive an `X-Cortex-Request-ID` for correlation. The API gateway also accepts
+`X-Cortex-Auth-Token`; the launcher expects that header for its mutation routes.
+The browser uses the local token for both graceful HTTP shutdown and launcher
+fallback. `/health` is a liveness endpoint, not evidence that a stopped daemon
+has released every resource.
 
 ## Core HTTP groups
 
@@ -63,6 +67,26 @@ authorization transaction, and `INTERVENTION_AUTHORIZATION_DENIED` names the
 reason when a request is refused or downgraded. The complete catalogue is
 listed in the canonical API document.
 
+## Browser-internal state
+
+Worker-to-popup/new-tab messages are a separate extension-private protocol in
+`lib/extension-protocol.ts`; they are not additional daemon WebSocket catalogue
+members. `GET_STATE` returns the cached state and its `stateAgeMs` duration,
+connection/stop intent, `stopStatus` (`idle`, `stopping`, `stopped`, `error`),
+`stopError`, focus session and current proposal presentation.
+
+Live `STATE_UPDATE` resets the sample age; a cached read preserves it. The
+worker normalizes optional biometrics/capture/storage fields consistently for
+live and hydrated consumers. The popup and new-tab page expire presentation
+after ten seconds and immediately invalidate current readings on disconnect.
+
+`STOP_STATUS` describes the worker operation. `STOP_CORTEX` responds with
+verified success or an error; setting sticky stop intent or losing the socket
+cannot produce a successful result. Launches share an in-flight operation;
+Stop invalidates continuation and drains an already-issued helper request before
+stopping the resulting process. See [Browser extension](Browser-Extension) for
+the ordered stages and timeout budgets.
+
 ## Privacy routes
 
 | Method/path | Behavior |
@@ -75,7 +99,7 @@ listed in the canonical API document.
 
 ## Change protocol
 
-When adding a boundary field or message:
+When adding a daemon-boundary field or message:
 
 1. edit the Pydantic source and the canonical `MessageType` catalogue;
 2. implement both producer and consumer with auth/size/replay bounds;
@@ -84,3 +108,5 @@ When adding a boundary field or message:
 5. run `make contracts`; update this page only when high-level behavior changes.
 
 Do not hand-edit generated `.d.ts` files or `.plasmo/` output.
+Extension-private messages instead require their TypeScript contract, runtime
+decoder, producers/consumers and focused lifecycle tests to change together.

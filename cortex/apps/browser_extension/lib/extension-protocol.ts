@@ -10,6 +10,7 @@
  */
 
 import { isApplyOutcome, type ApplyOutcome } from "./apply-state";
+import type { StopStatus } from "./daemon-stop";
 
 export interface ActionResultShape {
     action_id: string;
@@ -59,13 +60,20 @@ export interface StopIntentMessage {
     stopRequested: boolean;
 }
 
+export interface StopStatusMessage {
+    type: "STOP_STATUS";
+    status: StopStatus;
+    error: string | null;
+}
+
 export type PopupInboundMessage =
     | ConnectionChangedMessage
     | ConnectivityDiagnosticMessage
     | InterventionAppliedMessage
     | InterventionRestoreMessage
     | OverlayDismissedMessage
-    | StopIntentMessage;
+    | StopIntentMessage
+    | StopStatusMessage;
 
 // --- popup / new tab / page panel → background ---------------------------
 
@@ -199,6 +207,9 @@ export function isPopupInboundMessage(value: unknown): value is PopupInboundMess
                 || typeof value.intervention_id === "string";
         case "STOP_INTENT":
             return typeof value.stopRequested === "boolean";
+        case "STOP_STATUS":
+            return ["idle", "stopping", "stopped", "error"].includes(String(value.status))
+                && (value.error === null || typeof value.error === "string");
         default:
             return false;
     }

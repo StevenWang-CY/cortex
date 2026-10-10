@@ -20,7 +20,9 @@ Run with:
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
+import textwrap
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -143,6 +145,61 @@ def test_the_quit_event_routes_through_the_recap_flow(qapp):
     # Every other event passes straight through.
     assert filt.eventFilter(qapp, QEvent(QEvent.Type.Show)) is False
     assert calls == [None]
+
+
+@pytest.mark.parametrize("entry", ["controller._quit", "app.quit"])
+@pytest.mark.parametrize("mode", ["in_process", "websocket"])
+def test_completed_quit_exits_the_real_qt_event_loop(tmp_path, entry, mode):
+    """The recap interception must release Qt's final Quit event.
+
+    A mocked app.quit() cannot detect an event filter consuming the final
+    event. Run a fresh real event loop, with no daemon or native surfaces,
+    and an exit-code watchdog so a regression cannot hang the test suite.
+    """
+    script = textwrap.dedent(
+        f"""
+        from PySide6.QtCore import QTimer
+        from PySide6.QtWidgets import QApplication
+        from cortex.apps.desktop_shell.controller import (
+            CortexAppController, _QuitEventFilter,
+        )
+        from cortex.apps.desktop_shell.main import CortexApp
+
+        app = QApplication([])
+        app.setQuitOnLastWindowClosed(False)
+        controller = {"CortexAppController" if mode == "in_process" else "CortexApp"}()
+        controller._app = app
+        controller._quit_filter = _QuitEventFilter(
+            controller._on_user_initiated_quit,
+        )
+        app.installEventFilter(controller._quit_filter)
+        completed = []
+        app.aboutToQuit.connect(lambda: completed.append(True))
+        QTimer.singleShot(0, {entry})
+        QTimer.singleShot(1000, lambda: app.exit(93))
+        result = app.exec()
+        assert result == 0, "final Quit was consumed; watchdog ended the loop"
+        assert controller._quitting
+        assert completed == [True]
+        """
+    )
+    env = dict(os.environ)
+    for name in ("HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"):
+        sandbox = tmp_path / name.lower()
+        sandbox.mkdir()
+        env[name] = str(sandbox)
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    # No services are constructed here; use the ordinary no-session quit
+    # path so this also verifies native Quit routing without probe shortcuts.
+    env.pop("CORTEX_HEADLESS_STARTUP", None)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 # ---------------------------------------------------------------------------

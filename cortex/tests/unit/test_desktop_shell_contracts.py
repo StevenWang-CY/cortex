@@ -243,7 +243,7 @@ def test_dashboard_indicators_do_not_lie_before_data(qapp):
         consumer.set_extension_connected("Chrome", False)
         assert "Off" in consumer._conn_labels["Chrome"].text()
         # The camera placeholder says what it is waiting for.
-        assert "Waiting for the camera" in consumer._bio_empty_state.text()
+        assert "Session offline" in consumer._bio_empty_state.text()
     finally:
         window.deleteLater()
 

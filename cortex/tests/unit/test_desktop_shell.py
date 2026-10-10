@@ -426,6 +426,7 @@ def _setup_pyside6_mocks() -> bool:
 
     class MockQFrame(MockQWidget):
         class Shape:
+            NoFrame = 0
             HLine = 4
         def setFrameShape(self, s): pass
 

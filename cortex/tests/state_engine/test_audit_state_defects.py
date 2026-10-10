@@ -189,24 +189,29 @@ def test_shared_interruption_gate_denies_while_paused(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_d1_forty_seconds_of_silence_is_observed_as_inactivity() -> None:
+def test_d1_forty_seconds_of_silence_is_observed_as_inactivity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(InputHooks, "mouse_source_available", property(lambda self: True))
+    monkeypatch.setattr(InputHooks, "keyboard_source_available", property(lambda self: True))
     hooks = InputHooks(clock=FakeClock())
     aggregator = FeatureAggregator(hooks)
     # One keystroke, then silence. The 15 s sliding window prunes the event
     # long before 40 s have elapsed; the last-input marker must survive it.
     hooks.record_key_event(KeyType.REGULAR, timestamp=1_000.0)
-    aggregator.build_features(window_seconds=15.0, current_time=1_000.5)
-    later = aggregator.build_features(window_seconds=15.0, current_time=1_040.0)
+    for timestamp in range(1_000, 1_041):
+        later = aggregator.build_features(window_seconds=15.0, current_time=float(timestamp))
     assert later.inactivity_seconds == pytest.approx(40.0)
     assert later.key_press_count == 0  # the event itself left the window
 
 
-def test_d1_inactivity_is_bounded_by_exposure_not_machine_uptime() -> None:
+def test_d1_inactivity_is_bounded_by_exposure_not_machine_uptime(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(InputHooks, "mouse_source_available", property(lambda self: True))
+    monkeypatch.setattr(InputHooks, "keyboard_source_available", property(lambda self: True))
     hooks = InputHooks(clock=FakeClock())
     aggregator = FeatureAggregator(hooks)
     # No events ever, first observation at a large monotonic instant.
     first = aggregator.build_features(window_seconds=15.0, current_time=50_000.0)
-    later = aggregator.build_features(window_seconds=15.0, current_time=50_040.0)
+    for timestamp in range(50_001, 50_041):
+        later = aggregator.build_features(window_seconds=15.0, current_time=float(timestamp))
     assert first.inactivity_seconds == 0.0
     assert later.inactivity_seconds == pytest.approx(40.0)
 
@@ -383,7 +388,8 @@ def test_d3_smoother_exit_dwell_does_not_preempt_recovery() -> None:
     smoother.update(StateScores(hyper=0.6), quality, timestamp=0.0)
     assert smoother.update(StateScores(hyper=0.6), quality, timestamp=1.5).state == "HYPER"
     strong_flow = StateScores(flow=0.8, hyper=0.0)
-    smoother.update(strong_flow, quality, timestamp=2.0)
+    for timestamp in range(2, 8):
+        smoother.update(strong_flow, quality, timestamp=float(timestamp))
     assert smoother.update(strong_flow, quality, timestamp=7.5).state == "RECOVERY"
 
 

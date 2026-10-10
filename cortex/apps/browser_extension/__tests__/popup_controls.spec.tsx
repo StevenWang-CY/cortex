@@ -151,6 +151,23 @@ describe("popup controls", () => {
         expect(within(group).getByTestId("quiet-mode-snooze_15").getAttribute("aria-checked")).toBe("true");
     });
 
+    it("quiet mode provides one Tab stop and immediate wrapping arrow selection", async () => {
+        const { container } = await mountPopup(true);
+        const group = within(container).getByTestId("quiet-mode-control");
+        const radios = within(group).getAllByRole("radio");
+        expect(radios.map(button => button.tabIndex)).toEqual([0, -1, -1, -1]);
+        radios[0].focus();
+        await act(async () => fireEvent.keyDown(radios[0], { key: "ArrowLeft" }));
+        expect(document.activeElement).toBe(radios[3]);
+        expect(radios[3].getAttribute("aria-checked")).toBe("true");
+        expect(radios.map(button => button.tabIndex)).toEqual([-1, -1, -1, 0]);
+        await act(async () => fireEvent.keyDown(radios[3], { key: "Home" }));
+        expect(document.activeElement).toBe(radios[0]);
+        await act(async () => fireEvent.keyDown(radios[0], { key: "ArrowRight" }));
+        expect(document.activeElement).toBe(radios[1]);
+        expect(sent("QUIET_MODE_TOGGLE").map(message => message.kind)).toEqual(["pause", "off", "snooze_15"]);
+    });
+
     it("Stop Cortex asks once, names the consequence, and can be cancelled", async () => {
         const { container } = await mountPopup(true);
         await act(async () => fireEvent.click(within(container).getByTestId("stop-cortex")));

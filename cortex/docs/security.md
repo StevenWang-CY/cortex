@@ -1,6 +1,7 @@
 # Security model
 
-Last reviewed: 2026-08-30.
+Last reviewed: 2026-10-02 against the current working tree; this is an engineering
+review, not independent certification.
 
 Cortex is a local macOS application with browser/editor clients and optional
 cloud planning. Its security model is capability-based and fail-closed, but it
@@ -51,6 +52,15 @@ use the canonical installed path to avoid App Translocation ambiguity, and
 GUI-launched tools are resolved through known application-bundle paths rather
 than a shell `PATH`.
 
+Shutdown retains the authenticated client channel during the graceful
+receipt/restore window. The native host or launcher then verifies the daemon's
+process outcome; an unavailable HTTP endpoint alone does not prove exit.
+Discovery uses the daemon pidfile, listening sockets or an anchored executable
+identity, excludes the caller and parent, and never signals connected browser
+or editor clients. Failed signals or an unresolved process return an error.
+Concurrent Stop requests share one operation, and an already-issued launch is
+drained before discovery so it cannot restart sensing after Stop.
+
 ## Browser and editor clients
 
 Clients are untrusted transport adapters. Message types and size bounds are
@@ -98,6 +108,9 @@ raw SDK payloads are not returned to clients.
 | Apply acknowledgement is lost | Durable idempotency/receipt reconciliation; no blind duplicate |
 | User changes a Cortex-owned effect | Restore respects user supersession |
 | Shutdown during mutation | Restore is attempted; unresolved receipts recover next start |
+| Stop overlaps an in-flight launch | Launch continuation is invalidated; issued work drains before shutdown verification |
+| Native stop result is uncertain | UI preserves the failure/retry state; no success inferred from elapsed time |
+| Proposal expires or session disconnects | Presentation retires it; restoration records remain available |
 | Provider/account claims ZDR | UI reports it as unverified until the user verifies the provider account/contract |
 
 ## Residual risks
@@ -124,7 +137,17 @@ expected/actual authorization state, and a redacted correlation ID where
 available.
 
 The security/privacy regression set is described in
-[`privacy.md`](privacy.md) and `IMPLEMENTATION.md` section 13.5. Release
+[privacy.md](privacy.md), the [current implementation record](../../docs/implementation-2026-10.md)
+and the historical [implementation ledger](../../IMPLEMENTATION.md), section 13.5. Release
 candidates must also run secret scanning, dependency policy, SBOM/provenance,
 bundle-content inspection, signed-install lifecycle tests, and local-data
 deletion verification.
+
+The current local arm64 build passed dependency policy and mounted-artifact
+verification. Local arm64 Python and editor audits returned zero findings; the browser
+graph retains nine explicitly reviewed low/moderate exceptions. Those results
+are a dated snapshot, not a claim that dependencies remain vulnerability-free.
+The Intel dependency branch retains its separate reviewed Protobuf exception,
+described in the [release guide](../../docs/release/README.md).
+The ad-hoc artifact does not establish Developer ID notarization, an Intel
+build, physical permission behavior or a completed manual release matrix.

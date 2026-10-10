@@ -231,6 +231,12 @@ class FeatureFusion:
             and self._telemetry.observation_window_seconds > 0
             else 15_000
         )
+        mouse_source_available = bool(
+            self._telemetry is not None and self._telemetry.mouse_source_available
+        )
+        keyboard_source_available = bool(
+            self._telemetry is not None and self._telemetry.keyboard_source_available
+        )
         mouse_metrics_ready = bool(
             telemetry_window_ready
             and self._telemetry is not None
@@ -240,8 +246,8 @@ class FeatureFusion:
         typing_interval_ready = bool(
             telemetry_window_ready
             and self._telemetry is not None
-            and self._telemetry.key_press_count is not None
-            and self._telemetry.key_press_count >= 2
+            and self._telemetry.keystroke_interval_count is not None
+            and self._telemetry.keystroke_interval_count >= 2
         )
         correction_ready = bool(
             telemetry_window_ready
@@ -283,65 +289,65 @@ class FeatureFusion:
             ),
             FeatureName.MOUSE_VELOCITY_MEAN: self._feature_value(
                 mouse_velocity_mean,
-                source_present=self._telemetry is not None,
+                source_present=mouse_source_available,
                 quality=quality.telemetry,
                 age_ms=telemetry_age,
-                source_window_ms=15_000,
-                algorithm_version="input-aggregation-v2",
+                source_window_ms=telemetry_window_ms,
+                algorithm_version="input-aggregation-v2.1",
                 measurement_ready=mouse_metrics_ready,
             ),
             FeatureName.MOUSE_VELOCITY_VARIANCE: self._feature_value(
                 mouse_velocity_variance,
-                source_present=self._telemetry is not None,
+                source_present=mouse_source_available,
                 quality=quality.telemetry,
                 age_ms=telemetry_age,
-                source_window_ms=15_000,
-                algorithm_version="input-aggregation-v2",
+                source_window_ms=telemetry_window_ms,
+                algorithm_version="input-aggregation-v2.1",
                 measurement_ready=mouse_metrics_ready,
             ),
             FeatureName.CLICK_FREQUENCY: self._feature_value(
                 click_frequency,
-                source_present=self._telemetry is not None,
+                source_present=mouse_source_available,
                 quality=quality.telemetry,
                 age_ms=telemetry_age,
-                source_window_ms=15_000,
-                algorithm_version="input-aggregation-v2",
+                source_window_ms=telemetry_window_ms,
+                algorithm_version="input-aggregation-v2.1",
                 measurement_ready=telemetry_window_ready,
             ),
             FeatureName.KEYPRESS_RATE_PER_MIN: self._feature_value(
                 keypress_rate_per_min,
-                source_present=self._telemetry is not None,
+                source_present=keyboard_source_available,
                 quality=quality.telemetry,
                 age_ms=telemetry_age,
-                source_window_ms=15_000,
-                algorithm_version="input-aggregation-v2",
+                source_window_ms=telemetry_window_ms,
+                algorithm_version="input-aggregation-v2.1",
                 measurement_ready=telemetry_window_ready,
             ),
             FeatureName.KEYSTROKE_INTERVAL_VARIANCE: self._feature_value(
                 keystroke_interval_variance,
-                source_present=self._telemetry is not None,
+                source_present=keyboard_source_available,
                 quality=quality.telemetry,
                 age_ms=telemetry_age,
-                source_window_ms=15_000,
-                algorithm_version="input-aggregation-v2",
+                source_window_ms=telemetry_window_ms,
+                algorithm_version="input-aggregation-v2.1",
                 measurement_ready=typing_interval_ready,
             ),
             FeatureName.CORRECTION_RATE_PER_100_KEYS: self._feature_value(
                 correction_rate_per_100_keys,
-                source_present=self._telemetry is not None,
+                source_present=keyboard_source_available,
                 quality=quality.telemetry,
                 age_ms=telemetry_age,
-                source_window_ms=15_000,
-                algorithm_version="input-aggregation-v2",
+                source_window_ms=telemetry_window_ms,
+                algorithm_version="input-aggregation-v2.1",
                 measurement_ready=correction_ready,
             ),
             FeatureName.INACTIVITY_SECONDS: self._feature_value(
                 inactivity_seconds,
-                source_present=self._telemetry is not None,
+                source_present=mouse_source_available and keyboard_source_available,
                 quality=quality.telemetry,
                 age_ms=telemetry_age,
-                source_window_ms=15_000,
-                algorithm_version="input-aggregation-v2",
+                source_window_ms=telemetry_window_ms,
+                algorithm_version="input-aggregation-v2.1",
                 measurement_ready=telemetry_window_ready,
             ),
             # Both rates are per-minute *units* computed over the same 15 s
@@ -358,11 +364,11 @@ class FeatureFusion:
             ),
             FeatureName.SCROLL_BACK_RATE_PER_MIN: self._feature_value(
                 scroll_back_rate_per_min,
-                source_present=self._telemetry is not None,
+                source_present=mouse_source_available,
                 quality=quality.telemetry,
                 age_ms=telemetry_age,
                 source_window_ms=telemetry_window_ms,
-                algorithm_version="input-aggregation-v2",
+                algorithm_version="input-aggregation-v2.1",
                 measurement_ready=telemetry_window_ready,
             ),
             # Focus-graph aggregation is injected by the runtime after fusion.
@@ -508,8 +514,12 @@ class FeatureFusion:
         # Telemetry quality (always available if present; check freshness)
         telemetry_q = 0.0
         if self._telemetry is not None:
-            # Telemetry is high quality if we have recent data
-            telemetry_q = 1.0
+            # Freshly aggregated zeros cannot certify a disconnected source.
+            telemetry_q = float(any((
+                self._telemetry.mouse_source_available,
+                self._telemetry.keyboard_source_available,
+                self._telemetry.window_focus_source_available,
+            )))
             staleness = now - self._telemetry_timestamp
             if staleness > stale_threshold:
                 telemetry_q *= max(0.0, 1.0 - (staleness - stale_threshold) / 10.0)

@@ -2,6 +2,11 @@
 
 Cortex exposes a REST API on `http://127.0.0.1:9472` and a WebSocket server on `ws://127.0.0.1:9473`.
 
+Pydantic schemas in `cortex/libs/schemas/` are authoritative. Examples below are
+selected payloads, not substitutes for generated schemas. See the
+[current implementation record](../../docs/implementation-2026-10.md) for the
+model, source-availability and lifecycle changes.
+
 ## REST API
 
 Base URL: `http://127.0.0.1:9472`
@@ -13,7 +18,7 @@ processes. New v2 payloads use explicit `observed_at_unix_ms`,
 
 ### Authentication
 
-All mutating HTTP routes require a capability token, sent as `Authorization: Bearer <token>` (canonical) or via the legacy `X-Cortex-Auth-Token: <token>` header. The token is generated at first daemon start and persisted with mode `0600` at `~/Library/Application Support/Cortex/auth.token`. Missing or wrong tokens return `401 Unauthorized` with `WWW-Authenticate: Bearer`. `GET /health` accepts an optional token (the supervisor liveness probe must reach the daemon without owning the token).
+Operational HTTP routes, including sensitive reads and mutations, require a capability token, sent as `Authorization: Bearer <token>` (canonical) or via the legacy `X-Cortex-Auth-Token: <token>` header. The token is generated at first daemon start and persisted with mode `0600` at `~/Library/Application Support/Cortex/auth.token`. Missing or wrong tokens return `401 Unauthorized` with `WWW-Authenticate: Bearer`. `GET /health` accepts an optional token (the supervisor liveness probe must reach the daemon without owning the token).
 
 Every mutating response also carries an `X-Cortex-Request-ID` header. Clients may set their own on the request to correlate across logs (F19); otherwise the server generates one.
 
@@ -104,11 +109,15 @@ Submit physiology features from the physio engine.
 {
   "pulse_bpm": 72.0,
   "pulse_quality": 0.9,
-  "pulse_variability_proxy": 55.0,
+  "pulse_variability_proxy": null,
   "hr_delta_5s": 0.5,
   "valid": true
 }
 ```
+
+Pulse is experimental; HRV/respiration compatibility fields remain unavailable
+in product publication. Camera measurements do not contribute to production
+support scores.
 
 #### `POST /features/kinematics`
 
@@ -123,9 +132,12 @@ Submit kinematic features from the kinematics engine.
   "head_pitch": 0.0,
   "head_yaw": 0.0,
   "head_roll": 0.0,
-  "slump_score": 0.1,
-  "forward_lean_score": 0.1,
-  "shoulder_drop_ratio": 0.05,
+  "blink_valid_exposure_seconds": 60.0,
+  "head_neck_flexion_angle": null,
+  "head_neck_flexion_score": null,
+  "head_neck_proxy_available": false,
+  "slump_score": null,
+  "shoulder_drop_ratio": null,
   "confidence": 0.9
 }
 ```
@@ -141,16 +153,37 @@ Submit telemetry features from the telemetry engine.
   "mouse_velocity_variance": 5000.0,
   "mouse_jerk_score": 0.1,
   "click_burst_score": 0.1,
-  "click_frequency": 0.5,
+  "click_frequency": 0.5333333333333333,
   "keyboard_burst_score": 0.2,
   "keystroke_interval_variance": 500.0,
   "backspace_density": 0.05,
   "inactivity_seconds": 2.0,
-  "window_switch_rate": 5.0
+  "window_switch_rate": 4.0,
+  "observation_window_seconds": 15.0,
+  "mouse_source_available": true,
+  "keyboard_source_available": true,
+  "window_focus_source_available": true,
+  "mouse_move_count": 120,
+  "click_press_count": 8,
+  "key_press_count": 20,
+  "keystroke_interval_count": 18,
+  "scroll_event_count": 0,
+  "window_focus_event_count": 1,
+  "keypress_rate_per_min": 80.0,
+  "correction_rate_per_100_keys": 5.0,
+  "scroll_back_rate_per_min": 0.0
 }
 ```
 
 All feature endpoints return `{ "status": "ok", "timestamp": <float> }`.
+An acknowledgement records receipt, not measurement validity. Mouse/keyboard
+availability defaults to false for older payloads; omitting those flags cannot
+turn legacy zeros into observed inactivity. The producer must report actual
+listener availability. Inactivity requires both channels and continuous observed
+exposure; losing either source or a sampling gap above 3 seconds restarts it.
+Typing variance needs at least two positive regular-key intervals, independently
+of backspace count. The actual aggregation window and observation counts qualify
+the named features created by fusion.
 
 ---
 
@@ -161,7 +194,13 @@ All feature endpoints return `{ "status": "ok", "timestamp": <float> }`.
 Compute an evidence-aware deterministic support estimate. Named
 `FeatureValue` entries are canonical; flat fields are decode-only. Every named
 entry carries validity, quality, age, source-window exposure, algorithm
-version, and a missing reason when invalid.
+version, and a missing reason when invalid. The current registered model is
+`deterministic-support@2.5.0`, using `support-features-v2.2.0`.
+The smoother ignores duplicate/regressed observation times and resets scores,
+pending confirmation and the committed label after gaps above 3 seconds.
+Supply the complete v2 time tuple for explicit observation timing; without it,
+this endpoint uses its own injected clock rather than treating a caller's bare
+`timestamp` as a comparable monotonic clock.
 
 **Request body:**
 ```json
@@ -176,7 +215,7 @@ version, and a missing reason when invalid.
         "quality": 1.0,
         "age_ms": 0,
         "source_window_ms": 15000,
-        "algorithm_version": "input-aggregation-v2"
+        "algorithm_version": "input-aggregation-v2.1"
       }
     }
   },
@@ -393,11 +432,13 @@ implicit model request.
 
 #### `POST /intervention/apply`
 
-Submit an intervention plan to the authority boundary. In the shipping
-`suggest_only` mode the route validates and sanitizes the plan, broadcasts a
+This legacy endpoint validates and sanitizes a plan, broadcasts a
 presentation-only proposal, performs no adapter call or snapshot, and returns
-`applied: false`. Legacy `authorized` behavior remains experimental until
-manifest-bound authorization and durable action receipts are complete.
+`applied: false` in every execution mode. It has no exact manifest authorization
+fields and cannot grant workspace authority. The implemented mutation path is
+`INTERVENTION_AUTHORIZE` → `INTERVENTION_APPLY` → durable receipt and verification;
+see [adapters](adapters.md). Compatibility confirmation query parameters do not
+turn this route into that transaction path.
 
 **Request body:**
 ```json
@@ -418,7 +459,9 @@ manifest-bound authorization and durable action receipts are complete.
 
 #### `POST /intervention/restore`
 
-Restore workspace to pre-intervention state.
+Request a receipt-verified, scoped restore of Cortex-owned effects. This is not
+a blanket workspace rollback; a missing coordinator, failed receipt or changed
+ownership cannot be reported as a successful restoration.
 
 **Request body:**
 ```json
@@ -615,16 +658,39 @@ product clients ignore them and they cannot trigger an action.
 
 Selected payload shapes follow.
 
+### Browser extension runtime messages are a separate protocol
+
+The worker, popup and new-tab page also communicate through `chrome.runtime`.
+Their private types live in `lib/extension-protocol.ts`, not daemon `MessageType`.
+For example, the worker reports a stop outcome as:
+
+```json
+{ "type": "STOP_STATUS", "status": "error", "error": "Could not confirm shutdown." }
+```
+
+`status` is `idle`, `stopping`, `stopped` or `error`; `error` may be null.
+`STOP_INTENT` separately carries the user's `stopRequested` intent. `GET_STATE`
+hydration includes `stopStatus`, `stopError` and `stateAgeMs`. None of these
+private status frames is sent as a daemon WebSocket command. The popup waits
+for the shared stop operation's verified helper result; a disconnected socket
+alone is insufficient proof of process exit.
+
 #### `STATE_UPDATE` (server → client)
 
-Broadcast every 500ms to all connected clients.
+Nominally broadcast every 500 ms to authenticated clients. The payload also
+carries explicit estimate status, support scores, evidence coverage, model
+identity, exclusions and optional diagnostic/capture/store fields. A minimal
+illustrative subset follows.
 
 ```json
 {
   "type": "STATE_UPDATE",
   "payload": {
     "state": "FLOW",
+    "support_state": "flow_like",
+    "status": "estimated",
     "confidence": 0.87,
+    "evidence_coverage": 0.82,
     "scores": {
       "flow": 0.87,
       "hypo": 0.05,
@@ -638,12 +704,20 @@ Broadcast every 500ms to all connected clients.
       "overall": 0.9
     },
     "dwell_seconds": 45.2,
-    "reasons": ["Stable visible-eye activity", "Steady input"]
+    "reasons": ["Steady observed input"]
   },
   "timestamp": 12345.6,
   "sequence": 42
 }
 ```
+
+Browser surfaces clear unavailable or disconnected diagnostics immediately and
+expire a held state after 10 seconds without a fresh update. Worker hydration
+passes `stateAgeMs` as an elapsed duration; pages add their own elapsed time
+instead of comparing monotonic clocks from different contexts. This UI bound
+is separate from the 3-second inference-continuity bound. Neither timing rule
+establishes physiological validity. Clients must inspect capture status and
+pulse-unavailability reasons as well as numeric values.
 
 #### `INTERVENTION_TRIGGER` (server → client)
 

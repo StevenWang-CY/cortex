@@ -154,6 +154,8 @@ class TestFeatureFusion:
         )
         fusion.update_telemetry(
             TelemetryFeatures(
+                mouse_source_available=True, keyboard_source_available=True,
+                keystroke_interval_count=20,
                 mouse_velocity_mean=500.0, mouse_velocity_variance=5000.0,
                 mouse_jerk_score=0.1, click_burst_score=0.0,
                 click_frequency=0.5, keyboard_burst_score=0.1,
@@ -178,6 +180,8 @@ class TestFeatureFusion:
         fusion = FeatureFusion()
         fusion.update_telemetry(
             TelemetryFeatures(
+                mouse_source_available=True, keyboard_source_available=True,
+                keystroke_interval_count=20,
                 mouse_velocity_mean=300.0, mouse_velocity_variance=2000.0,
                 mouse_jerk_score=0.0, click_burst_score=0.0,
                 click_frequency=0.2, keyboard_burst_score=0.0,

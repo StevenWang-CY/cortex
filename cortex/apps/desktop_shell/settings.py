@@ -53,7 +53,6 @@ from cortex.apps.desktop_shell.a11y import (
 from cortex.apps.desktop_shell.components import (
     Disclosure,
     format_relative_age,
-    install_elide,
     status_pill_qss,
     wrap_capped,
 )
@@ -267,7 +266,11 @@ class SettingsDialog(QWidget):
         self.setWindowTitle("Cortex — Settings")
         self.setMinimumSize(440, 520)
         self.resize(480, 640)
-        self.setStyleSheet(f"background: {CX_BG}; color: {CX_TEXT};")
+        self.setObjectName("CortexSettings")
+        self.setStyleSheet(
+            f"QWidget#CortexSettings {{ background: {CX_BG}; color: {CX_TEXT}; }}"
+            f"QLabel {{ background: transparent; color: {CX_TEXT}; }}"
+        )
         set_accessible_name(self, "Cortex settings")
         set_accessible_description(
             self, "Cortex settings window. Escape closes it; Apply saves changes.",
@@ -423,7 +426,7 @@ class SettingsDialog(QWidget):
         )
         sensing_inner.addLayout(self._camera_perm_row["layout"])
 
-        self._input_telemetry_enabled = QCheckBox("Enable keyboard & mouse tracking")
+        self._input_telemetry_enabled = QCheckBox("Enable keyboard and mouse tracking")
         self._input_telemetry_enabled.setChecked(True)
         self._input_telemetry_enabled.setStyleSheet(_CHECKBOX_QSS)
         sensing_inner.addWidget(self._input_telemetry_enabled)
@@ -440,7 +443,7 @@ class SettingsDialog(QWidget):
         # emits ``recalibrate_requested`` which the controller routes
         # to the same in-process CalibrationRunner the onboarding
         # wizard drives.
-        recal_row = QHBoxLayout()
+        recal_row = QVBoxLayout()
         recal_row.setSpacing(SP3)
         self._baseline_freshness_label = QLabel(
             _format_baseline_freshness_label()
@@ -451,9 +454,8 @@ class SettingsDialog(QWidget):
         self._baseline_freshness_label.setStyleSheet(
             f"color: {CX_TEXT_SECONDARY}; background: transparent; border: none;"
         )
-        install_elide(self._baseline_freshness_label)
+        self._baseline_freshness_label.setWordWrap(True)
         recal_row.addWidget(self._baseline_freshness_label)
-        recal_row.addStretch()
 
         self._recalibrate_btn = QPushButton("Recalibrate profile")
         self._recalibrate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -521,6 +523,7 @@ class SettingsDialog(QWidget):
         int_inner.addWidget(self._sensitivity_slider)
 
         sens_desc = QLabel("1 = fewer interventions  ·  5 = intervene earlier")
+        sens_desc.setWordWrap(True)
         sens_desc.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         sens_desc.setStyleSheet(
             f"color: {CX_TEXT_TERTIARY}; background: transparent;"
@@ -582,7 +585,7 @@ class SettingsDialog(QWidget):
         fp_inner.setSpacing(SP3)
 
         self._auto_distraction_block = QCheckBox(
-            "Auto-arm a focus session when support may help",
+            "Automatically start focus protection",
         )
         self._auto_distraction_block.setChecked(False)
         self._auto_distraction_block.setStyleSheet(_CHECKBOX_QSS)
@@ -658,7 +661,7 @@ class SettingsDialog(QWidget):
         notif_inner.setSpacing(SP2)
 
         self._os_notifications = QCheckBox(
-            "Send macOS notifications when Cortex is in the background",
+            "Notify me when Cortex is in the background",
         )
         self._os_notifications.setChecked(True)
         self._os_notifications.setStyleSheet(_CHECKBOX_QSS)
@@ -770,23 +773,25 @@ class SettingsDialog(QWidget):
         )
         llm_inner.addWidget(self._llm_privacy_help)
 
-        self._external_context_ack = QCheckBox(
-            "I understand that only the exact preview I confirm will leave this Mac"
+        self._external_context_ack = QCheckBox("Allow requests I explicitly preview and confirm")
+        self._external_context_ack.setToolTip(
+            "Only the exact preview you confirm will leave this Mac."
         )
         self._external_context_ack.setChecked(False)
         self._external_context_ack.setStyleSheet(_CHECKBOX_QSS)
         self._external_context_ack.setVisible(False)
         llm_inner.addWidget(self._external_context_ack)
 
-        privacy_action_row = QHBoxLayout()
+        privacy_action_row = QVBoxLayout()
         self._privacy_summary = QLabel("Workspace context sharing is off")
+        self._privacy_summary.setWordWrap(True)
         self._privacy_summary.setFont(
             mac_native.system_font(FS_CAPTION, "regular")
         )
         self._privacy_summary.setStyleSheet(
             f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
-        privacy_action_row.addWidget(self._privacy_summary, stretch=1)
+        privacy_action_row.addWidget(self._privacy_summary)
         self._review_context_btn = QPushButton("Review request…")
         self._review_context_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._review_context_btn.setFont(
@@ -869,12 +874,11 @@ class SettingsDialog(QWidget):
         a11y_inner.setContentsMargins(SP4, SP4, SP4, SP4)
         a11y_inner.setSpacing(SP3)
 
-        palette_row = QHBoxLayout()
+        palette_row = QVBoxLayout()
         palette_label = QLabel("Color palette")
         palette_label.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
         palette_label.setStyleSheet(f"color: {CX_TEXT}; background: transparent;")
         palette_row.addWidget(palette_label)
-        palette_row.addStretch()
         self._palette_combo = QComboBox()
         self._palette_combo.addItem("Default", "default")
         self._palette_combo.addItem("Deuteranopia (red/green)", "deuteranopia")
@@ -928,7 +932,7 @@ class SettingsDialog(QWidget):
             lab = QLabel(slot.title())
             lab.setFont(mac_native.system_font(FS_CAPTION, "medium"))
             lab.setStyleSheet(
-                f"color: {CX_TEXT_SECONDARY}; background: transparent;"
+                f"font-size: {FS_CAPTION}px; color: {CX_TEXT_SECONDARY}; background: transparent;"
             )
             header_row.addWidget(lab, stretch=1)
         sched_inner.addLayout(header_row)
@@ -944,7 +948,11 @@ class SettingsDialog(QWidget):
             for _ in self._SCHEDULE_SLOTS:
                 cb = QComboBox()
                 cb.addItems(["on", "quiet", "off"])
-                cb.setStyleSheet(_COMBO_QSS)
+                cb.setStyleSheet(
+                    _COMBO_QSS
+                    + f"QComboBox {{ padding: 4px 5px; font-size: {FS_CAPTION}px; }}"
+                    + "QComboBox::drop-down { width: 14px; }"
+                )
                 combos.append(cb)
                 row.addWidget(cb, stretch=1)
             self._schedule_combos[day] = combos
@@ -1205,6 +1213,7 @@ class SettingsDialog(QWidget):
         label = QLabel(label_not_granted)
         label.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         label.setWordWrap(True)
+        label.setStyleSheet(f"color: {CX_TEXT_SECONDARY}; background: transparent;")
         label.setOpenExternalLinks(False)
         label.setTextFormat(Qt.TextFormat.RichText)
         label.setTextInteractionFlags(
@@ -1228,7 +1237,7 @@ class SettingsDialog(QWidget):
             "label_granted": label_granted,
             "label_not_granted": label_not_granted,
             "target": target,
-            "granted": False,
+            "granted": None,
         }
 
     def refresh_baseline_freshness(self) -> None:

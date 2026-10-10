@@ -1,16 +1,8 @@
-"""
-State Engine — Zombie-Reading Interception
+"""Conservative behavior-only reading check-in eligibility.
 
-Detects when the user is passively reading without absorbing content:
-- HYPO state active (low arousal)
-- Browser is the active app
-- Limited mouse XY movement (< 30 px/s)
-- Blink rate above baseline (glazed eyes)
-
-All four conditions must be sustained for a minimum duration (default 90s)
-before triggering. When detected, triggers an Active Recall overlay that
-scrapes the visible text and generates a fill-in-the-blank question to
-break the trance.
+The legacy class/argument names are retained for compatibility. A quiet input
+pattern does not establish whether somebody understands or absorbs a text.
+Camera measurements never change the eligibility or timing of this reminder.
 """
 
 from __future__ import annotations
@@ -22,11 +14,8 @@ from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 logger = logging.getLogger(__name__)
 
 # Detection thresholds
-_SCROLL_VELOCITY_MAX = 50.0  # px/s — steady reading pace
 _MOUSE_VELOCITY_MAX = 30.0   # px/s — minimal mouse movement
-_MIN_DURATION_SECONDS = 90.0  # Must sustain for 90s before triggering
-_NO_BLINK_MIN_DURATION_SECONDS = 120.0  # Require stronger evidence without camera kinematics
-_BLINK_ELEVATION_RATIO = 1.15  # Blink rate 15% above baseline
+_MIN_DURATION_SECONDS = 120.0  # Conservative sustained behavior-only dwell
 _COOLDOWN_SECONDS = 300.0  # 5 min cooldown between triggers
 
 # Browser app names (macOS)
@@ -38,17 +27,10 @@ _BROWSER_APPS = frozenset({
 
 
 class ZombieReadingDetector:
-    """
-    Detects passive reading (zombie-reading) patterns.
+    """Offer a reading check-in after sustained quiet input in a browser.
 
-    Monitors the combination of HYPO state, browser focus, slow scrolling,
-    low mouse movement, and elevated blink rate to identify when the user
-    is staring at text without absorbing it.
-
-    Usage:
-        detector = ZombieReadingDetector(blink_baseline=17.0)
-        if detector.update(state, telemetry, kinematics, active_app):
-            trigger_active_recall()
+    ``blink_baseline`` and ``blink_rate`` are accepted for older callers but
+    intentionally have no effect. They remain diagnostic-only measurements.
     """
 
     def __init__(
@@ -71,25 +53,25 @@ class ZombieReadingDetector:
         self._consecutive_frames: int = 0
 
     def update_baseline(self, blink_baseline: float) -> None:
-        """Update blink rate baseline."""
+        """Retain an older caller's diagnostic baseline without using it."""
         self._blink_baseline = blink_baseline
 
     def update(
         self,
         state: str,
-        mouse_velocity: float,
+        mouse_velocity: float | None,
         blink_rate: float | None,
         active_app: str,
         current_time: float | None = None,
         may_trigger: bool = True,
     ) -> bool:
         """
-        Check if zombie-reading conditions are met.
+        Check if sustained quiet browser behavior permits a check-in.
 
         Args:
-            state: Current cognitive state ("FLOW", "HYPO", "HYPER", "RECOVERY").
-            mouse_velocity: Mean mouse velocity in px/s.
-            blink_rate: Current blink rate in blinks/min. None = no data.
+            state: Current support state using the legacy wire names.
+            mouse_velocity: Mean mouse velocity in px/s; None means unavailable.
+            blink_rate: Deprecated diagnostic argument; ignored.
             active_app: Name of the currently active application.
             current_time: Override timestamp. None = use the injected clock.
             may_trigger: When False the detector keeps accumulating, but never
@@ -100,7 +82,7 @@ class ZombieReadingDetector:
                 than deferred and the whole dwell had to be served again.
 
         Returns:
-            True if zombie-reading has been sustained long enough to trigger.
+            True if observed behavior has persisted long enough to offer help.
         """
         if current_time is None:
             current_time = monotonic_seconds(self._clock)
@@ -126,10 +108,7 @@ class ZombieReadingDetector:
                 self._consecutive_frames += 1
 
             duration = current_time - self._zombie_start
-            required_duration = self._min_duration
-            if blink_rate is None:
-                required_duration = max(required_duration, _NO_BLINK_MIN_DURATION_SECONDS)
-            if duration >= required_duration:
+            if duration >= self._min_duration:
                 if not may_trigger:
                     # Hold the accumulator so the dwell already served counts
                     # once interruptions are allowed again.
@@ -137,8 +116,8 @@ class ZombieReadingDetector:
                 self._last_trigger = current_time
                 self._reset()
                 logger.info(
-                    "Zombie-reading detected after %.0fs (app=%s, mouse=%.1f, blink=%.1f)",
-                    duration, active_app, mouse_velocity, blink_rate or 0.0,
+                    "Reading check-in eligible after %.0fs (app=%s)",
+                    duration, active_app,
                 )
                 return True
         else:
@@ -149,12 +128,12 @@ class ZombieReadingDetector:
     def _check_conditions(
         self,
         state: str,
-        mouse_velocity: float,
+        mouse_velocity: float | None,
         blink_rate: float | None,
         active_app: str,
     ) -> bool:
-        """Check if all zombie-reading conditions are currently met."""
-        # Condition 1: HYPO state (low arousal)
+        """Check if the required behavioral observations are available."""
+        # A behavioral hypothesis, not a statement about cognition.
         if state != "HYPO":
             return False
 
@@ -163,15 +142,7 @@ class ZombieReadingDetector:
             return False
 
         # Condition 3: Low mouse velocity (reading, not interacting)
-        if mouse_velocity > _MOUSE_VELOCITY_MAX:
-            return False
-
-        # Condition 4: Blink rate above baseline (glazed eyes). If camera
-        # kinematics are unavailable, rely on the other sustained telemetry
-        # conditions rather than disabling the detector entirely.
-        if blink_rate is None:
-            return True
-        if blink_rate < self._blink_baseline * _BLINK_ELEVATION_RATIO:
+        if mouse_velocity is None or mouse_velocity > _MOUSE_VELOCITY_MAX:
             return False
 
         return True

@@ -1,13 +1,16 @@
 # Writing Workspace Adapters
 
-Workspace adapters connect Cortex to external applications (VS Code, Chrome, terminals) to gather context for LLM-powered interventions. This guide explains how to add a new adapter.
+Workspace adapters gather local application context for Cortex's local planner
+and explicitly previewed external requests. VS Code and Chrome/Edge have live
+producers; the terminal adapter is a developer-fed parser only. This guide
+explains how to add a context adapter while preserving the
+[current implementation boundaries](../../docs/implementation-2026-10.md).
 
-> **Authority status:** adapters may expose mutation capabilities for
-> experimental development, but the shipping mode is `suggest_only`.
-> A proposal or legacy trigger is never permission to call `execute`.
-> New mutating adapters cannot be product-enabled until the manifest,
-> exact-authorization, durable-receipt, idempotency, and restore fault matrix
-> in WP-6/WP-7 of the implementation plan pass.
+> **Authority status:** the shipping default is `suggest_only`. The
+> manifest-bound authorization, durable receipt, verification and scoped
+> restore path is implemented for the action catalog below. A proposal or
+> legacy trigger is never permission to call `execute`. New effects must meet
+> the same transaction and fault-recovery requirements before promotion.
 
 ## Formal Adapter Protocol
 
@@ -43,12 +46,14 @@ class MyAdapter:
 ```
 
 Key principles:
-1. **Graceful fallback** — always return `None` if the application isn't available
+
+1. **Graceful fallback** — generic `CortexAdapter.get_context()` returns `{}`
+   when unavailable; legacy typed readers may return `None` before wrapping
 2. **Timeout** — all operations should have a configurable timeout (default 2s)
 3. **No blocking** — all methods are async
 4. **Fail closed** — reject unknown actions, modes, schema majors, targets,
    and missing authorization
-5. **Receipt-driven restore** — a future mutation must return exact before
+5. **Receipt-driven restore** — an authorized mutation must return exact before
    state, postcondition fingerprint, inverse command, and idempotency key;
    an in-memory snapshot is not sufficient
 6. **Proposal purity** — context/proposal handlers have no path to
@@ -67,11 +72,13 @@ not through an adapter `execute` call.
 
 Receives `CONTEXT_RESPONSE` payloads from the VS Code extension and keeps the
 latest `EditorContext`:
-- current file basename and language
+
+- current local file path and language (the external broker reduces paths to basenames)
 - visible line range and symbol at cursor
 - diagnostics (errors, warnings), bounded
 - optional visible code excerpt, only when the user has not disabled
-  `cortex.shareEditorContent`, and only for `file` documents
+  `cortex.shareEditorContent`; `file` documents are supported, and `untitled`
+  documents require the separate `cortex.shareUntitledDocuments` opt-in
 
 The extension never reads terminal output or shell history; the
 `TerminalContext` slot in its payload is empty and the daemon treats it as
@@ -80,6 +87,7 @@ absent.
 ### BrowserAdapter (`context_engine/browser_adapter.py`)
 
 Receives `CONTEXT_RESPONSE` payloads from the Chrome/Edge extension:
+
 - active tab title, origin, and sanitized path
 - active-page excerpt (bounded, and only for origins the user has explicitly
   allowed; never in incognito)
@@ -146,7 +154,7 @@ class MyAppAdapter:
                 return {}
             self._available = True
             return MyAppContext(**data["payload"]).model_dump()
-        except (asyncio.TimeoutError, json.JSONDecodeError, Exception):
+        except Exception:
             self._available = False
             return {}
 
@@ -169,24 +177,30 @@ Update the context assembly to include your adapter. The `TaskContext.mode` fiel
 
 Do not map a model field directly to an effect. Define a typed action command,
 add it to an immutable action manifest, bind an exact unexpired authorization
-to that manifest hash, and return a durable action receipt. Until WP-6/WP-7
-are complete, keep new workspace modifications unavailable.
+to that manifest hash, and return a durable action receipt. Extend the existing
+transaction coordinator and the matching client protocol together. Keep a new
+capability unavailable until its target validation, idempotency, partial-failure,
+receipt verification, ownership-safe inverse and restart tests pass. Destructive
+tab closure, regrouping existing tabs and folding ranges remain outside the
+executable catalog because a safe inverse has not been established.
 
 ### Step 5: Write Tests
 
 Create unit tests in `tests/unit/test_my_adapter.py`:
 
 ```python
+import json
+
 import pytest
 from cortex.services.context_engine.my_adapter import MyAppAdapter
 
 class TestMyAppAdapter:
     @pytest.mark.asyncio
-    async def test_returns_none_when_unavailable(self):
+    async def test_returns_empty_context_when_unavailable(self):
         adapter = MyAppAdapter()
         result = await adapter.get_context()
-        assert result is None
-        assert not adapter.available
+        assert result == {}
+        assert not await adapter.health_check()
 
     @pytest.mark.asyncio
     async def test_parses_valid_response(self):
@@ -200,9 +214,8 @@ class TestMyAppAdapter:
 
         adapter = MyAppAdapter(ws_send_fn=mock_send, ws_receive_fn=mock_receive)
         result = await adapter.get_context()
-        assert result is not None
-        assert result.active_document == "test.md"
-        assert adapter.available
+        assert result["active_document"] == "test.md"
+        assert await adapter.health_check()
 ```
 
 ## Communication Protocol
@@ -223,17 +236,19 @@ rejected at schema construction.
 ```
 
 ### Effects (daemon → extension, only inside an authorized transaction)
-```json
-{
-  "type": "INTERVENTION_APPLY",
-  "payload": {
-    "intervention_id": "…",
-    "transaction_id": "…",
-    "manifest_digest": "…",
-    "actions": [ { "action_id": "…", "action_type": "highlight_tab", "target": "…" } ]
-  }
-}
-```
+
+Use the generated schemas from `libs/schemas/intervention_transaction.py`:
+
+| Frame | Payload schema | Required binding |
+| --- | --- | --- |
+| `INTERVENTION_AUTHORIZE` | `InterventionAuthorizationRequest` | Exact manifest digest, requested action IDs, requester and one-time consent |
+| `INTERVENTION_APPLY` | `InterventionApplyCommand` | Complete `manifest`, `authorization` and the exact authorized `actions` subset |
+| `INTERVENTION_RECEIPT` | `InterventionReceiptBatch` | Typed outcomes tied to the original authorization and action |
+| `INTERVENTION_RESTORE` | `InterventionRestoreCommand` | Exact Cortex-owned effects and verified inverse data |
+
+Do not replace the typed apply payload with a bare transaction ID or an
+unverified action list. Its validator checks manifest/authorization identity,
+the digest and equality of the exact authorized subset.
 
 The extension answers each action with an `INTERVENTION_RECEIPT`; the daemon
 verifies the receipt's postcondition and publishes

@@ -99,7 +99,8 @@ class FeatureAggregator:
         self._config = config or TelemetryConfig()
         self._tab_count_provider = tab_count_provider
         self._focus_graph = FocusGraphBuilder(clock=self._clock)
-        self._observation_started_at: float | None = None
+        self._input_observed_since: float | None = None
+        self._last_sample_at: float | None = None
         # WindowTracker exposes a sliding window, so the same event appears in
         # many successive snapshots. Keep a bounded identity ledger to feed
         # each real focus transition to the graph exactly once.
@@ -127,19 +128,20 @@ class FeatureAggregator:
             if current_time is None
             else current_time
         )
-        if self._observation_started_at is None:
-            self._observation_started_at = now
-        # Exposure = how long input has actually been observed. The hooks
-        # may have been listening before the first aggregation; use the
-        # earlier of the two starts so silence observed by the listeners
-        # is not discarded, while a fresh process still starts at zero.
-        exposure_started_at = self._observation_started_at
-        listening_since = getattr(self._hooks, "listening_since", None)
-        if isinstance(listening_since, (int, float)) and not isinstance(
-            listening_since, bool
-        ):
-            exposure_started_at = min(exposure_started_at, float(listening_since))
-        exposure_seconds = max(0.0, now - exposure_started_at)
+        mouse_available = self._hooks.mouse_source_available is True
+        keyboard_available = self._hooks.keyboard_source_available is True
+        # Inactivity means silence across *both* input channels. Restart its
+        # exposure when either channel is missing or sampling was interrupted.
+        gap = self._last_sample_at is not None and now - self._last_sample_at > 3.0
+        if not (mouse_available and keyboard_available):
+            self._input_observed_since = None
+        elif self._input_observed_since is None or gap:
+            self._input_observed_since = now
+        self._last_sample_at = now
+        exposure_seconds = (
+            max(0.0, now - self._input_observed_since)
+            if self._input_observed_since is not None else 0.0
+        )
 
         # Gather events
         events = self._hooks.get_events_in_window(window, now)
@@ -234,6 +236,9 @@ class FeatureAggregator:
             scroll_reversal_score=scroll_rev,
             scroll_back_rate_per_min=scroll_back_rate,
             observation_window_seconds=window,
+            mouse_source_available=mouse_available,
+            keyboard_source_available=keyboard_available,
+            keystroke_interval_count=len(self._regular_key_intervals_ms(key_events)),
             mouse_move_count=len(mouse_moves),
             click_press_count=sum(1 for event in mouse_clicks if event.pressed),
             key_press_count=len(typing_presses),
@@ -410,22 +415,23 @@ class FeatureAggregator:
         return float(np.clip(burst_count / total_pairs, 0.0, 1.0))
 
     @staticmethod
-    def _compute_keystroke_interval_variance(key_events: list[KeyEvent]) -> float:
-        """
-        Compute variance of keystroke intervals (ms^2).
-
-        Uses only regular key presses (not modifiers/navigation).
-        """
+    def _regular_key_intervals_ms(key_events: list[KeyEvent]) -> list[float]:
         presses = [k for k in key_events if k.pressed and k.key_type == KeyType.REGULAR]
-        if len(presses) < 2:
-            return 0.0
+        return [
+            (right.timestamp - left.timestamp) * 1000.0
+            for left, right in zip(presses, presses[1:], strict=False)
+            if right.timestamp > left.timestamp
+        ]
 
-        intervals_ms = []
-        for i in range(1, len(presses)):
-            dt_ms = (presses[i].timestamp - presses[i - 1].timestamp) * 1000.0
-            intervals_ms.append(dt_ms)
+    @staticmethod
+    def _compute_keystroke_interval_variance(key_events: list[KeyEvent]) -> float:
+        """Variance of at least two measured regular-key intervals (ms²).
 
-        return float(np.var(intervals_ms))
+        The numeric compatibility field stays zero before readiness. The
+        explicit interval count prevents fusion treating it as a measurement.
+        """
+        intervals = FeatureAggregator._regular_key_intervals_ms(key_events)
+        return float(np.var(intervals)) if len(intervals) >= 2 else 0.0
 
     @staticmethod
     def _compute_backspace_density(key_events: list[KeyEvent]) -> float:

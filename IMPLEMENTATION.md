@@ -1,5 +1,10 @@
 # Cortex: Rigorous Algorithm, Architecture, and Implementation Plan
 
+**Current review and implementation:** [October 2026 evidence-continuity and
+interaction refinement](docs/implementation-2026-10.md). It records the current
+baseline, newly reproduced findings, researched design choices, work packages
+and verification outcomes. The sections below preserve the earlier audit history.
+
 **Status:** release-relevant software implementation complete through the
 v0.4.0 full-stack correctness, honesty, and design-quality cycle (Section 30);
 reference-sensor, participant, and independent-review gates remain external,

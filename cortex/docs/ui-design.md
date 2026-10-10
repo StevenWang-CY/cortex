@@ -1,12 +1,12 @@
 # UI design and interaction contract
 
-Last reviewed: 2026-08-29.
+Last reviewed: 2026-10-02.
 
 This contract applies to the PySide6 desktop shell, Chrome/Edge extension,
 injected browser surfaces, and VS Code webview. The refinement pass was
 informed by Emil Kowalski's public [Skills for Design
 Engineers](https://github.com/emilkowalski/skills), pinned during review to
-commit `d23d7f88a2e21c9e4b1418c7abe420f5c1052ba7` (2026-08-21), especially
+commit `e8a175de22ae1e49370fc144c1f3bb9aeedf988d` for this review, especially
 `emil-design-eng`, `review-animations`, `improve-animations`,
 `find-animation-opportunities`, and `apple-design`.
 
@@ -31,7 +31,8 @@ authority explicit, and motion subordinate to comprehension.
 ## Token ownership
 
 `cortex/libs/design/tokens.yaml` is the source of truth. Run
-`python -m cortex.scripts.sync_design_tokens` to generate:
+`uv run --project cortex --locked python -m cortex.scripts.sync_design_tokens`
+from the repository root to generate:
 
 - `cortex/apps/browser_extension/design-tokens.ts`;
 - `cortex/apps/desktop_shell/tokens.py`.
@@ -135,11 +136,27 @@ it is centered. Anchored popovers originate from their trigger.
   quit routes (dashboard Quit, the recap sheet's "Quit Cortex", tray / Cmd+Q)
   emit `gui_quit_requested`. The recap sheet's "View full report" keeps
   Cortex open on every route and renders the report already in hand.
+  In both desktop hosts, closing the dashboard (red close control or Cmd+W)
+  hides it without ending the session; the menu-bar item reopens it. Actual
+  application Quit events enter the recap route before Qt teardown. Once that
+  route finishes, the host removes its Quit interceptor so the final
+  `QApplication.quit()` exits the event loop. `lastWindowClosed` must never
+  trigger session shutdown.
 - **Suggestion card:** a fixed-width (`POPUP_WIDTH`) notification anchored to
   the top-right of the cursor's screen. It shows with
-  `WA_ShowWithoutActivating`, never calls `activateWindow`, uses only
-  Cmd-modified shortcuts, and honours Escape once the user has clicked into
-  it. The breathing pacer (`BREATHING_PACER_SIZE`) appears only for breathing
+  `WA_ShowWithoutActivating` on unsolicited arrival. The dashboard's explicit
+  **Review suggestion** action activates the card and focuses **Dismiss**;
+  Cmd-modified shortcuts and Escape then work without a global hotkey.
+  Review is navigation, not authorization: no workspace action runs until its
+  exact authorization control is used. Both hosts use `SuggestionReview`,
+  which keeps a defensive copy of the exact payload. Its lifetime is at most
+  five minutes from first receipt, shortened by an earlier manifest expiry;
+  same-ID updates and reopening cannot renew that deadline. Action,
+  dismissal, quiet mode, matching terminal transaction, stop, and disconnect
+  retire the card and its dashboard entry. Late events for an older ID cannot
+  clear a replacement; retired cards reject queued action clicks. A visible
+  suggestion is counted once, even when updated or reopened.
+  The breathing pacer (`BREATHING_PACER_SIZE`) appears only for breathing
   plans. One "Why this?" toggle reveals the full causal explanation.
 - **Truthful indicators:** connection uses the info colour, not a state
   colour; extension dots carry text and accessible names; cost, session
@@ -164,8 +181,10 @@ it is centered. Anchored popovers originate from their trigger.
 - **Thread safety:** anything that must touch a widget from the daemon or a
   worker thread goes through a queued Qt signal (`DaemonBridge.ui_task`,
   `calibration_progress`); `QTimer.singleShot` from a non-Qt thread is not
-  allowed. Hidden windows own no running timers: the overlay's
-  `suppress()` is the single dismissal path.
+  allowed. Hidden visual surfaces stop their animation/refresh work. Expiry
+  and shutdown watchdogs still enforce their deadlines when a card or window
+  is hidden; hiding must not extend authority. The overlay's `suppress()`
+  stops its visual work, while `retire_suggestion()` also invalidates its ID.
 
 ## Surface-specific posture
 
@@ -175,7 +194,18 @@ it is centered. Anchored popovers originate from their trigger.
   exposes an immediate "End early" control and Escape route. Intervention
   footer controls must fit the production `POPUP_WIDTH` (380 px) notification
   width; shortcut hints belong in tooltips/accessibility descriptions when
-  visible copy would clip.
+  visible copy would clip. Status/connection groups wrap, consumer content
+  scrolls, and session controls stay reachable at compact sizes. Settings
+  and onboarding scroll independently of their pinned completion controls.
+  Disconnect clears current biometrics instead of retaining a live-looking
+  last value, and reconnect requires a new state update. Boolean, non-finite,
+  malformed, and nonpositive pulse values remain unavailable. Capture marked
+  stale or explicitly not flowing suppresses biometrics in both consumer and
+  advanced views. The camera section says **Camera estimates**, not a clinical
+  measurement. Verify the dashboard at 380 × 500 logical pixels, Settings at
+  440 px wide with schedule/privacy controls expanded, and onboarding at
+  600 × 520: no horizontal scrolling, clipped controls, or inaccessible
+  session/completion footer.
 - **Desktop privacy sheet:** source selection → exact preview → explicit send.
   The review step shows destination, retention caveat, expiry, byte size,
   redactions, and exact outbound prompt; changing sources burns the preview.
@@ -184,7 +214,11 @@ it is centered. Anchored popovers originate from their trigger.
   “Browser found,” native-host protocol, extension-profile detection, daemon
   reachability, and live WebSocket connection are distinct states. Repair copy
   names **Connect Extensions**, `Cmd+Shift+G`, and the mandatory `Cmd+Q`
-  restart; it never sends a packaged user to a Python/Terminal command.
+  restart; it never sends a packaged user to a Python/Terminal command. Stop
+  remains pending until the native helper or launcher confirms completion;
+  durable stop intent only disables automatic reconnect. Errors remain inline
+  and retryable. Quiet-mode radio controls implement roving focus and arrow,
+  Home and End navigation.
 - **Injected overlays:** one coherent 200 ms entrance, in-place content update,
   quick symmetric exit, no replay on a replacement proposal. Blocking
   surfaces use labelled modal semantics, initial focus, Tab containment,
@@ -193,7 +227,14 @@ it is centered. Anchored popovers originate from their trigger.
 - **Pulse Room/new tab:** decorative motion gets the available delight budget,
   but interactive controls are immediate, reduced-motion stops canvas work,
   hidden tabs cancel canvas work, reduced-transparency removes blur, and resume
-  cards retain native link semantics inside a real labelled list.
+  cards retain native link semantics inside a real labelled list. A persisted
+  pause control is independent of new-tab opt-out; restore restarts at most
+  one loop. Popup and new tab share the same signal projection: hydration
+  preserves capture/store/biometric fields and monotonic sample age, invalid
+  input/disconnect clears values, and ten seconds without an update expires
+  current presentation. That deadline is a UI continuity guard, not a
+  physiological accuracy claim. Art follows a fresh camera estimate; it is
+  neither an ECG nor breathing guidance. Layout remains in document flow.
 - **Onboarding:** progress is semantic, copy states what is detected versus
   configured, Return/click behavior is explicit, and no time-to-result promise
   substitutes for evidence requirements.
@@ -219,8 +260,11 @@ Reduce Motion.
 ## Verification
 
 ```bash
-python -m cortex.scripts.sync_design_tokens --check
-pytest -q cortex/tests/unit/test_ui_contrast_contract.py \
+uv run --project cortex --locked python -m cortex.scripts.sync_design_tokens --check
+QT_QPA_PLATFORM=offscreen uv run --project cortex --locked --extra dev pytest -q \
+  cortex/tests/unit/test_desktop_refinement.py \
+  cortex/tests/unit/test_shell_window_lifecycle.py \
+  cortex/tests/unit/test_ui_contrast_contract.py \
   cortex/tests/unit/test_desktop_shell_contracts.py \
   cortex/tests/unit/test_dashboard_stop.py \
   cortex/tests/unit/test_desktop_tokens_smoke.py \
@@ -239,6 +283,15 @@ cd ../vscode_extension
 npm run lint && npm run compile && npm test
 ```
 
-The implementation plans and acceptance evidence for this refinement live in
-the repository's `plans/` directory. Mark a plan complete only after its
+The current implementation and acceptance record is
+[evidence continuity and interaction refinement](../../docs/implementation-2026-10.md).
+The October 2026 check includes real offscreen Qt layouts and four subprocess
+Quit cases across both desktop hosts, inspected desktop/browser screenshots,
+and headless startup, shutdown, and same-profile restart of the built arm64
+app. It does not establish VoiceOver behavior, physical TCC/camera handling,
+human usability, or clinical accuracy. Complete the
+[manual release protocol](../../docs/release/manual-release-validation.md)
+against the exact signed/notarized candidate before recording those cases as
+passed.
+Earlier plans remain in `plans/`. Mark a plan complete only after its
 mechanical and interaction checks pass.

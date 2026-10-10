@@ -9,14 +9,18 @@ import { S } from "../styles";
 
 export interface StopCortexProps {
     stopping: boolean;
-    /** Sticky intent: Cortex was stopped from here and Start was not pressed. */
+    /** Sticky intent controls reconnect; it is not proof of daemon exit. */
     stopRequested: boolean;
+    confirmed?: boolean;
+    error?: string | null;
     onStop: () => void;
 }
 
 export function StopCortex({
     stopping,
     stopRequested,
+    confirmed = false,
+    error = null,
     onStop,
 }: StopCortexProps): React.ReactElement {
     const [confirming, setConfirming] = useState(false);
@@ -27,12 +31,29 @@ export function StopCortex({
         if (confirming) stopButtonRef.current?.focus({ preventScroll: true });
     }, [confirming]);
 
+    useEffect(() => {
+        // Confirmation belongs to one stop attempt. Starting a new session
+        // must return to the initial control, not revive the previous prompt.
+        if (stopping || confirmed) setConfirming(false);
+    }, [stopping, confirmed]);
+
     const cancel = () => {
         setConfirming(false);
         window.requestAnimationFrame(() => triggerRef.current?.focus({ preventScroll: true }));
     };
 
-    if (stopRequested && !stopping) {
+    if (error && !stopping) {
+        return (
+            <div style={S.stopConfirm}>
+                <div style={S.stopConfirmText} role="alert">{error}</div>
+                <button type="button" style={S.stopBtn} onClick={onStop} data-testid="stop-cortex-retry">
+                    Retry stop
+                </button>
+            </div>
+        );
+    }
+
+    if (confirmed && !stopping) {
         return (
             <div style={S.stoppedNote} role="status" data-testid="stop-cortex-stopped">
                 Cortex is stopped. Use Open Cortex above to start it again.
@@ -55,7 +76,9 @@ export function StopCortex({
                 }}
             >
                 <div style={S.stopConfirmText} id="cortex-stop-confirm-text">
-                    Stop Cortex? The camera and the Cortex app will shut down.
+                    {stopping
+                        ? "Stopping Cortex and finishing your session…"
+                        : "Stop Cortex? The camera and the Cortex app will shut down."}
                 </div>
                 <div style={S.stopConfirmRow}>
                     <button
@@ -84,6 +107,10 @@ export function StopCortex({
     }
 
     return (
+        <div>
+        {stopRequested && <div style={S.stoppedNote} role="status">
+            Automatic reconnect is paused. Shutdown has not been confirmed.
+        </div>}
         <button
             ref={triggerRef}
             type="button"
@@ -93,5 +120,6 @@ export function StopCortex({
         >
             Stop Cortex
         </button>
+        </div>
     );
 }

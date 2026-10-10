@@ -190,6 +190,8 @@ async def test_d9_terminal_rows_are_capped_regardless_of_age() -> None:
 def test_d13_per_minute_rates_are_stamped_with_their_real_window() -> None:
     fusion = FeatureFusion(clock=FakeClock())
     features = TelemetryFeatures(
+        mouse_source_available=True, keyboard_source_available=True,
+        keystroke_interval_count=20,
         mouse_velocity_mean=100.0,
         mouse_velocity_variance=10.0,
         mouse_jerk_score=0.0,

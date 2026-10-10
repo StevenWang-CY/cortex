@@ -93,6 +93,7 @@ def settings_dialog(qapp, monkeypatch):
 
 def test_initial_render_reports_not_granted_for_both(settings_dialog):
     dlg, _ = settings_dialog
+    dlg._refresh_permission_states()
     cam_label = dlg._camera_perm_row["label"]
     acc_label = dlg._accessibility_perm_row["label"]
 
@@ -101,6 +102,8 @@ def test_initial_render_reports_not_granted_for_both(settings_dialog):
     # the substring that's stable.
     assert "Camera access not granted" in cam_label.text()
     assert "Accessibility access not granted" in acc_label.text()
+    assert "cortex://open-system-settings/camera" in cam_label.text()
+    assert "cortex://open-system-settings/accessibility" in acc_label.text()
 
 
 def test_refresh_flips_to_granted_when_probe_returns_true(settings_dialog):

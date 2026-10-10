@@ -154,6 +154,9 @@ def _telemetry(**updates: object) -> TelemetryFeatures:
         "window_switch_rate": 3.0,
         "scroll_back_rate_per_min": 1.0,
         "observation_window_seconds": 15.0,
+        "mouse_source_available": True,
+        "keyboard_source_available": True,
+        "keystroke_interval_count": 20,
         "mouse_move_count": 50,
         "click_press_count": 8,
         "key_press_count": 30,
@@ -185,6 +188,7 @@ def test_fusion_requires_metric_exposure_but_preserves_observed_zero() -> None:
             click_press_count=0,
             keypress_rate_per_min=0.0,
             key_press_count=0,
+            keystroke_interval_count=0,
         ),
         timestamp=1.0,
     )
@@ -204,7 +208,7 @@ def test_fusion_requires_metric_exposure_but_preserves_observed_zero() -> None:
 
 
 def test_no_event_inactivity_is_bounded_by_collector_exposure() -> None:
-    hooks = Mock()
+    hooks = Mock(mouse_source_available=True, keyboard_source_available=True)
     hooks.get_events_in_window.return_value = {
         "mouse_moves": [],
         "mouse_clicks": [],
@@ -213,8 +217,10 @@ def test_no_event_inactivity_is_bounded_by_collector_exposure() -> None:
     }
     aggregator = FeatureAggregator(hooks)
     first = aggregator.build_features(window_seconds=15.0, current_time=1_000_000.0)
-    second = aggregator.build_features(window_seconds=15.0, current_time=1_000_010.0)
-    longer = aggregator.build_features(window_seconds=15.0, current_time=1_000_100.0)
+    for elapsed in range(1, 11):
+        second = aggregator.build_features(window_seconds=15.0, current_time=1_000_000.0 + elapsed)
+    for elapsed in range(11, 101):
+        longer = aggregator.build_features(window_seconds=15.0, current_time=1_000_000.0 + elapsed)
     assert first.inactivity_seconds == 0.0
     assert second.inactivity_seconds == 10.0
     # Audit D1: inactivity is bounded by observed exposure, never by the
@@ -351,8 +357,8 @@ def test_smoother_unknown_dwell_monotonic_replay_and_temporal_recovery() -> None
     recovery = ScoreSmoother(config)
     recovery.update(support, quality, timestamp=0.0)
     assert recovery.update(support, quality, timestamp=1.0).state == "HYPER"
-    recovery.update(flow, quality, timestamp=2.0)
-    recovered = recovery.update(flow, quality, timestamp=7.0)
+    for timestamp in range(2, 8):
+        recovered = recovery.update(flow, quality, timestamp=float(timestamp))
     assert recovered.state == "RECOVERY"
 
     missing = scorer.evaluate(_vector({}))

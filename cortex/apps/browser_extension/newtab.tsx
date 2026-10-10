@@ -1,8 +1,8 @@
 /**
  * Cortex Pulse Room — New Tab Page
  *
- * Renders your heartbeat as light. A single point of light that pulses at
- * your actual heart rate; pulse history ripples outward.
+ * Decorative light follows the most recent usable camera pulse estimate.
+ * This visualisation does not represent measured beat-to-beat timing.
  *
  * Inspired by Rafael Lozano-Hemmer's Pulse Room installation.
  */
@@ -11,7 +11,11 @@ import React, { useEffect, useRef, useState } from "react";
 import "./page-reset.css";
 import { CX, STATE_COLORS_RGB, STATE_LABELS, CX_KEYFRAMES } from "./design-tokens";
 import { newCorrelationId } from "./lib/correlation";
-import { LAUNCH_FAILED_STATUS } from "./lib/popup-view-model";
+import { LAUNCH_FAILED_STATUS, type CortexState } from "./lib/popup-view-model";
+import { currentSignalView, stateAgeMs, statePresentationFields } from "./lib/state-presentation";
+import { detectBrowser } from "./lib/browser";
+
+export const PULSE_MOTION_PAUSED_KEY = "cortex_pulse_motion_paused";
 
 /** Storage key shared with the popup's "Use the browser's default new tab". */
 export const NEWTAB_DISABLED_KEY = "cortex_newtab_disabled";
@@ -54,13 +58,13 @@ function nt_sendWithCid(
                         lastErr.message,
                     );
                 }
+                cb?.({ ok: false });
                 return;
             }
             if (cb) cb(response);
         });
     } catch {
-        /* extension context lost; newtab keeps rendering on cached
-           biometrics so silent-drop is fine here. */
+        cb?.({ ok: false });
     }
     return correlation_id;
 }
@@ -110,9 +114,10 @@ function headlinePrefix(state: string): string {
  */
 function DefaultNewTabNotice({ onRestore }: { onRestore: () => void }): React.ReactElement {
     const [hint, setHint] = useState("");
+    const browserName = detectBrowser() === "edge" ? "Edge" : "Chrome";
     const openDefault = () => {
         try {
-            chrome.tabs.update({ url: "chrome://new-tab-page" }, () => {
+            chrome.tabs.update({ url: detectBrowser() === "edge" ? "edge://newtab" : "chrome://new-tab-page" }, () => {
                 const lastErr = (chrome as unknown as {
                     runtime?: { lastError?: { message?: string } };
                 }).runtime?.lastError;
@@ -160,7 +165,7 @@ function DefaultNewTabNotice({ onRestore }: { onRestore: () => void }): React.Re
                     cursor: "pointer",
                 }}
             >
-                Open Chrome’s default new tab
+                Open {browserName}’s default new tab
             </button>
             {hint && <p role="status" style={{ margin: 0, fontSize: 12, color: CX.textTertiary }}>{hint}</p>}
             <button
@@ -204,20 +209,39 @@ function PulseRoom(): React.ReactElement {
     });
     const canvasBackgroundRef = useRef<string>(CX.light.window_bg);
 
-    const [displayHR, setDisplayHR] = useState(0);
-    const [displayConnected, setDisplayConnected] = useState(false);
-    const [displayState, setDisplayState] = useState("");
+    const [sample, setSample] = useState<{
+        state: CortexState | null; connected: boolean; age: number | null; receivedAt: number;
+    }>({ state: null, connected: false, age: null, receivedAt: performance.now() });
+    const [clock, setClock] = useState(performance.now());
+    const [motionPaused, setMotionPaused] = useState(false);
+    const signal = currentSignalView(sample.state, sample.connected,
+        stateAgeMs(sample.age, sample.receivedAt, clock), STATE_LABELS);
+    const displayHR = signal.heartRate;
+    const displayConnected = sample.connected;
+    const displayState = signal.stateKey;
+    // The canvas reads the same projection that supplies visible text.
+    stateRef.current = {
+        heartRate: displayHR ?? 0, state: displayState, confidence: 0,
+        connected: displayConnected,
+    };
+    if (displayHR) animRef.current.beatInterval = 60_000 / displayHR;
+    else animRef.current.rings = [];
     const [newtabDisabled, setNewtabDisabled] = useState<boolean | null>(null);
     // Resolve before the first paint/effect pass so a reduced-motion user
     // never briefly schedules the ordinary canvas loop during hydration.
     const [reducedMotion, setReducedMotion] = useState(
         () => window.matchMedia("(prefers-reduced-motion: reduce)").matches,
     );
-    const [pacerPhase, setPacerPhase] = useState<"inhale" | "hold" | "exhale">("inhale");
 
     // Launch controls
     const [launching, setLaunching] = useState(false);
     const [launchError, setLaunchError] = useState("");
+    const launchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const launchAttempt = useRef(0);
+    useEffect(() => () => {
+        launchAttempt.current++;
+        if (launchTimer.current !== null) clearTimeout(launchTimer.current);
+    }, []);
 
     // Activity tracking — resume cards at bottom
     const [activities, setActivities] = useState<RecentActivity[]>([]);
@@ -227,8 +251,13 @@ function PulseRoom(): React.ReactElement {
     useEffect(() => {
         let active = true;
         try {
-            chrome.storage.local.get(NEWTAB_DISABLED_KEY, (result) => {
-                if (active) setNewtabDisabled(result?.[NEWTAB_DISABLED_KEY] === true);
+            chrome.storage.local.get([NEWTAB_DISABLED_KEY, PULSE_MOTION_PAUSED_KEY], (result) => {
+                if (!active) return;
+                // Read lastError inside the callback so an unavailable store
+                // cannot leave the first render waiting indefinitely.
+                void chrome.runtime.lastError;
+                setNewtabDisabled(result?.[NEWTAB_DISABLED_KEY] === true);
+                setMotionPaused(result?.[PULSE_MOTION_PAUSED_KEY] === true);
             });
         } catch {
             setNewtabDisabled(false);
@@ -237,8 +266,9 @@ function PulseRoom(): React.ReactElement {
             changes: Record<string, { newValue?: unknown }>,
             area: string,
         ) => {
-            if (area !== "local" || !changes[NEWTAB_DISABLED_KEY]) return;
-            setNewtabDisabled(changes[NEWTAB_DISABLED_KEY].newValue === true);
+            if (area !== "local") return;
+            if (changes[NEWTAB_DISABLED_KEY]) setNewtabDisabled(changes[NEWTAB_DISABLED_KEY].newValue === true);
+            if (changes[PULSE_MOTION_PAUSED_KEY]) setMotionPaused(changes[PULSE_MOTION_PAUSED_KEY].newValue === true);
         };
         try {
             chrome.storage.onChanged.addListener(onChanged);
@@ -298,30 +328,27 @@ function PulseRoom(): React.ReactElement {
                     box-shadow: ${CX.shadowFloat}, inset 0 0 0 1px var(--cx-border-emphasis) !important;
                 }
             }
-            .cortex-resume-list {
-                position: absolute;
-                right: 32px;
-                bottom: 32px;
-                left: 32px;
-                z-index: 10;
-                display: flex;
-                gap: 16px;
-                max-width: calc(100vw - 64px);
-                padding: 4px;
-                overflow-x: auto;
-                scroll-snap-type: x proximity;
-                scrollbar-width: thin;
-            }
+            .cortex-pulse-room { min-height: 100svh; display: flex; flex-direction: column; position: relative; overflow-x: hidden; }
+            .cortex-pulse-header { position: relative; z-index: 10; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 24px 32px; }
+            .cortex-motion-control { border: 1px solid var(--cx-border-emphasis); border-radius: ${CX.radiusFull}px; padding: 8px 14px; color: ${CX.textSecondary}; background: ${CX.surface}; font: inherit; font-size: 12px; cursor: pointer; min-height: 36px; }
+            .cortex-motion-control { transition: background-color ${CX.durationFast} ${CX.easeOut}, color ${CX.durationFast} ${CX.easeOut}; }
+            .cortex-motion-control:active { background: ${CX.surface}; }
+            .cortex-motion-control:focus-visible { outline: 2px solid ${CX.accent}; outline-offset: 3px; }
+            .cortex-pulse-main { flex: 1; display: grid; place-items: center; position: relative; z-index: 1; padding: 64px 24px 72px; min-height: 380px; }
+            .cortex-pulse-caption { color: ${CX.textTertiary}; font-size: 12px; line-height: 1.6; margin: 18px 0 0; max-width: 320px; }
+            .cortex-pulse-announcement { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+            .cortex-resume-section { position: relative; z-index: 1; width: min(100%, 840px); margin: 0 auto; padding: 0 32px 28px; }
+            .cortex-resume-section h2 { margin: 0 4px 12px; color: ${CX.textSecondary}; font-size: 12px; font-weight: 500; }
+            .cortex-resume-list { display: flex; gap: 16px; padding: 4px; overflow-x: auto; scroll-snap-type: x proximity; scrollbar-width: thin; }
             @media (max-width: 640px) {
-                .cortex-resume-list {
-                    right: 12px;
-                    bottom: 12px;
-                    left: 12px;
-                    gap: 12px;
-                    max-width: calc(100vw - 24px);
-                }
+                .cortex-pulse-header { padding: 16px 20px; }
+                .cortex-pulse-main { padding: 48px 20px; }
+                .cortex-resume-section { padding: 0 16px 20px; }
+                .cortex-resume-list { gap: 12px; }
             }
+            @media (max-height: 620px) { .cortex-pulse-main { padding: 32px 20px; min-height: 320px; } }
             @media (prefers-reduced-motion: reduce) {
+                .cortex-launch-button:active { transform: none; }
                 .cortex-newtab-enter,
                 .cortex-resume-card {
                     animation: none !important;
@@ -361,78 +388,95 @@ function PulseRoom(): React.ReactElement {
         };
     }, []);
 
-    // Poll background for state
+    // Cached samples keep their original age. Polling the worker is not
+    // evidence that the daemon produced another measurement.
     useEffect(() => {
-        function poll() {
+        if (newtabDisabled !== false) return;
+        let active = true;
+        let interval: ReturnType<typeof setInterval> | null = null;
+        const clear = () => {
+            if (active) setSample({ state: null, connected: false, age: null, receivedAt: performance.now() });
+        };
+        const adopt = (raw: unknown, live: boolean) => {
+            if (!active || !raw || typeof raw !== "object") return;
+            const response = raw as Record<string, unknown>;
+            const value = live ? response.payload : response.state;
+            const state = value && typeof value === "object"
+                ? { ...value as CortexState, ...statePresentationFields(value) } : null;
+            const now = performance.now();
+            setSample(previous => ({
+                state, connected: live || response.connected === true,
+                age: live ? 0 : typeof response.stateAgeMs === "number" && Number.isFinite(response.stateAgeMs)
+                    ? Math.max(0, response.stateAgeMs)
+                    : response.stateAgeMs === null ? null
+                    : previous.state === null ? 0 : stateAgeMs(previous.age, previous.receivedAt, now),
+                receivedAt: now,
+            }));
+            setClock(now);
+        };
+        const poll = () => {
             try {
                 chrome.runtime.sendMessage({ type: "GET_STATE" }, (response) => {
-                    if (chrome.runtime.lastError || !response) return;
-                    stateRef.current.connected = response.connected;
-                    setDisplayConnected(response.connected);
-                    if (response.state) {
-                        stateRef.current.state = response.state.state || "";
-                        setDisplayState(response.state.state || "");
-                        stateRef.current.confidence = response.state.confidence || 0;
-                        const bio = response.state.biometrics;
-                        if (bio?.heart_rate) {
-                            stateRef.current.heartRate = Math.round(bio.heart_rate);
-                            animRef.current.beatInterval = 60000 / bio.heart_rate;
-                            setDisplayHR(Math.round(bio.heart_rate));
-                        }
-                    }
+                    if (chrome.runtime.lastError || !response) { clear(); return; }
+                    adopt(response, false);
                 });
-            } catch {
-                /* extension context lost */
-            }
-        }
-
-        poll();
-        const interval = setInterval(poll, 3000);
-
+            } catch { clear(); }
+        };
         const listener = (message: Record<string, unknown>) => {
-            if (message.type === "STATE_UPDATE" && message.payload) {
-                const payload = message.payload as Record<string, unknown>;
-                stateRef.current.state = (payload.state as string) || "";
-                setDisplayState((payload.state as string) || "");
-                stateRef.current.confidence = (payload.confidence as number) || 0;
-                stateRef.current.connected = true;
-                setDisplayConnected(true);
-                const bio = payload.biometrics as Record<string, number> | undefined;
-                if (bio?.heart_rate) {
-                    stateRef.current.heartRate = Math.round(bio.heart_rate);
-                    animRef.current.beatInterval = 60000 / bio.heart_rate;
-                    setDisplayHR(Math.round(bio.heart_rate));
-                }
+            if (message.type === "STATE_UPDATE") adopt(message, true);
+            if (message.type === "CONNECTION_CHANGED") {
+                if (message.connected !== true) clear();
+                else poll();
             }
+        };
+        const sync = () => {
+            if (interval !== null) clearInterval(interval);
+            interval = null;
+            if (document.visibilityState !== "visible") return;
+            setClock(performance.now());
+            poll();
+            let tick = 0;
+            interval = setInterval(() => {
+                setClock(performance.now());
+                if (++tick % 3 === 0) poll();
+            }, 1000);
         };
         chrome.runtime.onMessage.addListener(listener);
-
+        document.addEventListener("visibilitychange", sync);
+        sync();
         return () => {
-            clearInterval(interval);
+            active = false;
+            if (interval !== null) clearInterval(interval);
             chrome.runtime.onMessage.removeListener(listener);
+            document.removeEventListener("visibilitychange", sync);
         };
-    }, []);
+    }, [newtabDisabled]);
 
     // Fetch recent activities immediately; the cards' short entrance provides
     // visual continuity without an artificial data or interaction delay.
     useEffect(() => {
+        if (newtabDisabled !== false) return;
+        let active = true;
         try {
             chrome.runtime.sendMessage({ type: "GET_RECENT_ACTIVITIES", limit: 3 }, (result) => {
-                if (chrome.runtime.lastError || !Array.isArray(result)) return;
+                if (chrome.runtime.lastError || !active || !Array.isArray(result)) return;
                 setActivities(result);
                 setShowActivities(result.length > 0);
             });
         } catch { /* extension context lost */ }
-    }, []);
+        return () => { active = false; };
+    }, [newtabDisabled]);
 
     // Canvas animation loop + logo interaction
     const logoRef = useRef<HTMLDivElement>(null);
     const glowRef = useRef<HTMLDivElement>(null);
-    const lastPacerPhaseRef = useRef<"inhale" | "hold" | "exhale">("inhale");
+    const artRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
-        if (reducedMotion) {
+        if (reducedMotion || motionPaused || newtabDisabled !== false) {
             animRef.current.rings = [];
+            const canvas = canvasRef.current;
+            canvas?.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
             if (logoRef.current) logoRef.current.style.transform = "scale(1)";
             if (glowRef.current) {
                 glowRef.current.style.opacity = "0.35";
@@ -448,6 +492,11 @@ function PulseRoom(): React.ReactElement {
         if (!ctx) return;
 
         let rafId: number | null = null;
+        let center = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+        const locate = () => {
+            const box = artRef.current?.getBoundingClientRect();
+            if (box) center = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+        };
 
         function resize() {
             if (!canvas) return;
@@ -458,8 +507,16 @@ function PulseRoom(): React.ReactElement {
             // Fill immediately on resize to prevent a flash of the page ground
             ctx!.fillStyle = canvasBackgroundRef.current;
             ctx!.fillRect(0, 0, window.innerWidth, window.innerHeight);
+            locate();
         }
         resize();
+        const resizeObserver = typeof ResizeObserver === "function" ? new ResizeObserver(locate) : null;
+        if (artRef.current) {
+            resizeObserver?.observe(artRef.current);
+            const main = artRef.current.closest("main");
+            if (main) resizeObserver?.observe(main);
+        }
+        document.addEventListener("scroll", locate);
         window.addEventListener("resize", resize);
 
         function draw(now: number) {
@@ -469,8 +526,8 @@ function PulseRoom(): React.ReactElement {
 
             const w = window.innerWidth;
             const h = window.innerHeight;
-            const cx = w / 2;
-            const cy = h / 2 - 80; // Offset upwards to match the SVG layout
+            const cx = center.x;
+            const cy = center.y;
 
             const sr = stateRef.current;
             const anim = animRef.current;
@@ -501,17 +558,6 @@ function PulseRoom(): React.ReactElement {
             } else {
                 // Idle breathing
                 anim.pulsePhase = (Math.sin(now / 1500) * 0.5 + 0.5);
-            }
-
-            // Pacer phase for the aria-live region (4-7-8 mapped onto [0..1]).
-            {
-                const p = anim.pulsePhase;
-                const derived: "inhale" | "hold" | "exhale" =
-                    p < 0.33 ? "inhale" : p < 0.5 ? "hold" : "exhale";
-                if (derived !== lastPacerPhaseRef.current) {
-                    lastPacerPhaseRef.current = derived;
-                    setPacerPhase(derived);
-                }
             }
 
             // Ripple rings — delicate water ripples expanding outward
@@ -592,23 +638,36 @@ function PulseRoom(): React.ReactElement {
             stopAnimationLoop();
             document.removeEventListener("visibilitychange", syncAnimationLoop);
             window.removeEventListener("resize", resize);
+            document.removeEventListener("scroll", locate);
+            resizeObserver?.disconnect();
         };
-    }, [reducedMotion]);
+    }, [reducedMotion, motionPaused, newtabDisabled]);
 
     function handleLaunch() {
+        if (launching) return;
+        const attempt = ++launchAttempt.current;
         setLaunching(true);
         setLaunchError("");
-        nt_sendWithCid({ type: "LAUNCH_CORTEX" }, (raw: unknown) => {
-            const resp = raw as { ok?: boolean; status?: string } | undefined;
+        const settle = (ok: boolean) => {
+            if (attempt !== launchAttempt.current) return;
+            launchAttempt.current++;
+            if (launchTimer.current !== null) clearTimeout(launchTimer.current);
+            launchTimer.current = null;
             setLaunching(false);
-            if (resp?.ok && resp.status === "camera_enabled") {
-                // Connected — state updates will flow via polling
-            } else {
-                setLaunchError(LAUNCH_FAILED_STATUS);
-                setTimeout(() => setLaunchError(""), 15000);
-            }
+            setLaunchError(ok ? "" : LAUNCH_FAILED_STATUS);
+        };
+        launchTimer.current = setTimeout(() => settle(false), 45_000);
+        nt_sendWithCid({ type: "LAUNCH_CORTEX" }, (raw: unknown) => {
+            const resp = raw as { ok?: boolean } | undefined;
+            settle(resp?.ok === true);
         });
     }
+
+    const toggleMotion = () => {
+        const paused = !motionPaused;
+        setMotionPaused(paused);
+        void chrome.storage.local.set({ [PULSE_MOTION_PAUSED_KEY]: paused }).catch(() => {});
+    };
 
     if (newtabDisabled === true) {
         return (
@@ -624,19 +683,10 @@ function PulseRoom(): React.ReactElement {
     }
 
     const col = STATE_COLORS_RGB[displayConnected ? displayState : ""] || STATE_COLORS_RGB.FLOW;
-    const stateLabel = STATE_LABELS[displayState] ?? STATE_LABELS.UNKNOWN;
+    const stateLabel = signal.label;
 
     return (
-        <div
-            style={{
-                width: "100vw",
-                height: "100vh",
-                overflow: "hidden",
-                background: CX.bg,
-                margin: 0,
-                padding: 0,
-            }}
-        >
+        <div className="cortex-pulse-room" style={{ background: CX.bg, color: CX.text, fontFamily: CX.font }}>
             {/*
               CLAUDE.md rule 19: Plasmo's new-tab override page has a white
               <body> by default. The imported page-reset.css attaches with
@@ -652,30 +702,18 @@ function PulseRoom(): React.ReactElement {
                         ";margin:0;padding:0}",
                 }}
             />
-            <canvas
-                ref={canvasRef}
-                role="img"
-                aria-label="Cortex breathing pacer visualization"
-                style={{ display: "block", width: "100%", height: "100%" }}
-            />
-            <div
-                aria-live="polite"
-                aria-atomic="true"
-                data-testid="pacer-phase-announcement"
-                style={{
-                    position: "absolute",
-                    width: 1,
-                    height: 1,
-                    overflow: "hidden",
-                    clip: "rect(0 0 0 0)",
-                    whiteSpace: "nowrap",
-                }}
-            >
-                {pacerPhase}
-            </div>
+            <canvas ref={canvasRef} aria-hidden="true" style={{ position: "fixed", inset: 0, pointerEvents: "none", width: "100%", height: "100%" }} />
+            <header className="cortex-pulse-header">
+                <span style={{ fontSize: 12, color: CX.textSecondary, letterSpacing: "0.04em" }}>Pulse Room</span>
+                {reducedMotion ? <span style={{ fontSize: 12, color: CX.textTertiary }}>Reduced motion</span> : (
+                    <button className="cortex-motion-control" type="button" aria-pressed={motionPaused} onClick={toggleMotion}>
+                        {motionPaused ? "Resume motion" : "Pause motion"}
+                    </button>
+                )}
+            </header>
 
             {/* Static orb for reduced motion */}
-            {reducedMotion && (
+            {(reducedMotion || motionPaused) && (
                 <div style={{
                     position: "absolute", top: 0, left: 0, right: 0, bottom: 0,
                     background: `radial-gradient(circle at 50% 50%, rgba(${col.r},${col.g},${col.b},0.08), ${CX.bg})`,
@@ -683,16 +721,7 @@ function PulseRoom(): React.ReactElement {
                 }} />
             )}
 
-            {/* Centerpiece & breathing logo */}
-            <div
-                style={{
-                    position: "absolute",
-                    top: "50%",
-                    left: "50%",
-                    transform: "translate(-50%, -50%)",
-                    zIndex: 10,
-                }}
-            >
+            <main className="cortex-pulse-main">
                 <div className="cortex-newtab-enter cortex-motion-enter" style={{
                     display: "flex",
                     flexDirection: "column",
@@ -700,7 +729,7 @@ function PulseRoom(): React.ReactElement {
                     justifyContent: "center",
                     textAlign: "center",
                 }}>
-                <div style={{ position: "relative", marginBottom: 40 }}>
+                <div ref={artRef} style={{ position: "relative", marginBottom: 32 }}>
                     {/* Pre-rendered glow: blurred once, animated via opacity/scale only */}
                     <div
                         ref={glowRef}
@@ -738,7 +767,7 @@ function PulseRoom(): React.ReactElement {
 
                 <h1 style={{
                     fontFamily: CX.fontSerif,
-                    fontSize: 48,
+                    fontSize: "clamp(32px, 5vw, 48px)",
                     fontWeight: 400,
                     color: CX.text,
                     letterSpacing: "-0.02em",
@@ -766,7 +795,7 @@ function PulseRoom(): React.ReactElement {
                             userSelect: "none",
                         }}
                     >
-                        {displayHR > 0 ? `${displayHR} bpm · ${stateLabel}` : "Reading your pulse…"}
+                        {displayHR !== null ? `${displayHR} bpm · ${stateLabel}` : signal.bioStatusMessage}
                     </div>
                 ) : (
                     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 16 }}>
@@ -807,11 +836,19 @@ function PulseRoom(): React.ReactElement {
                         )}
                     </div>
                 )}
+                <p className="cortex-pulse-caption">
+                    {displayHR !== null ? "Light follows your latest camera pulse estimate." : "A little space between one thing and the next."}
+                </p>
+                <div className="cortex-pulse-announcement" role="status" aria-live="polite" aria-atomic="true">
+                    {displayConnected ? signal.stale ? "Waiting for fresh signals" : displayHR !== null ? `Pulse estimate available. ${stateLabel}` : signal.bioStatusMessage : "Cortex is resting"}
                 </div>
-            </div>
+                </div>
+            </main>
 
             {/* Resume cards — translucent material over the pulse field */}
             {showActivities && activities.length > 0 && (
+                <section className="cortex-resume-section" aria-labelledby="cortex-resume-title">
+                <h2 id="cortex-resume-title">Pick up where you left off</h2>
                 <div
                     className="cortex-resume-list"
                     role="list"
@@ -821,7 +858,7 @@ function PulseRoom(): React.ReactElement {
                     }}
                 >
                     {activities.slice(0, 3).map((a, index) => {
-                        const pct = Math.round(a.completion_pct || a.max_completion_pct || 0);
+                        const pct = Math.max(0, Math.min(100, Math.round(a.completion_pct || a.max_completion_pct || 0)));
                         const posLabel = formatActivityPosition(a.position);
                         const resumeUrl = getResumeUrl(a);
                         return (
@@ -875,14 +912,14 @@ function PulseRoom(): React.ReactElement {
                         );
                     })}
                 </div>
+                </section>
             )}
 
             {/* Brand watermark — bottom-right, whispered */}
             {!showActivities && <div
                 style={{
-                    position: "absolute",
-                    bottom: 24,
-                    right: 32,
+                    padding: "0 32px 24px",
+                    textAlign: "right",
                     fontSize: 11,
                     color: CX.textTertiary,
                     fontFamily: CX.fontSerif,

@@ -41,6 +41,9 @@ logger = logging.getLogger(__name__)
 # exceed the RECOVERY dwell (5 s) so a genuine post-HYPER recovery still
 # commits before the fallback fires.
 EXIT_TO_UNKNOWN_DWELL_SECONDS: float = 10.0
+# Six missed 500 ms evaluations reach the existing source freshness boundary.
+# A longer gap is not continuous observation and cannot satisfy any dwell.
+MAX_EVIDENCE_GAP_SECONDS: float = 3.0
 
 
 @dataclass
@@ -156,14 +159,26 @@ class ScoreSmoother:
             supplied_now = (
                 timestamp if timestamp is not None else monotonic_seconds(self._clock)
             )
-        # A replayed/regressed timestamp must not create negative dwell or move
-        # a candidate timer backward. The event ordering layer handles drops;
-        # this clamp is the final domain invariant.
-        now = (
-            max(supplied_now, self._last_update_at)
-            if self._last_update_at is not None
-            else supplied_now
-        )
+        # Replayed timestamps are not new evidence. In particular, repeated
+        # delivery must not amplify one observation through multiple EMA steps.
+        if self._last_update_at is not None and supplied_now <= self._last_update_at:
+            assert self._latest is not None
+            return self._latest.model_copy(deep=True)
+        now = supplied_now
+        if (
+            self._last_update_at is not None
+            and now - self._last_update_at > MAX_EVIDENCE_GAP_SECONDS
+        ):
+            # Preserve transition history, but discard the unobserved interval
+            # and every score/candidate from before it. Recovery needs a new
+            # confirmed support episode rather than an old pre-gap label.
+            self._candidate_state = None
+            self._candidate_since = now
+            self._dwell_seconds = 0.0
+            self._last_contributions = []
+            self._force_unknown(now, event_time)
+            self._smoothed = SmoothedScores()
+            self._exit_candidate_since = None
         self._last_update_at = now
         if self._state_entered_at is None:
             self._state_entered_at = now

@@ -15,7 +15,7 @@ build and release scripts; matching them exactly avoids lockfile drift.
 | Requirement | Pin | Install |
 |-------------|-----|---------|
 | macOS 13+ (Ventura or later) | — | required |
-| uv | `0.10.12` (`cortex/pyproject.toml` `tool.uv.required-version`) | `brew install uv` |
+| uv | `0.10.12` (`cortex/pyproject.toml` `tool.uv.required-version`) | install the pinned version and verify `uv --version` |
 | Python | `3.11.15` (`.python-version`; CI also validates 3.12.13 on Intel) | `uv python install 3.11.15` |
 | Node.js | `22.23.2` (`.node-version`) | your version manager (`fnm`, `mise`, `nvm`) |
 | pnpm | `9.15.9` (`packageManager` in the extension `package.json`) | `corepack prepare pnpm@9.15.9 --activate` |
@@ -40,7 +40,8 @@ make lint             # ruff
 make typecheck        # mypy --strict
 make codegen          # regenerate TypeScript schema types
 make codegen-check    # the CI drift gate
-make ci               # everything CI runs
+make ci               # local Python/contract subset of the hosted workflow
+./cortex/scripts/run_python_gate.sh  # canonical lint/types/wheel/tests/coverage gate
 ```
 
 ## Schema codegen workflow
@@ -48,19 +49,48 @@ make ci               # everything CI runs
 This is the project's most important convention. The Pydantic models in
 [cortex/libs/schemas/](cortex/libs/schemas/) are the single source of
 truth for every shape that crosses the daemon ↔ browser-extension
-boundary. The generated TypeScript file at
+boundary. The generated TypeScript declarations at
 [cortex/apps/browser_extension/types/generated/cortex_schemas.d.ts](cortex/apps/browser_extension/types/generated/cortex_schemas.d.ts)
-is hands-off:
+and [cortex/apps/vscode_extension/src/generated/cortex_schemas.d.ts](cortex/apps/vscode_extension/src/generated/cortex_schemas.d.ts)
+are hands-off:
 
 1. Edit a Pydantic model in `cortex/libs/schemas/`.
-2. Run `make codegen` to regenerate the `.d.ts`.
-3. Commit both the Python change and the regenerated `.d.ts`
+2. Run `make codegen` to regenerate both `.d.ts` files.
+3. Commit the Python change and both regenerated `.d.ts` files
    together.
 4. The pre-commit hook and the `schema-codegen-check` CI job both
    run `make codegen-check`, which fails the commit / PR if the
    `.d.ts` is stale.
 
-Don't hand-edit the `.d.ts`. The file's header refuses it.
+Don't hand-edit generated declarations; regenerate them from their Python source.
+
+## Algorithm, UI and lifecycle changes
+
+Read the [current implementation record](docs/implementation-2026-10.md),
+[model card](docs/model-cards/deterministic-support-v2.md) and
+[UI contract](cortex/docs/ui-design.md) before changing their invariants.
+
+- Input availability is distinct from measured zero. Observation gaps cannot
+  satisfy dwell, and camera physiology remains outside behavioral inference.
+- After changing a declared behavioral component, regenerate/check
+  `cortex.scripts.generate_support_model_identity` using the locked interpreter;
+  review whether the model version, feature schema and model card must change.
+- Design tokens come from `cortex/libs/design/tokens.yaml`; regenerate with
+  `cortex.scripts.sync_design_tokens`. Generated configuration references come
+  from `make config-sync`. Do not hand-edit generated output.
+- Test failure, disconnect, cancellation, stop and restart paths. Use real Qt
+  event-loop tests when changing quit/focus lifecycle; a mock `quit()` does not
+  establish process exit. Inspect final affected UI states at compact sizes and
+  with the relevant accessibility preferences.
+- Tests inherit the session HOME/XDG sandbox in `cortex/tests/conftest.py`.
+  Never bypass it for normal tests, use real cameras or modify user profiles.
+- Run browser TypeScript/Vitest/build and editor lint/compile/Jest/package
+  gates when their surfaces change. A local `make ci` does not run all of them.
+  Release-sensitive changes also require the [packaged checks](docs/release/README.md).
+
+Use descriptive branch names without `codex` or `agent`. Preserve the intended
+commit author and any required DCO sign-off; do not add an AI coauthor trailer.
+Keep generated builds, coverage output, local logs and credentials out of Git.
 
 ## Adding a new WebSocket message type
 
@@ -68,7 +98,7 @@ Don't hand-edit the `.d.ts`. The file's header refuses it.
 2. If the daemon dispatches on it, add a case in
    `cortex/services/api_gateway/websocket_server.py::_process_message`
    and update the catalog tests.
-3. Run `make codegen` and commit the regenerated `.d.ts` alongside.
+3. Run `make codegen` and commit both regenerated `.d.ts` files alongside.
 4. The TypeScript dispatch sites in `background.ts` / `popup.tsx` now
    type-check against the new union; their switch's `never` default
    flags any forgotten case at build time.
@@ -94,11 +124,14 @@ Smaller fixes use a Conventional-Commits-flavoured prefix
 
 Before submitting:
 
-- [ ] `make ci` passes locally (lint + typecheck + tests + codegen
-      drift check)
-- [ ] You added or updated tests for any code change
+- [ ] The canonical Python gate and relevant browser/editor/build gates pass;
+      documentation-only changes pass local link/contract and whitespace checks
+- [ ] Behavior changes have meaningful regression coverage
 - [ ] If you touched a Pydantic schema, you ran `make codegen` and
-      committed the regenerated `.d.ts`
+      committed both regenerated `.d.ts` files
+- [ ] Model/config/token documentation and generated identities remain in sync
+- [ ] README examples and current guides describe the implemented behavior;
+      historical measurements remain bound to their original milestone
 - [ ] If your change relates to an audit finding, the commit subject
       starts with `audit Fxx:` and `audit/execution-log.md` is updated
 - [ ] No new `print()` calls (use `structlog` via
@@ -111,7 +144,8 @@ Before submitting:
 - Linux or Windows support (Cortex is tied to AVFoundation, TCC, and
   macOS-specific frameworks)
 - Any change that puts biometrics into an LLM payload
-- Removal of the consent ladder, undo stack, or capability-token gate
+- Removal of exact authorization, durable receipt/restore safeguards, consent
+  boundaries or the capability-token gate
 - Bypassing the schema codegen drift gate
 
 ## Bug reports & ideas

@@ -75,6 +75,12 @@ describe("F07b + F08b extension auth wiring", () => {
     const realFetch = globalThis.fetch;
     globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
       fetchCalls.push({ url: String(input), init });
+      if (String(input).endsWith("/health")) {
+        return Promise.reject(new TypeError("endpoint closed"));
+      }
+      if (String(input).endsWith("/stop")) {
+        return Promise.resolve(new Response(JSON.stringify({ status: "stopped" }), { status: 200 }));
+      }
       return Promise.resolve(new Response("ok", { status: 200 }));
     }) as typeof fetch;
 
@@ -90,9 +96,9 @@ describe("F07b + F08b extension auth wiring", () => {
       const responses: unknown[] = [];
       listener({ type: "STOP_CORTEX" }, undefined, (r) => responses.push(r));
 
-      // STOP_CORTEX is async; give the inner queue time to drain.
-      // The chain has explicit setTimeout(1000) + setTimeout(500)
-      // gates; fake them out by stepping the event loop a few times.
+      // The endpoint closes after graceful shutdown. Native messaging is
+      // unavailable in this fixture, so the authenticated launcher verifies
+      // exit. A responding endpoint's full grace is covered by daemon_stop.
       for (let i = 0; i < 30; i++) {
         await new Promise((r) => setTimeout(r, 100));
         if (responses.length > 0) break;
@@ -118,6 +124,7 @@ describe("F07b + F08b extension auth wiring", () => {
       const shutdownHeaders =
         (shutdownFetch!.init?.headers as Record<string, string>) || {};
       expect(shutdownHeaders["X-Cortex-Auth-Token"]).toBe("ab".repeat(32));
+      expect(responses).toEqual([{ ok: true }]);
     } finally {
       globalThis.fetch = realFetch;
     }

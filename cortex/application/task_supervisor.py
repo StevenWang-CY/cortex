@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Callable, Coroutine
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Diagnostics keep values, never completed Task objects (which retain results
+# and exception tracebacks). The live registry is deliberately not capped.
+DIAGNOSTIC_HISTORY_LIMIT = 128
 
 
 class TaskGroupName(StrEnum):
@@ -55,7 +59,8 @@ class TaskSupervisor:
 
     def __init__(self, *, on_failure: FailureListener | None = None) -> None:
         self._tasks: dict[asyncio.Task[Any], tuple[str, bool]] = {}
-        self._failures: list[TaskFailure] = []
+        self._failures: deque[TaskFailure] = deque(maxlen=DIAGNOSTIC_HISTORY_LIMIT)
+        self._finished: deque[TaskRecord] = deque(maxlen=DIAGNOSTIC_HISTORY_LIMIT)
         self._expected_completion: set[asyncio.Task[Any]] = set()
         self._on_failure = on_failure
 
@@ -85,33 +90,30 @@ class TaskSupervisor:
         return task
 
     def _task_done(self, task: asyncio.Task[Any]) -> None:
-        metadata = self._tasks.get(task)
-        if (
-            metadata is None
-            or task.cancelled()
-            or task in self._expected_completion
-        ):
+        metadata = self._tasks.pop(task, None)
+        expected = task in self._expected_completion
+        self._expected_completion.discard(task)
+        if metadata is None:
             return
-        exception = task.exception()
         group, critical = metadata
-        if exception is None and not critical:
+        # Even expected completion must retrieve/report a real exception.
+        # Only a successful critical return is exempt during graceful stop.
+        exception = None if task.cancelled() else task.exception()
+        failure = None
+        if exception is not None or (critical and not expected and not task.cancelled()):
+            failure = TaskFailure(
+                name=task.get_name(), group=group, critical=critical,
+                exception_type=type(exception).__name__ if exception else "UnexpectedTaskExit",
+                message=str(exception)[:2048] if exception else "critical task returned before shutdown",
+            )
+            self._failures.append(failure)
+        self._finished.append(TaskRecord(
+            name=task.get_name(), group=group, critical=critical,
+            state="cancelled" if task.cancelled() else "failed" if exception else "completed",
+            failure=failure,
+        ))
+        if failure is None:
             return
-        failure = TaskFailure(
-            name=task.get_name(),
-            group=group,
-            critical=critical,
-            exception_type=(
-                type(exception).__name__
-                if exception is not None
-                else "UnexpectedTaskExit"
-            ),
-            message=(
-                str(exception)
-                if exception is not None
-                else "critical task returned before shutdown"
-            ),
-        )
-        self._failures.append(failure)
         logger.error(
             "Supervised task failed name=%s group=%s critical=%s",
             failure.name,
@@ -137,35 +139,43 @@ class TaskSupervisor:
         *,
         timeout: float = 5.0,
     ) -> tuple[asyncio.Task[Any], ...]:
-        targets = tuple(task for task in self.tasks(group) if not task.done())
+        current = asyncio.current_task()
+        targets = tuple(
+            task for task in self.tasks(group) if not task.done() and task is not current
+        )
         for task in targets:
             self._expected_completion.add(task)
             task.cancel()
         if targets:
-            gather = asyncio.gather(*targets, return_exceptions=True)
-            try:
-                await asyncio.wait_for(gather, timeout=max(0.0, timeout))
-            except TimeoutError:
+            # wait_for(gather(...)) waits for cancellation acknowledgement,
+            # so a child that finishes cleanup slowly can exceed the deadline
+            # indefinitely. wait returns at the deadline without disowning it.
+            _done, pending = await asyncio.wait(targets, timeout=max(0.0, timeout))
+            if pending:
                 logger.error(
                     "Timed out draining supervised tasks group=%s names=%s",
                     str(group) if group is not None else "all",
-                    [task.get_name() for task in targets if not task.done()],
+                    sorted(task.get_name() for task in pending),
                 )
         return targets
 
     def expect_completion(self, task: asyncio.Task[Any] | None) -> None:
         """Mark a graceful, non-cancellation exit as lifecycle-owned."""
 
-        if task is not None:
+        if task is not None and task in self._tasks:
             self._expected_completion.add(task)
 
     def forget_finished(self) -> None:
-        finished = {task for task in self._tasks if task.done()}
-        self._tasks = {task: meta for task, meta in self._tasks.items() if task not in finished}
-        self._expected_completion.difference_update(finished)
+        # A caller may run before the event loop dispatches done callbacks.
+        # Observe the outcome first instead of discarding an unread failure.
+        for task in tuple(self._tasks):
+            if task.done():
+                self._task_done(task)
 
     def snapshot(self) -> dict[str, Any]:
         groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for record in self._finished:
+            groups[record.group].append(asdict(record))
         for task, (group, critical) in self._tasks.items():
             if task.cancelled():
                 state = "cancelled"
@@ -175,10 +185,6 @@ class TaskSupervisor:
                 state = "completed"
             else:
                 state = "failed"
-            failure = next(
-                (candidate for candidate in reversed(self._failures) if candidate.name == task.get_name()),
-                None,
-            )
             groups[group].append(
                 asdict(
                     TaskRecord(
@@ -186,7 +192,7 @@ class TaskSupervisor:
                         group=group,
                         critical=critical,
                         state=state,
-                        failure=failure,
+                        failure=None,
                     )
                 )
             )

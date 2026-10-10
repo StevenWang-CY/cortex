@@ -566,8 +566,9 @@ def stop_daemon(*, log: Callable[[str], None] | None = None) -> dict:
        daemon's signal handler runs the same graceful chain).
     4. Wait :data:`SIGTERM_GRACE_S`; SIGKILL any survivor last.
 
-    Returns ``{"status": "stopped", "method": ...}`` or
-    ``{"status": "not_running"}`` when nothing was there to stop.
+    Returns ``{"status": "stopped", "method": ...}``, ``not_running``
+    when both the process and endpoint are absent, or ``error`` when exit
+    cannot be confirmed. Sending a signal is not evidence of process exit.
     """
     emit = log or (lambda message: logger.info("%s", message))
     token = _read_auth_token()
@@ -585,6 +586,11 @@ def stop_daemon(*, log: Callable[[str], None] | None = None) -> dict:
 
     pids = find_daemon_pids()
     if not pids:
+        if _daemon_http_alive():
+            return {
+                "status": "error",
+                "error": "Cortex's endpoint is still responding; no safe daemon PID was found.",
+            }
         if accepted:
             return {"status": "stopped", "method": "graceful"}
         return {"status": "not_running"}
@@ -598,7 +604,12 @@ def stop_daemon(*, log: Callable[[str], None] | None = None) -> dict:
     if survivors:
         _signal_pids(survivors, signal.SIGKILL, emit)
         emit(f"sent SIGKILL to pids: {sorted(survivors)}")
-    return {"status": "stopped", "method": "sigkill"}
+    if _wait_for_daemon_exit(2.0):
+        return {"status": "stopped", "method": "sigkill"}
+    return {
+        "status": "error",
+        "error": "Could not confirm daemon exit after shutdown. Open Cortex to check its status.",
+    }
 
 
 def _stop_daemon() -> dict:

@@ -1,20 +1,27 @@
-# Model card: deterministic support rules v2.4.0
+# Model card: deterministic support rules v2.5.0
 
 ## Status and ownership
 
 | Field | Value |
 | --- | --- |
 | Registry name | `deterministic-support` |
-| Version | `2.4.0` |
-| Feature schema | `support-features-v2.1.0` |
+| Version | `2.5.0` |
+| Feature schema | `support-features-v2.2.0` |
 | Implementation | `cortex/services/state_engine/rule_scorer.py` |
 | Operational wrapper | `cortex/services/state_engine/support_inference.py` |
 | Validation status | deterministic rules; no learned-model validation claim |
 | Production eligible | yes, subject to abstention and intervention gates below |
 | Safe rollback | `no-inference@safety-null-v1` |
 
-The runtime hashes the scorer implementation and feature catalog into every
-estimate. The digest is provenance, not proof of validity.
+Each estimate carries a build-generated digest of the feature schema, input
+acquisition and aggregation, focus graph, fusion, scorer, temporal smoother and
+registry. The digest identifies the reviewed implementation, not its validity;
+it does not claim that these heuristic rules have been empirically validated.
+This eleven-component manifest is scoped to behavioral inference. It excludes
+intervention helpers, runtime orchestration, configuration values and personal
+calibration; the digest alone cannot reproduce a complete proposal decision.
+The [current implementation record](../implementation-2026-10.md) describes the
+source repairs, regression evidence and outstanding validation boundaries.
 
 ## Intended use
 
@@ -31,7 +38,7 @@ four decision-support hypotheses:
 
 `unknown` is the required output while evidence is missing, warming, weak, or
 ambiguous. The uppercase `HYPER`, `FLOW`, `HYPO`, and `RECOVERY` values are
-one-cycle compatibility aliases only.
+legacy wire compatibility aliases for these hypotheses.
 
 The output may support a reversible, suggest-only workspace proposal. It must
 not be used to diagnose stress, overwhelm, fatigue, attention, arousal,
@@ -57,7 +64,7 @@ error, never implicit truncation or padding.
 
 Production behavior inputs:
 
-| Feature | Unit | Source window | Support use |
+| Feature | Unit | Default source window | Support use |
 | --- | --- | ---: | --- |
 | mouse velocity mean | px/s | 15 s | flow-like, under-engaged |
 | mouse velocity variance | px²/s² | 15 s | support-likely, flow-like |
@@ -70,24 +77,33 @@ Production behavior inputs:
 | re-read scroll bursts | bursts/min | 15 s | support-likely, flow-like |
 | focus-transition thrashing | ratio | 60 s | support-likely, flow-like |
 
-The aggregator publishes observation counts. Mouse statistics require at least
-two mouse observations; typing-interval variance requires at least two typing
-keypresses; correction rate requires at least one typing key. A connected
-stream containing zero events is an observed zero for rates, not a fabricated
-measurement.
+The aggregator publishes per-device availability and observation counts. Mouse
+features require a live mouse listener; keyboard features require a live,
+trusted keyboard listener and a current, non-prompting permission check.
+Neither absent listeners nor unavailable legacy provenance become observed zeros.
+Partial startup failure releases the listener pair, and a stopped listener
+invalidates its own features while leaving another observed channel available.
+
+Mouse statistics require at least two mouse observations. Typing-interval
+variance requires at least two positive intervals between regular keypresses
+(at least three regular presses); backspaces do not supply interval evidence.
+Correction rate requires at least one typing key. A connected stream containing
+zero events remains a valid zero for rates. Legitimately equal measured
+intervals may have zero variance.
 
 Inactivity is the elapsed time since the most recent input event of any kind,
 taken from the input hooks' last-input marker rather than from the 15 s
 sliding event window (which by construction can never witness more than 15 s
 of silence). It is bounded only by actual observation exposure: on collector
 startup, no-event inactivity begins at zero and grows with exposure rather
-than machine uptime. This is what makes the 30 s under-engaged floor, the
-flow-like "recent activity" gate (inactivity ≤ 30 s), and the zombie-reading
-detector reachable.
+than machine uptime. Both input channels must be observed to assert inactivity.
+Losing either source or a sampling gap longer than 3 s restarts exposure. The
+30 s under-engaged floor and flow-like recent-activity gate (inactivity ≤ 30 s)
+therefore operate only on an observed interval.
 
-Per-minute rates (tab switches, re-read scroll bursts) are computed over the
-same 15 s window as every other input feature and are stamped with that
-window; the focus-transition graph keeps its own 60 s window. Every focus
+Per-minute rates (tab switches, re-read scroll bursts) use the configured input
+aggregation window, 15 s by default, and are stamped with its actual duration;
+the focus-transition graph keeps its own 60 s window. Every focus
 event inside the window is a real transition (the tracker de-duplicates
 same-window refreshes), so a window holding *n* events reports *n* switches.
 
@@ -152,8 +168,13 @@ Important compound gates are:
 ## Temporal model and action boundary
 
 `ScoreSmoother` starts at `UNKNOWN`, uses an EMA, Schmitt-style entry/exit
-thresholds, monotonic elapsed time, and state-specific dwell. Regressed replay
-timestamps are clamped and cannot create negative dwell. `recovering` can only
+thresholds, monotonic elapsed time, and state-specific dwell. Duplicate or
+regressed observations do not update scores or dwell. An evaluation gap longer
+than 3 s (six nominal 500 ms ticks, matching the source freshness boundary)
+invalidates the committed label, scores and pending candidate. The next fresh
+observation begins a new confirmation interval; unobserved time cannot complete
+entry dwell, prolong a label, or establish recovery. The EMA remains per-sample
+with unchanged alpha under normal continuous input. `recovering` can only
 appear after a confirmed support-likely episode begins to subside; it is never
 scored from a mixed single frame. A committed label whose own smoothed score
 stays at or below the exit threshold for 10 s without any other state clearing
@@ -176,7 +197,31 @@ Break reminders are outside this model. They are opt-in and based only on the
 user's preferred elapsed active-work interval. Pulse, HRV, camera features,
 state labels, and the research stress integral are not inputs.
 
+Reading check-ins are behavior-only proposals. Blink values, missing camera
+input and blink baselines cannot change their timing or eligibility. The default
+is 120 s of observed mouse velocity at or below 30 px/s in a browser while the
+support estimate is `under_engaged`. Quiet interaction does not establish
+comprehension or attention. Goal check-ins use only the foreground
+editor file or active browser title; missing foreground metadata resets the pending check-in
+rather than counting as a mismatch. Both remain subject to the shared interruption
+and authorization gates.
+
 ## Change log
+
+**2.5.0 / support-features-v2.2.0** — Corrected input-source missingness,
+regular-key interval readiness and temporal continuity. Expanded build-time
+implementation provenance through acquisition, aggregation, fusion and smoothing.
+Camera-derived blink no longer influences reading proposals. Goal checks consume
+actual foreground metadata; a stationary live foreground app no longer expires
+with the 60 s focus-change window. Regression tests cover denied/dead/partial
+listeners, genuine inactivity, source recovery, long gaps, timestamp replay,
+camera invariance and the daemon's actual sampling/proposal call paths.
+
+Compatibility: additional telemetry fields have defaults, so older payloads still
+decode. Without explicit source availability their input features abstain until
+a current producer supplies it. Configured rule weights and normal 500 ms EMA
+behavior are unchanged. The retained `safety_null` entry disables inference.
+Reference-sensor and participant-held-out validation remain outstanding.
 
 **2.4.0** — `score_window_switch` is continuous and matches its own
 documentation. Both branches used the wrong divisor: the 10-20 switches/min
@@ -265,7 +310,8 @@ supported device/input configurations where consent and sample size permit.
   The feature's documented meaning ("time since last input event") is
   unchanged, so no feature-schema or model version increment was taken; the
   under-engaged rule, previously unreachable, is now live.
-- `mouse_variance_baseline` is floored at 1.0 in every transform (audit D2).
+- The original D2 divisor guard was superseded by the 1,000 px²/s²
+  readiness floor in version 2.3.0, as recorded above.
 - Tab-switch and scroll-back rates are stamped with their true 15 s window
   and switches are no longer under-counted by one per window (audit D13).
 - The legacy physiology/posture composites were deleted from the scorer

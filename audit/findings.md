@@ -7,6 +7,11 @@ production-certified. Current product limitations and external gates are in
 [limitations.md](../docs/limitations.md) and the
 [release evidence guide](../docs/release/README.md).
 
+The [October refinement record](../docs/implementation-2026-10.md) documents the
+subsequent working-tree review, fixes and current verification. Its findings
+are separate from the historical `Fxx` identifiers below; local uncommitted
+changes do not retroactively create immutable evidence for this ledger.
+
 Status meanings:
 
 - **Closed:** the named code defect has a committed regression contract.

@@ -16,26 +16,27 @@ produce a proposal; receipt of a proposal is never authority to mutate a tab,
 editor, window, or file.
 
 ```text
-capture / telemetry / client context
-                 |
-                 v
-      versioned observations + quality
-                 |
-                 v
- evidence-aware deterministic support estimates
-                 |
-                 v
- deterministic eligibility / safety gates
-                 |
-                 v
- schema-validated LLM or rule-based plan
-                 |
-                 v
-         non-mutating proposal
+camera -> quality-gated experimental diagnostics
+
+input/window telemetry -> availability + aggregation
+                                   |
+                                   v
+              abstaining deterministic support estimates
+                                   |
+                                   v
+                  eligibility / interruption gates
+                                   |
+local task context ----------------+
+                                   v
+        local plan or explicitly previewed external request
+                                   |
+                                   v
+                        non-mutating proposal
 ```
 
-The complete target design, migration order, and definition of done are in
-[`../../IMPLEMENTATION.md`](../../IMPLEMENTATION.md).
+The [current implementation record](../../docs/implementation-2026-10.md)
+describes the reviewed changes and verification boundaries. The earlier
+[implementation history](../../IMPLEMENTATION.md) records the broader migration.
 
 ## Current layers
 
@@ -47,12 +48,18 @@ The complete target design, migration order, and definition of done are in
 2. **Support inference.** `state_engine` currently applies deterministic
    fixed-denominator behavior rules, explicit abstention, smoothing, and
    hysteresis. Outputs are heuristic evidence strengths, not probabilities or
-   diagnostic states. Camera signals are diagnostic-only for this decision.
+   diagnostic states. The registered model is `deterministic-support@2.5.0`
+   with `support-features-v2.2.0`. Camera signals are diagnostic-only for this
+   decision and cannot change reading-check-in eligibility.
 3. **Eligibility and context.** trigger gates decide whether to assemble
-   browser/editor/terminal context. Missing evidence should suppress or
-   abstain; named validity and coverage gates enforce that invariant.
-4. **Planning.** `llm_engine` calls a configured Anthropic transport or a
-   deterministic fallback, then parses and validates the returned plan.
+   browser/editor context. The terminal parser has no shipping live producer.
+   Missing evidence should suppress or abstain; named validity and coverage
+   gates enforce that invariant.
+4. **Planning.** the default `no_llm` mode uses a local deterministic planner.
+   Explicit external mode requires an exact redacted preview and one-time
+   confirmation before the configured Anthropic transport is called. Returned
+   plans are parsed and validated locally; provider failure has a deterministic
+   fallback.
 5. **Presentation/authorized execution.** `intervention_engine` and the clients
    present proposals. The shipping default is non-mutating. Any enabled
    capability requires a manifest-bound authorization, idempotent command,
@@ -90,6 +97,32 @@ events use:
 Legacy bare `timestamp` fields remain compatibility-only during migration.
 Pydantic schemas in `cortex/libs/schemas` are canonical; generated
 TypeScript is checked in CI. Unknown major protocol versions are rejected.
+
+Input availability is tracked per device. A newly timestamped empty buffer
+does not establish inactivity: mouse observations need a live listener, and
+keyboard observations additionally need the current permission/trust checks.
+Inactivity requires both channels and is bounded by their continuous observed
+exposure. Source loss or a sampling gap above 3 seconds restarts that exposure.
+Typing variance requires two positive intervals between regular keypresses;
+backspaces cannot satisfy this readiness condition.
+
+The smoother retains per-sample EMA updates at the nominal 500 ms cadence.
+Duplicate or regressed timestamps do not update it. A gap above 3 seconds
+clears accumulated scores, pending confirmation and the committed label before
+fresh evidence begins another dwell. This continuity rule is an engineering
+bound, not a claim about a person's cognitive timescale.
+
+Foreground identity and transition history are separate. A live foreground
+application does not disappear merely because it has not changed for 60 seconds.
+Goal check-ins read the foreground editor's nested file metadata or active
+browser title; unavailable foreground metadata causes abstention, and a new goal
+clears the previous goal's file history. See the
+[model card](../../docs/model-cards/deterministic-support-v2.md) for exact rules.
+
+The generated behavioral implementation digest covers eleven schema,
+acquisition, aggregation, fusion, scoring and smoothing components. It does not
+hash the whole daemon, intervention helpers, configuration or calibration.
+Reproducing a proposal requires those inputs and the application revision too.
 
 ## Evidence boundary
 
@@ -130,8 +163,16 @@ The implemented ownership boundary is:
 - **composition:** a compatibility facade that constructs dependencies while
   the kernel owns structured background tasks.
 
-Compatibility facades remain intentionally thin and are removed only after
-transport parity coverage proves no external caller relies on them.
+The runtime facade still contains substantial composition and orchestration.
+The coordinator/port boundary does not imply a completed rewrite of that file;
+further extraction requires demonstrated value and transport-parity coverage.
+
+`TaskSupervisor` strongly owns every registered live task. Completion removes
+the Task reference and retains value-only completion/failure histories capped
+at 128 records each. Cancellation waits have deadlines; a child that has not
+finished remains owned, and a coordinator cannot start duplicate loops while
+its old children remain alive. A cancellation request or timeout is not proof
+that cleanup completed. Expected graceful completion still reports real errors.
 
 ## Persistence status
 
@@ -162,8 +203,9 @@ Camera and shutdown behavior are part of the architecture:
   opens `/Applications/Cortex.app`, preserving the GUI bundle's TCC identity;
   source-development hosts launch the foreground daemon through Terminal.app
   to obtain a development-safe camera lineage;
-- shutdown releases camera resources and uses multiple bounded termination
-  mechanisms;
+- shutdown releases camera resources and uses bounded graceful/termination
+  stages; the launcher reports success only after the endpoint and identified
+  daemon processes have exited, and native messaging preserves stop errors;
 - ad-hoc application signing does not enable hardened runtime.
 
 These constraints require installed-artifact verification in addition to unit
@@ -178,7 +220,7 @@ tests.
 - `cortex/services/physio_engine`: experimental rPPG pipeline
 - `cortex/services/kinematics_engine`: blink and head/neck proxies
 - `cortex/services/telemetry_engine`: input/window/focus telemetry
-- `cortex/services/state_engine`: legacy inference and detector modules
+- `cortex/services/state_engine`: registered behavioral inference, smoothing and check-in eligibility
 - `cortex/services/context_engine`: workspace context adapters
 - `cortex/services/llm_engine`: planning transports and validation
 - `cortex/services/intervention_engine`: proposal and contained action code

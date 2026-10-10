@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Cortex is a real-time biofeedback engine (webcam + input devices) that detects cognitive overwhelm and restructures the user's digital workspace. It ships as a **macOS .app** (DMG installer) that runs the daemon in-process via PySide6, with a Chrome/Edge extension (Plasmo/React MV3) and optional VS Code extension. The daemon exposes FastAPI on port 9472 and WebSocket on port 9473.
+Cortex is a macOS research prototype for local behavioral support and optional experimental camera estimates. Production support inference uses observed input/window behavior; camera physiology is diagnostic-only. The default planner is local and the default execution mode is `suggest_only`; proposals cannot restructure the workspace without a separate exact authorization transaction. It ships as a **macOS .app** (DMG installer) that runs the daemon in-process via PySide6, with a Chrome/Edge extension (Plasmo/React MV3) and optional VS Code extension. The daemon exposes FastAPI on port 9472 and WebSocket on port 9473.
 
 ## Key File Paths
 
@@ -16,7 +16,7 @@ Cortex is a real-time biofeedback engine (webcam + input devices) that detects c
 - `cortex/scripts/build_macos_app.sh` — Full build pipeline (extensions → sign → DMG)
 - `cortex/scripts/cortex_entitlements.plist` — Camera + automation entitlements for .app
 - `cortex/apps/desktop_shell/controller.py` — In-process daemon controller (Qt + asyncio bridge)
-- `cortex/apps/desktop_shell/dashboard.py` — Two-tab dashboard (consumer biometrics + advanced debug)
+- `cortex/apps/desktop_shell/dashboard.py` — Dashboard, History and Advanced tabs; compact layouts and explicit suggestion review
 - `cortex/apps/desktop_shell/connections.py` — One-click browser/editor extension setup
 - `cortex/apps/desktop_shell/tokens.py` — Design tokens (warm palette, typography, spacing)
 - `cortex/apps/desktop_shell/onboarding.py` — 6-step first-run wizard (camera, accessibility, BYOK, calibration, extensions, macOS notifications)
@@ -32,7 +32,7 @@ Cortex is a real-time biofeedback engine (webcam + input devices) that detects c
 
 1. **Processes spawned from Chrome inherit Chrome's TCC context.** Chrome does not have camera permission, so any subprocess it creates — even with `start_new_session=True`, `setsid`, `nohup`, or `osascript 'do shell script'` — will be denied camera access. `start_new_session=True` does NOT break TCC lineage.
 
-2. **The working solution is Terminal.app.** Use `osascript -e 'tell application "Terminal" to do script "..."'` to launch the daemon. Terminal.app has its own TCC camera grant. The daemon MUST run in Terminal's **foreground** (not `nohup & disown; exit`) to keep Terminal's TCC context.
+2. **The source-development camera launch path uses Terminal.app.** Packaged Cortex uses LaunchServices to open `/Applications/Cortex.app` and owns its own camera context. For the development host, use `osascript -e 'tell application "Terminal" to do script "..."'` to launch the daemon. Terminal.app has its own TCC camera grant. The daemon MUST run in Terminal's **foreground** (not `nohup & disown; exit`) to keep Terminal's TCC context.
 
 3. **Never run `tccutil reset Camera`.** This clears camera permission for ALL apps on the Mac (Zoom, FaceTime, etc.), not just Cortex. If you need to reset TCC for debugging, target only the specific bundle ID: `tccutil reset Camera com.cortex.daemon`.
 
@@ -46,7 +46,7 @@ Cortex is a real-time biofeedback engine (webcam + input devices) that detects c
 
 7. **MacBook camera needs ~2 seconds warmup.** `cv2.VideoCapture.read()` returns `(False, None)` for the first 1-2 seconds after opening. Always retry in a loop (4 retries x 0.5s) instead of a single attempt.
 
-8. **Check `.env` for hardcoded `CORTEX_CAPTURE__DEVICE_ID`.** If set to `0` (or any value), it bypasses ALL smart camera selection logic. When debugging camera issues, check `.env` first — a hardcoded device ID silently overrides everything.
+8. **Check `.env` for hardcoded `CORTEX_CAPTURE__DEVICE_ID`.** An explicit index overrides automatic camera preference/order. It does not bypass live identity, Continuity Camera rejection or post-open verification. When debugging camera issues, check `.env` first; a stale configured index can prevent selection of an otherwise available built-in camera.
 
 9. **`system_profiler SPCameraDataType` device order does NOT match AVFoundation.** Never use system_profiler output to determine camera indices for OpenCV/AVFoundation.
 
@@ -61,9 +61,9 @@ Cortex is a real-time biofeedback engine (webcam + input devices) that detects c
 ### Daemon Stop Flow
 
 13. **Stopping the daemon is a bounded chain that must never signal a client.** The proven order:
-    1. WebSocket `SHUTDOWN` message (with 300ms flush delay before disconnect)
+    1. WebSocket `SHUTDOWN` message (300ms flush delay; retain the authenticated socket during graceful receipt/restore work)
     2. HTTP `POST /shutdown` **with the capability token** (`X-Cortex-Auth-Token` read from `<config_dir>/auth.token`; without it the route answers 401 and the graceful step is dead code)
-    3. Wait for the daemon's own graceful shutdown (recap, receipts, database close): poll `/health` until connection refused, at least 20 s
+    3. Wait for the daemon's own graceful shutdown (recap, receipts, database close): allow a 20-second grace window while polling `/health`; an unavailable endpoint ends polling but does not prove process exit
     4. Native messaging `stop` command, which identifies the daemon by its pidfile or its **listening** socket (rule 14)
     5. `SIGTERM` that process only
     6. Wait, then `SIGKILL` any survivor
@@ -122,34 +122,51 @@ Cortex is a real-time biofeedback engine (webcam + input devices) that detects c
 
 37. **Current Claude models reject sampling parameters and forced tool choice.** `temperature`/`top_p`/`top_k` return HTTP 400 on Opus 4.7+ and Sonnet 5, and forced `tool_choice` is refused on the newest models. The planner uses structured outputs (`output_config.format`) with no sampling parameters, treats 400/404/422 and `stop_reason` `refusal`/`max_tokens` as terminal, and keeps one circuit breaker per model tier so a broken tier cannot silence the others.
 
+### Evidence, presentation and task lifetime
+
+38. **Unavailable input is not observed inactivity.** Preserve per-device listener availability and restart exposure after gaps; calibration must reject unavailable mouse samples. Typing variance requires two positive regular-key intervals, independently of backspace count.
+
+39. **Missing time cannot earn inference dwell.** Ignore nonincreasing timestamps; gaps above the documented 3-second continuity bound reset scores and dwell. Regenerate model identity after changing a declared component; changing a threshold also requires reviewing model version and card.
+
+40. **Stop intent is not confirmed shutdown.** Coalesce Stop requests, invalidate/drain an already-issued launch, and prevent stale continuations from enabling the camera. Only a verified native/launcher result can report stopped. Clear stale proposal presentation while preserving durable restoration receipts and snapshots.
+
+41. **Final Qt quit must reach the event loop.** Intercept explicit Quit for the recap flow, then remove the filter before the final `QApplication.quit()`. Ordinary dashboard close must not stop the session in either desktop mode. Test actual Qt event loops; mocked `quit()` cannot prove exit.
+
+42. **Presentation must share evidence lifetime.** Popup/new-tab signal display expires after ten seconds without updates and clears on disconnect or invalid data. Dashboard Review explicitly focuses the current suggestion; arrival itself must not steal focus. Keep completed task diagnostics bounded and value-only, while retaining ownership of unfinished cleanup tasks.
+
+Current implementation and verification: [October refinement](docs/implementation-2026-10.md).
+
 ---
 
 ## Build & Run
 
 ```bash
-# ─── DMG build (produces dist/Cortex.dmg) ───
-./cortex/scripts/build_macos_app.sh
+# Run from the repository root with the pinned Python/Node/pnpm toolchain.
+make setup
 
-# ─── Developer mode ───
-pip install -e "./cortex[dev]"
-python -m cortex.scripts.run_dev                    # Daemon from terminal
-python -m cortex.apps.desktop_shell.main            # Desktop app (WebSocket mode)
-python -m cortex.apps.desktop_shell.main --in-process  # Desktop app (in-process daemon)
+# DMG: dist/Cortex-<version>-macos-<arch>.dmg (ad-hoc by default)
+make dmg
+
+# Developer modes
+make dev
+uv run --project cortex --locked --extra dev --extra codegen python -m cortex.apps.desktop_shell.main
+uv run --project cortex --locked --extra dev --extra codegen python -m cortex.apps.desktop_shell.main --in-process
 
 # Browser extension
-cd cortex/apps/browser_extension
-pnpm install && npx plasmo dev            # Dev mode
-npx plasmo build                          # Chrome production build
-npx plasmo build --target=edge-mv3        # Edge production build
+make ext-dev
+make ext
+make ext-edge
 
-# Install native messaging (one-time, auto-detects all browsers)
-python -m cortex.scripts.install_native_host
-# Then RELOAD the extension (or restart browser)
+# Development native host; packaged users use Connect Extensions instead.
+uv run --project cortex --locked --extra dev --extra codegen python -m cortex.scripts.install_native_host
+# Fully quit the browser with Cmd+Q, then reopen. Reloading the extension is insufficient.
 
-# Tests
-pytest cortex/
-mypy cortex/ --strict
-ruff check cortex/
+# Canonical Python gate includes lint, strict types, wheel, coverage and Qt isolation.
+./cortex/scripts/run_python_gate.sh
+make codegen-check
+make contracts
+(cd cortex/apps/browser_extension && pnpm exec tsc --noEmit && pnpm test)
+(cd cortex/apps/vscode_extension && npm run lint && npm run compile && npm test)
 ```
 
 ## Ports
@@ -162,20 +179,20 @@ ruff check cortex/
 
 ## Schema Codegen (audit Debt-1)
 
-The Pydantic models in `cortex/libs/schemas/` are the single source of truth for every shape that crosses the daemon ↔ browser-extension boundary. Hand-written TypeScript interfaces in `cortex/apps/browser_extension/` previously drifted from these models (audit findings F42 / F43 / F44 / F45); the generator below makes drift impossible.
+The Pydantic models in `cortex/libs/schemas/` are the single source of truth for every shape that crosses the daemon ↔ browser-extension boundary. Hand-written TypeScript interfaces in `cortex/apps/browser_extension/` previously drifted from these models (audit findings F42 / F43 / F44 / F45); the generator below detects committed declaration drift; runtime validation remains required.
 
 ### Regenerate after editing any Pydantic schema
 
 ```bash
-python -m cortex.scripts.generate_ts_schemas
+make codegen
 ```
 
-Output goes to `cortex/apps/browser_extension/types/generated/cortex_schemas.d.ts`. The file ships with an `AUTOGENERATED — DO NOT EDIT BY HAND` header; hand-editing it is rejected by both the pre-commit hook and the CI gate.
+Output goes to `cortex/apps/browser_extension/types/generated/cortex_schemas.d.ts` and `cortex/apps/vscode_extension/src/generated/cortex_schemas.d.ts`. The file ships with an `AUTOGENERATED — DO NOT EDIT BY HAND` header; hand-editing it is rejected by both the pre-commit hook and the CI gate.
 
 ### Verify in sync (used by CI and pre-commit)
 
 ```bash
-python -m cortex.scripts.generate_ts_schemas --check
+make codegen-check
 ```
 
 `--check` regenerates into a tempfile, diffs against the committed copy, prints the diff on drift, and exits with code 1 if the file is stale.
@@ -183,9 +200,8 @@ python -m cortex.scripts.generate_ts_schemas --check
 ### One-time local install
 
 ```bash
-pip install -e "./cortex[codegen]"       # gets pydantic-to-typescript
-npm install -g json-schema-to-typescript # json2ts binary on PATH
-pip install pre-commit && pre-commit install
+make setup       # locked Python codegen extra and local json2ts dependency
+make precommit   # installs pre-commit hooks
 ```
 
 ### Gates
@@ -197,5 +213,11 @@ pip install pre-commit && pre-commit install
 
 1. Add a member to `cortex/libs/schemas/ws_message_types.py::MessageType` with the literal string.
 2. If the daemon dispatches on it, add a case in `cortex/services/api_gateway/websocket_server.py::_process_message` and update the `test_message_type_catalog_covers_*` tests.
-3. Run `python -m cortex.scripts.generate_ts_schemas` and commit the regenerated `.d.ts` alongside your Python change.
+3. Run `make codegen` and commit both regenerated `.d.ts` files alongside your Python change.
 4. The TypeScript dispatch sites in `background.ts` / `popup.tsx` now type-check against the new union; their switch's `never` default flags any forgotten case.
+
+## Git conventions
+
+- Use descriptive feature or milestone branch names; never include `codex` or `agent`.
+- Preserve the user's author identity and required DCO sign-off. Do not add an AI or agent coauthor trailer.
+- Stage selected source, tests and documentation; keep local builds, coverage databases and review evidence ignored.

@@ -44,5 +44,16 @@ to erase unresolved restore evidence. Uninstalling the app alone does not
 remove browser/editor storage, native-host manifests, Keychain credentials, or
 the configured storage root.
 
+Stopping Cortex clears current browser measurements and proposal presentation,
+including injected panels. It deliberately retains transaction receipts and tab
+snapshots needed to reconcile an interrupted authorized effect. Stopping a
+session is not a data-deletion request, and loss of the HTTP endpoint is not
+treated as proof that the camera-owning process exited.
+
+Pulse Room's motion pause is a local presentation preference. It does not stop
+sensing or change consent. The separate Quiet-mode **Pause** releases camera
+capture; **Stop Cortex** requests and verifies full daemon shutdown. New-tab
+opt-out and motion preferences are stored in extension-local settings.
+
 Read the exact [privacy disclosure](https://github.com/StevenWang-CY/cortex/blob/main/cortex/docs/privacy.md) and
 [data-flow/deletion map](https://github.com/StevenWang-CY/cortex/blob/main/docs/data-flow.md) before enabling external context.

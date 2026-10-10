@@ -65,6 +65,8 @@ class TestFeatureFusionPhysioGating:
         fusion = FeatureFusion()
         assert fusion.fuse(timestamp=0.0)[0].telemetry_seen_count == 0
         tel = TelemetryFeatures(
+            mouse_source_available=True, keyboard_source_available=True,
+            keystroke_interval_count=20,
             mouse_velocity_mean=300.0,
             mouse_velocity_variance=50.0,
             click_frequency=0.5,

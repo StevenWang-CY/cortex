@@ -4,6 +4,25 @@ Only a credentialed release workflow may produce a distributable Cortex DMG.
 Local `make dmg` output is an ad-hoc development artifact unless every required
 verification below is present.
 
+## Current local validation
+
+The 2026-10-02 review built application version **0.5.0** as an **ad-hoc
+arm64 development artifact** from the changed working tree. Its mounted DMG
+passed bundle identity/layout, strict nested signature, forbidden-pattern,
+native-host protocol, frozen-resource/model, and full headless startup/exit
+checks. A separate probe launched the built app twice with the same isolated
+HOME, storage, and ephemeral HTTP/WebSocket ports: both runs became healthy
+and ready, exited with code 0 after SIGTERM, and released both listeners.
+
+The local evidence is in `dist/evidence-review-2026-10-arm64/` and
+`dist/review-2026-10/restart-probe.json`. These ignored files are review
+artifacts; a clean checkout does not contain them. The durable summary,
+artifact hash, and evidence boundaries are in the
+[implementation record](../implementation-2026-10.md#packaged-artifact-and-completion).
+The build did **not** establish Developer ID notarization, Gatekeeper
+distribution approval, Intel execution, physical camera/TCC/VoiceOver
+behavior, or human/clinical effectiveness. No public release was performed.
+
 ## Reproducible inputs
 
 - Python: 184-package `cortex/uv.lock`, uv 0.10.12, `uv sync --locked`.
@@ -101,7 +120,13 @@ For each architecture, the tag workflow:
    scans generic credential forms only in text-like members, scans exact
    exported secrets and actual non-generic build home roots across all bytes,
    and runs a framed native-host `status` exchange and `Cortex --release-smoke`
-   under an isolated `HOME` before any UI/network/camera;
+   under an isolated `HOME`; the resource smoke precedes UI/network/camera
+   startup. A separate full-app probe then starts offscreen Qt, storage and
+   ephemeral local HTTP/WebSocket listeners with hardware acquisition
+   explicitly disabled, requires healthy matching-version/model-registry
+   output, sends SIGTERM, and requires exit code 0 with both listeners closed.
+   Startup failures, pending-task destruction, invalid Qt styles/fonts, and
+   camera-discovery/acquisition markers fail the probe;
 7. generates application SPDX and locked-Python CycloneDX SBOMs,
    architecture-specific `SHA256SUMS-<arch>`, `release-metadata.json`, and
    command evidence;
@@ -125,6 +150,21 @@ uv run --project cortex --locked python -m cortex.scripts.verify_macos_release \
   --require-notarized \
   --output dist/evidence-arm64/release-verification.json
 ```
+
+For an ad-hoc development DMG, omit `--require-notarized` and use a distinct
+ignored evidence directory. That verifies the local artifact under the weaker
+signing boundary; it must not be recorded as notarization or public-release
+assurance. Keep executable probes enabled. The production build rejects
+`CORTEX_SKIP_APP_PROBES=1` when notarization is required.
+
+The verifier's full-app probe uses a fresh temporary HOME/storage and an
+invalid camera device index in addition to `CORTEX_HEADLESS_STARTUP=1`.
+The invalid index is a fallback, not permission to discover cameras: the
+headless path must skip discovery and acquisition entirely. Never reuse a
+personal profile for automated release probes. Verify same-profile restart
+separately when lifecycle/storage code changes; preserve the first run's
+temporary storage, reuse the selected ports only after they close, and require
+the second launch to receive a new boot ID and complete the same exit checks.
 
 ## Consumer verification
 
@@ -158,6 +198,11 @@ promotion, execute [manual-release-validation.md](manual-release-validation.md)
 on at least one clean supported Mac using the exact signed/notarized candidate
 staged by CI, and upload a `manual-release-evidence-<arch>.json` record plus
 every non-sensitive evidence file it references to the same draft release.
+The protocol also covers ordinary window close versus Quit, ending and
+restarting sessions, compact layouts, keyboard suggestion review without focus
+theft, and signal clearing across disconnect/reconnect. Offscreen checks are
+useful regression evidence for these behaviors; they do not replace a native
+keyboard/VoiceOver and hardware pass.
 
 Publication carries an explicit **assurance tier**
 ([ADR 0007](../adr/0007-tiered-release-assurance.md)) that the promotion

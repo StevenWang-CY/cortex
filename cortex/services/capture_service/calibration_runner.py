@@ -38,6 +38,7 @@ from cortex.libs.schemas.calibration import (
     CalibrationProvenance,
     CalibrationReferenceTask,
 )
+from cortex.libs.schemas.features import TelemetryFeatures
 from cortex.libs.schemas.observations import (
     CameraIdentity,
     MissingReason,
@@ -604,10 +605,7 @@ async def _collect_live_calibration(
                     ),
                     current_time=monotonic_seconds(clock),
                 )
-                # A zero value can be a valid observation.  Input permission,
-                # not numeric magnitude, decides availability.
-                capture.samples["mouse_velocity_work"].append(telemetry.mouse_velocity_mean)
-                capture.samples["mouse_variance_work"].append(telemetry.mouse_velocity_variance)
+                _append_mouse_calibration_samples(capture, telemetry)
 
             if elapsed - last_progress_elapsed >= 1.0 / PROGRESS_HZ:
                 _emit_progress(
@@ -643,6 +641,15 @@ async def _collect_live_calibration(
             "no quality-gated face observations were captured; no calibration was saved"
         )
     return capture
+
+
+def _append_mouse_calibration_samples(
+    capture: CalibrationCapture, telemetry: TelemetryFeatures,
+) -> None:
+    """Preserve observed silence but reject a failed or revoked input source."""
+    if telemetry.mouse_source_available:
+        capture.samples["mouse_velocity_work"].append(telemetry.mouse_velocity_mean)
+        capture.samples["mouse_variance_work"].append(telemetry.mouse_velocity_variance)
 
 
 async def run_live_calibration(

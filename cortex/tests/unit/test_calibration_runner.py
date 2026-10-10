@@ -15,6 +15,7 @@ from cortex.libs.schemas.calibration import (
     CalibrationMetricName,
     CalibrationProvenance,
 )
+from cortex.libs.schemas.features import TelemetryFeatures
 from cortex.libs.schemas.observations import CameraIdentity
 from cortex.libs.schemas.physiology import SignalAlgorithmIdentity
 from cortex.services.capture_service import calibration_runner as runner_module
@@ -93,6 +94,28 @@ def _measured_capture() -> CalibrationCapture:
             "telemetry": _algorithm("telemetry-v2"),
         },
     )
+
+
+def test_mouse_calibration_distinguishes_observed_silence_from_missing_source() -> None:
+    capture = runner_module._empty_capture()
+    telemetry = TelemetryFeatures(
+        mouse_source_available=False,
+        mouse_velocity_mean=0.0, mouse_velocity_variance=0.0,
+        mouse_jerk_score=0.0, click_burst_score=0.0, click_frequency=0.0,
+        keyboard_burst_score=0.0, keystroke_interval_variance=0.0,
+        backspace_density=0.0, inactivity_seconds=0.0, window_switch_rate=0.0,
+    )
+    runner_module._append_mouse_calibration_samples(
+        capture, telemetry,
+    )
+    assert capture.samples["mouse_velocity_work"] == []
+    assert capture.samples["mouse_variance_work"] == []
+
+    runner_module._append_mouse_calibration_samples(
+        capture, telemetry.model_copy(update={"mouse_source_available": True}),
+    )
+    assert capture.samples["mouse_velocity_work"] == [0.0]
+    assert capture.samples["mouse_variance_work"] == [0.0]
 
 
 def test_simulation_can_only_create_isolated_demo_profile(config: CortexConfig) -> None:

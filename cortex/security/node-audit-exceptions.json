@@ -3,34 +3,6 @@
   "exceptions": [
     {
       "ecosystem": "pnpm",
-      "advisory_id": "GHSA-5p2g-fcmc-qvqq",
-      "package": "image-size",
-      "max_severity": "high",
-      "path_prefixes": [
-        ".>plasmo>@plasmohq/parcel-config>@parcel/transformer-less>less>image-size",
-        ".>vite>less>image-size",
-        ".>vitest"
-      ],
-      "expires_on": "2026-10-15",
-      "reason": "Re-reviewed 2026-09-04: still no patched release (pnpm audit reports patched_versions <0.0.0); the package is reachable only through dormant Plasmo/Vitest Less build tooling and never ships in the extension bundle.",
-      "mitigation": "Cortex compiles reviewed repository source only, accepts no user-supplied Less or image buffers, and ships no build tooling. Recheck upstream at each release; replace the Less transformer if a patched release does not appear."
-    },
-    {
-      "ecosystem": "pnpm",
-      "advisory_id": "GHSA-w3rx-r6r6-pgpr",
-      "package": "image-size",
-      "max_severity": "high",
-      "path_prefixes": [
-        ".>plasmo>@plasmohq/parcel-config>@parcel/transformer-less>less>image-size",
-        ".>vite>less>image-size",
-        ".>vitest"
-      ],
-      "expires_on": "2026-10-15",
-      "reason": "Re-reviewed 2026-09-04: still no patched release (pnpm audit reports patched_versions <0.0.0); the package is reachable only through dormant Plasmo/Vitest Less build tooling and never ships in the extension bundle.",
-      "mitigation": "Cortex compiles reviewed repository source only, accepts no user-supplied Less or image buffers, and ships no build tooling. Recheck upstream at each release; replace the Less transformer if a patched release does not appear."
-    },
-    {
-      "ecosystem": "pnpm",
       "advisory_id": "GHSA-qm9p-f9j5-w83w",
       "package": "@parcel/reporter-dev-server",
       "max_severity": "moderate",

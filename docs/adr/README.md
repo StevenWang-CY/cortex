@@ -3,6 +3,12 @@
 Accepted decisions are immutable. A change creates a new ADR that supersedes
 the old one; it does not rewrite history.
 
+For the current implementation and verification status of these accepted
+decisions, read the [October implementation record](../implementation-2026-10.md)
+and [architecture guide](../../cortex/docs/architecture.md). The source-availability,
+continuity and bounded-task repairs implement the existing decisions; the
+original ADR dates and decision text remain historical records.
+
 | ADR | Decision | Status |
 | --- | --- | --- |
 | [0001](0001-conservative-support-inference.md) | Conservative support inference and claim boundary | Accepted |

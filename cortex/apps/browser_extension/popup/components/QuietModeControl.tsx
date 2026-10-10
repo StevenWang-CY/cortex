@@ -5,7 +5,7 @@
  * the canonical ``QUIET_MODE_TOGGLE``.
  */
 
-import React from "react";
+import React, { useRef } from "react";
 import { S } from "../styles";
 
 export type QuietModeKind = "off" | "snooze_15" | "quiet_session" | "pause";
@@ -45,6 +45,7 @@ export function QuietModeControl({
     remainingMin,
     onSelect,
 }: QuietModeControlProps): React.ReactElement {
+    const buttons = useRef<Array<HTMLButtonElement | null>>([]);
     const status = quietModeStatus(kind, remainingMin);
     const current = OPTIONS.some((option) => option.kind === kind) ? kind : "off";
     return (
@@ -58,7 +59,7 @@ export function QuietModeControl({
                 aria-labelledby="cortex-quiet-label"
                 data-testid="quiet-mode-control"
             >
-                {OPTIONS.map((option) => {
+                {OPTIONS.map((option, index) => {
                     const active = current === option.kind;
                     return (
                         <button
@@ -66,8 +67,21 @@ export function QuietModeControl({
                             type="button"
                             role="radio"
                             aria-checked={active}
+                            tabIndex={active ? 0 : -1}
+                            ref={(element) => { buttons.current[index] = element; }}
                             data-testid={`quiet-mode-${option.kind}`}
                             onClick={() => { if (!active) onSelect(option.kind); }}
+                            onKeyDown={(event) => {
+                                const next = event.key === "Home" ? 0
+                                    : event.key === "End" ? OPTIONS.length - 1
+                                    : event.key === "ArrowRight" || event.key === "ArrowDown" ? (index + 1) % OPTIONS.length
+                                    : event.key === "ArrowLeft" || event.key === "ArrowUp" ? (index + OPTIONS.length - 1) % OPTIONS.length
+                                    : null;
+                                if (next === null) return;
+                                event.preventDefault();
+                                buttons.current[next]?.focus({ preventScroll: true });
+                                if (OPTIONS[next].kind !== current) onSelect(OPTIONS[next].kind);
+                            }}
                             style={{
                                 ...S.segmentBtn,
                                 ...(active ? S.segmentBtnActive : {}),

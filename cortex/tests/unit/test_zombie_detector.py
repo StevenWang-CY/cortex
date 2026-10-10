@@ -74,28 +74,14 @@ class TestZombieReadingDetector:
         result = detector.update("HYPO", 10.0, 22.0, "Google Chrome", trigger_time + 1.0)
         assert result is False
 
-    def test_blink_below_baseline_no_trigger(self):
-        """Low blink rate (not glazed) → no trigger."""
-        detector = ZombieReadingDetector(min_duration=5.0, blink_baseline=20.0, cooldown=0.0)
-        for i in range(100):
-            result = detector.update(
-                state="HYPO",
-                mouse_velocity=10.0,
-                blink_rate=15.0,  # below 20 * 1.15 = 23
-                active_app="Google Chrome",
-                current_time=1000.0 + float(i),
-            )
-            assert result is False
-
-    def test_blink_rate_none_returns_false(self):
-        """blink_rate=None (no data) must return False conservatively, not fall through to True."""
-        detector = ZombieReadingDetector(min_duration=5.0, blink_baseline=17.0, cooldown=0.0)
-        for i in range(100):
-            result = detector.update(
-                state="HYPO",
-                mouse_velocity=10.0,
-                blink_rate=None,
-                active_app="Google Chrome",
-                current_time=1000.0 + float(i),
-            )
-            assert result is False
+    def test_camera_values_do_not_change_reading_reminder(self):
+        """Diagnostic blink values cannot change eligibility or timing."""
+        trigger_times = []
+        for blink in (None, 0.0, 15.0, 40.0):
+            detector = ZombieReadingDetector(blink_baseline=20.0, cooldown=0.0)
+            times = [
+                i for i in range(150)
+                if detector.update("HYPO", 0.0, blink, "Google Chrome", 1000.0 + i)
+            ]
+            trigger_times.append(times)
+        assert trigger_times == [[120]] * 4

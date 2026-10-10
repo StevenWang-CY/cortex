@@ -143,10 +143,10 @@ _WHY_COPY: dict[str, str] = {
         "system-wide events, not just our own window."
     ),
     "llm_backend": (
-        "With Claude access, suggestions are written for the exact page "
-        "and task in front of you. Your Bedrock token stays in the macOS "
-        "Keychain; Cortex reads it once at launch and never persists it "
-        "elsewhere. Without it, Cortex uses its built-in offline suggestions."
+        "Claude is optional. Generic planning sends no workspace content; "
+        "external-context planning requires an exact preview you confirm "
+        "for each request. Your Bedrock token stays in the macOS Keychain. "
+        "The local planner works without a token."
     ),
     "calibration": (
         "Calibration records quality-gated rest and representative-work "
@@ -643,9 +643,13 @@ class OnboardingWindow(QWidget):
         # combined card heights, so Qt compressed widgets into each
         # other (e.g. card 3's region picker + token row overlapped the
         # description and hint paragraphs).
-        self.setMinimumSize(600, 720)
-        self.resize(640, 820)
-        self.setStyleSheet(f"background: {CX_BG}; color: {CX_TEXT};")
+        self.setMinimumSize(600, 520)
+        self.resize(640, 740)
+        self.setObjectName("CortexOnboarding")
+        self.setStyleSheet(
+            f"QWidget#CortexOnboarding {{ background: {CX_BG}; color: {CX_TEXT}; }}"
+            f"QLabel {{ background: transparent; color: {CX_TEXT}; }}"
+        )
         # F49: durable per-step completion record. Loaded from disk so
         # a re-entry into the wizard does not lose prior progress.
         self._onboarding_state = OnboardingState.load()
@@ -926,7 +930,8 @@ class OnboardingWindow(QWidget):
                 "}"
             )
             scroll.setWidget(content)
-            outer.addWidget(scroll)
+            self._scroll_area = scroll
+            outer.addWidget(scroll, stretch=1)
         else:  # pragma: no cover - test stub path
             outer.addWidget(content)
 
@@ -1112,14 +1117,18 @@ class OnboardingWindow(QWidget):
         layout.addStretch()
 
         # ── Finish bar ────────────────────────────────────────────────
+        finish_bar = QWidget()
+        finish_layout = QVBoxLayout(finish_bar)
+        finish_layout.setContentsMargins(SP8, SP3, SP8, SP4)
+        finish_layout.setSpacing(SP2)
         self._finish_note = QLabel("")
         self._finish_note.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         self._finish_note.setStyleSheet(
             f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
-        wrap_capped(self._finish_note, 340)
+        wrap_capped(self._finish_note)
         set_accessible_name(self._finish_note, "Setup steps still open")
-        layout.addWidget(self._finish_note)
+        finish_layout.addWidget(self._finish_note)
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
@@ -1138,7 +1147,8 @@ class OnboardingWindow(QWidget):
         )
         self._finish_btn_ref = finish_btn
         btn_row.addWidget(finish_btn)
-        layout.addLayout(btn_row)
+        finish_layout.addLayout(btn_row)
+        outer.addWidget(finish_bar)
 
         # audit-w2 (F55 carry-over): chain tab order across the wizard.
         # Step 1 + 2 Grant buttons live behind a closure (``_cortex_set_state``);
@@ -1854,10 +1864,11 @@ class OnboardingWindow(QWidget):
         layout = frame.layout()
 
         desc = QLabel(
-            "Cortex calls Anthropic Claude via AWS Bedrock to write "
-            "suggestions for the exact task in front of you. Paste your "
-            "long-lived bearer token below — it's stored only in the macOS "
-            "Keychain and never written to disk."
+            "Cortex starts with a local planner. Add an AWS Bedrock bearer "
+            "token to make Claude available, then choose a planning mode in "
+            "Settings. Workspace content leaves this Mac only after you "
+            "review and confirm the exact request. Your token stays in "
+            "the macOS Keychain."
         )
         desc.setWordWrap(True)
         desc.setFont(mac_native.system_font(FS_CAPTION, "regular"))
@@ -1916,6 +1927,7 @@ class OnboardingWindow(QWidget):
         key_row.addWidget(save_key_btn)
 
         self._key_widget = QWidget()
+        self._key_widget.setStyleSheet("background: transparent;")
         self._key_widget.setLayout(key_row)
         layout.addWidget(self._key_widget)
 
@@ -1964,8 +1976,7 @@ class OnboardingWindow(QWidget):
             self._render_llm_status("Skipped — using offline suggestions", "neutral")
 
         hint = QLabel(
-            "Stored in the macOS Keychain (service: cortex.bedrock). "
-            "Region and token can be changed later in Settings."
+            "You can update your region and token later in Settings."
         )
         hint.setWordWrap(True)
         hint.setFont(mac_native.system_font(FS_CAPTION, "regular"))

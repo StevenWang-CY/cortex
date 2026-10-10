@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from math import isfinite
 from typing import Any
 
 from cortex.apps.desktop_shell.tokens import STATE_LABELS
@@ -20,7 +21,15 @@ def _number(value: object, default: float = 0.0) -> float:
         candidate = float(value)
     except (TypeError, ValueError):
         return default
-    return candidate if candidate == candidate else default
+    return candidate if isfinite(candidate) else default
+
+
+def _measurement(value: object, *, positive: bool = False) -> float | None:
+    """Missing and malformed measurements remain unavailable, never zero."""
+    candidate = _number(value, float("nan"))
+    if not isfinite(candidate) or candidate < 0 or (positive and candidate == 0):
+        return None
+    return candidate
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,11 +111,13 @@ def consumer_state_view(payload: Mapping[str, Any]) -> ConsumerStateViewModel:
 
     biometrics = _mapping(payload.get("biometrics"))
     raw_hr = biometrics.get("heart_rate")
-    heart_rate = _number(raw_hr) if raw_hr is not None else None
+    heart_rate = _measurement(raw_hr, positive=True)
     raw_hrv = biometrics.get("hrv_rmssd")
-    hrv = _number(raw_hrv) if raw_hrv is not None else None
+    hrv = _measurement(raw_hrv)
     raw_blink = biometrics.get("blink_rate")
-    blink = _number(raw_blink) if raw_blink is not None else None
+    blink = _measurement(raw_blink)
+    if capture.get("stale") or capture.get("frames_flowing") is False:
+        heart_rate, hrv, blink = None, None, None
     if heart_rate is None:
         if not bool(capture.get("frames_flowing", True)):
             bio_status = (
@@ -159,6 +170,10 @@ def advanced_state_view(payload: Mapping[str, Any]) -> AdvancedStateViewModel:
         "hypo": _number(canonical.get("under_engaged", legacy.get("hypo"))),
         "recovery": _number(canonical.get("recovering", legacy.get("recovery"))),
     }
+    scores = {key: max(0.0, min(1.0, value)) for key, value in scores.items()}
+    signal_quality = dict(_mapping(payload.get("signal_quality")))
+    for channel in ("physio", "kinematics", "telemetry"):
+        signal_quality[channel] = max(0.0, min(1.0, _number(signal_quality.get(channel))))
     status = str(payload.get("status", "insufficient_evidence"))
     source = payload.get("source")
     if source == "fallback":
@@ -170,16 +185,18 @@ def advanced_state_view(payload: Mapping[str, Any]) -> AdvancedStateViewModel:
     else:
         degraded = None
     raw_hr = _mapping(payload.get("biometrics")).get("heart_rate")
+    capture = _mapping(payload.get("capture"))
+    capture_current = not capture.get("stale") and capture.get("frames_flowing") is not False
     return AdvancedStateViewModel(
         state=str(payload.get("state", "UNKNOWN")),
         scores=scores,
-        signal_quality=_mapping(payload.get("signal_quality")),
+        signal_quality=signal_quality,
         evidence_strength=max(0.0, min(1.0, _number(payload.get("confidence")))),
         evidence_coverage=max(
             0.0,
             min(1.0, _number(payload.get("evidence_coverage"))),
         ),
         dwell_seconds=max(0.0, _number(payload.get("dwell_seconds"))),
-        heart_rate=_number(raw_hr) if raw_hr is not None else None,
+        heart_rate=_measurement(raw_hr, positive=True) if capture_current else None,
         degraded_message=degraded,
     )

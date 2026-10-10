@@ -119,10 +119,23 @@ describe("worker connectivity behaviour", () => {
         await settle();
         const listener = globalThis.__cortexChrome.runtime.onMessage.addListener.mock
             .calls[0][0] as Listener;
-        listener({ type: "STOP_CORTEX" }, {}, () => undefined);
-        // The stop chain flushes SHUTDOWN for 300-500 ms before it closes
-        // the socket; wait that out so the keepalive check below is real.
-        await new Promise((r) => setTimeout(r, 800));
+        // Stop is authoritative only once its process-exit result arrives.
+        // An unavailable health endpoint ends polling but cannot by itself
+        // make the UI claim shutdown succeeded.
+        vi.mocked(fetch).mockImplementation(async (url) => {
+            if (String(url).endsWith("/health")) throw new TypeError("connection refused");
+            return { ok: true, json: async () => ({}) } as Response;
+        });
+        globalThis.__cortexChrome.runtime.sendNativeMessage.mockImplementation((_host, request, callback) => {
+            if (request.command === "get_auth_token") callback({ command: "get_auth_token", status: "ok", auth_token: "a".repeat(64) });
+            else if (request.command === "stop") callback({ command: "stop", status: "stopped" });
+            else callback({ command: "status", status: "stopped" });
+        });
+        const stopped = new Promise(resolve => listener({ type: "STOP_CORTEX" }, {}, resolve));
+        let earlyStart: unknown;
+        listener({ type: "CONNECT" }, {}, result => { earlyStart = result; });
+        expect(earlyStart).toMatchObject({ ok: false });
+        expect(await stopped).toEqual({ ok: true });
         await settle();
         const socketsAfterStop = getAllSockets().length;
 
@@ -140,5 +153,52 @@ describe("worker connectivity behaviour", () => {
         await settle();
         expect(getAllSockets().length).toBe(socketsAfterStop + 1);
         expect(globalThis.__cortexChrome.storage.session.__peek().cortex_stop_requested).toBeUndefined();
+    });
+
+    it.each(["stopped", "error"])("clears stopped-session proposals while preserving recovery records (%s)", async (outcome) => {
+        await import("../background");
+        await settle();
+        const fake = globalThis.__cortexChrome;
+        const listener = fake.runtime.onMessage.addListener.mock.calls[0][0] as Listener;
+        fake.tabs.query.mockResolvedValue([{ id: 12, url: "https://example.com", incognito: false }]);
+        const recoveryRecords = {
+            cortex_tab_snapshot: { t1: { chromeTabId: 12, url: "https://example.com", title: "Reading" } },
+            cortex_tab_mgr_snapshots: { t1: { url: "https://example.com" } },
+            cortex_intervention_transaction_journal_v1: { recovery: "receipt-kept" },
+        };
+        await fake.storage.session.set({
+            ...recoveryRecords,
+            cortex_active_intervention: { intervention_id: "old-session", suggested_actions: [{ type: "dim_screen" }] },
+            cortex_active_intervention_cid: "old-cid",
+            cortex_active_intervention_mounted_at: Date.now(),
+        });
+        const getState = () => new Promise<Record<string, unknown>>(resolve => {
+            listener({ type: "GET_STATE" }, {}, response => resolve(response as Record<string, unknown>));
+        });
+        expect((await getState()).intervention).toMatchObject({ intervention_id: "old-session" });
+        vi.mocked(fetch).mockImplementation(async (url) => {
+            if (String(url).endsWith("/health")) throw new TypeError("connection refused");
+            return { ok: true, json: async () => ({}) } as Response;
+        });
+        fake.runtime.sendNativeMessage.mockImplementation((_host, request, callback) => {
+            if (request.command === "get_auth_token") callback({ command: "get_auth_token", status: "ok", auth_token: "a".repeat(64) });
+            else if (request.command === "stop") callback({ command: "stop", status: outcome, error: outcome === "error" ? "Process remains alive" : undefined });
+            else callback({ command: "status", status: "stopped" });
+        });
+        await new Promise(resolve => listener({ type: "STOP_CORTEX" }, {}, resolve));
+        expect((await getState()).intervention).toBeNull();
+        const stored = fake.storage.session.__peek();
+        expect(stored).toMatchObject(recoveryRecords);
+        for (const key of ["cortex_active_intervention", "cortex_active_intervention_cid", "cortex_active_intervention_mounted_at"]) {
+            expect(stored[key]).toBeUndefined();
+        }
+        expect(fake.runtime.sendMessage).toHaveBeenCalledWith({ type: "OVERLAY_DISMISSED", intervention_id: null });
+        expect(fake.scripting.executeScript).toHaveBeenCalledWith(expect.objectContaining({
+            target: { tabId: 12 }, func: expect.any(Function),
+        }));
+        expect(fake.tabs.remove).not.toHaveBeenCalled();
+        // A late storage read / failed prior removal must also respect Stop.
+        await fake.storage.session.set({ cortex_active_intervention: { intervention_id: "late-read" } });
+        expect((await getState()).intervention).toBeNull();
     });
 });

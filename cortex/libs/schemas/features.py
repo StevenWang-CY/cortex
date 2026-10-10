@@ -381,6 +381,15 @@ class TelemetryFeatures(BaseModel):
         gt=0.0,
         description="Actual telemetry aggregation window; required by v2 inference",
     )
+    mouse_source_available: bool = Field(
+        False, description="A live mouse listener observed this window; missing legacy flags abstain",
+    )
+    keyboard_source_available: bool = Field(
+        False, description="A live, trusted keyboard listener observed this window",
+    )
+    keystroke_interval_count: int | None = Field(
+        None, ge=0, description="Positive intervals between regular key presses; excludes backspaces",
+    )
     mouse_move_count: int | None = Field(None, ge=0)
     click_press_count: int | None = Field(None, ge=0)
     key_press_count: int | None = Field(None, ge=0)

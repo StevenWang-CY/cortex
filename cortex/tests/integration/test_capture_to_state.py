@@ -58,6 +58,8 @@ def _flow_kinematics() -> KinematicFeatures:
 def _flow_telemetry() -> TelemetryFeatures:
     """Telemetry features consistent with FLOW state."""
     return TelemetryFeatures(
+        mouse_source_available=True, keyboard_source_available=True,
+        keystroke_interval_count=20,
         mouse_velocity_mean=400.0,
         mouse_velocity_variance=5000.0,
         mouse_jerk_score=0.1,
@@ -111,6 +113,8 @@ def _hyper_kinematics() -> KinematicFeatures:
 def _hyper_telemetry() -> TelemetryFeatures:
     """Telemetry features consistent with HYPER state."""
     return TelemetryFeatures(
+        mouse_source_available=True, keyboard_source_available=True,
+        keystroke_interval_count=20,
         mouse_velocity_mean=1200.0,
         mouse_velocity_variance=50000.0,  # high variance = thrashing
         mouse_jerk_score=0.8,
@@ -164,6 +168,8 @@ def _hypo_kinematics() -> KinematicFeatures:
 def _hypo_telemetry() -> TelemetryFeatures:
     """Telemetry features consistent with HYPO state."""
     return TelemetryFeatures(
+        mouse_source_available=True, keyboard_source_available=True,
+        keystroke_interval_count=20,
         mouse_velocity_mean=30.0,  # minimal movement
         mouse_velocity_variance=200.0,
         mouse_jerk_score=0.0,

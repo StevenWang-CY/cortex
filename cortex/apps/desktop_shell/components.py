@@ -43,6 +43,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+try:
+    from PySide6.QtCore import QRect, QSize
+    from PySide6.QtWidgets import QLayout, QLayoutItem
+except ImportError:  # pragma: no cover - legacy Qt doubles
+    QLayout = None
+
 # The opacity fade is real-PySide6 only; the legacy stubbed harness omits
 # the animation classes. Guarded at import time so every surface that
 # imports this module stays importable there; the toast simply snaps.
@@ -89,6 +95,78 @@ from cortex.apps.desktop_shell.tokens import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+if QLayout is not None:
+    class WrappingLayout(QLayout):
+        """Lay out complete controls in rows, without squeezing their labels.
+
+        Hidden controls consume no space. Height follows the available width,
+        so status combinations work inside a resizable scroll viewport.
+        """
+
+        def __init__(self, parent: QWidget | None = None, spacing: int = SP2) -> None:
+            super().__init__(parent)
+            self._items: list[QLayoutItem] = []
+            self.setContentsMargins(0, 0, 0, 0)
+            self.setSpacing(spacing)
+
+        def addItem(self, item: QLayoutItem) -> None:
+            self._items.append(item)
+
+        def count(self) -> int:
+            return len(self._items)
+
+        def itemAt(self, index: int) -> QLayoutItem | None:
+            return self._items[index] if 0 <= index < len(self._items) else None
+
+        def takeAt(self, index: int) -> QLayoutItem | None:
+            return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+        def expandingDirections(self) -> Qt.Orientation:
+            return Qt.Orientation(0)
+
+        def hasHeightForWidth(self) -> bool:
+            return True
+
+        def heightForWidth(self, width: int) -> int:
+            return self._arrange(QRect(0, 0, width, 0), apply=False)
+
+        def minimumSize(self) -> QSize:
+            result = QSize()
+            for item in self._items:
+                if not item.isEmpty():
+                    result = result.expandedTo(item.minimumSize())
+            margins = self.contentsMargins()
+            return result + QSize(
+                margins.left() + margins.right(), margins.top() + margins.bottom()
+            )
+
+        def sizeHint(self) -> QSize:
+            return self.minimumSize()
+
+        def setGeometry(self, rect: QRect) -> None:
+            super().setGeometry(rect)
+            self._arrange(rect, apply=True)
+
+        def _arrange(self, rect: QRect, *, apply: bool) -> int:
+            margins = self.contentsMargins()
+            area = rect.adjusted(margins.left(), margins.top(), -margins.right(), -margins.bottom())
+            x, y, row_height = area.x(), area.y(), 0
+            for item in self._items:
+                if item.isEmpty():
+                    continue
+                size = item.sizeHint()
+                width = min(size.width(), max(0, area.width()))
+                if x > area.x() and x + width > area.right() + 1:
+                    x, y, row_height = area.x(), y + row_height + self.spacing(), 0
+                if apply:
+                    item.setGeometry(QRect(x, y, width, size.height()))
+                x += width + self.spacing()
+                row_height = max(row_height, size.height())
+            return y + row_height - rect.y() + margins.bottom()
+else:
+    WrappingLayout = QHBoxLayout
 
 
 # ─────────────────────────────────────────────────────────────────────────

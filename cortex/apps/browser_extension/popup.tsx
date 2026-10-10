@@ -19,6 +19,7 @@ import {
 } from "./design-tokens";
 import { newCorrelationId } from "./lib/correlation";
 import { getLastRuntimeError } from "./lib/chrome-runtime";
+import { POPUP_STOP_TIMEOUT_MS, type StopStatus } from "./lib/daemon-stop";
 import { verifiedPresentedActionIds } from "./lib/intervention-transaction";
 import { DAEMON_HTTP_URL } from "./config";
 import { getAuthToken } from "./lib/auth";
@@ -33,7 +34,6 @@ import {
     connectivityViewModel,
     normaliseMicroSteps,
     parseExecutionMode,
-    supportStateViewModel,
     LAUNCH_FAILED_STATUS,
     LAUNCH_PENDING_STATUS,
     type CortexState,
@@ -52,6 +52,7 @@ import {
 } from "./lib/extension-protocol";
 import { cleanTabReason, hasRealErrorAnalysis } from "./lib/reason-phrases";
 import { S } from "./popup/styles";
+import { currentSignalView, stateAgeMs } from "./lib/state-presentation";
 import { ConnectionPanel, VersionBanner } from "./popup/components/ConnectionPanel";
 import {
     IDLE_APPLY_STATE,
@@ -487,6 +488,29 @@ function CortexPopup(): React.ReactElement {
     const [handshakeError, setHandshakeError] = useState<string | null>(null);
     const [versionBannerDismissed, setVersionBannerDismissed] = useState(false);
     const [stopRequested, setStopRequested] = useState(false);
+    const [stopStatus, setStopStatus] = useState<StopStatus>("idle");
+    const [stopError, setStopError] = useState<string | null>(null);
+    const stopTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const stopping = stopStatus === "stopping";
+    const settleStop = useCallback((status: StopStatus, error: string | null = null) => {
+        if (status === "stopping" && stopTimeout.current === null) {
+            // Hydration and broadcasts need the same bound as this popup's
+            // own click. Reopening a popup must not create an endless spinner.
+            stopTimeout.current = setTimeout(() => {
+                stopTimeout.current = null;
+                setStopStatus("error");
+                setStopError("Shutdown could not be confirmed. Check Cortex before trying again.");
+            }, POPUP_STOP_TIMEOUT_MS);
+        } else if (status !== "stopping" && stopTimeout.current !== null) {
+            clearTimeout(stopTimeout.current);
+            stopTimeout.current = null;
+        }
+        setStopStatus(status);
+        setStopError(error);
+    }, []);
+    useEffect(() => () => {
+        if (stopTimeout.current !== null) clearTimeout(stopTimeout.current);
+    }, []);
     const [costInfo, setCostInfo] = useState<{
         cost_today: number;
         budget_today: number;
@@ -523,6 +547,12 @@ function CortexPopup(): React.ReactElement {
     const [causalExplanation, setCausalExplanation] = useState<string>("");
     const [microSteps, setMicroSteps] = useState<MicroStep[]>([]);
     const [briefing, setBriefing] = useState<MorningBriefing | null>(null);
+    const [sampleClock, setSampleClock] = useState(performance.now());
+    const sampleAge = useRef<{ age: number | null; receivedAt: number }>({ age: null, receivedAt: performance.now() });
+    useEffect(() => {
+        const clock = setInterval(() => setSampleClock(performance.now()), 1000);
+        return () => clearInterval(clock);
+    }, []);
     const [newtabDisabled, setNewtabDisabled] = useState(false);
     const [quietMode, setQuietMode] = useState(false);
     const [quietModeKind, setQuietModeKind] = useState<string>("off");
@@ -903,14 +933,20 @@ function CortexPopup(): React.ReactElement {
             const resp = raw as {
                 connected: boolean;
                 stopRequested?: boolean;
+                stopStatus?: StopStatus;
+                stopError?: string | null;
                 state: CortexState | null;
+                stateAgeMs?: number | null;
                 focusSession: FocusSnapshot | null;
                 intervention?: Record<string, unknown>;
             } | undefined;
             if (!resp) return;
             setConnected(resp.connected);
             setStopRequested(resp.stopRequested === true);
+            settleStop(resp.stopStatus ?? "idle", resp.stopError ?? null);
             setState(resp.state);
+            sampleAge.current = { age: resp.stateAgeMs === null ? null : resp.stateAgeMs ?? 0, receivedAt: performance.now() };
+            setSampleClock(performance.now());
             setFocus(resp.focusSession);
             if (resp.intervention) adoptIntervention(resp.intervention);
         });
@@ -959,6 +995,10 @@ function CortexPopup(): React.ReactElement {
             switch (msg.type) {
                 case "CONNECTION_CHANGED":
                     setConnected(msg.connected);
+                    if (!msg.connected) {
+                        setState(null);
+                        sampleAge.current = { age: null, receivedAt: performance.now() };
+                    }
                     // A live connection is proof the handshake succeeded;
                     // never keep a stale rejection over a healthy socket.
                     if (msg.connected) {
@@ -993,10 +1033,15 @@ function CortexPopup(): React.ReactElement {
                 case "STOP_INTENT":
                     setStopRequested(msg.stopRequested);
                     return;
+                case "STOP_STATUS":
+                    settleStop(msg.status, msg.error);
+                    return;
             }
         }
         switch (msg.type) {
             case "STATE_UPDATE":
+                sampleAge.current = { age: 0, receivedAt: performance.now() };
+                setSampleClock(performance.now());
                 setState(msg.payload as CortexState);
                 if (msg.focusSession) setFocus(msg.focusSession as FocusSnapshot);
                 break;
@@ -1339,19 +1384,27 @@ function CortexPopup(): React.ReactElement {
         return () => clearTimeout(handle);
     }, [recap, recapTimestamp, handleDismissRecap]);
 
-    const [stopping, setStopping] = useState(false);
     const handleStopCortex = useCallback(() => {
-        setStopping(true);
-        // Force local UI to disconnected immediately
-        setConnected(false);
-        setState(null);
-        setFocus(null);
-        sendWithCid({ type: "STOP_CORTEX" });
-        setTimeout(() => {
-            setStopping(false);
-            setStopRequested(true);
-        }, 2000);
-    }, []);
+        if (stopTimeout.current !== null) return;
+        settleStop("stopping");
+        setStopRequested(true);
+        try {
+            chrome.runtime.sendMessage({ type: "STOP_CORTEX", correlation_id: newCorrelationId() }, (raw: unknown) => {
+                const error = getLastRuntimeError();
+                const result = raw as { ok?: boolean; error?: string } | undefined;
+                if (error || result?.ok !== true) {
+                    settleStop("error", error?.message || result?.error || "Could not confirm shutdown. Open Cortex to check, or retry.");
+                    return;
+                }
+                setConnected(false);
+                setState(null);
+                setFocus(null);
+                settleStop("stopped");
+            });
+        } catch {
+            settleStop("error", "The extension could not reach its background service. Retry or open Cortex.");
+        }
+    }, [settleStop]);
 
     const handleStartFocus = useCallback(() => {
         const goal = goalInput.trim();
@@ -1367,14 +1420,15 @@ function CortexPopup(): React.ReactElement {
     }, []);
 
     // Derived presentation models keep transport semantics out of the JSX.
-    const supportView = supportStateViewModel(state, connected, STATE_LABELS);
-    const estimateReady = state?.status === undefined || state.status === "estimated";
+    const supportView = currentSignalView(state, connected,
+        stateAgeMs(sampleAge.current.age, sampleAge.current.receivedAt, sampleClock), STATE_LABELS);
+    const estimateReady = !supportView.stale && (state?.status === undefined || state.status === "estimated");
     const stateStr = supportView.stateKey;
     const stateColor = STATE_COLORS[stateStr] || CX.textTertiary;
     const stateTextColor = STATE_TEXT_COLORS[stateStr] || CX.textSecondary;
     const stateLabel = supportView.label;
-    const hr = state?.biometrics?.heart_rate;
-    const blink = state?.biometrics?.blink_rate;
+    const hr = supportView.heartRate;
+    const blink = supportView.blinkRate;
     const captureStale = supportView.captureStale;
     const storeDegraded = supportView.storeDegraded;
     const bioStatusMessage = supportView.bioStatusMessage;
@@ -1966,6 +2020,8 @@ function CortexPopup(): React.ReactElement {
                 <StopCortex
                     stopping={stopping}
                     stopRequested={stopRequested && !connected}
+                    confirmed={stopStatus === "stopped"}
+                    error={stopError}
                     onStop={handleStopCortex}
                 />
             </div>

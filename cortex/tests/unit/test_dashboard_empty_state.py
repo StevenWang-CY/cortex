@@ -69,7 +69,7 @@ def test_consumer_empty_state_visible_before_first_frame(dashboard):
     assert consumer._has_received_state is False
     placeholder = consumer._bio_empty_state
     assert placeholder is not None
-    assert "Waiting for the camera" in placeholder.text()
+    assert "Session offline" in placeholder.text()
     assert "biometrics" in placeholder.text().lower()
     # The widget is constructed visible-by-default; under offscreen it
     # only becomes effectively-on-screen when the dashboard is shown,

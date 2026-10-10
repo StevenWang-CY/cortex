@@ -74,6 +74,18 @@ class WindowTracker:
         return self._running
 
     @property
+    def current_focus(self) -> WindowFocusEvent | None:
+        """Latest observed focus while tracking is live, regardless of dwell.
+
+        A focus-change window can be empty during ordinary sustained work;
+        that does not mean the foreground application disappeared.
+        """
+        if not self._running:
+            return None
+        with self._lock:
+            return self._events[-1] if self._events else None
+
+    @property
     def is_available(self) -> bool:
         return self._available
 

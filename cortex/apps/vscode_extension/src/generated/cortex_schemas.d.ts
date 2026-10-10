@@ -3,7 +3,7 @@
 //
 // Source of truth: cortex/libs/schemas/*.py (Pydantic v2 models).
 // Schema package: cortex-wire/2.0
-// Source SHA-256: 4fbcc7e6a3cd4bd68233d9fc5ab09e3835952d15126df17b6156800ac87e1e15
+// Source SHA-256: 688a2988bdadc515e7456a2e27522ed1d52914ae572e569b76a62b3c3f20e595
 // Drift-gate: a pre-commit hook and the GitHub Actions CI run
 //   `python -m cortex.scripts.generate_ts_schemas --check`
 // and fail if this file is out of sync with the Python models.
@@ -3757,6 +3757,18 @@ export interface TelemetryFeatures {
    * Actual telemetry aggregation window; required by v2 inference
    */
   observation_window_seconds?: number | null;
+  /**
+   * A live mouse listener observed this window; missing legacy flags abstain
+   */
+  mouse_source_available?: boolean;
+  /**
+   * A live, trusted keyboard listener observed this window
+   */
+  keyboard_source_available?: boolean;
+  /**
+   * Positive intervals between regular key presses; excludes backspaces
+   */
+  keystroke_interval_count?: number | null;
   mouse_move_count?: number | null;
   click_press_count?: number | null;
   key_press_count?: number | null;

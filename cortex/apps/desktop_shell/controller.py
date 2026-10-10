@@ -409,6 +409,7 @@ class CortexAppController:
         # fresh wrapper coroutines while the daemon loop is already exiting.
         self._daemon_stop_future: Future[None] | None = None
         self._quitting: bool = False
+        self._quit_filter: _QuitEventFilter | None = None
         self._qt_shutdown_started: bool = False
         # P2 (audit-prod): teardown handle for the light/dark appearance
         # observer; kept alive for the controller lifetime.
@@ -456,6 +457,12 @@ class CortexAppController:
         self._dashboard = DashboardWindow()
         self._connections = ConnectionsPanel()
         self._overlay = OverlayWindow()
+        from cortex.apps.desktop_shell.suggestion_review import SuggestionReview
+        self._suggestion_review = SuggestionReview(self._dashboard, self._overlay)
+        self._bridge.intervention_transaction_state.connect(
+            self._suggestion_review.transaction_updated,
+        )
+        self._bridge.quiet_mode_state_received.connect(self._suggestion_review.quiet_updated)
         # P0 §3.7: lazy — full-screen break overlay lives in its own
         # frameless window. Instantiated on first use so headless test
         # harnesses that never trigger a break don't pay the QSoundEffect
@@ -1043,6 +1050,9 @@ class CortexAppController:
 
     def _dismiss_overlay(self) -> None:
         """Single overlay dismissal path: stops its timers, then hides."""
+        review = getattr(self, "_suggestion_review", None)
+        if review is not None:
+            review.clear()
         overlay = self._overlay
         if overlay is None:
             return
@@ -1398,19 +1408,14 @@ class CortexAppController:
         if self._paused:
             return
         self._active_intervention_id = payload.get("intervention_id")
-        # Phase-3 P0-DF-12.2 (dual-fire de-dup): when the daemon
-        # already stamped ``desktop_not_focused`` we KNOW the OS-level
-        # notification path is firing. Surface the cue *only* via the
-        # notification — popping the overlay on a hidden / cross-Space
-        # window flashes nothing visible but does keep the dashboard
-        # "armed" with a pending intervention that the user can't see.
-        # When the user comes back, the standard re-mount path on
-        # ``handleIntervention`` (via stored ``activeIntervention``)
-        # restores the overlay; here we just skip the immediate show.
+        review = getattr(self, "_suggestion_review", None)
+        if review is not None:
+            review.present(payload, show_immediately=payload.get("desktop_not_focused") is not True)
+            return
+        elif self._overlay is not None and payload.get("desktop_not_focused") is not True:
+            self._overlay.show_intervention(payload)
         if payload.get("desktop_not_focused") is True:
             return
-        if self._overlay is not None:
-            self._overlay.show_intervention(payload)
         # Audit-2 fix: bump the Today/Blocked counter so the dashboard
         # numeric reflects reality instead of staying at the placeholder.
         if self._dashboard is not None and hasattr(
@@ -1427,6 +1432,8 @@ class CortexAppController:
             self._tray.set_connected(connected)
         if self._dashboard is not None:
             self._dashboard.set_connected(connected)
+        if not connected and (review := getattr(self, "_suggestion_review", None)):
+            review.clear()
 
     @Slot()
     def _on_daemon_stopped(self) -> None:
@@ -1436,6 +1443,8 @@ class CortexAppController:
         # within the same Qt process is honoured (e.g. test harnesses,
         # future hot-restart support).
         self._stopping = False
+        if review := getattr(self, "_suggestion_review", None):
+            review.clear()
         if self._dashboard is not None and hasattr(
             self._dashboard, "notify_daemon_stopped"
         ):
@@ -2394,6 +2403,12 @@ class CortexAppController:
         # already in progress and returns instead of arming a second stop.
         self._quitting = True
         logger.info("Shutting down Cortex desktop shell")
+        # The recap flow has completed. Let the final QApplication.quit()
+        # event reach Qt; otherwise our own filter consumes it and leaves
+        # app.exec() running after the daemon has already stopped.
+        quit_filter = getattr(self, "_quit_filter", None)
+        if self._app is not None and quit_filter is not None:
+            self._app.removeEventFilter(quit_filter)
         if self._overlay is not None:
             self._overlay.close()
         if self._dashboard is not None:

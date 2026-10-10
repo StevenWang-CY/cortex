@@ -1,31 +1,36 @@
-# Demo media
+# Product screenshots
 
-The root `README.md` references the screenshots below. Keep filenames stable
-or update the README in lockstep.
+The root [README](../../README.md) uses captures of the implemented interface
+from the October refinement review. Displayed measurements, activity and
+workspace context are **synthetic fixtures**. They illustrate layout and
+interaction states, not measured physiology, inference accuracy or a live user
+session.
 
-## Expected files
+| File | Current example | Dimensions |
+| --- | --- | --- |
+| `dashboard.png` | Compact desktop Dashboard with camera estimates and session controls | 400 × 680 |
+| `suggestion-review.png` | Explicit Review suggestion surface within the desktop dashboard | 400 × 680 |
+| `pulse-room.jpg` | Light Pulse Room with decorative ambient motion and pause control | 1280 × 720 |
 
-| Filename | What to capture | Aspect / size guidance |
-|----------|-----------------|------------------------|
-| `dashboard.png` | The macOS dashboard at rest, FLOW state, with real biometrics visible (HR, HRV, blink rate). Use the Dashboard tab unless the Advanced tab is the feature being documented. | 420 × 700 minimum; raw app capture preferred |
-| `overlay.png` | The real intervention overlay injected into a safe demo Chrome tab, showing headline + causal explanation + per-tab recommendations + single CTA | 1280 × 720 or larger |
-| `pulse-room.png` | The real Pulse Room new-tab page with the central orb pulsing at a visible HR | 1280 × 720 or larger |
+These files were copied without pixel edits from the inspected application
+captures under the ignored local `dist/review-2026-10/screenshots/` evidence
+directory. The public copies are intentional documentation assets. The
+[implementation record](../../docs/implementation-2026-10.md) describes the
+broader rendered inspection and its limits.
 
-Optional extras (drop in if you have them):
+`overlay.png` is retained as **historical demo media** and is not used in the
+current README. Its wording and automatic tab-closing example do not represent
+the current suggestion-only default or exact-authorization workflow.
 
-- `hero.gif` — 8–15 s loop of a full intervention cycle: HYPER detected → overlay appears → causal explanation visible → one-click execute → tabs close → undo button reachable. Target 1280 × ~720, < 6 MB, 12–18 fps.
-- `architecture.svg` — exported from a diagramming tool (Excalidraw / Mermaid live editor / Figma) showing the L1→L5 layered pipeline. Replaces the ASCII block in the README "How It Works" section.
-- `state-classification.png` — a still from a session showing the state transition timeline.
+## Updating the examples
 
-## Capture tips
-
-- Use a safe local demo workspace for the browser-overlay screenshot so no private tab titles or file paths leak.
-- Capture the dashboard and Pulse Room in the appearance currently implemented by the product; do not recolor screenshots to imply a theme the page does not render.
-- For the GIF, [Gifox](https://gifox.io/) or `ffmpeg` produces smaller files than Kap.
-- Optimise with [gifsicle](https://www.lcdf.org/gifsicle/) — `gifsicle -O3 --lossy=80` typically halves file size with no visible quality loss.
-
-## Privacy
-
-Never include identifiable workspace context — file paths from real
-projects, real tab titles with sensitive content, real terminal output
-containing secrets. Use a dedicated demo profile.
+- Capture the actual current interface; use synthetic or explicitly approved
+  demonstration data and label fixtures in the accompanying document.
+- Keep disabled or unavailable signals unavailable. Do not add HRV, infer
+  cognitive state from the camera, or portray the Pulse Room trace as an ECG.
+- Show suggestions as proposals. If demonstrating an enabled workspace effect,
+  include the exact authorization, resulting receipt and scoped restore flow.
+- Preserve the implemented palette, typography, proportions and motion controls.
+  Keep the screenshot files and README references synchronized.
+- Exclude private tab titles, file paths, user identities, tokens and logs.
+  Use an isolated profile; never capture a real workspace merely for decoration.

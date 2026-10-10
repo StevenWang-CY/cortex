@@ -4,6 +4,18 @@ This log maps the implementation work packages in
 [IMPLEMENTATION.md](../IMPLEMENTATION.md) to immutable commits. Test totals are
 evidence from the named commit/working tree, not permanent README promises.
 
+## Current working-tree refinement
+
+The [October implementation record](../docs/implementation-2026-10.md) covers the
+subsequent algorithm, task-lifetime, launch/stop and interface refinement on the
+`0.5.0` development line, including the expanded documentation pass. Its local
+checks and ad-hoc arm64 artifact are recorded against baseline
+`8edb71bdef468c677569af16c03bdbe14d1a1d53` plus a source-change manifest. These
+changes are uncommitted; no new immutable commit, public release or wiki
+publication is claimed here. The following tables remain historical records.
+
+## Original implementation packages
+
 | Work package | Commit | Result |
 | --- | --- | --- |
 | WP0 — containment and build contracts | `ca28125` | Native auth, suggest-only, consent exactness, proposal purity, version/release gates |
@@ -275,4 +287,3 @@ the record at the `self-attested` tier and the publish workflow promoted the
 draft, so v0.4.0 is the public *Latest* release with an Assurance section that
 names the tier, the CI-only Intel artifact, and the absence of an independent
 reviewer.
-
