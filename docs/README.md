@@ -4,10 +4,11 @@ Cortex is a macOS research prototype with local behavioral support inference,
 optional experimental camera estimates and separately authorized workspace
 effects. The default planner is local and execution defaults to `suggest_only`.
 
-The [October implementation and verification record](implementation-2026-10.md)
-is the current review entry point for the `0.5.0` working tree. It records the
-implemented changes, research choices, local checks and remaining release and
-research requirements. A local build is not a published or notarized release.
+The [0.5.1 validation record](release/0.5.1-validation.md) is the current review
+entry point. The [October implementation record](implementation-2026-10.md)
+preserves the preceding `0.5.0` work. Both distinguish implemented behavior
+from outstanding release and research requirements. A local build is not a
+published or notarized release.
 
 ## Use and develop Cortex
 

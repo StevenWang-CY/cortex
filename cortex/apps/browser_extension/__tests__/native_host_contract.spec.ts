@@ -1,4 +1,6 @@
-import { spawnSync } from "node:child_process";
+import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
@@ -21,26 +23,39 @@ function frame(payload: Record<string, unknown>): Buffer {
 
 function runActualPythonHost(payload: Record<string, unknown>): unknown {
   const repositoryRoot = resolve(process.cwd(), "../../..");
-  const python = process.env.CORTEX_PYTHON_BIN || "python3";
+  const projectPython = resolve(repositoryRoot, "cortex/.venv/bin/python");
+  const python = process.env.CORTEX_PYTHON_BIN || (existsSync(projectPython) ? projectPython : "python3");
+  const profile = mkdtempSync(resolve(tmpdir(), "cortex-native-contract-"));
   const runner = [
     "from cortex.scripts import native_host",
     "import cortex.libs.auth",
     `cortex.libs.auth.load_or_create_token = lambda: ${JSON.stringify(EXPECTED_TOKEN)}`,
     "native_host.log = lambda _message: None",
+    "native_host.is_daemon_running = lambda: False",
     "native_host.main()",
   ].join("; ");
 
-  const result = spawnSync(python, ["-c", runner], {
-    cwd: repositoryRoot,
-    env: {
-      ...process.env,
-      PYTHONPATH: repositoryRoot,
-    },
-    input: frame(payload),
-    maxBuffer: 1024 * 1024,
-    timeout: HOST_PROCESS_TIMEOUT_MS,
-    killSignal: "SIGKILL",
-  });
+  let result: SpawnSyncReturns<Buffer>;
+  try {
+    result = spawnSync(python, ["-c", runner], {
+      cwd: repositoryRoot,
+      env: {
+        ...process.env,
+        PYTHONPATH: repositoryRoot,
+        HOME: profile,
+        XDG_CONFIG_HOME: resolve(profile, ".config"),
+        XDG_DATA_HOME: resolve(profile, ".local/share"),
+        XDG_STATE_HOME: resolve(profile, ".local/state"),
+        XDG_CACHE_HOME: resolve(profile, ".cache"),
+      },
+      input: frame(payload),
+      maxBuffer: 1024 * 1024,
+      timeout: HOST_PROCESS_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
+  } finally {
+    rmSync(profile, { recursive: true, force: true });
+  }
 
   if (result.error) {
     throw new Error(
@@ -52,7 +67,9 @@ function runActualPythonHost(payload: Record<string, unknown>): unknown {
       `native host exited ${String(result.status)}: ${result.stderr.toString("utf8")}`,
     );
   }
-  expect(result.stdout.length).toBeGreaterThanOrEqual(4);
+  if (result.stdout.length < 4) {
+    throw new Error(`native host returned no frame; run make setup or set CORTEX_PYTHON_BIN. ${result.stderr.toString("utf8")}`);
+  }
   const responseLength = result.stdout.readUInt32LE(0);
   const body = result.stdout.subarray(4);
   expect(body.length).toBe(responseLength);

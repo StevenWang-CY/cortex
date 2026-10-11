@@ -100,7 +100,7 @@ analyses.
 ## 5. Feature and measurement plan
 
 The current candidate is `support-features-v2.2.0` with deterministic support
-model `2.5.0`; freeze its exact identity before the first confirmatory
+model `2.6.0`; freeze its exact identity before the first confirmatory
 participant. Earlier schema data must retain its original version and cannot
 be silently pooled across changed availability/typing-interval semantics. For
 every feature, publish unit, source, aggregation window, minimum observation

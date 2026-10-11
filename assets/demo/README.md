@@ -1,7 +1,7 @@
 # Product screenshots
 
 The root [README](../../README.md) uses captures of the implemented interface
-from the October refinement review. Displayed measurements, activity and
+from the October refinement and 0.5.1 review. Displayed measurements, activity and
 workspace context are **synthetic fixtures**. They illustrate layout and
 interaction states, not measured physiology, inference accuracy or a live user
 session.
@@ -12,9 +12,11 @@ session.
 | `suggestion-review.png` | Explicit Review suggestion surface within the desktop dashboard | 400 × 680 |
 | `pulse-room.jpg` | Light Pulse Room with decorative ambient motion and pause control | 1280 × 720 |
 
-These files were copied without pixel edits from the inspected application
-captures under the ignored local `dist/review-2026-10/screenshots/` evidence
-directory. The public copies are intentional documentation assets. The
+The desktop images were refreshed on 2026-10-11 from actual offscreen Qt
+captures in `dist/review-0.5.1/`; Pulse Room retains the inspected October
+capture in `dist/review-2026-10/screenshots/`. No pixels were edited. These
+ignored directories hold local evidence; the public copies are intentional
+documentation assets. The
 [implementation record](../../docs/implementation-2026-10.md) describes the
 broader rendered inspection and its limits.
 

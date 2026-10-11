@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import pytest
+
 from cortex.apps.desktop_shell.view_models import (
     advanced_state_view,
     consumer_state_view,
+    pulse_unavailable_copy,
 )
 
 
@@ -90,3 +93,24 @@ def test_pulse_copy_states_the_real_blocker_instead_of_a_permanent_warm_up() -> 
     # Unknown or malformed reasons fall back to the neutral copy, never a crash.
     assert _view_with_reason({"code": "something_new"}) == "Reading your pulse…"
     assert _view_with_reason("garbage") == "Reading your pulse…"  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("capture", [
+    {"face_detected": False}, {"pulse_unavailable": {"code": "filling"}},
+])
+def test_camera_readiness_overrides_cached_pulse_on_both_desktop_tabs(capture):
+    payload = {"biometrics": {"heart_rate": 72}, "capture": capture}
+    assert consumer_state_view(payload).heart_rate is None
+    assert advanced_state_view(payload).heart_rate is None
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -1, True, 10**400, None])
+def test_unusable_warmup_progress_never_reaches_copy(value):
+    assert pulse_unavailable_copy({"code": "filling", "observed": value, "required": 10}) == "Reading your pulse…"
+
+
+@pytest.mark.parametrize("pulse", [29, 221, 10**400])
+def test_pulse_outside_transport_range_remains_unavailable(pulse):
+    payload = {"biometrics": {"heart_rate": pulse}}
+    assert consumer_state_view(payload).heart_rate is None
+    assert advanced_state_view(payload).heart_rate is None

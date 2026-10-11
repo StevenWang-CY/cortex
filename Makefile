@@ -12,7 +12,7 @@ EXT_DIR       := cortex/apps/browser_extension
 .DEFAULT_GOAL := help
 
 .PHONY: help setup dev test test-unit test-eval lint format typecheck \
-        codegen codegen-check config-sync contracts version-sync version-check audit ci ext ext-dev \
+        codegen codegen-check config-sync contracts version-sync version-check audit ci verify ext ext-dev \
         ext-edge dmg clean wiki precommit
 
 help: ## Show this help
@@ -41,7 +41,7 @@ dev: ## Start the daemon (FastAPI :9472, WebSocket :9473)
 
 # ─── Tests / quality ──────────────────────────────────────────────────
 
-test: ## Full pytest suite — mirrors ci.yml exactly (unit+integration+services+state_engine+eval+physio+performance; desktop_shell isolated)
+test: ## Python tests with Qt isolation (use verify for the full release checks)
 	QT_QPA_PLATFORM=offscreen $(PYTEST) cortex/tests/ --ignore=cortex/tests/unit/test_desktop_shell.py
 
 test-unit: ## Unit tests only (legacy desktop-shell stubs run in their isolation wrapper)
@@ -79,14 +79,29 @@ version-check: ## Fail if any runtime/manifest version diverges
 
 audit: ## Emit and enforce Python/browser/VS Code dependency audit reports
 	mkdir -p audit-results
-	$(UV_RUN) pip-audit --format json --output audit-results/python.json
-	$(PY) cortex/scripts/verify_dependency_audit.py --ecosystem pip --report audit-results/python.json --summary-out audit-results/python-summary.json
+	rm -f audit-results/python.json audit-results/python-summary.json audit-results/browser.json audit-results/browser-summary.json audit-results/vscode.json audit-results/vscode-summary.json
+	$(UV_RUN) pip-audit --format json --output audit-results/python.json || true
+	@audit_args=""; \
+	if [ "$$($(PY) -c 'import platform; print(platform.system() + "-" + platform.machine())')" = "Darwin-x86_64" ]; then \
+	  audit_args="--exceptions cortex/security/python-intel-audit-exceptions.json"; \
+	fi; \
+	$(PY) cortex/scripts/verify_dependency_audit.py --ecosystem pip --report audit-results/python.json --summary-out audit-results/python-summary.json $$audit_args
 	cd $(EXT_DIR) && (pnpm audit --json > ../../../audit-results/browser.json || true)
 	$(PY) cortex/scripts/verify_dependency_audit.py --ecosystem pnpm --report audit-results/browser.json --exceptions cortex/security/node-audit-exceptions.json --summary-out audit-results/browser-summary.json
 	cd cortex/apps/vscode_extension && (npm audit --json > ../../../audit-results/vscode.json || true)
 	$(PY) cortex/scripts/verify_dependency_audit.py --ecosystem npm --report audit-results/vscode.json --summary-out audit-results/vscode-summary.json
 
 ci: lint typecheck test codegen-check version-check contracts ## Run local Python/contract CI gates
+
+verify: ## Full local release checks: Python, contracts, browser/editor builds, replay, audits
+	./cortex/scripts/run_python_gate.sh
+	$(MAKE) codegen-check contracts
+	cd $(EXT_DIR) && pnpm exec tsc --noEmit && pnpm test
+	cd $(EXT_DIR) && pnpm exec plasmo build && pnpm exec plasmo build --target=edge-mv3
+	$(PYTEST) cortex/tests/performance/test_bundle_size.py -q
+	cd cortex/apps/vscode_extension && npm run lint && npm run compile && npm test && npm run package:vsix
+	$(PY) -m cortex.services.eval.regression_harness
+	$(MAKE) audit
 
 # ─── Browser extension ────────────────────────────────────────────────
 

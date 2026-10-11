@@ -436,10 +436,13 @@ class StateConfig(BaseModel):
     estimate_entry_threshold: float = Field(0.40, ge=0.0, le=1.0)
     estimate_exit_threshold: float = Field(0.25, ge=0.0, le=1.0)
     inference_mode: Literal["deterministic", "safety_null"] = "deterministic"
-    hyper_dwell_seconds: int = 30
-    hypo_dwell_seconds: int = 60
-    flow_dwell_seconds: int = 120
-    ema_alpha: float = 0.3
+    hyper_dwell_seconds: int = Field(30, ge=0)
+    hypo_dwell_seconds: int = Field(60, ge=0)
+    flow_dwell_seconds: int = Field(120, ge=0)
+    ema_alpha: float = Field(
+        0.3, gt=0.0, le=1.0,
+        description="EMA weight per nominal 500 ms; scaled by actual elapsed time",
+    )
 
     @model_validator(mode="after")
     def _estimate_hysteresis_is_ordered(self) -> StateConfig:

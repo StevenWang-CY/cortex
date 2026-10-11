@@ -489,10 +489,9 @@ def _make_history_icon(color_hex: str, size: int = 13) -> object:
 
 _GLOBAL_QSS = f"""
 QWidget#CortexDashboard {{
-    /* The NSWindow behind Qt's content view is tinted and pinned to the
-       light Aqua appearance by mac_native.apply_vibrancy; off-mac the
-       QApplication palette supplies the same light window colour. */
-    background-color: transparent;
+    /* Keep first paint, offscreen rendering and an unavailable AppKit
+       bridge opaque; native chrome uses the matching light appearance. */
+    background-color: {CX_BG};
 }}
 QLineEdit {{
     selection-background-color: {BRAND_ACCENT};
@@ -1046,11 +1045,16 @@ class _ConsumerTab(QWidget):
         bio_heading.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
         bio_heading.setStyleSheet(SECTION_HEADING_QSS)
         bio_inner.addWidget(bio_heading)
+        bio_caption = QLabel("Experimental · for personal reference")
+        bio_caption.setWordWrap(True)
+        bio_caption.setFont(mac_native.system_font(FS_CAPTION, "regular"))
+        bio_caption.setStyleSheet(f"color: {CX_TEXT_SECONDARY}; background: transparent;")
+        bio_inner.addWidget(bio_caption)
 
         # Phase J-3: empty state before the first capture frame. The copy
         # says what is actually happening — the camera has not delivered a
         # frame yet — rather than instructing the user to do something.
-        self._bio_empty_state = QLabel("Waiting for the camera… Live biometrics appear as soon as frames arrive.")
+        self._bio_empty_state = QLabel("Waiting for usable camera evidence… Estimates appear when the signal is ready.")
         self._bio_empty_state.setObjectName("CortexBioEmptyState")
         self._bio_empty_state.setWordWrap(True)
         self._bio_empty_state.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1940,6 +1944,8 @@ class _ConsumerTab(QWidget):
         self._refresh_restore_pill()
 
     def update_state(self, payload: dict) -> None:
+        if self._session_phase in (_PHASE_STOPPING, _PHASE_ENDED):
+            return
         view = consumer_state_view(payload)
         # A received update retires the initial instructions. Reconnecting
         # requires a fresh update before measurements are shown again.
@@ -2045,6 +2051,20 @@ class _ConsumerTab(QWidget):
                 )
         except Exception:
             pass
+
+    def expire_state(self) -> None:
+        """Clear live presentation without changing transport/session authority."""
+        self._last_state = "UNKNOWN"
+        self._render_state_badge("UNKNOWN", "Waiting for fresh signals")
+        self._set_text_if_changed(self._bpm_label, "--")
+        self._set_text_if_changed(self._blk_label, "--")
+        self._set_text_if_changed(self._bio_status_label, "Waiting for fresh signals…")
+        self._bio_numerics.hide()
+        self._bio_empty_state.hide()
+        self._bio_status_label.show()
+        self._health_banner.hide()
+        self._today_current_streak = 0.0
+        self._today_last_tick = time.monotonic()
 
     # G3 (audit-prod): seconds without a STATE_UPDATE before we consider
     # the prior session ended (daemon stopped / network blip / sleep).
@@ -2500,8 +2520,21 @@ class HRTracePlot(QWidget):
         self.setMinimumWidth(300)
 
     def add_value(self, hr: float) -> None:
+        if not 30.0 <= hr <= 220.0:
+            return
         self._values.append(hr)
         self.update()
+
+    def clear(self) -> None:
+        self._values.clear()
+        self.update()
+
+    def value_range(self) -> tuple[float, float]:
+        """Fit every displayed measurement, including values above 180 bpm."""
+        if not self._values:
+            return 0.0, 10.0
+        lower = max(0.0, min(self._values) - 5.0)
+        return lower, max(lower + 10.0, max(self._values) + 5.0)
 
     def paintEvent(self, event: object) -> None:
         painter = QPainter(self)
@@ -2522,13 +2555,12 @@ class HRTracePlot(QWidget):
         if len(self._values) < 2:
             painter.setPen(QColor(CX_TEXT_TERTIARY))
             painter.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Waiting for HR data...")
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Waiting for a fresh pulse estimate…")
             painter.end()
             return
 
-        min_hr = max(40.0, min(self._values) - 5)
-        max_hr = min(180.0, max(self._values) + 5)
-        hr_range = max(max_hr - min_hr, 10.0)
+        min_hr, max_hr = self.value_range()
+        hr_range = max_hr - min_hr
 
         painter.setPen(QPen(QColor(0, 0, 0, 12), 1))  # ~ tertiary label
         for tick in range(int(min_hr), int(max_hr) + 1, 10):
@@ -2894,6 +2926,8 @@ class _AdvancedTab(QWidget):
         hr = view.heart_rate
         if hr is not None:
             self._hr_plot.add_value(hr)
+        else:
+            self._hr_plot.clear()
 
         for name in ("flow", "hyper", "hypo", "recovery"):
             val = scores.get(name, 0.0)
@@ -2930,6 +2964,20 @@ class _AdvancedTab(QWidget):
                     f"{ev['evidence_strength']:.0%} evidence"
                 )
             self._timeline_text.setText("\n".join(lines) if lines else "No events yet")
+
+    def clear_live_state(self, message: str) -> None:
+        """Historical events remain; current diagnostics cannot outlive evidence."""
+        self._hr_plot.clear()
+        for bar in (self._physio_q, self._kine_q, self._tele_q):
+            bar.set_value(0.0)
+        self._physio_q.set_subcomponents(luminance=None, motion_penalty=None, face_loss_rate=None)
+        for name, bar in self._score_bars.items():
+            self._set_value_if_changed(bar, 0)
+            self._set_text_if_changed(self._score_labels[name], "—")
+        self._set_text_if_changed(self._confidence_lbl, "Evidence strength: unavailable")
+        self._set_text_if_changed(self._dwell_lbl, "Coverage: unavailable · Dwell: unavailable")
+        self._set_text_if_changed(self._degraded_badge, message)
+        self._degraded_badge.show()
 
 
 # ---------------------------------------------------------------------------
@@ -3096,6 +3144,10 @@ class DashboardWindow(QWidget):
         super().__init__(parent)
         self._closing_for_quit = False
         self._connected = False
+        self._last_state_received_at: float | None = None
+        self._state_freshness_timer = QTimer(self)
+        self._state_freshness_timer.setSingleShot(True)
+        self._state_freshness_timer.timeout.connect(self._expire_stale_state)
         self._last_recap_payload: dict = {}
         self.setObjectName("CortexDashboard")
         self.setWindowTitle("Cortex")
@@ -3179,6 +3231,7 @@ class DashboardWindow(QWidget):
         # ``daemon_stop_requested`` (and its legacy alias
         # ``stop_requested``) tells the controller to ask the daemon to
         # stop; ``gui_quit_requested`` tells it to quit Qt.
+        self._consumer.daemon_stop_requested.connect(self._pause_live_diagnostics)
         self._consumer.daemon_stop_requested.connect(self.daemon_stop_requested.emit)
         self._consumer.gui_quit_requested.connect(self.gui_quit_requested.emit)
         self._consumer.stop_requested.connect(self.stop_requested.emit)
@@ -3238,6 +3291,7 @@ class DashboardWindow(QWidget):
 
     def showEvent(self, event: object) -> None:  # noqa: D401 - Qt override
         super().showEvent(event)
+        self._expire_stale_state()
         # On first show, snap to the centre of whatever screen the user
         # currently has so a stale geometry from a previous multi-monitor
         # session can't strand the window at e.g. x=2412 on a 1728-wide
@@ -3282,8 +3336,33 @@ class DashboardWindow(QWidget):
     # -- Public update methods (signature-stable) ------------------------
 
     def update_state(self, payload: dict) -> None:
+        if self._consumer._session_phase in (_PHASE_STOPPING, _PHASE_ENDED):
+            return
+        self._last_state_received_at = time.monotonic()
+        self._state_freshness_timer.start(10_000)
         self._consumer.update_state(payload)
         self._advanced.update_state(payload)
+
+    def _expire_stale_state(self) -> None:
+        """Same ten-second presentation deadline as the browser surfaces."""
+        received_at = self._last_state_received_at
+        if received_at is None:
+            return
+        remaining = 10.0 - (time.monotonic() - received_at)
+        if remaining > 0:
+            # Coarse Qt timers may wake early; never shorten the deadline.
+            self._state_freshness_timer.start(max(1, int(remaining * 1000) + 1))
+            return
+        self._last_state_received_at = None
+        self._state_freshness_timer.stop()
+        if self._consumer._session_phase == _PHASE_LIVE:
+            self._consumer.expire_state()
+        self._advanced.clear_live_state("Waiting for fresh signals")
+
+    def _pause_live_diagnostics(self) -> None:
+        self._last_state_received_at = None
+        self._state_freshness_timer.stop()
+        self._advanced.clear_live_state("Ending session — live diagnostics paused")
 
     def refresh_baseline_freshness(self) -> None:
         """P0 §3.4 — proxy down to the consumer tab's pill. Called by
@@ -3301,10 +3380,17 @@ class DashboardWindow(QWidget):
 
     def set_connected(self, connected: bool) -> None:
         self._connected = connected
+        if not connected:
+            self._last_state_received_at = None
+            self._state_freshness_timer.stop()
+            self._advanced.clear_live_state("Session offline — live diagnostics unavailable")
         self._consumer.set_connected(connected)
 
     def set_starting(self) -> None:
         self._connected = False
+        self._last_state_received_at = None
+        self._state_freshness_timer.stop()
+        self._advanced.clear_live_state("Starting — waiting for fresh signals")
         self._consumer.set_starting()
 
     def set_session_restart_available(self, available: bool) -> None:

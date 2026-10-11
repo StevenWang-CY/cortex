@@ -54,7 +54,11 @@ export function statePresentationFields(raw: unknown): Pick<CortexState, "biomet
 
 /** Age travels as a duration; monotonic clocks from different contexts never mix. */
 export function stateAgeMs(ageAtReceipt: number | null, receivedAt: number, now = performance.now()): number {
-    return ageAtReceipt === null ? Infinity : ageAtReceipt + Math.max(0, now - receivedAt);
+    if (ageAtReceipt === null || !Number.isFinite(ageAtReceipt) || ageAtReceipt < 0
+        || !Number.isFinite(receivedAt) || !Number.isFinite(now) || now < receivedAt) {
+        return Infinity;
+    }
+    return ageAtReceipt + now - receivedAt;
 }
 
 export function currentSignalView(
@@ -63,7 +67,8 @@ export function currentSignalView(
     ageMs: number,
     labels: Readonly<Record<string, string>>,
 ) {
-    const stale = connected && state !== null && (!Number.isFinite(ageMs) || ageMs >= STATE_FRESHNESS_MS);
+    const stale = connected && state !== null
+        && (!Number.isFinite(ageMs) || ageMs < 0 || ageMs >= STATE_FRESHNESS_MS);
     const current = connected && !stale ? state : null;
     const view = supportStateViewModel(current, connected, labels);
     const pulse = numberOrNull(current?.biometrics?.heart_rate);
@@ -71,7 +76,7 @@ export function currentSignalView(
         && current?.capture?.frames_flowing !== false
         && current?.capture?.face_detected !== false;
     const heartRate = captureReady && !current?.capture?.pulse_unavailable
-        && pulse !== null && pulse > 0 ? Math.round(pulse) : null;
+        && pulse !== null && pulse >= 30 && pulse <= 220 ? Math.round(pulse) : null;
     const blink = numberOrNull(current?.biometrics?.blink_rate);
     return {
         ...view,

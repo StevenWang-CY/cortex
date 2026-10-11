@@ -30,7 +30,7 @@ new profile is committed atomically only after review; cancel/failure preserves
 the previous profile. Reload verifies the exact committed profile ID.
 
 Acquisition/profile versions and the production behavioral model version are
-separate. Model `2.5.0` uses feature schema `support-features-v2.2.0`; calibrating
+separate. Model `2.6.0` uses feature schema `support-features-v2.2.0`; calibrating
 does not train that model or validate its labels. The production scorer uses
 the calibrated mouse-variance baseline where applicable; measured camera
 diagnostics do not gain authority over support or reading-check-in eligibility.

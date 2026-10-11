@@ -32,10 +32,12 @@ from cortex.apps.desktop_shell.context_privacy_controller import (
     ContextPrivacyController,
 )
 from cortex.apps.desktop_shell.dashboard import DashboardWindow
+from cortex.apps.desktop_shell.font_assets import install_application_fonts
 from cortex.apps.desktop_shell.message_router import DesktopMessageRouter
 from cortex.apps.desktop_shell.onboarding import OnboardingWindow, onboarding_marker_path
 from cortex.apps.desktop_shell.overlay import OverlayWindow
 from cortex.apps.desktop_shell.settings import SettingsDialog
+from cortex.apps.desktop_shell.tokens import FS_FOOTNOTE
 from cortex.apps.desktop_shell.tray import CortexTrayIcon
 from cortex.libs.auth import load_or_create_token
 from cortex.libs.config.settings import APIConfig, get_config
@@ -612,6 +614,8 @@ class CortexApp:
             logger.debug("application palette apply failed", exc_info=True)
         self._app.setApplicationName("Cortex")
         self._app.setOrganizationName("Cortex")
+        self._app.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
+        install_application_fonts()
         self._app.setQuitOnLastWindowClosed(False)  # Keep running in tray
 
         # Create UI components

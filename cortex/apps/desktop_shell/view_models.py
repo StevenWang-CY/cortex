@@ -19,7 +19,7 @@ def _number(value: object, default: float = 0.0) -> float:
         return default
     try:
         candidate = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     return candidate if isfinite(candidate) else default
 
@@ -30,6 +30,12 @@ def _measurement(value: object, *, positive: bool = False) -> float | None:
     if not isfinite(candidate) or candidate < 0 or (positive and candidate == 0):
         return None
     return candidate
+
+
+def _pulse(value: object) -> float | None:
+    candidate = _measurement(value, positive=True)
+    # Same supported range as the physiological transport contract.
+    return candidate if candidate is not None and 30.0 <= candidate <= 220.0 else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,10 +77,13 @@ def pulse_unavailable_copy(reason: Any) -> str:
     code = str(reason.get("code") or "")
     missing = str(reason.get("missing_reason") or "").lower()
     if code == "filling":
-        observed = _number(reason.get("observed"))
-        required = _number(reason.get("required"))
-        if observed is not None and required and required > 0:
-            return f"Reading your pulse… {min(observed, required):.0f} of {required:.0f} s"
+        observed = _measurement(reason.get("observed"))
+        required = _measurement(reason.get("required"), positive=True)
+        if observed is not None and required is not None:
+            return (
+                f"Reading your pulse… {int(min(observed, required) + 0.5)} "
+                f"of {int(required + 0.5)} s"
+            )
         return default
     if code in {"no_observations", "duplicate_timestamps", "too_few_valid_samples"}:
         return default if code != "no_observations" else "Waiting for the camera…"
@@ -111,19 +120,26 @@ def consumer_state_view(payload: Mapping[str, Any]) -> ConsumerStateViewModel:
 
     biometrics = _mapping(payload.get("biometrics"))
     raw_hr = biometrics.get("heart_rate")
-    heart_rate = _measurement(raw_hr, positive=True)
+    heart_rate = _pulse(raw_hr)
     raw_hrv = biometrics.get("hrv_rmssd")
     hrv = _measurement(raw_hrv)
     raw_blink = biometrics.get("blink_rate")
     blink = _measurement(raw_blink)
-    if capture.get("stale") or capture.get("frames_flowing") is False:
+    if (
+        capture.get("stale") or capture.get("frames_flowing") is False
+        or capture.get("face_detected") is False
+    ):
         heart_rate, hrv, blink = None, None, None
+    if capture.get("pulse_unavailable"):
+        heart_rate, hrv = None, None
     if heart_rate is None:
         if not bool(capture.get("frames_flowing", True)):
             bio_status = (
                 "Camera offline — check System Settings → Privacy "
                 "& Security → Camera"
             )
+        elif capture.get("stale"):
+            bio_status = "Camera signal paused — waiting for fresh frames"
         elif not bool(capture.get("face_detected", True)):
             bio_status = "Looking for your face…"
         else:
@@ -186,9 +202,13 @@ def advanced_state_view(payload: Mapping[str, Any]) -> AdvancedStateViewModel:
         degraded = None
     raw_hr = _mapping(payload.get("biometrics")).get("heart_rate")
     capture = _mapping(payload.get("capture"))
-    capture_current = not capture.get("stale") and capture.get("frames_flowing") is not False
+    capture_current = (
+        not capture.get("stale") and capture.get("frames_flowing") is not False
+        and capture.get("face_detected") is not False
+        and not capture.get("pulse_unavailable")
+    )
     return AdvancedStateViewModel(
-        state=str(payload.get("state", "UNKNOWN")),
+        state=str(payload.get("state", "UNKNOWN")) if status == "estimated" else "UNKNOWN",
         scores=scores,
         signal_quality=signal_quality,
         evidence_strength=max(0.0, min(1.0, _number(payload.get("confidence")))),
@@ -197,6 +217,6 @@ def advanced_state_view(payload: Mapping[str, Any]) -> AdvancedStateViewModel:
             min(1.0, _number(payload.get("evidence_coverage"))),
         ),
         dwell_seconds=max(0.0, _number(payload.get("dwell_seconds"))),
-        heart_rate=_measurement(raw_hr, positive=True) if capture_current else None,
+        heart_rate=_pulse(raw_hr) if capture_current else None,
         degraded_message=degraded,
     )

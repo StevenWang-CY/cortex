@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { currentSignalView, stateAgeMs, statePresentationFields, STATE_FRESHNESS_MS } from "../lib/state-presentation";
 import type { CortexState } from "../lib/popup-view-model";
+import { pulseUnavailableCopy } from "../lib/popup-view-model";
 
 const state = (overrides: Partial<CortexState> = {}): CortexState => ({
     state: "FLOW", status: "estimated", confidence: 0.8, scores: {}, signal_quality: {}, dwell_seconds: 2,
@@ -30,7 +31,7 @@ describe("live presentation continuity", () => {
             { pulse_unavailable: { code: "filling", message: "not ready" } }]) {
             expect(currentSignalView(state({ capture }), true, 0, labels).heartRate).toBeNull();
         }
-        for (const heart_rate of [null, 0, -1, NaN, Infinity]) {
+        for (const heart_rate of [null, 0, -1, 29, 221, NaN, Infinity]) {
             const invalid = state({ biometrics: { ...valid.biometrics!, heart_rate } });
             expect(currentSignalView(invalid, true, 0, labels).heartRate).toBeNull();
         }
@@ -50,5 +51,19 @@ describe("live presentation continuity", () => {
         expect(expired.heartRate).toBeNull();
         expect(expired.stateKey).toBe("UNKNOWN");
         expect(expired.label).toBe("Waiting for fresh signals");
+    });
+    it("rejects malformed or regressed age metadata", () => {
+        for (const age of [-1, NaN, Infinity]) {
+            expect(stateAgeMs(age, 100, 200)).toBe(Infinity);
+            expect(currentSignalView(state(), true, age, labels).heartRate).toBeNull();
+        }
+        expect(stateAgeMs(0, 100, 99)).toBe(Infinity);
+        expect(stateAgeMs(0, NaN, 200)).toBe(Infinity);
+    });
+    it("never renders non-finite or negative warmup progress", () => {
+        for (const observed of [NaN, Infinity, -1, null, true]) {
+            expect(pulseUnavailableCopy({ code: "filling", observed, required: 10 })).toBe("Reading your pulse…");
+        }
+        expect(pulseUnavailableCopy({ code: "filling", observed: 2.5, required: 10 })).toBe("Reading your pulse… 3 of 10 s");
     });
 });

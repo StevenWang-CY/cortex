@@ -1,6 +1,6 @@
 # Product and evidence limitations
 
-Last reviewed: 2026-10-02. Cortex 0.5.0 is an alpha research prototype for
+Last reviewed: 2026-10-11. Cortex 0.5.1 is an alpha research prototype for
 local, user-controlled workspace support. It is not a medical device, clinical
 tool, productivity judge, accessibility accommodation, or validated estimator
 of cognition.
@@ -14,7 +14,7 @@ probabilities. Names such as `support_likely` and `flow_like` describe rule
 patterns; they do not measure overwhelm, flow, stress, fatigue, attention,
 arousal, intent, ability, or health.
 
-The current registry version is `2.5.0`, with feature schema
+The current registry version is `2.6.0`, with feature schema
 `support-features-v2.2.0`. Missing input sources abstain; silence counts only
 while the corresponding listeners are observed and available. Duplicate or
 regressed timestamps cannot advance smoothing/dwell, and observation gaps
@@ -169,7 +169,7 @@ attest those external settings. See the [privacy disclosure](../cortex/docs/priv
   and listener release. Neither proves physical camera release, native
   keyboard/VoiceOver behavior, or recovery after every OS-level failure.
 
-- **Source test coverage is 69.32%, with an enforced 65% floor.** Earlier
+- **Source tests enforce a measured 65% coverage floor.** Earlier
   configuration declared an 85% floor without the canonical gate enabling
   coverage or selecting its configuration. The current gate explicitly passes
   `--cov --cov-config=cortex/pyproject.toml`, enables branch coverage, and
@@ -181,7 +181,7 @@ attest those external settings. See the [privacy disclosure](../cortex/docs/priv
   subsystem or failure path is covered. The floor may ratchet upward; lowering
   it to accept a regression is not permitted.
 
-- **The current Chrome production build is 269,269 bytes gzipped**, measured
+- **The preceding Chrome production build was 269,269 bytes gzipped**, measured
   2026-10-02 from `plasmo build` (838,326 bytes uncompressed, 17 files). The
   equivalent Edge build is 269,271 bytes gzipped. Both remain within the
   existing 280,000-byte gzip and 900,000-byte uncompressed gates. Prior
@@ -237,6 +237,12 @@ storage and received a new boot ID. See the
 for exact artifacts and evidence. The sandboxed probes did not access physical
 cameras or the user's real profile, grant TCC permissions, validate VoiceOver,
 establish reference-sensor accuracy, or notarize/publish a release.
+
+The [0.5.1 validation record](release/0.5.1-validation.md) reports the latest
+source and packaging results; the measurements above retain their original
+dates. Desktop live signals now share the browser's ten-second expiry, and
+time-scaled smoothing prevents cadence changes from changing the effective
+time constant. Neither correction validates the underlying state labels.
 
 Source code can build ad-hoc DMGs for development. Only a release candidate
 with attached Developer ID, Apple notarization/stapling, mounted-artifact smoke,

@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import platform
+import shutil
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -29,15 +30,18 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _command(command: list[str]) -> str:
+def _command(command: list[str], *, cwd: Path | None = None) -> str:
     try:
         completed = subprocess.run(
             command,
-            cwd=_ROOT,
+            cwd=_ROOT if cwd is None else cwd,
             check=False,
             capture_output=True,
             text=True,
+            timeout=30,
         )
+    except subprocess.TimeoutExpired:
+        return "unavailable (timeout)"
     except FileNotFoundError:
         return "unavailable (not found)"
     except OSError as exc:
@@ -45,6 +49,14 @@ def _command(command: list[str]) -> str:
     if completed.returncode != 0:
         return f"unavailable ({completed.returncode})"
     return (completed.stdout or completed.stderr).strip()
+
+
+def _browser_package_manager_version() -> str:
+    # Match build_macos_app.sh's Corepack preference and project directory.
+    # At the repository root Corepack may resolve a different global pnpm;
+    # packageManager is declared by the browser extension's package.json.
+    command = ["corepack", "pnpm"] if shutil.which("corepack") else ["pnpm"]
+    return _command([*command, "--version"], cwd=_ROOT / "cortex/apps/browser_extension")
 
 
 def artifact_record(path: Path, *, output_dir: Path) -> dict[str, Any]:
@@ -122,7 +134,7 @@ def generate(
             "python": platform.python_version(),
             "uv": _command(["uv", "--version"]),
             "node": _command(["node", "--version"]),
-            "pnpm": _command(["pnpm", "--version"]),
+            "pnpm": _browser_package_manager_version(),
             "xcode": _command(["xcodebuild", "-version"]),
         },
         "inputs": records,

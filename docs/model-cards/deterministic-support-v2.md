@@ -1,11 +1,11 @@
-# Model card: deterministic support rules v2.5.0
+# Model card: deterministic support rules v2.6.0
 
 ## Status and ownership
 
 | Field | Value |
 | --- | --- |
 | Registry name | `deterministic-support` |
-| Version | `2.5.0` |
+| Version | `2.6.0` |
 | Feature schema | `support-features-v2.2.0` |
 | Implementation | `cortex/services/state_engine/rule_scorer.py` |
 | Operational wrapper | `cortex/services/state_engine/support_inference.py` |
@@ -173,8 +173,24 @@ regressed observations do not update scores or dwell. An evaluation gap longer
 than 3 s (six nominal 500 ms ticks, matching the source freshness boundary)
 invalidates the committed label, scores and pending candidate. The next fresh
 observation begins a new confirmation interval; unobserved time cannot complete
-entry dwell, prolong a label, or establish recovery. The EMA remains per-sample
-with unchanged alpha under normal continuous input. `recovering` can only
+entry dwell, prolong a label, or establish recovery. A changed `boot_id` starts
+a new temporal history because monotonic times from different boots cannot be
+compared. Source fusion also ignores nonincreasing timestamps and restarts its
+five-snapshot telemetry warm-up after a gap above three seconds.
+
+The EMA preserves the nominal 500 ms response with elapsed-time weight
+`alpha(dt) = 1 - (1 - ema_alpha) ** (dt / 0.5)`. This follows by composing the
+retention factor from [single exponential smoothing](https://www.itl.nist.gov/div898/handbook/pmc/section4/pmc431.htm)
+over the elapsed number of nominal intervals. It is an engineering time-scale
+correction, not an empirically fitted cognitive model. The first sample and the
+first sample after a gap receive one nominal update; unobserved gaps cannot
+earn extra weight. Constant-input traces sampled every 10, 100, 250, 500,
+1,000 or 2,000 ms produce equal scores at the same elapsed time. Varying inputs
+still depend on the actual observations. Non-finite timestamps are rejected
+without altering the prior state; finite numeric observations are required at
+the schema boundary. Invalid alpha or negative dwell settings are rejected.
+
+`recovering` can only
 appear after a confirmed support-likely episode begins to subside; it is never
 scored from a mixed single frame. A committed label whose own smoothed score
 stays at or below the exit threshold for 10 s without any other state clearing
@@ -207,6 +223,14 @@ rather than counting as a mismatch. Both remain subject to the shared interrupti
 and authorization gates.
 
 ## Change log
+
+**2.6.0 / support-features-v2.2.0** — Time-scale the EMA, isolate clock domains,
+reject non-finite numeric evidence and invalid temporal configuration, and
+make source warm-up count only fresh ordered snapshots. The rule weights,
+normal 500 ms response and diagnostic-only physiology boundary are unchanged.
+The [0.5.1 validation record](../release/0.5.1-validation.md) records software
+checks; physiological accuracy and participant-held-out effectiveness remain
+unestablished.
 
 **2.5.0 / support-features-v2.2.0** — Corrected input-source missingness,
 regular-key interval readiness and temporal continuity. Expanded build-time

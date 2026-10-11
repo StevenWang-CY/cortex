@@ -1,6 +1,6 @@
 # UI design and interaction contract
 
-Last reviewed: 2026-10-02.
+Last reviewed: 2026-10-11.
 
 This contract applies to the PySide6 desktop shell, Chrome/Edge extension,
 injected browser surfaces, and VS Code webview. The refinement pass was
@@ -127,7 +127,10 @@ it is centered. Anchored popovers originate from their trigger.
 
 - **Appearance:** every Qt window pins the Aqua (light) appearance through
   `mac_native.apply_vibrancy(widget, appearance="light")`, and the
-  `QApplication` palette comes from `mac_native.application_palette()`. The
+  `QApplication` palette comes from `mac_native.application_palette()`. Both
+  hosts register the bundled display fonts and system text font before creating
+  windows. The dashboard paints an opaque semantic background so first paint
+  and a failed/unavailable native bridge remain legible. The
   shell never inherits the system dark theme half-way; the suggestion card is
   the one surface that pins `"dark"` on purpose.
 - **Session semantics:** "End session" stops sensing, shows the recap, and
@@ -200,8 +203,14 @@ it is centered. Anchored popovers originate from their trigger.
   Disconnect clears current biometrics instead of retaining a live-looking
   last value, and reconnect requires a new state update. Boolean, non-finite,
   malformed, and nonpositive pulse values remain unavailable. Capture marked
-  stale or explicitly not flowing suppresses biometrics in both consumer and
-  advanced views. The camera section says **Camera estimates**, not a clinical
+  stale, explicitly not flowing or without a detected face suppresses biometrics
+  in both consumer and advanced views. A pulse-unavailable reason overrides a
+  cached pulse; supported pulse values are bounded to the transport's 30–220 bpm.
+  Ten seconds without a fresh state clears both tabs' live diagnostics while
+  leaving session controls usable; hiding the window does not extend freshness.
+  Stop/disconnect clears live Advanced diagnostics, and queued updates cannot
+  revive an ending/ended session. The camera section says **Camera estimates**,
+  with an experimental caption, not a clinical
   measurement. Verify the dashboard at 380 × 500 logical pixels, Settings at
   440 px wide with schedule/privacy controls expanded, and onboarding at
   600 × 520: no horizontal scrolling, clipped controls, or inaccessible

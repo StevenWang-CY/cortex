@@ -24,8 +24,8 @@ Two dependencies are exported:
 
 The dependencies accept the token in either ``Authorization: Bearer
 <token>`` (canonical) or ``X-Cortex-Auth-Token: <token>`` (legacy /
-browser-extension friendlier — Chrome can attach custom headers via
-``fetch`` without triggering CORS preflight on the ``X-`` prefix).
+browser-extension compatibility). Custom ``X-`` headers are not CORS
+safelisted; cross-origin browser requests may require a preflight.
 
 Threat model recap (from ``cortex/libs/auth/local_token.py``):
 closes the *cross-origin localhost* gap. A hostile webpage in another
@@ -62,8 +62,7 @@ def extract_token(
 
     ``Authorization: Bearer <token>`` is canonical. The legacy
     ``X-Cortex-Auth-Token`` header is accepted because the browser
-    extension's ``fetch`` calls are easier to keep CORS-preflight-free
-    with an ``X-`` prefix; both must validate against the same token
+    extension historically sends it; both must validate against the same token
     file, and either header alone is sufficient.
 
     Returns ``None`` if neither header carried a usable value so the

@@ -113,7 +113,7 @@ disclosure manifest. Text remains untrusted even after redaction; prompt
 instructions cannot grant a capability.
 
 The separately selected support estimate comes from behavioral inference,
-currently model `2.5.0` / `support-features-v2.2.0`. Camera pulse, blink and
+currently model `2.6.0` / `support-features-v2.2.0`. Camera pulse, blink and
 head/neck proxies cannot contribute to that score. Unavailable input channels
 remain missing evidence and may yield `unknown`; a disconnected input source
 must not be presented or disclosed as measured inactivity.

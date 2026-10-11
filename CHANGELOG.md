@@ -4,6 +4,60 @@ All notable changes to Cortex. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.5.1] — 2026-10-11
+
+### Correctness and numerical integrity
+
+- Scale exponential smoothing by actual elapsed time while preserving the
+  nominal 500 ms response. Constant evidence now produces the same smoothed
+  score across sampling rates; clock-domain changes restart confirmation.
+- Reject non-finite measurements and timestamps before they poison inference
+  or serialize as valid-but-null observations. Validate smoothing and dwell
+  settings; fusion abstains on unusable numeric measurements.
+- Ignore duplicate/regressed source updates and restart telemetry warm-up
+  after observation gaps. Register behavioral model `2.6.0` with regenerated
+  implementation provenance; feature schema and heuristic weights stay unchanged.
+- Return private, JSON-safe HTTP 422 validation details for malformed inputs,
+  including NaN/Infinity, while preserving field locations and request IDs.
+
+### Interface and integration
+
+- Expire desktop live readings after ten seconds without a fresh update,
+  including while hidden. Clear Advanced diagnostics on disconnect/stop and
+  reject queued readings while a session is ending.
+- Align desktop/browser camera readiness and pulse-range checks. Clear cached
+  readings when the face or pulse evidence becomes unavailable; prevent
+  malformed warm-up counters from reaching user-facing copy.
+- Fit the pulse trace to its full supported range, clear it across missing
+  evidence, use an opaque dashboard background and load the shared display
+  fonts in both desktop hosts. Keep compact scrolling and the session footer.
+- Reject oversized native messages immediately without waiting for an open
+  input pipe to close; reject truncated framing and return a bounded error
+  even when schema initialization fails.
+- Make native-host browser tests select the locked project interpreter and
+  isolate the user profile. Align browser metadata with the product's actual
+  workspace-support purpose.
+
+### Release and maintenance
+
+- Clean up decoded credentials and partially configured signing Keychains on
+  every setup failure, including Apple agreement/notarization errors. Write
+  temporary credentials with owner-only permissions and register cleanup
+  before creating the Keychain; exercise the actual workflow shell with fault
+  injection for both notarization credential modes.
+- Add `make verify` for the complete local release checks and make local
+  Python auditing apply the same architecture-specific policy as CI. Reject
+  stale audit reports after a failed refresh. Enforce the built browser bundle
+  budget and deterministic replay explicitly in the release gate as in main CI.
+- Record the package manager from the same project directory and Corepack
+  selection used by the build; bound tool-version probes so metadata cannot
+  hang behind an unresponsive command.
+- Simplify the main README, refresh real UI captures with synthetic data, and
+  update the model, interface and release documentation.
+
+Evidence, release status and remaining validation boundaries are recorded in
+[the 0.5.1 validation record](docs/release/0.5.1-validation.md).
+
 ## [v0.5.0] — 2026-10-09
 
 Version 0.5.0 carries two passes over the v0.4.0 source. The October

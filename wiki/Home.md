@@ -1,12 +1,12 @@
 # Cortex
 
-Cortex 0.5.0 is a macOS alpha research prototype for local, user-controlled
+Cortex 0.5.1 is a macOS alpha research prototype for local, user-controlled
 workspace support. It combines bounded activity telemetry, optional
 experimental camera signals, browser/editor context, and a deterministic or
 schema-validated planner to present conservative suggestions.
 
-This wiki source reflects the October 2026 implementation review. The application
-version is `0.5.0`; its deterministic behavioral model is `2.5.0`, with feature
+This wiki source reflects the 2026-10-11 implementation review. The application
+version is `0.5.1`; its deterministic behavioral model is `2.6.0`, with feature
 schema `support-features-v2.2.0`. These version numbers identify different
 contracts. Local edits to `wiki/` do not publish the GitHub wiki or a release.
 
@@ -50,14 +50,15 @@ a focus session does not quit the app. Explicit Quit and the browser's confirmed
 Stop action follow the shutdown path.
 
 Current refinements distinguish unavailable input from observed inactivity,
-reset inference dwell across evidence gaps, and expire browser signal displays
+reset inference dwell across evidence gaps, scale smoothing by elapsed time,
+reject non-finite observations, and expire desktop and browser signal displays
 when updates stop. Pulse Room has persistent motion pause and respects reduced
 motion. Shutdown remains pending until the helper verifies process exit; an
 unconfirmed stop remains visible as an error.
 
 See [README.md](https://github.com/StevenWang-CY/cortex/blob/main/README.md) for developer commands and
 [IMPLEMENTATION.md](https://github.com/StevenWang-CY/cortex/blob/main/IMPLEMENTATION.md) for the implementation history.
-The current checkout's `docs/implementation-2026-10.md` records the latest audit,
+The current checkout's `docs/release/0.5.1-validation.md` records the latest review,
 design decisions, completed changes, validation and remaining release/research
 requirements. A verified local ad-hoc arm64 build is not a published, notarized
 release or physiological validation.

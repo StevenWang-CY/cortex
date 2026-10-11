@@ -68,6 +68,10 @@ jobs:
           pnpm --dir cortex/apps/browser_extension test
           pnpm --dir cortex/apps/browser_extension exec plasmo build
           pnpm --dir cortex/apps/browser_extension exec plasmo build --target=edge-mv3
+      - name: Enforce built-bundle budgets and deterministic replay
+        run: |
+          uv run --project cortex --locked --extra dev --extra codegen pytest cortex/tests/performance/test_bundle_size.py -q
+          uv run --project cortex --locked --extra dev --extra codegen python -m cortex.services.eval.regression_harness
       - name: VS Code extension lint, compile, and test
         run: |
           npm --prefix cortex/apps/vscode_extension run lint
@@ -185,6 +189,8 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           TEMP_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_TEMP_KEYCHAIN_PASSWORD }}
         run: |
+          set -euo pipefail
+          umask 077
           : "${APPLE_DEVELOPER_ID_P12_BASE64:?missing certificate secret}"
           : "${APPLE_DEVELOPER_ID_P12_PASSWORD:?missing certificate password}"
           : "${TEMP_KEYCHAIN_PASSWORD:?missing temporary keychain password}"
@@ -194,40 +200,61 @@ jobs:
           )"
           CERTIFICATE_PATH="${RUNNER_TEMP}/developer-id.p12"
           KEYCHAIN_PATH="${RUNNER_TEMP}/cortex-signing.keychain-db"
+          if [[ -e "${KEYCHAIN_PATH}" ]]; then
+            echo "::error::Refusing to replace an existing signing Keychain"
+            exit 1
+          fi
+          KEYCHAIN_OWNED=0
+          KEEP_KEYCHAIN=0
           CREDENTIAL_FILES=("${CERTIFICATE_PATH}")
-          cleanup_decoded_credentials() {
+          cleanup_signing_setup() {
+            local result=$?
             rm -f "${CREDENTIAL_FILES[@]}"
+            if [[ "${KEYCHAIN_OWNED}" == "1" && "${KEEP_KEYCHAIN}" != "1" ]]; then
+              security delete-keychain "${KEYCHAIN_PATH}" >/dev/null 2>&1 || true
+            fi
+            return "${result}"
           }
-          trap cleanup_decoded_credentials EXIT
+          trap cleanup_signing_setup EXIT
           printf '%s' "${APPLE_DEVELOPER_ID_P12_BASE64}" | base64 --decode > "${CERTIFICATE_PATH}"
           if [[ "${NOTARY_AUTH_MODE}" == "api-key" ]]; then
             NOTARY_KEY_PATH="${RUNNER_TEMP}/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
             CREDENTIAL_FILES+=("${NOTARY_KEY_PATH}")
             printf '%s' "${APPLE_NOTARY_KEY_P8_BASE64}" | base64 --decode > "${NOTARY_KEY_PATH}"
           fi
+          # Register cleanup before creation: even a partial creation or a
+          # failed notary validation must not strand imported private keys.
+          KEYCHAIN_OWNED=1
+          echo "CORTEX_CI_KEYCHAIN=${KEYCHAIN_PATH}" >> "${GITHUB_ENV}"
+          echo "CORTEX_NOTARIZE_KEYCHAIN=${KEYCHAIN_PATH}" >> "${GITHUB_ENV}"
           security create-keychain -p "${TEMP_KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
           security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
           security unlock-keychain -p "${TEMP_KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
           security import "${CERTIFICATE_PATH}" -P "${APPLE_DEVELOPER_ID_P12_PASSWORD}" -A -t cert -f pkcs12 -k "${KEYCHAIN_PATH}"
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${TEMP_KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${TEMP_KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}" >/dev/null
           security list-keychains -d user -s "${KEYCHAIN_PATH}" login.keychain-db
-          if [[ "${NOTARY_AUTH_MODE}" == "api-key" ]]; then
-            xcrun notarytool store-credentials cortex-ci-notary \
-              --key "${NOTARY_KEY_PATH}" \
-              --key-id "${APPLE_NOTARY_KEY_ID}" \
-              --issuer "${APPLE_NOTARY_ISSUER_ID}" \
-              --keychain "${KEYCHAIN_PATH}"
-          else
-            xcrun notarytool store-credentials cortex-ci-notary \
-              --apple-id "${APPLE_ID_USERNAME}" \
-              --password "${APPLE_ID_APP_PASSWORD}" \
-              --team-id "${APPLE_TEAM_ID}" \
-              --keychain "${KEYCHAIN_PATH}"
+          store_notary_credentials() {
+            if [[ "${NOTARY_AUTH_MODE}" == "api-key" ]]; then
+              xcrun notarytool store-credentials cortex-ci-notary \
+                --key "${NOTARY_KEY_PATH}" \
+                --key-id "${APPLE_NOTARY_KEY_ID}" \
+                --issuer "${APPLE_NOTARY_ISSUER_ID}" \
+                --keychain "${KEYCHAIN_PATH}"
+            else
+              xcrun notarytool store-credentials cortex-ci-notary \
+                --apple-id "${APPLE_ID_USERNAME}" \
+                --password "${APPLE_ID_APP_PASSWORD}" \
+                --team-id "${APPLE_TEAM_ID}" \
+                --keychain "${KEYCHAIN_PATH}"
+            fi
+          }
+          if ! store_notary_credentials; then
+            echo "::error::Apple notarization validation failed. For HTTP 403 reporting a missing or expired agreement, the Apple Developer Account Holder must review the team's agreements before retrying. Signing and publication remain blocked."
+            exit 1
           fi
-          cleanup_decoded_credentials
-          trap - EXIT
-          echo "CORTEX_CI_KEYCHAIN=${KEYCHAIN_PATH}" >> "${GITHUB_ENV}"
-          echo "CORTEX_NOTARIZE_KEYCHAIN=${KEYCHAIN_PATH}" >> "${GITHUB_ENV}"
+          # Only a validated setup hands the Keychain to subsequent build
+          # steps. The EXIT trap still deletes the decoded p12/p8 files.
+          KEEP_KEYCHAIN=1
 
       - name: Build, sign, notarize, staple, mount, and verify DMG
         env:

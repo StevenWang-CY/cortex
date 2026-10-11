@@ -48,7 +48,7 @@ describes the reviewed changes and verification boundaries. The earlier
 2. **Support inference.** `state_engine` currently applies deterministic
    fixed-denominator behavior rules, explicit abstention, smoothing, and
    hysteresis. Outputs are heuristic evidence strengths, not probabilities or
-   diagnostic states. The registered model is `deterministic-support@2.5.0`
+   diagnostic states. The registered model is `deterministic-support@2.6.0`
    with `support-features-v2.2.0`. Camera signals are diagnostic-only for this
    decision and cannot change reading-check-in eligibility.
 3. **Eligibility and context.** trigger gates decide whether to assemble
@@ -106,8 +106,11 @@ exposure. Source loss or a sampling gap above 3 seconds restarts that exposure.
 Typing variance requires two positive intervals between regular keypresses;
 backspaces cannot satisfy this readiness condition.
 
-The smoother retains per-sample EMA updates at the nominal 500 ms cadence.
-Duplicate or regressed timestamps do not update it. A gap above 3 seconds
+The smoother scales EMA retention by actual elapsed time, preserving the
+nominal 500 ms response. Duplicate or regressed timestamps do not update it;
+non-finite times are rejected and a changed clock domain starts a new history.
+Fusion counts only ordered source updates and restarts telemetry warm-up after
+a gap above 3 seconds. A gap above 3 seconds in inference
 clears accumulated scores, pending confirmation and the committed label before
 fresh evidence begins another dwell. This continuity rule is an engineering
 bound, not a claim about a person's cognitive timescale.

@@ -10,7 +10,7 @@ diagnostic or accurate against an independent sensor.
 
 The current protocol is `calibration/2.0.0`, with profile schema `2.0` and
 calibration feature schema `features/2.0`. These are separate from behavioral
-inference's `support-features-v2.2.0` and model `2.5.0`. The
+inference's `support-features-v2.2.0` and model `2.6.0`. The
 [current implementation record](../../docs/implementation-2026-10.md) and
 [behavioral model card](../../docs/model-cards/deterministic-support-v2.md)
 describe that boundary.

@@ -41,6 +41,7 @@ make typecheck        # mypy --strict
 make codegen          # regenerate TypeScript schema types
 make codegen-check    # the CI drift gate
 make ci               # local Python/contract subset of the hosted workflow
+make verify           # full local source, client build, replay and audit gates
 ./cortex/scripts/run_python_gate.sh  # canonical lint/types/wheel/tests/coverage gate
 ```
 
@@ -66,12 +67,14 @@ Don't hand-edit generated declarations; regenerate them from their Python source
 
 ## Algorithm, UI and lifecycle changes
 
-Read the [current implementation record](docs/implementation-2026-10.md),
+Read the [current validation record](docs/release/0.5.1-validation.md),
 [model card](docs/model-cards/deterministic-support-v2.md) and
 [UI contract](cortex/docs/ui-design.md) before changing their invariants.
 
 - Input availability is distinct from measured zero. Observation gaps cannot
   satisfy dwell, and camera physiology remains outside behavioral inference.
+  Reject non-finite values before transport. Smoothing uses elapsed monotonic
+  time; keep its 500 ms nominal behavior and test alternate cadences and boots.
 - After changing a declared behavioral component, regenerate/check
   `cortex.scripts.generate_support_model_identity` using the locked interpreter;
   review whether the model version, feature schema and model card must change.

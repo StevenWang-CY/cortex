@@ -11,6 +11,8 @@ from __future__ import annotations
 import logging
 from collections import deque
 from dataclasses import dataclass
+from math import expm1, isfinite, log1p
+from uuid import UUID
 
 from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 from cortex.libs.config.settings import StateConfig
@@ -44,6 +46,9 @@ EXIT_TO_UNKNOWN_DWELL_SECONDS: float = 10.0
 # Six missed 500 ms evaluations reach the existing source freshness boundary.
 # A longer gap is not continuous observation and cannot satisfy any dwell.
 MAX_EVIDENCE_GAP_SECONDS: float = 3.0
+# Preserve the reviewed 2 Hz response while making it independent of jitter
+# or delivery frequency: retention(dt) = (1 - alpha) ** (dt / 0.5).
+NOMINAL_UPDATE_SECONDS: float = 0.5
 
 
 @dataclass
@@ -118,6 +123,7 @@ class ScoreSmoother:
         self._config = config or StateConfig()
         self._clock = clock or SYSTEM_CLOCK
         self._alpha = self._config.ema_alpha
+        self._step_alpha = self._alpha
         self._smoothed = SmoothedScores()
         self._current_state = UserState.UNKNOWN
         self._state_entered_at: float | None = None
@@ -128,6 +134,7 @@ class ScoreSmoother:
         # exit threshold (None while it is above). Drives the exit dwell.
         self._exit_candidate_since: float | None = None
         self._last_update_at: float | None = None
+        self._last_boot_id: UUID | None = None
         self._transitions: deque[StateTransition] = deque(maxlen=100)
         self._last_contributions: list[FeatureContribution] = []
         self._latest: StateEstimate | None = None
@@ -159,12 +166,25 @@ class ScoreSmoother:
             supplied_now = (
                 timestamp if timestamp is not None else monotonic_seconds(self._clock)
             )
+        if not isfinite(supplied_now):
+            raise ValueError("inference timestamp must be finite")
+        boot_id = event_time.boot_id if event_time is not None else self._clock.boot_id
+        if self._last_boot_id is not None and boot_id != self._last_boot_id:
+            # Monotonic values from different boots are never comparable.
+            # Start a new temporal history even if the numeric time increased.
+            self.reset()
+        self._last_boot_id = boot_id
         # Replayed timestamps are not new evidence. In particular, repeated
         # delivery must not amplify one observation through multiple EMA steps.
         if self._last_update_at is not None and supplied_now <= self._last_update_at:
             assert self._latest is not None
             return self._latest.model_copy(deep=True)
         now = supplied_now
+        elapsed = (
+            NOMINAL_UPDATE_SECONDS
+            if self._last_update_at is None
+            else now - self._last_update_at
+        )
         if (
             self._last_update_at is not None
             and now - self._last_update_at > MAX_EVIDENCE_GAP_SECONDS
@@ -179,6 +199,12 @@ class ScoreSmoother:
             self._force_unknown(now, event_time)
             self._smoothed = SmoothedScores()
             self._exit_candidate_since = None
+            elapsed = NOMINAL_UPDATE_SECONDS
+        # expm1/log1p preserve precision for tiny positive intervals/weights.
+        self._step_alpha = (
+            1.0 if self._alpha == 1.0
+            else -expm1(log1p(-self._alpha) * elapsed / NOMINAL_UPDATE_SECONDS)
+        )
         self._last_update_at = now
         if self._state_entered_at is None:
             self._state_entered_at = now
@@ -355,7 +381,7 @@ class ScoreSmoother:
         )
 
     def _ema(self, previous: float, current: float) -> float:
-        return self._alpha * current + (1.0 - self._alpha) * previous
+        return self._step_alpha * current + (1.0 - self._step_alpha) * previous
 
     def _decay_scores(self) -> None:
         self._smoothed.flow = self._ema(self._smoothed.flow, 0.0)
@@ -536,5 +562,8 @@ class ScoreSmoother:
         self._candidate_since = 0.0
         self._exit_candidate_since = None
         self._last_update_at = None
+        self._last_boot_id = None
+        self._step_alpha = self._alpha
+        self._last_contributions = []
         self._transitions.clear()
         self._latest = None

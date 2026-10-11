@@ -2,7 +2,7 @@
 # =============================================================================
 # Cortex macOS Build Pipeline
 #
-# Produces dist/Cortex.dmg from the project source.
+# Produces dist/Cortex-<version>-macos-<arch>.dmg from the project source.
 # Steps: extensions → key-free env → PyInstaller → sign app → DMG → sign → notarize → verify
 # =============================================================================
 set -euo pipefail

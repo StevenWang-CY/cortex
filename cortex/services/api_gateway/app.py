@@ -23,8 +23,9 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
 from cortex import __version__
@@ -102,13 +103,30 @@ def create_app(
     # readable without a token. Off unless explicitly enabled for development.
     app = FastAPI(
         title="Cortex API Gateway",
-        description="Somatic Workspace Engine — Internal Service API",
+        description="Local Workspace Support — Internal Service API",
         version=__version__,
         lifespan=lifespan,
         docs_url="/docs" if cfg.expose_api_docs else None,
         redoc_url="/redoc" if cfg.expose_api_docs else None,
         openapi_url="/openapi.json" if cfg.expose_api_docs else None,
     )
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error_response(
+        request: Request, error: RequestValidationError,
+    ) -> JSONResponse:
+        # Pydantic includes the rejected input and validator context in its
+        # default errors. Echoing them can disclose selected workspace data;
+        # NaN/Infinity inputs also make JSONResponse itself raise, turning a
+        # validation failure into HTTP 500. Keep the standard detail shape
+        # with actionable field locations, without input/context values.
+        return JSONResponse(
+            status_code=422,
+            content={"detail": [
+                {key: item[key] for key in ("type", "loc", "msg") if key in item}
+                for item in error.errors()
+            ]},
+        )
 
     # F13: per-route rate limiting. Registered BEFORE the correlation
     # middleware in source order — Starlette's middleware stack treats

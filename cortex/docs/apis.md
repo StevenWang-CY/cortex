@@ -4,7 +4,7 @@ Cortex exposes a REST API on `http://127.0.0.1:9472` and a WebSocket server on `
 
 Pydantic schemas in `cortex/libs/schemas/` are authoritative. Examples below are
 selected payloads, not substitutes for generated schemas. See the
-[current implementation record](../../docs/implementation-2026-10.md) for the
+[current validation record](../../docs/release/0.5.1-validation.md) for the
 model, source-availability and lifecycle changes.
 
 ## REST API
@@ -21,6 +21,12 @@ processes. New v2 payloads use explicit `observed_at_unix_ms`,
 Operational HTTP routes, including sensitive reads and mutations, require a capability token, sent as `Authorization: Bearer <token>` (canonical) or via the legacy `X-Cortex-Auth-Token: <token>` header. The token is generated at first daemon start and persisted with mode `0600` at `~/Library/Application Support/Cortex/auth.token`. Missing or wrong tokens return `401 Unauthorized` with `WWW-Authenticate: Bearer`. `GET /health` accepts an optional token (the supervisor liveness probe must reach the daemon without owning the token).
 
 Every mutating response also carries an `X-Cortex-Request-ID` header. Clients may set their own on the request to correlate across logs (F19); otherwise the server generates one.
+
+Authenticated requests with invalid fields return HTTP 422 and a `detail`
+array of `{type, loc, msg}` entries. Rejected input and validator context are
+excluded from that response. Feature measurements and timestamps must be
+finite: NaN and infinity cannot enter the observation pipeline. Authentication
+is checked before request-body validation.
 
 ---
 
@@ -195,7 +201,7 @@ Compute an evidence-aware deterministic support estimate. Named
 `FeatureValue` entries are canonical; flat fields are decode-only. Every named
 entry carries validity, quality, age, source-window exposure, algorithm
 version, and a missing reason when invalid. The current registered model is
-`deterministic-support@2.5.0`, using `support-features-v2.2.0`.
+`deterministic-support@2.6.0`, using `support-features-v2.2.0`.
 The smoother ignores duplicate/regressed observation times and resets scores,
 pending confirmation and the committed label after gaps above 3 seconds.
 Supply the complete v2 time tuple for explicit observation timing; without it,

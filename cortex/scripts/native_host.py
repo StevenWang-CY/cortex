@@ -83,8 +83,8 @@ def log(msg: str) -> None:
 def read_message_bytes() -> bytes | None:
     """Read a native messaging request from stdin as raw bytes.
 
-    Returns ``None`` when stdin is closed before a full length prefix
-    arrives. Length-prefix-only validation lives here so callers can
+    Returns ``None`` when stdin is closed before any length-prefix bytes
+    arrive; partial frames raise. Length-prefix validation lives here so callers can
     defer schema parsing to :func:`parse_native_message` (audit F14).
     The legacy ``read_message()`` returned a parsed ``dict`` and used an
     8 MB cap; the new contract is 64 KB and a bytes return so the
@@ -92,21 +92,23 @@ def read_message_bytes() -> bytes | None:
     JSON in one place.
     """
     raw_length = sys.stdin.buffer.read(4)
-    if len(raw_length) < 4:
+    if not raw_length:
         return None
+    if len(raw_length) < 4:
+        raise ValueError("native_message_truncated_header")
     length = struct.unpack("<I", raw_length)[0]
     # Tight cap (64 KB) lives in the schema module; reject earlier here
     # so we never allocate megabytes for an obviously-bogus prefix.
     # The schema layer rejects again — defense in depth.
     if length > 64 * 1024:
-        # Drain whatever bytes are available so we don't desync the
-        # protocol for the next message; cap at 1 MB to bound work.
-        try:
-            sys.stdin.buffer.read(min(length, 1024 * 1024))
-        except Exception as drain_exc:
-            log(f"oversized-payload drain failed: {drain_exc}")
-        return b""
-    return sys.stdin.buffer.read(length)
+        # sendNativeMessage starts one host per request. There is no next
+        # frame to realign; draining waits indefinitely if the browser keeps
+        # stdin open after a corrupt length prefix.
+        raise ValueError("native_message_too_large")
+    payload = sys.stdin.buffer.read(length)
+    if len(payload) != length:
+        raise ValueError("native_message_truncated_payload")
+    return payload
 
 
 def send_message(msg: dict[str, object]) -> None:
@@ -432,7 +434,7 @@ def main() -> None:
 
         raw = read_message_bytes()
         if raw is None:
-            # stdin closed without a full prefix; nothing we can usefully
+            # stdin closed without any prefix; nothing we can usefully
             # reply to. The Chrome native-messaging protocol expects no
             # further output in this case.
             log("stdin closed before payload arrived")
@@ -496,7 +498,14 @@ def main() -> None:
         try:
             _send_validated_response(_native_error(e))
         except Exception:
-            pass
+            # A broken/missing schema dependency must still produce a framed
+            # error. This fixed envelope is intentionally stdlib-only and
+            # discloses no exception details or local paths.
+            try:
+                send_message(_native_error("native_host_initialization_failed"))
+            except Exception:
+                # A closed stdout is the one boundary we cannot report over.
+                pass
 
 
 if __name__ == "__main__":

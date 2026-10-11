@@ -11,6 +11,7 @@ tracks per-channel signal quality for downstream state classification.
 from __future__ import annotations
 
 import logging
+from math import isfinite
 
 from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 from cortex.libs.schemas.features import (
@@ -26,6 +27,8 @@ from cortex.libs.schemas.state import SignalQuality
 from cortex.libs.schemas.temporal import EventTime
 
 logger = logging.getLogger(__name__)
+
+MAX_SOURCE_GAP_SECONDS = 3.0
 
 
 class FeatureFusion:
@@ -80,9 +83,10 @@ class FeatureFusion:
         today so this is belt-and-braces, but the ordering invariant must
         match the code regardless.
         """
-        self._physio_timestamp = (
-            timestamp if timestamp is not None else monotonic_seconds(self._clock)
-        )
+        now = self._source_time(timestamp)
+        if self._physio is not None and now <= self._physio_timestamp:
+            return
+        self._physio_timestamp = now
         self._physio = features
 
     def update_kinematics(
@@ -92,9 +96,10 @@ class FeatureFusion:
 
         Phase 4 fix #5: see ``update_physio`` for ordering rationale.
         """
-        self._kinematics_timestamp = (
-            timestamp if timestamp is not None else monotonic_seconds(self._clock)
-        )
+        now = self._source_time(timestamp)
+        if self._kinematics is not None and now <= self._kinematics_timestamp:
+            return
+        self._kinematics_timestamp = now
         self._kinematics = features
 
     def update_telemetry(
@@ -104,11 +109,21 @@ class FeatureFusion:
 
         Phase 4 fix #5: see ``update_physio`` for ordering rationale.
         """
-        self._telemetry_timestamp = (
-            timestamp if timestamp is not None else monotonic_seconds(self._clock)
-        )
+        now = self._source_time(timestamp)
+        if self._telemetry is not None:
+            if now <= self._telemetry_timestamp:
+                return
+            if now - self._telemetry_timestamp > MAX_SOURCE_GAP_SECONDS:
+                self._telemetry_seen_count = 0
+        self._telemetry_timestamp = now
         self._telemetry = features
         self._telemetry_seen_count += 1
+
+    def _source_time(self, timestamp: float | None) -> float:
+        now = timestamp if timestamp is not None else monotonic_seconds(self._clock)
+        if not isfinite(now):
+            raise ValueError("feature timestamp must be finite")
+        return now
 
     def fuse(
         self,
@@ -131,7 +146,7 @@ class FeatureFusion:
         if event_time is not None:
             now = event_time.observed_at_mono_ns / 1_000_000_000.0
         else:
-            now = timestamp if timestamp is not None else monotonic_seconds(self._clock)
+            now = self._source_time(timestamp)
 
         # Physio features (dimensions 1-3 + respiration)
         hr = None
@@ -449,10 +464,11 @@ class FeatureFusion:
         """Build a truthful named value from source presence and freshness."""
 
         fresh = age_ms <= 13_000
+        finite = value is not None and isfinite(value)
         valid = (
             source_present
             and measurement_ready
-            and value is not None
+            and finite
             and fresh
             and quality > 0.0
         )
@@ -470,6 +486,8 @@ class FeatureFusion:
             reason = MissingReason.SOURCE_DISCONNECTED
         elif not fresh:
             reason = MissingReason.FRAME_DROPPED
+        elif value is not None and not finite:
+            reason = MissingReason.ARTIFACT
         elif not measurement_ready:
             reason = MissingReason.INSUFFICIENT_WINDOW
         else:

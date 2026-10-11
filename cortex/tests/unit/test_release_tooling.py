@@ -960,6 +960,36 @@ def test_release_evidence_records_missing_optional_builder_tool() -> None:
     )
 
 
+@pytest.mark.parametrize("corepack_available", [True, False])
+def test_release_evidence_uses_the_same_package_manager_context_as_the_build(
+    monkeypatch: pytest.MonkeyPatch, corepack_available: bool,
+) -> None:
+    from cortex.scripts import generate_release_evidence as evidence
+
+    monkeypatch.setattr(evidence.shutil, "which", lambda _: "/fixture/corepack" if corepack_available else None)
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        # A machine-wide pnpm must never be mistaken for the project pin.
+        version = "9.15.9" if kwargs["cwd"] == _ROOT / "cortex/apps/browser_extension" else "12.4.1"
+        return subprocess.CompletedProcess(command, 0, stdout=version, stderr="")
+
+    monkeypatch.setattr(evidence.subprocess, "run", run)
+    assert evidence._browser_package_manager_version() == "9.15.9"
+    expected = ["corepack", "pnpm", "--version"] if corepack_available else ["pnpm", "--version"]
+    assert calls[0][0] == expected
+    assert calls[0][1]["timeout"] == 30
+
+
+def test_release_evidence_tool_probe_cannot_hang(monkeypatch: pytest.MonkeyPatch) -> None:
+    def timeout(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+    assert _command(["fixture-tool", "--version"]) == "unavailable (timeout)"
+
+
 def test_release_evidence_rejects_checksum_paths(tmp_path: Path) -> None:
     artifact = tmp_path / f"Cortex-{__version__}-macos-arm64.dmg"
     artifact.write_bytes(b"artifact")
@@ -1552,4 +1582,3 @@ def test_independently_reviewed_notes_state_both_architectures(tmp_path: Path) -
     assert report["ci_only_architectures"] == []
     assert "Tier: independently reviewed" in notes
     assert "CI-verified only" not in notes
-

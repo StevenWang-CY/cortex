@@ -15,10 +15,11 @@ covers the completed evidence-continuity, runtime and interface refinement.
 [Earlier implementation history](../IMPLEMENTATION.md) remains available.
 This README describes the current package and product boundary.
 
-Application version remains `0.5.0`; behavioral model `2.5.0` uses
-`support-features-v2.2.0`. The October local arm64 build passed mounted-artifact
-startup/shutdown and same-profile restart checks. It is an ad-hoc development
-artifact, not a new published or notarized release.
+Application version is `0.5.1`; behavioral model `2.6.0` uses
+`support-features-v2.2.0`. See the [current validation record](../docs/release/0.5.1-validation.md)
+for source checks, packaging and publication status. Run `make verify` from
+the repository root for the full local release checks. A local ad-hoc build
+does not establish notarization or a public release.
 
 ## Safety and evidence status
 
@@ -127,7 +128,9 @@ reinterpreted as evidence.
 Input silence is evidence only while the corresponding listener is available.
 Typing variance requires at least two positive regular-key intervals;
 backspaces do not satisfy that count. Nonincreasing timestamps are ignored by
-smoothing; gaps above three seconds reset scores and dwell. The model identity
+smoothing and fusion; gaps above three seconds reset scores, dwell and source
+warm-up. Smoothing scales by elapsed time, numeric evidence must be finite,
+and clock-domain changes restart confirmation. The model identity
 includes eleven telemetry/schema/fusion/smoothing/scoring components; it does
 not hash the entire runtime, configuration or intervention policy. See the
 [model card](../docs/model-cards/deterministic-support-v2.md) for precise scope.

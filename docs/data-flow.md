@@ -1,6 +1,6 @@
 # Data flow and deletion map
 
-This document names the implemented flows in Cortex 0.5.0. The canonical
+This document names the implemented flows in Cortex 0.5.1. The canonical
 external-context disclosure is [cortex/docs/privacy.md](../cortex/docs/privacy.md);
 security controls are in [cortex/docs/security.md](../cortex/docs/security.md).
 The [current implementation record](implementation-2026-10.md) documents the
@@ -30,7 +30,7 @@ flowchart LR
 ```
 
 Camera diagnostics have no edge into production support scoring or automatic
-state-driven eligibility. The behavioral model is `deterministic-support@2.5.0`
+state-driven eligibility. The behavioral model is `deterministic-support@2.6.0`
 with `support-features-v2.2.0`. Missing input sources contribute no evidence;
 healthy observed zero rates remain usable. Source loss or an acquisition gap
 above 3 seconds restarts inactivity exposure. Duplicate/regressed inference

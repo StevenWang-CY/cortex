@@ -126,15 +126,16 @@ Cortex is a macOS research prototype for local behavioral support and optional e
 
 38. **Unavailable input is not observed inactivity.** Preserve per-device listener availability and restart exposure after gaps; calibration must reject unavailable mouse samples. Typing variance requires two positive regular-key intervals, independently of backspace count.
 
-39. **Missing time cannot earn inference dwell.** Ignore nonincreasing timestamps; gaps above the documented 3-second continuity bound reset scores and dwell. Regenerate model identity after changing a declared component; changing a threshold also requires reviewing model version and card.
+39. **Missing time cannot earn inference dwell.** Ignore nonincreasing timestamps; gaps above the documented 3-second continuity bound reset scores and dwell. Smoothing weights scale with elapsed monotonic time from a 500 ms nominal cadence; boot changes reset continuity. Reject NaN/infinity before transport. Regenerate model identity after changing a declared component; changing a threshold also requires reviewing model version and card.
 
 40. **Stop intent is not confirmed shutdown.** Coalesce Stop requests, invalidate/drain an already-issued launch, and prevent stale continuations from enabling the camera. Only a verified native/launcher result can report stopped. Clear stale proposal presentation while preserving durable restoration receipts and snapshots.
 
 41. **Final Qt quit must reach the event loop.** Intercept explicit Quit for the recap flow, then remove the filter before the final `QApplication.quit()`. Ordinary dashboard close must not stop the session in either desktop mode. Test actual Qt event loops; mocked `quit()` cannot prove exit.
 
-42. **Presentation must share evidence lifetime.** Popup/new-tab signal display expires after ten seconds without updates and clears on disconnect or invalid data. Dashboard Review explicitly focuses the current suggestion; arrival itself must not steal focus. Keep completed task diagnostics bounded and value-only, while retaining ownership of unfinished cleanup tasks.
+42. **Presentation must share evidence lifetime.** Desktop/popup/new-tab signal display expires after ten seconds without updates and clears on disconnect or invalid data. Hidden windows still expire, and queued state cannot repopulate an ended session. Dashboard Review explicitly focuses the current suggestion; arrival itself must not steal focus. Keep completed task diagnostics bounded and value-only, while retaining ownership of unfinished cleanup tasks.
 
-Current implementation and verification: [October refinement](docs/implementation-2026-10.md).
+Current verification: [0.5.1 validation](docs/release/0.5.1-validation.md).
+Implementation history: [October refinement](docs/implementation-2026-10.md).
 
 ---
 

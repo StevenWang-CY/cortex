@@ -131,7 +131,7 @@ Optional planning transports are AWS Bedrock, GCP Vertex, and the direct
 Anthropic API; all are BYOK, network-off by default, and remain outside the
 authority boundary.
 
-The current model is `2.5.0` and its feature schema is
+The current model is `2.6.0` and its feature schema is
 `support-features-v2.2.0`. Its generated eleven-component identity covers
 telemetry schema/acquisition/aggregation, focus graph, feature fusion, smoothing,
 feature catalog, registry, scorer and inference wrapper. It is not a whole-app

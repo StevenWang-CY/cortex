@@ -6,6 +6,11 @@ verification below is present.
 
 ## Current local validation
 
+The current source candidate is **0.5.1**. Its algorithm, UI, protocol, and
+packaging checks are tracked in the [0.5.1 validation record](0.5.1-validation.md).
+The following 0.5.0 results are historical evidence and do not establish a
+signed 0.5.1 release.
+
 The 2026-10-02 review built application version **0.5.0** as an **ad-hoc
 arm64 development artifact** from the changed working tree. Its mounted DMG
 passed bundle identity/layout, strict nested signature, forbidden-pattern,
@@ -70,8 +75,17 @@ set:
 
 Partial or mixed credential sets fail before a Keychain is created. Secrets are
 decoded only into the runner temporary directory, imported into a temporary
-Keychain, removed after import even when credential validation fails, and the
-Keychain is deleted in an `always()` cleanup step.
+Keychain, and removed by an exit trap even when credential validation fails.
+Failed setup deletes its owned Keychain immediately; successful setup hands it
+to the existing `always()` cleanup step. Key material uses private file modes.
+
+An Apple HTTP 403 reporting a missing or expired agreement requires the Apple
+Developer Account Holder to review the team's agreements in the Developer
+portal and App Store Connect. Rotating passwords or bypassing notarization
+does not resolve this account condition. After the agreement is accepted,
+rerun the failed release workflow; retain the same source tag and evidence
+requirements. The preceding v0.5.0 workflow encountered this condition on both
+architectures.
 
 The scrubbed key-free environment consumed by PyInstaller and any developer
 environment backup are also staged in the runner temporary directory, outside

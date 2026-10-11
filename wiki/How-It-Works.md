@@ -32,7 +32,7 @@ proxies only.
 
 ## 3. Estimate a support hypothesis
 
-The production model (`2.5.0`, feature schema `support-features-v2.2.0`) is
+The production model (`2.6.0`, feature schema `support-features-v2.2.0`) is
 deterministic and has no fitted training data. It combines
 mouse, keyboard, tab, reread, and focus-transition features with fixed
 denominators and explicit evidence coverage. Insufficient, weak, warming, or

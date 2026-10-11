@@ -43,7 +43,9 @@ class FeatureName(StrEnum):
 class FeatureValue(BaseModel):
     """One named, provenance-bearing input to the support engine."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True, use_enum_values=True)
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, use_enum_values=True, allow_inf_nan=False,
+    )
 
     value: float | None = None
     valid: bool = False
@@ -70,6 +72,8 @@ class FeatureValue(BaseModel):
 
 class FrameMeta(BaseModel):
     """Metadata for a captured webcam frame."""
+
+    model_config = ConfigDict(allow_inf_nan=False)
 
     timestamp: float = Field(
         ...,
@@ -161,6 +165,8 @@ class FrameMeta(BaseModel):
 
 class PhysioFeatures(BaseModel):
     """Physiological features extracted from rPPG analysis."""
+
+    model_config = ConfigDict(allow_inf_nan=False)
 
     pulse_bpm: float | None = Field(
         None, ge=30.0, le=220.0, description="Instantaneous heart rate in BPM"
@@ -256,6 +262,8 @@ class PhysioFeatures(BaseModel):
 class KinematicFeatures(BaseModel):
     """Kinematic features from face mesh and pose estimation."""
 
+    model_config = ConfigDict(allow_inf_nan=False)
+
     blink_rate: float | None = Field(
         None, ge=0.0, le=60.0, description="Blinks per minute"
     )
@@ -332,6 +340,8 @@ class KinematicFeatures(BaseModel):
 
 class TelemetryFeatures(BaseModel):
     """Telemetry features from mouse, keyboard, and window tracking."""
+
+    model_config = ConfigDict(allow_inf_nan=False)
 
     mouse_velocity_mean: float = Field(
         ..., ge=0.0, description="Mean mouse velocity in px/s"
@@ -413,6 +423,8 @@ class FeatureVector(BaseModel):
     source is represented by an invalid :class:`FeatureValue`, never by a
     fabricated numeric zero.
     """
+
+    model_config = ConfigDict(allow_inf_nan=False)
 
     timestamp: float = Field(
         ...,

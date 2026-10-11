@@ -87,6 +87,58 @@ def test_disconnect_and_reconnect_require_fresh_measurements(dashboard):
     assert tab._bio_numerics.isVisibleTo(tab)
 
 
+def test_connected_dashboard_expires_and_recovers_without_losing_session(dashboard, monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr("cortex.apps.desktop_shell.dashboard.time.monotonic", lambda: clock[0])
+    payload = {"status": "estimated", "state": "FLOW", "biometrics": {"heart_rate": 72},
+               "scores": {"flow": 0.8}}
+    dashboard.set_connected(True)
+    dashboard.update_state(payload)
+    clock[0] = 109.9
+    dashboard._expire_stale_state()
+    assert dashboard._consumer._bpm_label.text() == "72"
+    clock[0] = 110.0
+    dashboard.hide()
+    dashboard._expire_stale_state()
+    assert dashboard._consumer._bpm_label.text() == "--"
+    assert dashboard._consumer._state_label.text() == "Waiting for fresh signals"
+    assert dashboard._consumer._stop_btn.text() == "End session"
+    assert dashboard._advanced._score_labels["flow"].text() == "—"
+    assert not dashboard._advanced._hr_plot._values
+    assert not dashboard._state_freshness_timer.isActive()
+    dashboard.update_state(payload)
+    assert dashboard._consumer._bpm_label.text() == "72"
+    assert dashboard._advanced._score_labels["flow"].text() == "0.80"
+
+
+def test_disconnected_advanced_tab_clears_live_diagnostics(dashboard):
+    dashboard.update_state({"status": "estimated", "state": "FLOW",
+                            "biometrics": {"heart_rate": 72}, "scores": {"flow": 0.8}})
+    dashboard.set_connected(False)
+    assert not dashboard._advanced._hr_plot._values
+    assert dashboard._advanced._score_labels["flow"].text() == "—"
+    assert "offline" in dashboard._advanced._degraded_badge.text()
+
+
+def test_queued_reading_cannot_revive_ending_session(dashboard):
+    payload = {"status": "estimated", "state": "FLOW", "biometrics": {"heart_rate": 72}}
+    dashboard.update_state(payload)
+    dashboard._consumer._arm_stop()
+    dashboard.update_state(payload)
+    assert dashboard._consumer._bpm_label.text() == "--"
+    assert not dashboard._advanced._hr_plot._values
+    assert not dashboard._state_freshness_timer.isActive()
+
+
+def test_pulse_trace_fits_the_entire_supported_range(dashboard):
+    plot = dashboard._advanced._hr_plot
+    for pulse in (30.0, 72.0, 180.0, 220.0, math.nan, math.inf):
+        plot.add_value(pulse)
+    low, high = plot.value_range()
+    assert low < 30.0 < 220.0 < high
+    assert len(plot._values) == 4
+
+
 @pytest.mark.parametrize("value", [math.inf, -math.inf, math.nan, "bad", True, -1])
 def test_invalid_measurements_never_become_zero_or_infinite(value):
     payload = {"biometrics": {"heart_rate": value, "blink_rate": value}, "support_scores": {"flow_like": value}}

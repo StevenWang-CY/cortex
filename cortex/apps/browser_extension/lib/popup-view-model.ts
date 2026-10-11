@@ -307,7 +307,8 @@ export function pulseUnavailableCopy(reason: unknown): string {
     if (code === "filling") {
         const observed = typeof r.observed === "number" ? r.observed : null;
         const required = typeof r.required === "number" ? r.required : null;
-        if (observed !== null && required !== null && required > 0) {
+        if (observed !== null && Number.isFinite(observed) && observed >= 0
+            && required !== null && Number.isFinite(required) && required > 0) {
             return `Reading your pulse… ${Math.round(Math.min(observed, required))} of ${Math.round(required)} s`;
         }
         return fallback;

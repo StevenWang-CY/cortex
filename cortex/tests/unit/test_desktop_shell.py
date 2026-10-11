@@ -762,6 +762,7 @@ class TestDashboard:
         dash = DashboardWindow()
         payload = {
             "state": "FLOW",
+            "status": "estimated",
             "confidence": 0.87,
             "scores": {"flow": 0.87, "hypo": 0.05, "hyper": 0.08, "recovery": 0.0},
             "signal_quality": {"physio": 0.9, "kinematics": 0.85, "telemetry": 0.95},
@@ -774,7 +775,7 @@ class TestDashboard:
 
     def test_state_transitions_no_duplicates(self):
         dash = DashboardWindow()
-        base = {"confidence": 0.8, "scores": {}, "signal_quality": {}, "dwell_seconds": 0, "reasons": []}
+        base = {"status": "estimated", "confidence": 0.8, "scores": {}, "signal_quality": {}, "dwell_seconds": 0, "reasons": []}
         dash.update_state({"state": "FLOW", **base})
         dash.update_state({"state": "FLOW", **base})
         assert len(dash._timeline_events) == 1

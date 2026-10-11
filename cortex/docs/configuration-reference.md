@@ -52,10 +52,10 @@ This reference contains **198 runtime settings**.
 | `state.estimate_entry_threshold` | `CORTEX_STATE__ESTIMATE_ENTRY_THRESHOLD` | `float` | `0.4` | ≥ 0.0; ≤ 1.0 | — |
 | `state.estimate_exit_threshold` | `CORTEX_STATE__ESTIMATE_EXIT_THRESHOLD` | `float` | `0.25` | ≥ 0.0; ≤ 1.0 | — |
 | `state.inference_mode` | `CORTEX_STATE__INFERENCE_MODE` | `Literal[deterministic, safety_null]` | `"deterministic"` | — | — |
-| `state.hyper_dwell_seconds` | `CORTEX_STATE__HYPER_DWELL_SECONDS` | `int` | `30` | — | — |
-| `state.hypo_dwell_seconds` | `CORTEX_STATE__HYPO_DWELL_SECONDS` | `int` | `60` | — | — |
-| `state.flow_dwell_seconds` | `CORTEX_STATE__FLOW_DWELL_SECONDS` | `int` | `120` | — | — |
-| `state.ema_alpha` | `CORTEX_STATE__EMA_ALPHA` | `float` | `0.3` | — | — |
+| `state.hyper_dwell_seconds` | `CORTEX_STATE__HYPER_DWELL_SECONDS` | `int` | `30` | ≥ 0 | — |
+| `state.hypo_dwell_seconds` | `CORTEX_STATE__HYPO_DWELL_SECONDS` | `int` | `60` | ≥ 0 | — |
+| `state.flow_dwell_seconds` | `CORTEX_STATE__FLOW_DWELL_SECONDS` | `int` | `120` | ≥ 0 | — |
+| `state.ema_alpha` | `CORTEX_STATE__EMA_ALPHA` | `float` | `0.3` | > 0.0; ≤ 1.0 | EMA weight per nominal 500 ms; scaled by actual elapsed time |
 | `intervention.execution_mode` | `CORTEX_INTERVENTION__EXECUTION_MODE` | `Literal[suggest_only, authorized, research_autonomous]` | `"suggest_only"` | — | — |
 | `intervention.overlay_threshold` | `CORTEX_INTERVENTION__OVERLAY_THRESHOLD` | `float` | `0.7` | — | — |
 | `intervention.complexity_threshold` | `CORTEX_INTERVENTION__COMPLEXITY_THRESHOLD` | `float` | `0.6` | — | — |
