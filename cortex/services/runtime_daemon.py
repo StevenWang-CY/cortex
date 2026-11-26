@@ -8499,7 +8499,19 @@ class CortexDaemon:
         if "quiet_mode" in settings:
             requested_on = bool(settings["quiet_mode"])
             duration = int(settings.get("quiet_duration_minutes") or 0)
-            if requested_on:
+            if requested_on and self._quiet_mode_kind == "pause":
+                # The pause's own SETTINGS_SYNC tells the dialog
+                # ``quiet_mode: true``, so its next Apply sends the checkbox
+                # back checked. Honouring that as "snooze" turned an
+                # indefinite pause into a timed snooze and reopened the
+                # camera the user had just released. Quiet is already on;
+                # only the dedicated quiet controls change its kind.
+                logger.info(
+                    "settings_sync quiet_mode=true ignored while paused "
+                    "(source=%s)",
+                    settings.get("source") or "settings_sync",
+                )
+            elif requested_on:
                 # Honour an explicit duration; otherwise leave at the
                 # default for snooze_15.
                 await self.set_quiet_mode(
@@ -8648,6 +8660,14 @@ class CortexDaemon:
         # validated configuration even if a compromised client attempted to
         # smuggle a more-authoritative value in SETTINGS_SYNC.
         applied["execution_mode"] = self.intervention_execution_mode
+        # Quiet state is the daemon's, not the sender's. Echoing the raw
+        # payload reported ``quiet_mode: false`` for a pause the daemon kept,
+        # and a partial payload (the browser's ``{webcam_enabled: true}``)
+        # carried no key at all, which the browser reads as "not quiet" —
+        # dropping its own notification gate and inverting its pause
+        # shortcut. Report what ``set_quiet_mode`` broadcasts.
+        applied["quiet_mode"] = self._quiet_mode_kind != "off"
+        applied["quiet_mode_kind"] = self._quiet_mode_kind
         await self._ws_server.broadcast_settings(applied)
 
     # ------------------------------------------------------------------
