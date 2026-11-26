@@ -541,6 +541,11 @@ class ContextPrivacyDialog(QDialog):
         steps: list[Any] = raw_steps if isinstance(raw_steps, list) else []
         step_text = "\n".join(f"• {str(step)}" for step in steps[:5])
         body = "\n".join(part for part in (headline, focus, step_text) if part)
+        # The result page is reused: restate the verdict, or a success after
+        # an earlier failure keeps the "!" / "Request was not sent" heading.
+        self._result_mark.setText("✓")
+        self._result_mark.setStyleSheet(f"color: {CX_SUCCESS_TEXT}; background: transparent;")
+        self._result_title.setText("Request sent once")
         self._result_plan.setText(body)
         self._result_detail.setText(
             "The exact preview was consumed and the response passed the local schema and action-vocabulary checks. No workspace action was authorized."
