@@ -7,7 +7,7 @@ Neither the macOS default bypass list ("*.local, 169.254/16") nor an
 environment proxy without NO_PROXY covers ``127.0.0.1``, so on a Mac
 with a configured proxy the source-mode shell sent its AUTH token to the
 proxy and never reached the daemon. The bridge talks only to loopback
-and must connect directly. (05c748b made the same fix for the privacy
+and must connect directly. (c139007 made the same fix for the privacy
 controller's ``urlopen`` calls.)
 """
 

@@ -13,6 +13,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The 0.6.0 validation record and the release guide state that the `v0.6.0`
   release run stopped at Apple's HTTP 403 (agreement missing or expired) and
   what clears it.
+- The commits of the 0.6.0 round carry the maintainer's GitHub identity. They
+  had gone out under a second account's email; author, committer and sign-off
+  emails were corrected with content, names, dates and messages unchanged, and
+  `v0.6.0` was re-created on the corrected history. The validation record maps
+  the commit identifiers it quotes.
 
 ## [v0.6.0] — 2026-11-26
 

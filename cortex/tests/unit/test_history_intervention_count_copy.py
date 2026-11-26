@@ -1,6 +1,6 @@
 """History's "no interventions" copy must respect the report's real count.
 
-Follow-up to b380ca0 / a02947c. Both empty states were driven by the number
+Follow-up to 5cc8f83 / 42fdd05. Both empty states were driven by the number
 of HYPER state changes, but the report carries a real
 ``interventions_triggered`` counter and the schema says not to conflate the
 two. A session with two interventions and only a FLOW -> HYPO change showed

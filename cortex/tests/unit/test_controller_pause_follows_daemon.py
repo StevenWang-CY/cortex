@@ -10,7 +10,7 @@ Cmd+Shift+/ shortcut or a timed quiet mode decaying. After any of those:
 * pausing from the tray and resuming anywhere else left the dashboard
   frozen on its last reading, because every later state frame was
   dropped as "paused";
-* the tray item's title (which follows the daemon since 499f491) and
+* the tray item's title (which follows the daemon since c794314) and
   its action disagreed: it read "Resume" and requested another pause,
   or read "Pause" and requested a resume.
 

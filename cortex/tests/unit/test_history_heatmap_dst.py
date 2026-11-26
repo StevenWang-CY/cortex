@@ -1,6 +1,6 @@
 """History's hourly heatmap stays on the user's clock across a DST change.
 
-Follow-up to 4f1300d. The bucketing loop kept the UTC offset of a FLOW
+Follow-up to 97bafb9. The bucketing loop kept the UTC offset of a FLOW
 interval's start for the whole interval, so a span crossing a daylight-saving
 change was filed an hour off after the switch. The daemon's own longitudinal
 roll-up steps in UTC and buckets each slice by its own local hour; the
