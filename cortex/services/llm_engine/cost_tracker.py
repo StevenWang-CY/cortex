@@ -134,6 +134,8 @@ class CostTracker:
         # A negative is normalised to 0.0 (the canonical "disabled" sentinel).
         warn_usd = float(warn_usd) if warn_usd > 0 else 0.0
         kill_usd = float(kill_usd) if kill_usd > 0 else 0.0
+        # Kept so a later ``set_kill_usd`` can lift a clamped warning back up.
+        self._configured_warn_usd = warn_usd
         # A misordered pair must never cost the user their spend cap. Raising
         # here re-created the exact failure the block above fixed by another
         # door: the planner's ``except (OSError, ValueError)`` dropped the
@@ -382,6 +384,24 @@ class CostTracker:
     def warn_usd(self) -> float:
         """The soft per-day USD budget cap (the ``WARN`` threshold)."""
         return self._warn_usd
+
+    def set_kill_usd(self, kill_usd: float) -> None:
+        """Change the hard daily cap live (the Settings "Daily LLM cap").
+
+        Same normalisation as the constructor: ``<= 0`` means unlimited, and
+        a cap below the configured warning pulls the warning down to it so
+        the kill-switch stays armed. The one-shot WARN/KILL log latches are
+        re-armed so crossing the new threshold is logged.
+        """
+        kill = float(kill_usd) if kill_usd > 0 else 0.0
+        warn = self._configured_warn_usd
+        if kill > 0 and warn > 0 and kill < warn:
+            warn = kill
+        with self._lock:
+            self._kill_usd = kill
+            self._warn_usd = warn
+            self._killed_today = None
+            self._warned_today = None
 
     def budget_exhausted(self, *, now: datetime | None = None) -> bool:
         """True when today's spend has reached the hard ``kill_usd`` cap.
