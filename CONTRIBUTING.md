@@ -67,7 +67,7 @@ Don't hand-edit generated declarations; regenerate them from their Python source
 
 ## Algorithm, UI and lifecycle changes
 
-Read the [current validation record](docs/release/0.5.1-validation.md),
+Read the [current validation record](docs/release/0.6.0-validation.md),
 [model card](docs/model-cards/deterministic-support-v3.md),
 [physiology qualification](docs/research/physiology-qualification.md) and
 [UI contract](cortex/docs/ui-design.md) before changing their invariants.

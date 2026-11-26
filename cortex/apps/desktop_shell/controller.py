@@ -106,6 +106,10 @@ class DaemonBridge(QObject):
     # CortexAppController so the UI nudges the user toward
     # ``take_biology_break`` without forcing the modal break overlay.
     break_recommendation_received = Signal(dict)
+    # A request to bring the dashboard forward: a tap on a macOS banner, or
+    # the browser's "Open Cortex" through ``POST /dashboard/raise``. The
+    # daemon broadcast RAISE_DASHBOARD to the desktop and nothing listened.
+    raise_dashboard_requested = Signal()
     # P0 §3.4: pushed at ~2 Hz from the CalibrationRunner so the
     # onboarding wizard's ECG trace, status pills, numerics, and bar all
     # stay in sync with the running capture loop. Payload is a plain
@@ -264,6 +268,14 @@ class DaemonBridge(QObject):
             self.auto_focus_armed_changed.emit(False, "")
         except Exception:
             logger.debug("on_stop_focus_auto emit failed", exc_info=True)
+
+    def on_raise_dashboard(self, _payload: dict) -> None:
+        """Queue a RAISE_DASHBOARD so the GUI thread shows the window."""
+
+        try:
+            self.raise_dashboard_requested.emit()
+        except Exception:
+            logger.debug("raise_dashboard_requested emit failed", exc_info=True)
 
     def on_break_recommendation(self, payload: dict) -> None:
         """Queue a BREAK_RECOMMENDATION so the dashboard can offer the break."""
@@ -548,6 +560,7 @@ class CortexAppController:
             self._bridge.break_recommendation_received.connect(
                 self._dashboard.apply_break_recommendation,
             )
+        self._bridge.raise_dashboard_requested.connect(self._show_dashboard)
 
         self._overlay.dismissed.connect(self._on_overlay_dismissed)
         # Overlay buttons are proposal gestures. The controller forwards the
@@ -1103,6 +1116,7 @@ class CortexAppController:
                 MessageType.START_FOCUS_AUTO.value: bridge.on_start_focus_auto,
                 MessageType.STOP_FOCUS_AUTO.value: bridge.on_stop_focus_auto,
                 MessageType.BREAK_RECOMMENDATION.value: bridge.on_break_recommendation,
+                MessageType.RAISE_DASHBOARD.value: bridge.on_raise_dashboard,
                 MessageType.INTERVENTION_FAILED.value: bridge.on_intervention_failed,
                 MessageType.INTERVENTION_TRANSACTION_STATE.value: (
                     bridge.on_intervention_transaction_state

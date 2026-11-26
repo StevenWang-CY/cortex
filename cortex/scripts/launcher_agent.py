@@ -31,6 +31,14 @@ import urllib.request
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# Requests to the daemon and to this launcher on 127.0.0.1 must not go through
+# a proxy. A plain ``urlopen`` builds its opener from ``getproxies()`` -- the
+# ``HTTP_PROXY`` environment or the macOS system proxy -- and a configured proxy
+# cannot reach this machine's loopback: the health check then reads as "not
+# running" and ``/shutdown`` never arrives. An empty ``ProxyHandler`` pins a
+# direct connection.
+_LOOPBACK_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 logger = logging.getLogger(__name__)
 
 PORT = 9471
@@ -488,7 +496,7 @@ def _request_graceful_shutdown(token: str) -> bool:
         headers={_AUTH_TOKEN_HEADER: token} if token else {},
     )
     try:
-        with urllib.request.urlopen(req, timeout=2) as resp:
+        with _LOOPBACK_OPENER.open(req, timeout=2) as resp:
             return 200 <= int(resp.status) < 300
     except urllib.error.HTTPError as exc:
         logger.debug("HTTP /shutdown rejected: %s", exc.code)
@@ -505,7 +513,7 @@ def _daemon_http_alive() -> bool:
     listener still owns the port, so the daemon has not finished closing.
     """
     try:
-        with urllib.request.urlopen(
+        with _LOOPBACK_OPENER.open(
             f"http://127.0.0.1:{DAEMON_HTTP_PORT}/health", timeout=1,
         ):
             return True
@@ -717,8 +725,7 @@ class LauncherHandler(BaseHTTPRequestHandler):
 def _check_existing_launcher() -> bool:
     """Check if another launcher agent is already running on our port."""
     try:
-        import urllib.request
-        resp = urllib.request.urlopen(
+        resp = _LOOPBACK_OPENER.open(
             f"http://127.0.0.1:{PORT}/health", timeout=2,
         )
         data = json.loads(resp.read())

@@ -285,9 +285,10 @@ for exact artifacts and evidence. The sandboxed probes did not access physical
 cameras or the user's real profile, grant TCC permissions, validate VoiceOver,
 establish reference-sensor accuracy, or notarize/publish a release.
 
-The [0.5.1 validation record](release/0.5.1-validation.md) reports the latest
-source and packaging results; the measurements above retain their original
-dates. Desktop live signals now share the browser's ten-second expiry, and
+The [0.6.0 validation record](release/0.6.0-validation.md) reports the latest
+source, packaging and installed-app results, including a camera permission
+grant and a live session on a physical Mac; the measurements above retain
+their original dates and their sandboxed scope. Desktop live signals now share the browser's ten-second expiry, and
 time-scaled smoothing prevents cadence changes from changing the effective
 time constant. Neither correction validates the underlying state labels.
 

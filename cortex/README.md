@@ -16,7 +16,7 @@ covers the completed evidence-continuity, runtime and interface refinement.
 This README describes the current package and product boundary.
 
 Application version is `0.6.0`; support model `3.0.0` uses
-`support-features-v3.0.0`. See the [current validation record](../docs/release/0.5.1-validation.md)
+`support-features-v3.0.0`. See the [current validation record](../docs/release/0.6.0-validation.md)
 for source checks, packaging and publication status. Run `make verify` from
 the repository root for the full local release checks. A local ad-hoc build
 does not establish notarization or a public release.
