@@ -178,6 +178,8 @@ Cortex is a macOS research prototype for local behavioral support and optional e
 
 62. **The Intel Python graph can be reproduced on Apple silicon.** MediaPipe 0.10.21 ships universal2 wheels. Export the lock, keep the lines whose markers hold for `darwin`/`x86_64`/Python 3.12, and install them with `uv pip install --no-deps` into a Python 3.12 environment. That environment has NumPy 1.26 and the Intel Protobuf, runs the real-model test, and audits with `pip-audit -r … --no-deps --disable-pip`. It is not Intel hardware: the hosted Intel job is still the check of record.
 
+63. **A start-up window is not a failure state, and the first seconds need their own screenshot.** `capture.frames_flowing` is false while the camera opens and the face model loads (about twelve seconds), and every client rendered that as "Camera offline — open Settings to allow camera access". Three live runs missed it because each took its first screenshot after the window had passed. A state that means "not yet" needs its own signal (`capture.starting`) and its own wording; when checking an installed build, capture the screen in the first five seconds as well as after it settles.
+
 Current verification: [0.6.0 validation](docs/release/0.6.0-validation.md).
 Implementation history: [October refinement](docs/implementation-2026-10.md).
 

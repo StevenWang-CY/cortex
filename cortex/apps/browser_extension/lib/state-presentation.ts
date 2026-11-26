@@ -40,6 +40,7 @@ export function statePresentationFields(raw: unknown): Pick<CortexState, "biomet
             ...(typeof capture.frames_flowing === "boolean" ? { frames_flowing: capture.frames_flowing } : {}),
             ...(typeof capture.face_detected === "boolean" ? { face_detected: capture.face_detected } : {}),
             stale: capture.stale === true,
+            ...(capture.starting === true ? { starting: true } : {}),
             pulse_unavailable: typeof reason.code === "string" ? {
                 code: reason.code,
                 message: typeof reason.message === "string" ? reason.message : "",

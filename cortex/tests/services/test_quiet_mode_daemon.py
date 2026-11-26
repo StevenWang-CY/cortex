@@ -85,6 +85,21 @@ class _FakeConfig:
         self.intervention = _FakeConfigIntervention()
 
 
+class _FakeServices:
+    """The slice of the service registry that a capture start writes to."""
+
+    def __init__(self) -> None:
+        self.values: dict[str, object] = {}
+        self.history: list[tuple[str, object]] = []
+
+    def register(self, name: str, value: object) -> None:
+        self.values[name] = value
+        self.history.append((name, value))
+
+    def get(self, name: str, default: object = None) -> object:
+        return self.values.get(name, default)
+
+
 class _MinimalDaemon:
     """Pulls just enough of ``RuntimeDaemon`` to exercise set_quiet_mode."""
 
@@ -115,6 +130,11 @@ class _MinimalDaemon:
         self._auto_focus_recovery_started = False
         self._ws_server = _FakeWSServer()
         self.config = _FakeConfig()
+        # A resume from pause is a capture start: the daemon marks it so the
+        # clients say "Starting camera…" until the first frame.
+        self._capture_starting = False
+        self._capture_first_frame_ticks_left: int | None = None
+        self._services = _FakeServices()
 
     def _spawn_background_task(self, coro, *, name=None):
         """Test stub — schedule and immediately cancel so the test's
@@ -133,6 +153,10 @@ class _MinimalDaemon:
     _broadcast_quiet_mode_state = CortexDaemon._broadcast_quiet_mode_state
     set_quiet_mode = CortexDaemon.set_quiet_mode
     _decay_quiet_mode_after = CortexDaemon._decay_quiet_mode_after
+    _set_capture_starting = CortexDaemon._set_capture_starting
+    _hold_capture_starting_until_first_frame = (
+        CortexDaemon._hold_capture_starting_until_first_frame
+    )
     _emit_stop_focus_auto = CortexDaemon._emit_stop_focus_auto
     _reset_auto_focus_timers = CortexDaemon._reset_auto_focus_timers
     _capture_restart_permitted = CortexDaemon._capture_restart_permitted
@@ -182,6 +206,12 @@ async def test_set_quiet_mode_off_resumes_capture_after_pause() -> None:
     # Resume restarts capture.
     assert d._capture_pipeline.started == 1
     assert d._quiet_mode_kind == "off"
+    # The restart was marked as a start in flight, so clients said "Starting
+    # camera…" and not "Camera offline" while it ran.  The mark is held until
+    # the first frame arrives.
+    assert d._services.history == [("capture_starting", True)]
+    assert d._capture_starting is True
+    assert d._capture_first_frame_ticks_left is not None
     # Quiet window is cleared.
     assert d._trigger_policy.cleared == 1
 

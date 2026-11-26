@@ -540,6 +540,15 @@ class CaptureStatus(BaseModel):
             "init failure followed by a successful resume)."
         ),
     )
+    starting: bool = Field(
+        False,
+        description=(
+            "True while the daemon is opening the camera and loading the "
+            "face model, before the first frame. Never true together with "
+            "``frames_flowing`` or ``stale``. Clients show a start-up "
+            "message here, not the camera-offline guidance."
+        ),
+    )
     sequence: int | None = Field(
         None,
         description=(

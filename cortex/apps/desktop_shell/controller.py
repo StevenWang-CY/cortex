@@ -2237,13 +2237,28 @@ class CortexAppController:
                 if not ready_for_review:
                     self._calibration_runner = None
                 if paused_capture and self._daemon is not None:
+                    # Reloading the face model takes about ten seconds; mark
+                    # the restart so the dashboard says "Starting camera…".
+                    mark_starting = getattr(self._daemon, "_set_capture_starting", None)
+                    hold_starting = getattr(
+                        self._daemon, "_hold_capture_starting_until_first_frame", None
+                    )
+                    if callable(mark_starting):
+                        mark_starting(True)
+                    restored = False
                     try:
                         await self._daemon._capture_pipeline.start()
+                        restored = True
                     except Exception:
                         logger.debug(
                             "restoring capture pipeline after calibration failed",
                             exc_info=True,
                         )
+                    finally:
+                        if restored and callable(hold_starting):
+                            hold_starting()
+                        elif callable(mark_starting):
+                            mark_starting(False)
 
         if self._daemon_loop is not None and self._daemon_loop.is_running():
             asyncio.run_coroutine_threadsafe(_drive(), self._daemon_loop)

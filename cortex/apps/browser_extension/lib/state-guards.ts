@@ -33,6 +33,7 @@ export interface CapturePipelineFlags {
     frames_flowing?: boolean;
     face_detected?: boolean;
     stale?: boolean;
+    starting?: boolean;
 }
 
 export interface StoreFlags {

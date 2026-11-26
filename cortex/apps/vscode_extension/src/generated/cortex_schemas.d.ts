@@ -3,7 +3,7 @@
 //
 // Source of truth: cortex/libs/schemas/*.py (Pydantic v2 models).
 // Schema package: cortex-wire/2.0
-// Source SHA-256: 74fd021ad64ece53dfedc5d945a3e039c5384c7c466175343d85c9512fa2fa71
+// Source SHA-256: de49d8bc450815b5c7459618c84f4e9075cfcd619eda8bec12296db610dfd934
 // Drift-gate: a pre-commit hook and the GitHub Actions CI run
 //   `python -m cortex.scripts.generate_ts_schemas --check`
 // and fail if this file is out of sync with the Python models.
@@ -4556,6 +4556,10 @@ export interface CaptureStatus {
    */
   stale?: boolean;
   /**
+   * True while the daemon is opening the camera and loading the face model, before the first frame. Never true together with ``frames_flowing`` or ``stale``. Clients show a start-up message here, not the camera-offline guidance.
+   */
+  starting?: boolean;
+  /**
    * Latest capture-loop sequence number; surfaced for debug overlays that need to detect dropped frames. None when the producer does not stamp a sequence.
    */
   sequence?: number | null;
@@ -5110,6 +5114,10 @@ export interface CaptureStatus1 {
    * True when the daemon planted ``capture_stale`` because the pipeline failed to start or has gone offline. Cleared automatically when ``frames_flowing`` is True (transient init failure followed by a successful resume).
    */
   stale?: boolean;
+  /**
+   * True while the daemon is opening the camera and loading the face model, before the first frame. Never true together with ``frames_flowing`` or ``stale``. Clients show a start-up message here, not the camera-offline guidance.
+   */
+  starting?: boolean;
   /**
    * Latest capture-loop sequence number; surfaced for debug overlays that need to detect dropped frames. None when the producer does not stamp a sequence.
    */

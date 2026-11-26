@@ -94,6 +94,21 @@ class _FakeConfig:
         self.intervention = _FakeConfigIntervention()
 
 
+class _FakeServices:
+    """The slice of the service registry that a capture start writes to."""
+
+    def __init__(self) -> None:
+        self.values: dict[str, object] = {}
+        self.history: list[tuple[str, object]] = []
+
+    def register(self, name: str, value: object) -> None:
+        self.values[name] = value
+        self.history.append((name, value))
+
+    def get(self, name: str, default: object = None) -> object:
+        return self.values.get(name, default)
+
+
 class _MinimalDaemon:
     """A trimmed CortexDaemon that exposes ``set_quiet_mode`` +
     ``_evaluate_auto_distraction_block`` + ``disarm_auto_focus`` for
@@ -128,9 +143,15 @@ class _MinimalDaemon:
         self._break_active = False
         self._consent_policy = ConsentPolicy()
         self.config = _FakeConfig()
+        # A resume from pause is a capture start, which the daemon marks.
+        self._capture_starting = False
+        self._capture_first_frame_ticks_left: int | None = None
+        self._services = _FakeServices()
 
         # Method binds.
         for name in (
+            "_set_capture_starting",
+            "_hold_capture_starting_until_first_frame",
             "set_quiet_mode",
             "_broadcast_quiet_mode_state",
             "get_quiet_mode_state",

@@ -258,6 +258,10 @@ from cortex.storage.maintenance import StorageMaintenance
 
 logger = logging.getLogger(__name__)
 
+# State updates (two a second) for which a capture start stays marked after
+# the pipeline's ``start`` returns, while its first frame is on the way.
+_CAPTURE_FIRST_FRAME_GRACE_TICKS = 10
+
 
 @dataclass(frozen=True)
 class _ReceptivityInputs:
@@ -1098,6 +1102,15 @@ class CortexDaemon:
         # the dashboard / popup overlay can flip from "Reading your
         # pulse" to "Camera offline" within a single broadcast cycle.
         self._capture_stale: bool = False
+        # True only while a capture start is in flight (camera open plus the
+        # face model's load, about twelve seconds on a cold start).  Surfaced
+        # as ``capture.starting`` so clients say "Starting camera…" in that
+        # window, not the offline guidance.
+        self._capture_starting: bool = False
+        # After a start succeeds the mark is held until the first frame is
+        # processed, at most this long; without the hold one state update
+        # between "pipeline started" and "first frame" read as offline.
+        self._capture_first_frame_ticks_left: int | None = None
         # B2 (Phase 4.1): counter incremented for every duplicate
         # INTERVENTION_APPLIED ack (same intervention_id, same phase).
         # Surfaced via /health diagnostics so duplicate-ack churn from
@@ -1776,6 +1789,38 @@ class CortexDaemon:
             exc_info=exc,
         )
 
+    def _set_capture_starting(self, starting: bool) -> None:
+        """Record whether a capture start is in flight, for ``capture.starting``."""
+
+        self._capture_starting = starting
+        self._capture_first_frame_ticks_left = None
+        self._services.register("capture_starting", starting)
+
+    def _hold_capture_starting_until_first_frame(self) -> None:
+        """The pipeline is up: keep the mark until it delivers a frame.
+
+        ``capture.frames_flowing`` turns true only when a frame has been
+        processed, a moment after the pipeline's ``start`` returns.  Clearing
+        the mark at once left one state update that was neither starting nor
+        flowing, which the clients rendered as "Camera offline".  The hold is
+        bounded: a pipeline that starts and then delivers nothing is reported
+        as offline after ``_CAPTURE_FIRST_FRAME_GRACE_TICKS`` state updates.
+        """
+
+        if self._capture_starting:
+            self._capture_first_frame_ticks_left = _CAPTURE_FIRST_FRAME_GRACE_TICKS
+
+    def _expire_capture_starting_hold(self) -> None:
+        """Count one state update against a held mark; drop it when spent."""
+
+        left = self._capture_first_frame_ticks_left
+        if not self._capture_starting or left is None:
+            return
+        if left <= 0:
+            self._set_capture_starting(False)
+        else:
+            self._capture_first_frame_ticks_left = left - 1
+
     async def _emit_capture_stale_broadcast(self) -> None:
         """B1 (Phase 4.1): synthesise + broadcast a STATE_UPDATE that
         carries ``capture.stale=True`` so every client learns within a
@@ -1904,8 +1949,11 @@ class CortexDaemon:
         """
 
         logger.info("startup.hardware_begin name=capture_pipeline")
+        self._set_capture_starting(True)
+        started = False
         try:
             await self._capture_pipeline.start()
+            started = True
             self._capture_available = True
             self._capture_stale = False
             self._services.register("capture_stale", False)
@@ -1954,8 +2002,16 @@ class CortexDaemon:
                     "telemetry-first mode"
                 )
             self._capture_available = False
+            # The start is over before its failure is announced, so no
+            # broadcast can carry both "starting" and the failure.
+            self._set_capture_starting(False)
             self._capture_stale = True
             await self._emit_capture_stale_broadcast()
+        finally:
+            if started:
+                self._hold_capture_starting_until_first_frame()
+            else:
+                self._set_capture_starting(False)
 
     async def await_apply_confirmation(
         self,
@@ -2159,6 +2215,9 @@ class CortexDaemon:
             if not self._input_hooks.start():
                 logger.info("Input acquisition unavailable; behavioral features will abstain")
             self._window_tracker.start()
+            # Marked here, not only inside the task, so the first state
+            # update of the session already says the camera is starting.
+            self._set_capture_starting(True)
             self._spawn_background_task(
                 self._start_optional_hardware(),
                 name="cortex-capture-startup",
@@ -3499,6 +3558,11 @@ class CortexDaemon:
 
         self._services.register("latest_frame_meta", output.frame_meta)
         self._runtime_status.publish_frame(output.frame_meta)
+        if self._capture_starting and bool(
+            getattr(output.frame_meta, "frame_available", True)
+        ):
+            # The first delivered frame ends the start-up window.
+            self._set_capture_starting(False)
         observation = self._observation_from_output(output)
         identity = self._camera_identity_from_output(output)
         self._handle_camera_identity(identity, observation)
@@ -4038,6 +4102,7 @@ class CortexDaemon:
                     continue
                 event_time = EventTime.from_clock(self._clock)
                 timestamp = event_time.observed_at_mono_ns / 1_000_000_000.0
+                self._expire_capture_starting_hold()
                 try:
                     vector, quality = self._feature_fusion.fuse(event_time=event_time)
 
@@ -6515,12 +6580,20 @@ class CortexDaemon:
                     # Keep the latch: if the stop is somehow abandoned, the
                     # next resume still knows capture was running.
                     return
+                self._set_capture_starting(True)
+                resumed = False
                 try:
                     await self._capture_pipeline.start()
+                    resumed = True
                     self._capture_available = True
                     self._capture_processing_enabled = True
                 except Exception:
                     logger.exception("set_quiet_mode: resume capture failed")
+                finally:
+                    if resumed:
+                        self._hold_capture_starting_until_first_frame()
+                    else:
+                        self._set_capture_starting(False)
                 self._pause_was_capturing = False
 
             if kind == "off":
@@ -8726,8 +8799,11 @@ class CortexDaemon:
                 and not self._capture_available
                 and self._capture_restart_permitted(surface="apply_settings")
             ):
+                self._set_capture_starting(True)
+                enabled = False
                 try:
                     await self._capture_pipeline.start()
+                    enabled = True
                     self._capture_available = True
                     self._capture_stale = False
                     self._services.register("capture_stale", False)
@@ -8736,8 +8812,14 @@ class CortexDaemon:
                     logger.exception("Failed to enable capture pipeline")
                     self._capture_available = False
                     self._capture_processing_enabled = False
+                    self._set_capture_starting(False)
                     self._capture_stale = True
                     await self._emit_capture_stale_broadcast()
+                finally:
+                    if enabled:
+                        self._hold_capture_starting_until_first_frame()
+                    else:
+                        self._set_capture_starting(False)
             elif (
                 not desired_capture
                 and self._capture_available
