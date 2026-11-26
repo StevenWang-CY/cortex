@@ -26,7 +26,10 @@ class FeatureName(StrEnum):
     """
 
     HEART_RATE_BPM = "heart_rate_bpm"
+    HRV_SDNN_MS = "hrv_sdnn_ms"
+    RESPIRATION_RATE_BPM = "respiration_rate_bpm"
     BLINK_RATE_PER_MIN = "blink_rate_per_min"
+    PERCLOS = "perclos_60s"
     HEAD_NECK_FLEXION_SCORE = "head_neck_flexion_score"
     MOUSE_VELOCITY_MEAN = "mouse_velocity_mean"
     MOUSE_VELOCITY_VARIANCE = "mouse_velocity_variance"
@@ -177,25 +180,29 @@ class PhysioFeatures(BaseModel):
     pulse_variability_proxy: float | None = Field(
         None,
         ge=0.0,
-        description="Compatibility field; unavailable in product pending validation",
+        description=(
+            "RMSSD of camera pulse intervals in ms over the trailing two "
+            "minutes, with estimated beat-timing noise removed"
+        ),
     )
     hrv_sdnn: float | None = Field(
-        None, ge=0.0, description="Compatibility field; unavailable in product"
+        None, ge=0.0, description="SDNN of camera pulse intervals in ms (trailing 5 min)"
     )
     hrv_pnn50: float | None = Field(
-        None, ge=0.0, le=1.0, description="Compatibility field; unavailable in product"
+        None, ge=0.0, le=1.0,
+        description="Share of successive interval differences above 50 ms",
     )
     hrv_sd1: float | None = Field(
-        None, ge=0.0, description="Compatibility field; unavailable in product"
+        None, ge=0.0, description="Poincare SD1 in ms (short-term variability)"
     )
     hrv_sd2: float | None = Field(
-        None, ge=0.0, description="Compatibility field; unavailable in product"
+        None, ge=0.0, description="Poincare SD2 in ms (long-term variability)"
     )
     hrv_lf_hf_ratio: float | None = Field(
-        None, ge=0.0, description="Compatibility field; unavailable in product"
+        None, ge=0.0, description="LF/HF power ratio of the interval series"
     )
     hrv_sample_entropy: float | None = Field(
-        None, ge=0.0, description="Compatibility field; unavailable in product"
+        None, ge=0.0, description="Sample entropy of the interval series"
     )
     physio_sqi: float | None = Field(
         None, ge=0.0, le=1.0, description="Composite physiological signal-quality index"
@@ -211,7 +218,7 @@ class PhysioFeatures(BaseModel):
         None,
         ge=0.0,
         le=60.0,
-        description="Compatibility field; unavailable in product pending validation",
+        description="Breathing rate in breaths/min when two channels agree",
     )
     pulse_evidence: SignalEstimate | None = Field(
         None,
@@ -459,10 +466,10 @@ class FeatureVector(BaseModel):
         None, ge=30.0, le=220.0, description="Instantaneous heart rate (BPM)"
     )
     hrv_rmssd: float | None = Field(
-        None, ge=0.0, description="Compatibility field; unavailable in product"
+        None, ge=0.0, description="RMSSD of camera pulse intervals (ms)"
     )
     hrv_sdnn: float | None = Field(
-        None, ge=0.0, description="Compatibility field; unavailable in product"
+        None, ge=0.0, description="SDNN of camera pulse intervals (ms)"
     )
     hr_delta: float | None = Field(
         None, description="Heart rate gradient over 5s"
@@ -540,7 +547,7 @@ class FeatureVector(BaseModel):
         None,
         ge=0.0,
         le=60.0,
-        description="Compatibility field; unavailable in product",
+        description="Breathing rate in breaths/min",
     )
     thrashing_score: float = Field(
         0.0, ge=0.0, le=1.0, description="Focus thrashing score from transition graph"

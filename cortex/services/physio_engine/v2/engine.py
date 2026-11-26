@@ -50,13 +50,10 @@ class PhysiologyEngineV2:
             high_hz=config.bandpass_high,
             filter_order=config.bandpass_order,
             max_head_jitter_deg=config.max_head_jitter_deg,
-            # Signal-presence thresholds. These existed on ``RPPGSignalConfig``
-            # from the start but were only ever read by the legacy shadow
-            # estimator, so the published v2 path ran with no test for whether
-            # a cardiac signal was present at all.
+            # Signal-presence thresholds (harmonic SNR floor plus a guard
+            # against a degenerate flat spectrum).
             nsqi_threshold=config.nsqi_threshold,
             min_cardiac_snr_db=config.min_cardiac_snr_db,
-            min_peak_concentration=config.min_peak_concentration,
             minimum_window_quality=config.minimum_window_quality,
             experimental_hrv_enabled=config.experimental_hrv_enabled,
             hrv_min_window_seconds=float(config.hrv_min_window_seconds),
@@ -67,7 +64,17 @@ class PhysiologyEngineV2:
             backend,
             low_hz=config.respiration_low_hz,
             high_hz=config.respiration_high_hz,
-            min_window_seconds=float(config.respiration_window_seconds),
+            # The acquisition gate accepts a window once ``min_valid_coverage``
+            # of it is filled, and a resampled window of N samples spans
+            # (N - 1) sample periods.  Requiring the full nominal duration
+            # here therefore rejected every window the gate had just
+            # accepted: no breathing rate could ever be published, with the
+            # publication switch on or off.  The estimator's minimum is the
+            # duration the gate guarantees.
+            min_window_seconds=max(
+                30.0,
+                config.min_valid_coverage * float(config.respiration_window_seconds),
+            ),
             minimum_channel_quality=config.respiration_min_channel_quality,
             max_channel_disagreement_bpm=(
                 config.respiration_max_channel_disagreement_bpm

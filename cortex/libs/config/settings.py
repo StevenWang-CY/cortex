@@ -436,6 +436,17 @@ class StateConfig(BaseModel):
     estimate_entry_threshold: float = Field(0.40, ge=0.0, le=1.0)
     estimate_exit_threshold: float = Field(0.25, ge=0.0, le=1.0)
     inference_mode: Literal["deterministic", "safety_null"] = "deterministic"
+    physiology_weight: float = Field(
+        0.35,
+        ge=0.0,
+        le=0.5,
+        description=(
+            "Share of a support score that qualified camera physiology may "
+            "move when fully observed; 0 makes the rules behaviour-only. The "
+            "scorer caps the effective value below estimate_entry_threshold "
+            "so physiology alone cannot establish a state."
+        ),
+    )
     hyper_dwell_seconds: int = Field(30, ge=0)
     hypo_dwell_seconds: int = Field(60, ge=0)
     flow_dwell_seconds: int = Field(120, ge=0)
@@ -540,6 +551,14 @@ class InterventionConfig(BaseModel):
     focus_break_interval_minutes: int = Field(50, ge=15, le=180)
     focus_break_duration_seconds: int = Field(300, ge=60, le=1800)
     focus_break_inactivity_pause_seconds: float = Field(60.0, ge=5.0, le=900.0)
+
+    # Body-aware break suggestion: offered when the cumulative physiological
+    # strain load (see state_engine.strain_load) crosses its threshold. It
+    # needs the camera and a personal reference, so it stays silent otherwise.
+    enable_strain_break_suggestions: bool = True
+    strain_break_threshold_seconds: float = Field(600.0, ge=120.0, le=7200.0)
+    strain_recovery_half_life_seconds: float = Field(600.0, ge=60.0, le=7200.0)
+    strain_break_duration_seconds: int = Field(180, ge=60, le=1800)
 
     # P0 §3.7 risk mitigation (spec line 643): the spec calls for
     # audio to default off when ``mic_active`` was detected in the
@@ -651,7 +670,26 @@ class TelemetryConfig(BaseModel):
 class RPPGSignalConfig(BaseModel):
     """rPPG signal processing configuration."""
 
-    window_seconds: int = Field(10, ge=8, le=60)
+    window_seconds: int = Field(
+        10,
+        ge=8,
+        le=60,
+        description=(
+            "Shortest pulse analysis window; used until long_window_seconds "
+            "of observations have accumulated"
+        ),
+    )
+    long_window_seconds: int = Field(
+        20,
+        ge=8,
+        le=40,
+        description=(
+            "Preferred pulse analysis window once enough observations exist. "
+            "Twice the span halves the spectral noise under the cardiac line: "
+            "on the 4TU reference videos it took heart-rate MAE from 2.6 to "
+            "1.6 BPM at the same publication level"
+        ),
+    )
     stride_seconds: int = Field(1, ge=1)
     backend: Literal["pos", "chrom", "green"] = "pos"
     backend_expected_sha256: str | None = Field(
@@ -676,21 +714,20 @@ class RPPGSignalConfig(BaseModel):
         ),
     )
     min_cardiac_snr_db: float = Field(
-        2.0,
+        0.0,
         description=(
-            "Minimum in-band to out-of-band SNR in dB for a window to count as "
-            "carrying a cardiac signal; the dominant guard against publishing a "
-            "heart rate read out of noise"
+            "Minimum harmonic SNR in dB (power at the candidate rate and its "
+            "second harmonic over the rest of the band) for a window to count "
+            "as carrying a cardiac signal. Windows between this floor and "
+            "3 dB are published only when they continue an established rate"
         ),
     )
-    min_peak_concentration: float = Field(
-        0.40,
-        ge=0.0,
-        le=1.0,
+    skin_region: Literal["face", "patches"] = Field(
+        "face",
         description=(
-            "Minimum share of in-band power concentrated at the selected "
-            "spectral peak for a window to count as carrying a cardiac signal; "
-            "separates a cardiac line from wandering illumination drift"
+            "Where the skin colour is sampled: 'face' averages the whole "
+            "facial skin inside the face outline (eyes, brows and lips "
+            "removed); 'patches' is the earlier forehead-and-cheeks sample"
         ),
     )
     minimum_window_quality: float = Field(
@@ -706,15 +743,33 @@ class RPPGSignalConfig(BaseModel):
     min_valid_coverage: float = Field(0.80, ge=0.0, le=1.0)
     max_interpolation_gap_ms: float = Field(250.0, gt=0.0)
     max_motion_rejected_fraction: float = Field(0.10, ge=0.0, le=1.0)
-    hrv_min_window_seconds: int = Field(180, ge=180)
-    hrv_min_valid_ibi: int = Field(120, ge=120)
-    experimental_hrv_enabled: bool = False
+    hrv_min_window_seconds: int = Field(
+        60,
+        ge=30,
+        le=300,
+        description=(
+            "Clean beat coverage required before beat-to-beat variability "
+            "(RMSSD, pNN50, SD1) is published; dispersion metrics need twice this"
+        ),
+    )
+    hrv_min_valid_ibi: int = Field(
+        40,
+        ge=20,
+        description="Accepted beat intervals required before RMSSD is published",
+    )
+    experimental_hrv_enabled: bool = Field(
+        True,
+        description="Publish camera pulse-rate variability when its evidence gates pass",
+    )
     respiration_window_seconds: int = Field(45, ge=30, le=60)
     respiration_low_hz: float = Field(0.08, gt=0.0)
     respiration_high_hz: float = Field(0.50, gt=0.0)
     respiration_min_channel_quality: float = Field(0.35, ge=0.0, le=1.0)
     respiration_max_channel_disagreement_bpm: float = Field(3.0, gt=0.0)
-    experimental_respiration_enabled: bool = False
+    experimental_respiration_enabled: bool = Field(
+        True,
+        description="Publish the camera breathing-rate estimate when its channels agree",
+    )
 
     @field_validator("respiration_high_hz")
     @classmethod
@@ -728,6 +783,8 @@ class RPPGSignalConfig(BaseModel):
     def _signal_bands_and_windows_are_coherent(self) -> RPPGSignalConfig:
         if self.stride_seconds > self.window_seconds:
             raise ValueError("rPPG stride_seconds cannot exceed window_seconds")
+        if self.long_window_seconds < self.window_seconds:
+            raise ValueError("long_window_seconds cannot be shorter than window_seconds")
         if self.bandpass_high <= self.bandpass_low:
             raise ValueError("bandpass_high must exceed bandpass_low")
         if self.fps_clamp_max <= self.fps_clamp_min:

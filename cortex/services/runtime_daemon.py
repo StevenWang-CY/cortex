@@ -75,6 +75,7 @@ from cortex.libs.schemas.calibration import (
 from cortex.libs.schemas.features import (
     FeatureName,
     FeatureValue,
+    FeatureVector,
     KinematicFeatures,
     PhysioFeatures,
 )
@@ -215,6 +216,12 @@ from cortex.services.launcher.daemon_process import (
 from cortex.services.launcher.launcher import ProjectLauncher
 from cortex.services.llm_engine import create_llm_client
 from cortex.services.llm_engine.parser import enrich_plan_with_context
+from cortex.services.physio_engine.camera_physiology import (
+    CameraPhysiologyProcessor,
+    build_rgb_observation_buffer,
+    face_normalized_vertical_position,
+    numeric_observation_from_capture,
+)
 from cortex.services.physio_engine.pulse_estimator import PulseEstimator, PulseStabilizer
 from cortex.services.session_report.generator import SessionReportGenerator
 from cortex.services.session_report.longitudinal import LongitudinalAggregator
@@ -229,7 +236,13 @@ from cortex.services.state_engine.leetcode_mode_resolver import LeetCodeModeReso
 from cortex.services.state_engine.longitudinal import LongitudinalTracker
 from cortex.services.state_engine.model_registry import SupportModelRegistry
 from cortex.services.state_engine.parasympathetic_rebound import ParasympatheticReboundDetector
+from cortex.services.state_engine.physiology_baseline import (
+    PhysiologyBaselineTracker,
+    PhysiologyMetricName,
+    PhysiologyReference,
+)
 from cortex.services.state_engine.rabbit_hole import RabbitHoleDetector
+from cortex.services.state_engine.strain_load import StrainLoadTracker, strain_reading
 from cortex.services.state_engine.support_inference import SupportInferenceEngine
 from cortex.services.state_engine.trigger_policy import TriggerDecision, TriggerPolicy
 from cortex.services.state_engine.zombie_detector import ZombieReadingDetector
@@ -304,17 +317,9 @@ def _build_rgb_observation_buffer(
 ) -> ObservationBuffer[NumericObservation]:
     """Build the bounded camera-signal history used by runtime inference."""
 
-    window_seconds = max(
-        float(config.signal.rppg.window_seconds),
-        float(config.signal.rppg.respiration_window_seconds),
-    )
-    max_age_seconds = window_seconds + config.signal.rppg.max_interpolation_gap_ms / 1000.0 + 1.0
-    return ObservationBuffer(
-        max_age_seconds=max_age_seconds,
-        max_items=max(
-            config.capture.observation_buffer_max_items,
-            int(max_age_seconds * config.signal.rppg.fps_clamp_max) + 2,
-        ),
+    return build_rgb_observation_buffer(
+        config.signal.rppg,
+        minimum_items=config.capture.observation_buffer_max_items,
     )
 
 
@@ -409,30 +414,9 @@ def _interpolate_nan_window(window: NDArray[np.float64]) -> NDArray[np.float64]:
 
 
 def _face_normalized_vertical_position(landmarks_px: Any) -> float | None:
-    """Return face-centre vertical position in units of observed face height.
+    """Compatibility alias for the shared camera-physiology helper."""
 
-    Pixel displacement is camera-resolution and distance dependent. Dividing
-    by the current face height yields a dimensionless motion channel suitable
-    for detrending; invalid/degenerate landmark sets abstain explicitly.
-    """
-
-    try:
-        landmarks = np.asarray(landmarks_px, dtype=np.float64)
-    except (TypeError, ValueError):
-        return None
-    if (
-        landmarks.ndim != 2
-        or landmarks.shape[0] < 3
-        or landmarks.shape[1] < 2
-        or not bool(np.isfinite(landmarks[:, :2]).all())
-    ):
-        return None
-    vertical = landmarks[:, 1]
-    lower, upper = np.percentile(vertical, [5.0, 95.0])
-    face_height = float(upper - lower)
-    if face_height < 1.0:
-        return None
-    return float(np.median(vertical) / face_height)
+    return face_normalized_vertical_position(landmarks_px)
 
 
 def _supervise_background_task(task: asyncio.Task[Any]) -> None:
@@ -3222,7 +3206,7 @@ class CortexDaemon:
     def _reset_camera_dependent_state(self, *, invalidate_calibration: bool) -> None:
         self._rgb_observations.clear()
         self._pulse_estimator.reset()
-        self._physiology_v2.reset()
+        self._camera_physiology().reset()
         self._latest_respiration_evidence = None
         self._blink_detector.reset()
         self._head_pose.reset()
@@ -3379,6 +3363,26 @@ class CortexDaemon:
             self._reset_camera_dependent_state(invalidate_calibration=False)
         self._face_present_prev = face_now
 
+    def _camera_physiology(self) -> CameraPhysiologyProcessor:
+        """Processor bound to the current physiology engine.
+
+        The engine is replaced whenever camera-dependent components are
+        rebuilt (calibration reload, settings change), so the processor is
+        re-created with it rather than keeping history from the old one.
+        """
+
+        processor: CameraPhysiologyProcessor | None = getattr(
+            self, "_physio_processor", None
+        )
+        if processor is None or processor.engine is not self._physiology_v2:
+            processor = CameraPhysiologyProcessor(
+                self.config.signal.rppg,
+                nominal_fps=float(self.config.capture.fps),
+                engine=self._physiology_v2,
+            )
+            self._physio_processor = processor
+        return processor
+
     def _prepare_rppg_window(self) -> PreparedObservationWindow:
         cfg = self.config.signal.rppg
         return prepare_observation_window(
@@ -3475,60 +3479,17 @@ class CortexDaemon:
             observation.model_dump(mode="json"),
         )
 
-        validity = str(observation.validity)
-        missing_reason = observation.missing_reason
-        rgb_value: NDArray[np.float64] | None = None
-        motion_face_widths_per_second: float | None = None
         frame = getattr(output, "frame", None)
         landmarks_px = getattr(output, "landmarks_px", None)
-        roi_frame: Any | None = None
-        if (
-            validity == ObservationValidity.VALID.value
-            and frame is not None
-            and landmarks_px is not None
-        ):
-            roi_frame = self._roi_extractor.extract(
-                frame,
-                landmarks_px,
-                observation.observed_at_unix_ms / 1000.0,
-            )
-            combined_rgb = roi_frame.combined_rgb()
-            if combined_rgb is not None and bool(np.isfinite(combined_rgb).all()):
-                rgb_value = np.asarray(combined_rgb, dtype=np.float64)
-                # D7 (v0.4.0): resolution- and frame-rate-independent motion
-                # evidence from the face tracker (face widths per second),
-                # replacing the unreachable px×45/width "degrees" heuristic.
-                motion_face_widths_per_second = getattr(
-                    observation.value, "motion_face_widths_per_second", None
-                )
-            else:
-                validity = ObservationValidity.REJECTED.value
-                missing_reason = MissingReason.OCCLUDED
-        elif validity == ObservationValidity.VALID.value:
-            validity = ObservationValidity.REJECTED.value
-            missing_reason = MissingReason.ARTIFACT
-
-        if validity != ObservationValidity.VALID.value:
-            if validity == ObservationValidity.REJECTED.value:
-                self._frames_low_quality_rejected += 1
-            rgb_value = None
-
-        numeric = NumericObservation(
-            observed_at_unix_ms=observation.observed_at_unix_ms,
-            observed_at_mono_ns=observation.observed_at_mono_ns,
-            boot_id=observation.boot_id,
-            sequence=observation.sequence,
-            value=rgb_value,
-            validity=validity,
-            missing_reason=missing_reason,
-            quality=observation.quality if rgb_value is not None else 0.0,
-            motion_face_widths_per_second=motion_face_widths_per_second,
-            head_vertical_face_units=(
-                _face_normalized_vertical_position(landmarks_px)
-                if rgb_value is not None and landmarks_px is not None
-                else None
-            ),
+        numeric = numeric_observation_from_capture(
+            observation=observation,
+            frame=frame,
+            landmarks_px=landmarks_px,
+            roi_extractor=self._roi_extractor,
         )
+        validity = numeric.validity
+        if validity == ObservationValidity.REJECTED.value:
+            self._frames_low_quality_rejected += 1
         try:
             self._rgb_observations.append(numeric)
         except ValueError:
@@ -3556,24 +3517,21 @@ class CortexDaemon:
             self._last_physio_update_mono_ns == 0
             or observation.observed_at_mono_ns - self._last_physio_update_mono_ns >= stride_ns
         ):
-            prepared = self._prepare_rppg_window()
-            if (
-                prepared.ready
-                and prepared.values is not None
-                and prepared.sample_times_mono_ns is not None
-            ):
-                pulse_result = self._physiology_v2.pulse.process_window(
-                    prepared.values,
-                    prepared.sample_times_mono_ns,
-                    sample_rate_hz=prepared.sample_rate_hz,
-                    boot_id=observation.boot_id,
-                    observation_quality=prepared.quality,
-                    motion_face_widths_per_second=(
-                        prepared.mean_motion_face_widths_per_second
-                    ),
-                    face_presence_ratio=prepared.valid_fraction,
-                )
+            # One shared processor turns the observation buffer into pulse,
+            # pulse-rate variability and breathing estimates; the
+            # qualification harness drives the same object, so its reports
+            # describe this code path.
+            processor = self._camera_physiology()
+            update = processor.process(
+                self._rgb_observations.snapshot(),
+                boot_id=observation.boot_id,
+            )
+            prepared = update.prepared
+            pulse_result = update.pulse
+            if pulse_result is not None:
                 unix_seconds_at_observation = observation.observed_at_unix_ms / 1000.0
+                # The legacy estimator stays as a shadow comparison only; its
+                # values are never published beside the v2 evidence.
                 self._pulse_estimator.process_window(
                     pulse_result.waveform,
                     timestamp=unix_seconds_at_observation,
@@ -3588,78 +3546,19 @@ class CortexDaemon:
                     "legacy_physio_shadow",
                     legacy_physio_shadow.model_dump(mode="json"),
                 )
-                if pulse_result.summary.hr.value is None:
-                    # The acquisition-aware v2 gate is authoritative for
-                    # availability even while the legacy stabilizer remains
-                    # the displayed pulse implementation. A clean-looking
-                    # spectrum cannot override failed observation evidence.
-                    self._latest_physio = PhysioFeatures(
-                        pulse_bpm=None,
-                        pulse_quality=pulse_result.summary.quality,
-                        pulse_variability_proxy=None,
-                        physio_sqi=pulse_result.summary.quality,
-                        physio_sqi_components={
-                            "observation_quality": prepared.quality,
-                            "valid_fraction": prepared.valid_fraction,
-                            "artifact_fraction": prepared.artifact_fraction,
-                        },
-                        hr_delta_5s=None,
-                        valid=False,
-                    )
-                else:
-                    # The compatibility fields and their evidence must refer
-                    # to the same estimate.  The legacy stabilizer is retained
-                    # only as a shadow comparison during migration; publishing
-                    # its value beside v2 provenance would create an
-                    # unverifiable hybrid result.
-                    self._latest_physio = PhysioFeatures(
-                        pulse_bpm=pulse_result.summary.hr.value,
-                        pulse_quality=pulse_result.summary.quality,
-                        pulse_variability_proxy=None,
-                        physio_sqi=pulse_result.summary.quality,
-                        physio_sqi_components={
-                            "observation_quality": prepared.quality,
-                            "valid_fraction": prepared.valid_fraction,
-                            "artifact_fraction": prepared.artifact_fraction,
-                        },
-                        hr_delta_5s=None,
-                        respiration_rate_bpm=None,
-                        valid=True,
-                    )
-                respiration_window = self._prepare_respiration_window()
-                if (
-                    respiration_window.ready
-                    and respiration_window.values is not None
-                    and respiration_window.sample_times_mono_ns is not None
-                ):
-                    respiration_result = self._physiology_v2.respiration.process_window(
-                        respiration_window.values,
-                        respiration_window.sample_times_mono_ns,
-                        sample_rate_hz=respiration_window.sample_rate_hz,
-                        boot_id=observation.boot_id,
-                        head_vertical_face_units=(respiration_window.head_vertical_face_units),
-                    )
-                    self._latest_respiration_evidence = respiration_result.fused
+                self._latest_physio = update.features
+                self._latest_respiration_evidence = processor.latest_respiration
+                if update.respiration is not None:
                     self._services.register(
                         "latest_respiration_evidence",
                         {
-                            "fused": respiration_result.fused.model_dump(mode="json"),
+                            "fused": update.respiration.fused.model_dump(mode="json"),
                             "channels": {
                                 name: estimate.model_dump(mode="json")
-                                for name, estimate in respiration_result.channels.items()
+                                for name, estimate in update.respiration.channels.items()
                             },
                         },
                     )
-                self._latest_physio = self._latest_physio.model_copy(
-                    update={
-                        "pulse_evidence": pulse_result.summary.hr,
-                        "hrv_evidence": {
-                            metric.value: estimate
-                            for metric, estimate in pulse_result.hrv_estimates.items()
-                        },
-                        "respiration_evidence": self._latest_respiration_evidence,
-                    }
-                )
                 self._services.register("latest_physio", self._latest_physio)
                 self._services.register(
                     "latest_pulse_evidence",
@@ -3695,6 +3594,7 @@ class CortexDaemon:
                     timestamp=mono_seconds,
                 )
             else:
+                self._latest_respiration_evidence = None
                 self._publish_unavailable_physio(
                     prepared,
                     mono_seconds=mono_seconds,
@@ -3943,6 +3843,105 @@ class CortexDaemon:
         if finalized:
             logger.info("Finalized %d policy outcome window(s)", len(finalized))
 
+    def _physiology_baseline_tracker(self) -> PhysiologyBaselineTracker:
+        """Personal physiology reference for the current camera ownership."""
+
+        tracker: PhysiologyBaselineTracker | None = getattr(
+            self, "_physiology_baseline", None
+        )
+        if tracker is None:
+            tracker = PhysiologyBaselineTracker(self._load_baselines())
+            self._physiology_baseline = tracker
+        return tracker
+
+    def _strain_load_tracker(self) -> StrainLoadTracker:
+        tracker: StrainLoadTracker | None = getattr(self, "_strain_load", None)
+        if tracker is None:
+            intervention = self.config.intervention
+            tracker = StrainLoadTracker(
+                threshold_seconds=float(intervention.strain_break_threshold_seconds),
+                recovery_half_life_seconds=float(
+                    intervention.strain_recovery_half_life_seconds
+                ),
+            )
+            self._strain_load = tracker
+        return tracker
+
+    def _observe_physiology_reference(
+        self,
+        vector: FeatureVector,
+        timestamp: float,
+    ) -> PhysiologyReference:
+        """Feed this tick's valid camera measurements to the reference tracker."""
+
+        tracker = self._physiology_baseline_tracker()
+        for metric, name in (
+            (PhysiologyMetricName.HEART_RATE, FeatureName.HEART_RATE_BPM),
+            (PhysiologyMetricName.SDNN, FeatureName.HRV_SDNN_MS),
+            (PhysiologyMetricName.RESPIRATION, FeatureName.RESPIRATION_RATE_BPM),
+            (PhysiologyMetricName.BLINK_RATE, FeatureName.BLINK_RATE_PER_MIN),
+        ):
+            item = vector.features.get(name)
+            if item is not None and item.valid and item.value is not None:
+                tracker.observe(metric, float(item.value), timestamp)
+        reference = tracker.reference()
+        self._scorer.set_physiology_reference(reference)
+        return reference
+
+    async def _maybe_recommend_strain_break(
+        self,
+        tracker: StrainLoadTracker,
+        vector: FeatureVector,
+        timestamp: float,
+    ) -> None:
+        """Suggest a breathing break when the strain load crosses its threshold.
+
+        The suggestion is an interruption like any other: it passes the shared
+        gate (quiet mode, pause, receptivity, cooldown, hourly cap) and counts
+        against it. A crossing the gate refuses stays owed.
+        """
+
+        intervention = self.config.intervention
+        if not intervention.enable_strain_break_suggestions:
+            return
+        if not tracker.should_break():
+            return
+        if not self._interruption_allowed(surface="strain_break", current_time=timestamp):
+            tracker.defer()
+            return
+        from cortex.libs.schemas.realtime import BreakRecommendation
+
+        # Slow, extended exhalation when variability is clearly depressed;
+        # an even box cadence otherwise.
+        sdnn_reference = self._physiology_baseline_tracker().reference().sdnn
+        pattern: Literal["4-7-8", "box", "coherent"] = "box"
+        if (
+            vector.hrv_sdnn is not None
+            and sdnn_reference.ready
+            and sdnn_reference.z(float(vector.hrv_sdnn)) <= -1.5
+        ):
+            pattern = "coherent"
+        recommendation = BreakRecommendation(
+            reason="Your body has been working hard for a while.",
+            urgency="medium",
+            basis="physiological_strain",
+            stress_load=tracker.current_load,
+            threshold=tracker.threshold,
+            duration_seconds=int(intervention.strain_break_duration_seconds),
+            breathing_pattern=pattern,
+        )
+        await self._ws_server.send_message(
+            MessageType.BREAK_RECOMMENDATION.value,
+            recommendation.model_dump(mode="json"),
+        )
+        self._trigger_policy.record_intervention(timestamp=timestamp)
+        logger.info(
+            "Strain break suggested (load=%.0f threshold=%.0f pattern=%s)",
+            tracker.current_load,
+            tracker.threshold,
+            pattern,
+        )
+
     async def _state_loop(self) -> None:
         try:
             while True:
@@ -3975,14 +3974,12 @@ class CortexDaemon:
                             algorithm_version="focus-transition-graph-v2",
                         )
 
-                    # Product containment: the current webcam pipeline has
-                    # not met the validation duration/reference gates for
-                    # HRV or respiration. Null them before *any* scorer,
-                    # detector, report, or policy can consume an injected or
-                    # stale value. Heart rate remains quality-gated and live.
-                    vector.hrv_rmssd = None
-                    vector.hrv_sdnn = None
-                    vector.respiration_rate = None
+                    # Camera physiology is read against the person's own
+                    # reference: every valid measurement updates it, and the
+                    # scorer standardises this tick's values against it.
+                    physiology_reference = self._observe_physiology_reference(
+                        vector, timestamp
+                    )
 
                     # Same-category tab switching is topically coherent and
                     # is meant to discount the window-switch support signal.
@@ -4043,15 +4040,27 @@ class CortexDaemon:
                                     exc_info=True,
                                 )
 
-                    # Containment: webcam HRV/respiration and the derived
-                    # stress integral are unavailable until metric-specific
-                    # reference validation lands. Never carry an old tracker
-                    # value into a public state estimate.
-                    estimate.stress_integral = None
+                    # Strain load: time spent with physiology pointing to
+                    # strain fills it, calm time drains it. It is published
+                    # only once physiology has actually been observed, so a
+                    # camera-less session reports None rather than a zero.
+                    physiology_block = self._scorer.last_physiology.support_likely
+                    strain_now = strain_reading(
+                        physiology_block.score, physiology_block.coverage
+                    )
+                    strain_tracker = self._strain_load_tracker()
+                    strain_tracker.update(strain_now, timestamp)
+                    if strain_now is not None:
+                        self._strain_observed = True
+                    estimate.stress_integral = (
+                        strain_tracker.current_load
+                        if getattr(self, "_strain_observed", False)
+                        else None
+                    )
 
-                    # Opt-in break reminders use only elapsed active-work time
-                    # and the user's declared interval. They do not consume
-                    # pulse, HRV, state labels, or the retired stress integral.
+                    # Opt-in elapsed-time reminders use only active-work time
+                    # and the user's declared interval; the strain-based
+                    # suggestion below is separate and has its own switch.
                     inactivity_feature = vector.features.get(FeatureName.INACTIVITY_SECONDS)
                     input_is_active = bool(
                         inactivity_feature is not None
@@ -4110,6 +4119,10 @@ class CortexDaemon:
                         self._focus_break_policy.record_recommended()
                         self._trigger_policy.record_intervention(timestamp=timestamp)
 
+                    await self._maybe_recommend_strain_break(
+                        strain_tracker, vector, timestamp
+                    )
+
                     # P0 §3.9: feed the causal attributor at the same
                     # cadence so the per-signal sparkline buffers fill
                     # smoothly. Also stash the live feature vector so
@@ -4138,8 +4151,8 @@ class CortexDaemon:
                     if vector.hr is not None:
                         self._longitudinal.accumulate(
                             hr=vector.hr,
-                            hrv=None,
-                            resp=None,
+                            hrv=vector.hrv_rmssd,
+                            resp=vector.respiration_rate,
                             state=estimate.state,
                         )
 
@@ -4157,6 +4170,12 @@ class CortexDaemon:
                         )
                         if vector.hr:
                             self._session_report.record_hr(float(vector.hr))
+                        if vector.hrv_rmssd:
+                            self._session_report.record_hrv(float(vector.hrv_rmssd))
+                        if estimate.stress_integral is not None:
+                            self._session_report.record_stress(
+                                float(estimate.stress_integral)
+                            )
                     except Exception:
                         logger.debug("session_report record failed", exc_info=True)
                     # The camera measures only a camera-relative head/neck
@@ -4166,6 +4185,27 @@ class CortexDaemon:
                     biometrics = {
                         "heart_rate": vector.hr,
                         "hr_delta": vector.hr_delta,
+                        "pulse_quality": vector.physio_sqi,
+                        "hrv_rmssd": vector.hrv_rmssd,
+                        "hrv_sdnn": vector.hrv_sdnn,
+                        "respiration_rate": vector.respiration_rate,
+                        "perclos": vector.perclos_60s,
+                        "strain": strain_now,
+                        "strain_load_ratio": (
+                            strain_tracker.load_ratio
+                            if estimate.stress_integral is not None
+                            else None
+                        ),
+                        "stress_integral": estimate.stress_integral,
+                        "physiology_reference_ready": any(
+                            item.ready
+                            for item in (
+                                physiology_reference.heart_rate,
+                                physiology_reference.sdnn,
+                                physiology_reference.respiration,
+                                physiology_reference.blink_rate,
+                            )
+                        ),
                         "blink_rate": vector.blink_rate,
                         "head_neck_flexion_score": (
                             vector.head_neck_flexion_score

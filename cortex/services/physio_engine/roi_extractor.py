@@ -31,6 +31,37 @@ from cortex.libs.config.settings import LandmarksConfig, get_config
 logger = logging.getLogger(__name__)
 
 
+# MediaPipe FaceMesh topology: the face outline and the features that are not
+# skin.  The pulse signal comes from skin, and its noise falls with the number
+# of skin pixels averaged, so the facial-skin region is the whole face inside
+# the outline minus eyes, brows and lips rather than three small patches.
+FACE_OVAL: tuple[int, ...] = (
+    10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379,
+    378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127,
+    162, 21, 54, 103, 67, 109,
+)
+_NON_SKIN_FEATURES: tuple[tuple[int, ...], ...] = (
+    # left eye, right eye
+    (33, 246, 161, 160, 159, 158, 157, 173, 133, 155, 154, 153, 145, 144, 163, 7),
+    (263, 466, 388, 387, 386, 385, 384, 398, 362, 382, 381, 380, 374, 373, 390, 249),
+    # left brow, right brow
+    (70, 63, 105, 66, 107, 55, 65, 52, 53, 46),
+    (300, 293, 334, 296, 336, 285, 295, 282, 283, 276),
+    # lips
+    (61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185),
+)
+# The outline is pulled this far towards the face centre so the hairline, jaw
+# edge and background never enter the mean when a landmark is a pixel off.
+FACE_OVAL_SHRINK = 0.92
+# Each non-skin feature is grown by this factor around its own centre.
+NON_SKIN_GROW = 1.35
+# Sub-pixel polygon rasterisation: a mask that snaps to whole pixels jumps by
+# a pixel row from frame to frame and writes that jump into the colour mean.
+_RASTER_SHIFT = 4
+# A facial-skin region smaller than this has too few pixels to average.
+MIN_FACE_SKIN_PIXELS = 400
+
+
 @dataclass(frozen=True)
 class RoiTrace:
     """Mean RGB values from a single ROI region."""
@@ -57,6 +88,7 @@ class RoiTraceFrame:
     right_cheek: RoiTrace | None
     timestamp: float
     head_jitter_px: float = 0.0
+    face_skin: RoiTrace | None = None
 
     @property
     def best_roi(self) -> RoiTrace | None:
@@ -90,6 +122,17 @@ class RoiTraceFrame:
         Returns:
             Array of shape (3,) with [R, G, B] means, or None if no ROIs.
         """
+        # The whole facial-skin region is the preferred sample whenever it
+        # was extracted: it averages an order of magnitude more pixels than
+        # the patches. Its illumination gate is wider at the dark end because
+        # dark skin in an ordinary room is a valid sample, not a dark frame.
+        skin = self.face_skin
+        if (
+            skin is not None
+            and skin.pixel_count >= MIN_FACE_SKIN_PIXELS
+            and 20.0 <= skin.luma_mean <= 225.0
+        ):
+            return skin.to_array()
         rois = [
             roi for roi in [self.forehead, self.left_cheek, self.right_cheek]
             if (
@@ -122,8 +165,16 @@ class RoiExtractor:
         trace = extractor.extract(frame, landmarks_px, timestamp)
     """
 
-    def __init__(self, landmarks_config: LandmarksConfig | None = None) -> None:
+    def __init__(
+        self,
+        landmarks_config: LandmarksConfig | None = None,
+        *,
+        skin_region: str = "face",
+    ) -> None:
+        if skin_region not in {"face", "patches"}:
+            raise ValueError("skin_region must be 'face' or 'patches'")
         self._config = landmarks_config or get_config().landmarks
+        self._skin_region = skin_region
         self._prev_face_center: NDArray[np.float64] | None = None
         self._latest_head_jitter_px: float = 0.0
 
@@ -163,6 +214,73 @@ class RoiExtractor:
             right_cheek=right_cheek,
             timestamp=timestamp,
             head_jitter_px=self._latest_head_jitter_px,
+            face_skin=(
+                self.extract_face_skin(frame, landmarks_px)
+                if self._skin_region == "face"
+                else None
+            ),
+        )
+
+    def extract_face_skin(
+        self,
+        frame: NDArray[np.uint8],
+        landmarks_px: NDArray[np.float32],
+    ) -> RoiTrace | None:
+        """Mean colour of the facial skin: face outline minus eyes, brows, lips.
+
+        Returns ``None`` when the landmark set is not a full face mesh or the
+        region is too small to average.
+        """
+
+        landmarks = np.asarray(landmarks_px, dtype=np.float64)
+        if landmarks.ndim != 2 or landmarks.shape[0] <= max(FACE_OVAL):
+            return None
+        if not bool(np.isfinite(landmarks[:, :2]).all()):
+            return None
+        height, width = frame.shape[:2]
+        outline = landmarks[list(FACE_OVAL), :2]
+        centre = outline.mean(axis=0)
+        outline = centre + (outline - centre) * FACE_OVAL_SHRINK
+        x0 = int(max(0, np.floor(outline[:, 0].min())))
+        y0 = int(max(0, np.floor(outline[:, 1].min())))
+        x1 = int(min(width, np.ceil(outline[:, 0].max()) + 1))
+        y1 = int(min(height, np.ceil(outline[:, 1].max()) + 1))
+        if x1 - x0 < 8 or y1 - y0 < 8:
+            return None
+        origin = np.asarray([x0, y0], dtype=np.float64)
+        scale = float(1 << _RASTER_SHIFT)
+
+        def _fill(mask: NDArray[np.uint8], points: NDArray[np.float64], value: int) -> None:
+            fixed = np.round((points - origin) * scale).astype(np.int32)
+            cv2.fillPoly(
+                mask, [fixed], (value,), lineType=cv2.LINE_AA, shift=_RASTER_SHIFT
+            )
+
+        mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+        _fill(mask, outline, 255)
+        for feature in _NON_SKIN_FEATURES:
+            hull = cv2.convexHull(landmarks[list(feature), :2].astype(np.float32))
+            points = hull.reshape(-1, 2).astype(np.float64)
+            feature_centre = points.mean(axis=0)
+            _fill(mask, feature_centre + (points - feature_centre) * NON_SKIN_GROW, 0)
+
+        selected = mask > 127
+        if int(np.count_nonzero(selected)) < MIN_FACE_SKIN_PIXELS:
+            return None
+        pixels = frame[y0:y1, x0:x1][selected].astype(np.float64)  # BGR
+        blue, green, red = pixels[:, 0], pixels[:, 1], pixels[:, 2]
+        luma = 0.114 * blue + 0.587 * green + 0.299 * red
+        red_green = red - green
+        blue_green = blue - green
+        mean_bgr = pixels.mean(axis=0)
+        return RoiTrace(
+            r=float(mean_bgr[2]),
+            g=float(mean_bgr[1]),
+            b=float(mean_bgr[0]),
+            pixel_count=int(len(pixels)),
+            luma_mean=float(luma.mean()),
+            luma_std=float(luma.std()),
+            chroma_std=float(np.std(np.concatenate([red_green, blue_green]))),
         )
 
     def _update_head_jitter(self, landmarks_px: NDArray[np.float32]) -> None:

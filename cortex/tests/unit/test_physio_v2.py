@@ -15,6 +15,7 @@ from cortex.libs.schemas.physiology import (
     BeatCandidate,
     BeatStatus,
     EvidenceStatus,
+    InterBeatInterval,
     PhysiologyMetric,
 )
 from cortex.services.physio_engine.quality_scorer import QualityScorer
@@ -26,7 +27,11 @@ from cortex.services.physio_engine.v2.backends import (
 )
 from cortex.services.physio_engine.v2.beats import BeatLedger
 from cortex.services.physio_engine.v2.engine import PhysiologyEngineV2
-from cortex.services.physio_engine.v2.hrv import build_hrv_estimates
+from cortex.services.physio_engine.v2.hrv import (
+    build_hrv_estimates,
+    rmssd_ms,
+    select_interval_series,
+)
 from cortex.services.physio_engine.v2.pulse import PulsePipelineV2
 from cortex.services.physio_engine.v2.replay import (
     DatasetManifestError,
@@ -314,7 +319,7 @@ def test_refractory_conflicts_and_implausible_ibis_are_explicit() -> None:
     assert any(item.rejection_reason == "ibi_too_long" for item in intervals)
 
 
-def test_hrv_metrics_are_metric_gated_and_disabled_by_default() -> None:
+def test_hrv_metrics_each_follow_their_own_contract() -> None:
     ledger = BeatLedger(history_seconds=700.0)
     candidates = [
         _candidate(i * 1_000_000_000, window="long")
@@ -331,27 +336,129 @@ def test_hrv_metrics_are_metric_gated_and_disabled_by_default() -> None:
     disabled = build_hrv_estimates(
         intervals, algorithm=identity, boot_id=_BOOT, enabled=False
     )
-    assert disabled[PhysiologyMetric.RMSSD].status == "unavailable"
-    assert disabled[PhysiologyMetric.RMSSD].value is None
+    assert all(estimate.value is None for estimate in disabled.values())
+    assert "turned off" in (disabled[PhysiologyMetric.RMSSD].unavailable_reason or "")
     assert disabled[PhysiologyMetric.RMSSD].algorithm.name.startswith("hrv-v2:")
     assert disabled[PhysiologyMetric.RMSSD].algorithm != identity
     assert disabled[PhysiologyMetric.RMSSD].algorithm.configuration_sha256 is not None
+
     enabled = build_hrv_estimates(
         intervals, algorithm=identity, boot_id=_BOOT, enabled=True
     )
+    # A perfectly regular beat train has no variability to report...
     assert enabled[PhysiologyMetric.RMSSD].status == "experimental"
     assert enabled[PhysiologyMetric.RMSSD].value == pytest.approx(0.0)
-    assert enabled[PhysiologyMetric.SDNN].status == "experimental"
-    assert enabled[PhysiologyMetric.PNN50].status == "unavailable"
-    assert enabled[PhysiologyMetric.LF_HF_RATIO].status == "unavailable"
+    assert enabled[PhysiologyMetric.SDNN].value == pytest.approx(0.0)
+    assert enabled[PhysiologyMetric.PNN50].value == pytest.approx(0.0)
+    # ...and no spectrum or entropy to estimate, which is an abstention with
+    # a reason rather than a fabricated zero.
+    for metric in (PhysiologyMetric.LF_HF_RATIO, PhysiologyMetric.SAMPLE_ENTROPY):
+        assert enabled[metric].status == "unavailable"
+        assert enabled[metric].unavailable_reason
 
 
-def test_respiration_requires_long_agreeing_channels_and_stays_unpublished() -> None:
+def test_hrv_needs_enough_recent_clean_beats() -> None:
+    ledger = BeatLedger()
+    # Thirty seconds of beats: below the sixty-second contract.
+    candidates = [_candidate(i * 1_000_000_000, window="short") for i in range(1, 31)]
+    _, intervals = ledger.ingest(
+        candidates,
+        window_id="short",
+        window_start_mono_ns=0,
+        window_end_mono_ns=31_000_000_000,
+        boundary_margin_ns=0,
+    )
+    identity = RPPGBackendRegistry.with_packaged_backends().resolve("pos").identity
+    estimates = build_hrv_estimates(
+        intervals, algorithm=identity, boot_id=_BOOT, enabled=True
+    )
+    rmssd = estimates[PhysiologyMetric.RMSSD]
+    assert rmssd.value is None
+    assert "clean beat" in (rmssd.unavailable_reason or "")
+
+
+def test_hrv_successive_differences_do_not_span_a_rejected_beat() -> None:
+    """A dropped beat must not be differenced across as if nothing happened."""
+
+    ledger = BeatLedger()
+    # 0.80 s and 0.90 s intervals alternate, then one beat is missing
+    # (a 1.7 s gap), then the pattern resumes.
+    stamps = [1_000_000_000]
+    for index in range(1, 140):
+        step = 800_000_000 if index % 2 else 900_000_000
+        if index == 70:
+            step = 1_700_000_000
+        stamps.append(stamps[-1] + step)
+    _, intervals = ledger.ingest(
+        [_candidate(value, window="gap") for value in stamps],
+        window_id="gap",
+        window_start_mono_ns=0,
+        window_end_mono_ns=stamps[-1] + 1_000_000_000,
+        boundary_margin_ns=0,
+    )
+    series = select_interval_series(intervals, window_seconds=120.0)
+    assert series.artifact_fraction > 0.0
+    differences = series.successive_differences()
+    # Every surviving difference is the true 100 ms alternation; the pair
+    # straddling the gap is excluded instead of adding a spurious one.
+    assert np.allclose(np.abs(differences), 100.0)
+    assert rmssd_ms(series) == pytest.approx(100.0)
+
+
+def test_timing_noise_is_removed_from_variability_in_variance() -> None:
+    """Known beat-timing jitter is subtracted; a hopeless ratio abstains."""
+
+    rng = np.random.default_rng(5)
+    true_sd = 25.0
+    durations = 850.0 + rng.normal(0.0, true_sd, size=160)
+    stamps = np.concatenate(([1_000.0], 1_000.0 + np.cumsum(durations)))
+    jitter_sigma = 12.0
+    noisy = stamps + rng.normal(0.0, jitter_sigma, size=len(stamps))
+
+    def _intervals(sigma: float | None) -> tuple[InterBeatInterval, ...]:
+        ledger = BeatLedger()
+        candidates = [
+            BeatCandidate(
+                candidate_id=f"j-{index}",
+                absolute_mono_ns=int(value * 1_000_000),
+                prominence=1.0,
+                quality=0.9,
+                source_window_id="jitter",
+                timing_sigma_ms=sigma,
+            )
+            for index, value in enumerate(noisy)
+        ]
+        _, result = ledger.ingest(
+            candidates,
+            window_id="jitter",
+            window_start_mono_ns=0,
+            window_end_mono_ns=int(noisy[-1] * 1_000_000) + 1_000_000_000,
+            boundary_margin_ns=0,
+        )
+        return result
+
+    truth = float(np.sqrt(np.mean(np.diff(durations) ** 2)))
+    raw = rmssd_ms(select_interval_series(_intervals(None), window_seconds=300.0))
+    corrected_series = select_interval_series(
+        _intervals(jitter_sigma), window_seconds=300.0
+    )
+    corrected = rmssd_ms(corrected_series)
+    assert raw is not None and corrected is not None
+    assert raw > truth + 8.0  # jitter inflates the uncorrected statistic
+    assert abs(corrected - truth) < abs(raw - truth)
+    assert 0.0 < corrected_series.timing_noise_share() < 1.0
+
+
+def test_respiration_requires_agreeing_channels_and_respects_the_off_switch() -> None:
     fs = 30.0
     t = np.arange(int(45 * fs), dtype=np.float64) / fs
     times = 1_000_000_000 + np.rint(t * 1e9).astype(np.int64)
     backend = RPPGBackendRegistry.with_packaged_backends().resolve("pos")
-    fusion = RespirationFusionV2(backend, minimum_channel_quality=0.20)
+    fusion = RespirationFusionV2(
+        backend,
+        minimum_channel_quality=0.20,
+        experimental_publication_enabled=False,
+    )
     result = fusion.process_window(
         _rgb_trace(t, respiration_hz=0.25),
         times,
@@ -359,10 +466,77 @@ def test_respiration_requires_long_agreeing_channels_and_stays_unpublished() -> 
         boot_id=_BOOT,
         head_vertical_face_units=0.5 + 0.02 * np.sin(2 * np.pi * 0.25 * t),
     )
-    assert all(channel.status == "experimental" for channel in result.channels.values())
+    assert result.channels["color_envelope"].status == "experimental"
+    assert result.channels["head_motion"].status == "experimental"
+    # No beats were supplied, so the third channel abstains with a reason.
+    assert result.channels["beat_interval"].status == "unavailable"
     assert result.fused.status == "unavailable"
     assert result.fused.value is None
-    assert "reference" in (result.fused.unavailable_reason or "")
+    assert "turned off" in (result.fused.unavailable_reason or "")
+
+
+def test_respiration_window_the_acquisition_gate_accepts_is_long_enough() -> None:
+    """A ready 45 s window spans slightly under 45 s and must still be usable.
+
+    The estimator used to demand the full nominal duration, so every window
+    the acquisition gate accepted was rejected and no breathing rate could
+    be published under any configuration.
+    """
+
+    config = RPPGSignalConfig()
+    engine = PhysiologyEngineV2(config)
+    fs = 30.0
+    samples = int(config.respiration_window_seconds * fs)
+    t = np.arange(samples, dtype=np.float64) / fs  # spans (samples - 1) / fs
+    times = 1_000_000_000 + np.rint(t * 1e9).astype(np.int64)
+    result = engine.respiration.process_window(
+        _rgb_trace(t, respiration_hz=0.25),
+        times,
+        sample_rate_hz=fs,
+        boot_id=_BOOT,
+        head_vertical_face_units=0.5 + 0.02 * np.sin(2 * np.pi * 0.25 * t),
+    )
+    reasons = [
+        estimate.unavailable_reason or ""
+        for estimate in (result.fused, *result.channels.values())
+    ]
+    assert not any("requires at least" in reason for reason in reasons)
+
+
+def test_two_agreeing_breathing_channels_outvote_a_third() -> None:
+    fs = 30.0
+    t = np.arange(int(45 * fs), dtype=np.float64) / fs
+    times = 1_000_000_000 + np.rint(t * 1e9).astype(np.int64)
+    backend = RPPGBackendRegistry.with_packaged_backends().resolve("pos")
+    fusion = RespirationFusionV2(
+        backend,
+        minimum_channel_quality=0.20,
+        experimental_publication_enabled=True,
+    )
+    # Beat intervals carrying respiratory sinus arrhythmia at 0.25 Hz.
+    beat_times = np.arange(1.2, 45.0, 0.85)
+    beat_times = beat_times + 0.03 * np.sin(2 * np.pi * 0.25 * beat_times)
+    beats_ns = 1_000_000_000 + np.rint(beat_times * 1e9).astype(np.int64)
+    ledger = BeatLedger()
+    _, intervals = ledger.ingest(
+        [_candidate(int(value), window="resp") for value in beats_ns],
+        window_id="resp",
+        window_start_mono_ns=int(times[0]),
+        window_end_mono_ns=int(times[-1]) + 1_000_000_000,
+        boundary_margin_ns=0,
+    )
+    result = fusion.process_window(
+        _rgb_trace(t, respiration_hz=0.25),
+        times,
+        sample_rate_hz=fs,
+        boot_id=_BOOT,
+        # The head moves at an unrelated rate (fidgeting, not breathing).
+        head_vertical_face_units=np.sin(2 * np.pi * 0.12 * t),
+        beat_intervals=intervals,
+    )
+    assert result.channels["beat_interval"].value == pytest.approx(15.0, abs=1.5)
+    assert result.fused.status == "experimental"
+    assert result.fused.value == pytest.approx(15.0, abs=1.5)
 
 
 def test_respiration_opt_in_fuses_agreement_and_abstains_on_disagreement() -> None:

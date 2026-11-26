@@ -182,7 +182,13 @@ class TestPriorAgeing:
             observation_quality=0.95,
         )
         assert overlapping.prior_weight == pytest.approx(prior_weight(1.0), abs=1e-6)
-        assert overlapping.summary.hr.value == pytest.approx(72.0, abs=1.0)
+        # The fresh prior keeps the selection on the established 72 BPM line
+        # (the window is read as continuing that track), but a stronger
+        # competing tone leaves the line with a negative harmonic SNR, so the
+        # window abstains instead of publishing either tone.
+        assert overlapping.sqi_components["continues_track"] == 1.0
+        assert overlapping.sqi_components["harmonic_snr_db"] < 0.0
+        assert overlapping.summary.hr.value is None
 
         stale = _pipeline()
         stale.process_window(
@@ -283,7 +289,15 @@ class TestHeuristicBoundLabels:
             head_vertical_face_units=np.sin(2 * np.pi * 0.25 * t),
         )
         assert result.fused.status == EvidenceStatus.EXPERIMENTAL.value
-        for estimate in (result.fused, *result.channels.values()):
+        published = [
+            estimate
+            for estimate in (result.fused, *result.channels.values())
+            if estimate.value is not None
+        ]
+        # The fused rate and the two channels that had a signal; the
+        # beat-interval channel was given no beats and abstains.
+        assert len(published) == 3
+        for estimate in published:
             assert estimate.uncertainty is not None
             assert interval_kind(estimate.uncertainty) == "heuristic"
             assert estimate.uncertainty.confidence_level is None
@@ -367,8 +381,11 @@ class TestMotionGate:
         # The deprecated legacy proxy for the same 4 px/frame motion at 640 px
         # is 0.28 deg: below the 7.5 deg gate and a ~2 % SQI penalty at most.
         legacy = run(head_jitter_deg=4.0 * 45.0 / 640.0)
+        motionless = run()
         assert legacy.summary.hr.value is not None
-        assert legacy.summary.quality == pytest.approx(still.summary.quality, abs=0.02)
+        assert legacy.summary.quality == pytest.approx(
+            motionless.summary.quality, abs=0.02
+        )
 
     def test_face_width_evidence_takes_precedence_over_legacy_proxy(self) -> None:
         t = _times(10.0)

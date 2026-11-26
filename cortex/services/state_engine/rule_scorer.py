@@ -1,10 +1,19 @@
 """Evidence-aware deterministic support scorer.
 
 The production path emits bounded heuristic scores, never probabilities or a
-diagnosis. Each score uses a fixed denominator, so removing or lowering the
-quality of evidence cannot increase its strength. Webcam-derived physiology,
-blink, and head/neck values are intentionally excluded pending the registered
-participant-held-out validation protocol.
+diagnosis. Two evidence blocks are scored separately, each against a fixed
+denominator so that missing or low-quality evidence is never renormalised
+into strength:
+
+* the *behaviour* block (keyboard, pointer, focus transitions) establishes
+  which support hypotheses are eligible at all;
+* the *physiology* block (camera heart rate, pulse-rate variability,
+  breathing, blinking, eye closure, each against the person's own reference)
+  corroborates or tempers an eligible behavioural reading.
+
+``physiology_evidence`` defines the fusion and its bounds. Without a camera
+the physiology block has zero coverage and the output is exactly the
+behaviour-only score.
 """
 
 from __future__ import annotations
@@ -28,6 +37,14 @@ from cortex.libs.schemas.state import (
 )
 from cortex.services.state_engine.feature_schema import ORDERED_FEATURES
 from cortex.services.state_engine.model_registry import deterministic_support_identity
+from cortex.services.state_engine.physiology_baseline import PhysiologyReference
+from cortex.services.state_engine.physiology_evidence import (
+    NO_PHYSIOLOGY,
+    PhysiologyEvidence,
+    evaluate_physiology,
+    fuse,
+    fuse_coverage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +111,31 @@ class RuleScorer:
         self._baselines = baselines or UserBaselines()
         # Optional tab category context for same-category discount
         self._tab_categories: list[str] | None = None
+        # Personal reference the physiology block standardises against; None
+        # until the session (or a calibration) has supplied one.
+        self._physiology_reference: PhysiologyReference | None = None
+        self.last_physiology: PhysiologyEvidence = NO_PHYSIOLOGY
+
+    def set_physiology_reference(self, reference: PhysiologyReference | None) -> None:
+        """Provide the current personal physiology reference (or clear it)."""
+
+        self._physiology_reference = reference
+
+    # The physiology block may contribute at most this share of the entry
+    # threshold, whatever the configuration says: with behaviour at zero the
+    # fused score then stays below the level at which a state can be entered.
+    _PHYSIOLOGY_ENTRY_SHARE: float = 0.9
+
+    @property
+    def physiology_weight(self) -> float:
+        """Effective physiology weight after the cannot-establish-a-state cap."""
+
+        return float(
+            min(
+                self._config.physiology_weight,
+                self._PHYSIOLOGY_ENTRY_SHARE * self._config.estimate_entry_threshold,
+            )
+        )
 
     @property
     def baselines(self) -> UserBaselines:
@@ -225,17 +267,46 @@ class RuleScorer:
                 under if under_count >= 2 and under_coverage >= minimum_coverage else 0.0
             ),
         }
-        coverage_by_state = {
+        behaviour_coverage = {
             SupportState.SUPPORT_LIKELY: support_coverage,
             SupportState.UNDER_ENGAGED: under_coverage,
             SupportState.FLOW_LIKE: flow_coverage,
+        }
+
+        # Physiology corroborates or tempers the behavioural reading; it is
+        # fused only once behaviour has made some hypothesis eligible, so a
+        # camera can never be the sole basis of an estimate.
+        weight = self.physiology_weight
+        observed_physiology = (
+            evaluate_physiology(features, self._physiology_reference)
+            if weight > 0.0
+            else NO_PHYSIOLOGY
+        )
+        # Kept for consumers that read physiology in its own right (the
+        # strain load, the live display), whatever behaviour is doing.
+        self.last_physiology = observed_physiology
+        physiology: PhysiologyEvidence = NO_PHYSIOLOGY
+        if any(eligible.values()):
+            physiology = observed_physiology
+            contributions.extend(physiology.contributions)
+        fused = {
+            state: fuse(eligible[state], physiology.block(state), weight)
+            for state in eligible
+        }
+        coverage_by_state = {
+            **{
+                state: fuse_coverage(
+                    behaviour_coverage[state], physiology.block(state), weight
+                )
+                for state in behaviour_coverage
+            },
             SupportState.RECOVERING: 0.0,
             SupportState.UNKNOWN: 0.0,
         }
         scores = SupportScores(
-            support_likely=eligible[SupportState.SUPPORT_LIKELY],
-            under_engaged=eligible[SupportState.UNDER_ENGAGED],
-            flow_like=eligible[SupportState.FLOW_LIKE],
+            support_likely=fused[SupportState.SUPPORT_LIKELY],
+            under_engaged=fused[SupportState.UNDER_ENGAGED],
+            flow_like=fused[SupportState.FLOW_LIKE],
             # Recovery is a temporal relation and is owned by ScoreSmoother.
             recovering=0.0,
         )
@@ -478,9 +549,22 @@ class RuleScorer:
             FeatureName.HEART_RATE_BPM: legacy(
                 fv.hr, present=fv.hr is not None, version="legacy-flat-v1"
             ),
+            FeatureName.HRV_SDNN_MS: legacy(
+                fv.hrv_sdnn, present=fv.hrv_sdnn is not None, version="legacy-flat-v1"
+            ),
+            FeatureName.RESPIRATION_RATE_BPM: legacy(
+                fv.respiration_rate,
+                present=fv.respiration_rate is not None,
+                version="legacy-flat-v1",
+            ),
             FeatureName.BLINK_RATE_PER_MIN: legacy(
                 fv.blink_rate,
                 present=fv.blink_rate is not None,
+                version="legacy-flat-v1",
+            ),
+            FeatureName.PERCLOS: legacy(
+                fv.perclos_60s,
+                present=fv.perclos_60s is not None,
                 version="legacy-flat-v1",
             ),
             FeatureName.HEAD_NECK_FLEXION_SCORE: legacy(
@@ -539,11 +623,9 @@ class RuleScorer:
 
     # =========================================================================
     # Sub-score transforms shared by the Level-A rules (all return 0-1).
-    # The pre-v2 physiology/posture scorers (pulse elevation, HRV drop,
-    # blink suppression, posture collapse, workspace complexity and the
-    # legacy hyper/hypo/flow/recovery composites) were removed: nothing in
-    # the production path called them and the model card excludes camera
-    # inputs from every production rule (audit D17).
+    # Physiology is scored in ``physiology_evidence`` against the personal
+    # reference and fused in ``evaluate``; the pre-v2 composites that mixed
+    # population thresholds into the behaviour weights are not coming back.
     # =========================================================================
 
     def score_mouse_thrash(self, velocity_variance: float) -> float:

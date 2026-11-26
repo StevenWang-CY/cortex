@@ -71,11 +71,12 @@ DistractionBlockPreset = Literal["developer", "student", "writer", "custom"]
 
 
 class BreakRecommendation(BaseModel):
-    """Opt-in elapsed-focus BREAK_RECOMMENDATION wire payload.
+    """BREAK_RECOMMENDATION wire payload.
 
-    The old HRV-integral fields remain optional decode aliases for one release;
-    production recommendations use ``basis``, elapsed time, and the user's
-    preferred interval.
+    ``basis`` says why the break is suggested: ``elapsed_focus`` when the
+    user's preferred focus interval has passed, ``physiological_strain`` when
+    the cumulative strain load crossed its threshold (``stress_load`` and
+    ``threshold`` then carry the load, in strain-seconds).
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -92,20 +93,20 @@ class BreakRecommendation(BaseModel):
         "low",
         description="Presentation tone only; elapsed-time reminders use low.",
     )
-    basis: Literal["elapsed_focus", "legacy_stress_integral"] = "elapsed_focus"
+    basis: Literal[
+        "elapsed_focus", "physiological_strain", "legacy_stress_integral"
+    ] = "elapsed_focus"
     focus_elapsed_seconds: float | None = Field(None, ge=0.0)
     preferred_interval_seconds: float | None = Field(None, gt=0.0)
     stress_load: float | None = Field(
         None,
         ge=0.0,
-        deprecated=True,
-        description="Legacy compatibility field; never populated in production.",
+        description="Strain load in strain-seconds for a physiological_strain break.",
     )
     threshold: float | None = Field(
         None,
         ge=0.0,
-        deprecated=True,
-        description="Legacy compatibility field; never populated in production.",
+        description="Strain-load threshold that was crossed.",
     )
     duration_seconds: int = Field(
         ...,
@@ -608,7 +609,35 @@ class BiometricsSummary(BaseModel):
         None, description="rPPG heart-rate estimate in BPM"
     )
     hrv_rmssd: float | None = Field(
-        None, description="Compatibility field; unavailable in product"
+        None,
+        description=(
+            "RMSSD of camera pulse intervals (ms, trailing two minutes); "
+            "interpret as a change against the personal reference"
+        ),
+    )
+    hrv_sdnn: float | None = Field(
+        None, description="SDNN of camera pulse intervals (ms, trailing five minutes)"
+    )
+    pulse_quality: float | None = Field(
+        None, ge=0.0, le=1.0, description="Quality of the current pulse window"
+    )
+    strain: float | None = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Share of the observed physiology that currently points to strain "
+            "against the personal reference; None while physiology is too sparse"
+        ),
+    )
+    strain_load_ratio: float | None = Field(
+        None,
+        ge=0.0,
+        description="Cumulative strain load as a fraction of the break threshold",
+    )
+    physiology_reference_ready: bool = Field(
+        False,
+        description="True once a personal reference exists for at least one metric",
     )
     hr_delta: float | None = Field(
         None,
@@ -672,7 +701,7 @@ class BiometricsSummary(BaseModel):
         deprecated=True,
     )
     respiration_rate: float | None = Field(
-        None, description="Compatibility field; unavailable in product"
+        None, description="Breathing rate in breaths/min when two channels agree"
     )
     thrashing_score: float | None = Field(
         None,
@@ -684,7 +713,7 @@ class BiometricsSummary(BaseModel):
     stress_integral: float | None = Field(
         None,
         ge=0.0,
-        description="Compatibility field; unavailable pending validation",
+        description="Cumulative physiological strain load in strain-seconds",
     )
 
 

@@ -214,6 +214,7 @@ class CapturePipeline:
         self._last_captured: CapturedFrame | None = None
         self._observations_missing = 0
         self._observations_rejected = 0
+        self._offline_tracker_ready = False
 
     @property
     def is_running(self) -> bool:
@@ -671,6 +672,29 @@ class CapturePipeline:
             observation=observation,
             camera_identity=camera_identity,
         )
+
+    def process_offline_frame(self, captured: CapturedFrame) -> PipelineOutput:
+        """Run one frame through the production tracking and quality path.
+
+        For replaying recorded frames (qualification against reference
+        datasets, tests): the caller supplies every frame with its own event
+        time and never starts the camera loop.  The face tracker is created
+        on first use and released by :meth:`release_offline`.
+        """
+
+        if self._running:
+            raise RuntimeError("offline replay cannot share a running pipeline")
+        if not self._offline_tracker_ready:
+            self._initialize_face_tracker()
+            self._offline_tracker_ready = True
+        return self._process_frame(captured)
+
+    def release_offline(self) -> None:
+        """Release the tracker created by :meth:`process_offline_frame`."""
+
+        if self._offline_tracker_ready:
+            self._face_tracker.release()
+            self._offline_tracker_ready = False
 
     async def _publish_output(self, output: PipelineOutput) -> None:
         """Retain every observation, then publish with bounded backpressure."""
