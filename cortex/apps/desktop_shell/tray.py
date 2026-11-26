@@ -447,13 +447,11 @@ class CortexTrayIcon(QSystemTrayIcon):
                 action.setChecked(self._quiet_mode_kind == match)
             except Exception:
                 continue
-        # The pause action's checkmark mirrors set_paused; force-sync.
-        try:
-            self._pause_action.setCheckable(True)
-            self._pause_action.setChecked(self._quiet_mode_kind == "pause")
-        except Exception:
-            pass
-        self._sync_native_checkmarks()
+        # The daemon's kind is authoritative for pause too: a pause or resume
+        # made from the dashboard, extension or decay must retitle the item
+        # and the tooltip, not only move its checkmark. ``set_paused`` also
+        # syncs the native menu.
+        self.set_paused(self._quiet_mode_kind == "pause")
 
     def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
