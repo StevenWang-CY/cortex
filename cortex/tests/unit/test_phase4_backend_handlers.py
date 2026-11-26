@@ -99,6 +99,7 @@ async def test_b1_capture_unavailable_reaches_in_process_desktop() -> None:
         "frames_flowing": False,
         "face_detected": False,
         "stale": True,
+        "starting": False,
         "sequence": None,
         "pulse_unavailable": None,
     }

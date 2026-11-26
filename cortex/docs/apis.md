@@ -744,6 +744,16 @@ is separate from the 3-second inference-continuity bound. Neither timing rule
 establishes physiological validity. Clients must inspect capture status and
 pulse-unavailability reasons as well as numeric values.
 
+The `capture` object reports the camera channel: `frames_flowing` (a frame
+newer than two seconds exists), `face_detected`, `stale` (the capture failed
+to start or went away), `starting` and `pulse_unavailable`. `starting` is true
+while the camera is opening and the face model is loading, before the first
+frame, and is never true together with `frames_flowing` or `stale`: a retry
+after a failed start (the permission was missing and has just been granted)
+is reported as `starting`, not as `stale`. A client shows a start-up message
+for `starting`, and the camera-offline guidance only when frames are not
+flowing and no start is in flight.
+
 The optional `biometrics` object carries the camera estimates: `heart_rate`,
 `pulse_quality`, `hrv_sdnn`, `respiration_rate`, `blink_rate`, `perclos` and
 the head/neck proxy fields. Since 0.6.0 it also carries `strain` (the share of

@@ -149,10 +149,15 @@ def consumer_state_view(payload: Mapping[str, Any]) -> ConsumerStateViewModel:
         heart_rate, hrv = None, None
     if heart_rate is None:
         if not bool(capture.get("frames_flowing", True)):
-            # Cortex's own Settings asks macOS for first-use access and
-            # deep-links to System Settings only for a denied grant; an app
-            # that was never asked is not listed there.
-            bio_status = "Camera offline — open Settings to allow camera access"
+            if bool(capture.get("starting", False)) and not bool(capture.get("stale", False)):
+                # The camera is opening and the face model is loading.  Nothing
+                # is wrong yet, and the permission may already be granted.
+                bio_status = "Starting camera…"
+            else:
+                # Cortex's own Settings asks macOS for first-use access and
+                # deep-links to System Settings only for a denied grant; an
+                # app that was never asked is not listed there.
+                bio_status = "Camera offline — open Settings to allow camera access"
         elif capture.get("stale"):
             bio_status = "Camera signal paused — waiting for fresh frames"
         elif not bool(capture.get("face_detected", True)):

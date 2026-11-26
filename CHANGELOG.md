@@ -231,6 +231,18 @@ client audit round, each fix with a regression test.
   popup points at Cortex's own Settings, which asks macOS for first-use access.
   An app that was never asked has no row under System Settings → Camera.
 - Pause is disabled once a session has ended.
+- A camera that is still starting is no longer reported as offline. Opening
+  the camera and loading the face model takes about twelve seconds, and
+  through that window the dashboard and the browser popup said "Camera
+  offline — open Settings to allow camera access" at every launch, to a user
+  who had already granted the permission. `STATE_UPDATE` carries
+  `capture.starting` for that window and both clients say "Starting camera…";
+  the offline guidance is kept for a capture that failed or went away. The
+  same holds for the restart after the permission is granted, after a
+  calibration and after a pause: a start in flight is reported in preference
+  to the failure it is retrying, and the mark is held until the first frame
+  arrives (for at most five seconds), so no update in between reads as
+  offline.
 
 ### Found by an independent review
 
@@ -305,7 +317,7 @@ exceptions that expired on 2026-11-22.
 - Align both READMEs, the contributor guide, documentation index,
   limitations, data flow, architecture, calibration, API, privacy, UI and setup
   guides, research protocols and local wiki with the 0.6.0 boundary. AGENTS.md
-  rules 43–62 record the physiology, live-run, review and Intel lessons.
+  rules 43–63 record the physiology, live-run, review and Intel lessons.
 
 The camera physiology evidence and its limits are recorded in
 [the qualification report](docs/research/physiology-qualification.md).

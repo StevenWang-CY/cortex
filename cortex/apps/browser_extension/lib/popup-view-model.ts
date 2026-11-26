@@ -38,6 +38,7 @@ export interface CortexState {
         frames_flowing?: boolean;
         face_detected?: boolean;
         stale?: boolean;
+        starting?: boolean;
         pulse_unavailable?: PulseReadinessReason | null;
     };
     store?: { degraded?: boolean };
@@ -280,7 +281,11 @@ export function supportStateViewModel(
         bioStatusMessage: !state
             ? "Connecting to Cortex…"
             : !framesFlowing
-                ? "Camera offline — open Cortex Settings to allow camera access"
+                // The camera is opening and the face model is loading: nothing
+                // is wrong yet, and the permission may already be granted.
+                ? state.capture?.starting === true
+                    ? "Starting camera…"
+                    : "Camera offline — open Cortex Settings to allow camera access"
                 : !faceDetected
                     ? "Looking for your face…"
                     : pulseUnavailableCopy(state.capture?.pulse_unavailable),

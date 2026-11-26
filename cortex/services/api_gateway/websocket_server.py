@@ -3814,10 +3814,29 @@ class WebSocketServer:
         except Exception:
             logger.debug("pulse readiness projection failed", exc_info=True)
 
+        # The camera takes several seconds to open and the face model about
+        # ten more to load.  In that window nothing is wrong, so the clients
+        # must not show the offline guidance (which sends the user to grant a
+        # permission they may already have granted).
+        capture_starting = False
+        try:
+            capture_starting = (
+                bool(self._service_provider().get("capture_starting"))
+                and not frames_flowing
+            )
+        except Exception:
+            logger.debug("capture start-up projection failed", exc_info=True)
+        if capture_starting:
+            # A start is in flight.  If an earlier start failed (the camera
+            # permission was missing, and has just been granted), that
+            # failure is being retried: report the retry, not the failure.
+            stale = False
+
         capture_status = CaptureStatus(
             frames_flowing=frames_flowing,
             face_detected=face_detected,
             stale=stale,
+            starting=capture_starting,
             sequence=capture_sequence,
             pulse_unavailable=pulse_unavailable,
         )
