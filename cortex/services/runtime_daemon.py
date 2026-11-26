@@ -3772,6 +3772,10 @@ class CortexDaemon:
         self._services.register("latest_telemetry", features)
         self._runtime_data.publish_telemetry(features)
         self._feature_fusion.update_telemetry(features)
+        # Window thrashing is one of the seven workspace-complexity factors.
+        # Nothing fed it, so it was a constant zero and rapid window switching
+        # never moved the complexity score or its trigger gate.
+        self._context_engine.set_window_switch_rate(features.window_switch_rate)
 
     async def _refresh_context(self) -> None:
         """Build and publish one context snapshot."""
