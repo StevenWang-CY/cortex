@@ -415,7 +415,10 @@ def _raise_dashboard(target: str) -> dict:
             },
             method="POST",
         )
-        resp = urllib.request.urlopen(req, timeout=2)
+        # Loopback only: an empty ProxyHandler keeps a configured HTTP proxy
+        # (environment or macOS system setting) from swallowing the request.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        resp = opener.open(req, timeout=2)
         return {"ok": True, "status": resp.status}
     except Exception as exc:  # noqa: BLE001 — extension wants the string
         return {"ok": False, "error": str(exc)}

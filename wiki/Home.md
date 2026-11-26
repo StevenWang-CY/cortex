@@ -65,7 +65,7 @@ unconfirmed stop remains visible as an error.
 
 See [README.md](https://github.com/StevenWang-CY/cortex/blob/main/README.md) for developer commands and
 [IMPLEMENTATION.md](https://github.com/StevenWang-CY/cortex/blob/main/IMPLEMENTATION.md) for the implementation history.
-The current checkout's `docs/release/0.5.1-validation.md` records the latest review,
+The current checkout's `docs/release/0.6.0-validation.md` records the latest review,
 design decisions, completed changes, validation and remaining release/research
 requirements. `docs/research/physiology-qualification.md` records the camera
 physiology evidence added in 0.6.0 and its limits. A verified local ad-hoc

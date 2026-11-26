@@ -244,10 +244,10 @@ class SettingsDialog(QWidget):
     # Payload is the current provider key (e.g. "bedrock", "vertex",
     # "anthropic", "rule_based").
     test_provider_requested = Signal(str)
-    # P0 §3.15: emitted when the user changes the daily LLM cap.
-    # Controller (or Phase 4b daemon's settings sync) consumes the
-    # value via the SETTINGS_SYNC channel. Payload is USD.
-    daily_budget_changed = Signal(float)
+    # P0 §3.15: the daily LLM cap travels in the Apply payload
+    # (``daily_llm_budget_usd``) like every other setting. A dedicated
+    # ``daily_budget_changed`` signal was declared here for it but never
+    # emitted or connected, and has been removed.
     # P0 §3.25: emitted when the user picks a new accessibility
     # palette in the dropdown. Payload is the palette name
     # ("default" / "deuteranopia" / "protanopia" / "tritanopia").

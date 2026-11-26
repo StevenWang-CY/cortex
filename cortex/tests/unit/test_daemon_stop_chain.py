@@ -324,7 +324,7 @@ def world_factory(monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(launcher_agent, "_monotonic", world.monotonic)
         monkeypatch.setattr(launcher_agent, "find_daemon_pids", world.find_pids)
         monkeypatch.setattr(launcher_agent, "_read_auth_token", lambda: token)
-        monkeypatch.setattr(urllib.request, "urlopen", world.urlopen)
+        monkeypatch.setattr(launcher_agent._LOOPBACK_OPENER, "open", world.urlopen)
         monkeypatch.setattr(os, "kill", world.kill)
         return world
 

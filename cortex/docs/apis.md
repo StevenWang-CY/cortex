@@ -4,7 +4,7 @@ Cortex exposes a REST API on `http://127.0.0.1:9472` and a WebSocket server on `
 
 Pydantic schemas in `cortex/libs/schemas/` are authoritative. Examples below are
 selected payloads, not substitutes for generated schemas. See the
-[current validation record](../../docs/release/0.5.1-validation.md) for the
+[current validation record](../../docs/release/0.6.0-validation.md) for the
 model, source-availability and lifecycle changes, and the
 [model card](../../docs/model-cards/deterministic-support-v3.md) for the 0.6.0
 camera physiology fields.

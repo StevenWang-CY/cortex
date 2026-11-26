@@ -32,19 +32,25 @@ export interface DailyStats {
     hrSamples: number;
 }
 
+// ``x.com`` is two characters and a TLD: unanchored, ``/x\.com/`` matches
+// dropbox.com, fedex.com, box.com, linux.com and any URL that merely mentions
+// one of them, so those sites were treated as distractions in every preset.
+// Match the host itself (with any subdomain) and nothing else.
+const X_COM = /^https?:\/\/(?:[^/?#@]*\.)?x\.com(?:[:/?#]|$)/i;
+
 const FOCUS_PRESET_DOMAINS: Readonly<Record<string, readonly RegExp[]>> = {
     developer: [
-        /reddit\.com/i, /twitter\.com/i, /x\.com/i, /facebook\.com/i,
+        /reddit\.com/i, /twitter\.com/i, X_COM, /facebook\.com/i,
         /instagram\.com/i, /tiktok\.com/i, /youtube\.com/i, /netflix\.com/i,
         /9gag\.com/i, /buzzfeed\.com/i, /tumblr\.com/i, /twitch\.tv/i,
     ],
     student: [
         /instagram\.com/i, /tiktok\.com/i, /youtube\.com/i, /reddit\.com/i,
-        /twitter\.com/i, /x\.com/i, /netflix\.com/i, /twitch\.tv/i,
+        /twitter\.com/i, X_COM, /netflix\.com/i, /twitch\.tv/i,
         /facebook\.com/i, /snapchat\.com/i,
     ],
     writer: [
-        /twitter\.com/i, /x\.com/i, /reddit\.com/i, /facebook\.com/i,
+        /twitter\.com/i, X_COM, /reddit\.com/i, /facebook\.com/i,
         /instagram\.com/i, /tiktok\.com/i, /youtube\.com/i, /netflix\.com/i,
         /hacker-news\.firebaseio\.com/i, /news\.ycombinator\.com/i,
     ],
@@ -56,7 +62,7 @@ const ALWAYS_DISTRACTION = [
     /twitch\.tv/i, /9gag\.com/i, /buzzfeed\.com/i, /tumblr\.com/i,
 ];
 const CONDITIONAL_DISTRACTION = [
-    /reddit\.com/i, /twitter\.com/i, /x\.com/i, /facebook\.com/i,
+    /reddit\.com/i, /twitter\.com/i, X_COM, /facebook\.com/i,
 ];
 const AI_ASSISTANT_URL_PATTERN = /gemini\.google\.com|chatgpt\.com|chat\.openai\.com|claude\.ai|copilot\.microsoft\.com|perplexity\.ai/i;
 const VIDEO_PLATFORM_URL_PATTERN = /youtube\.com|youtu\.be/i;

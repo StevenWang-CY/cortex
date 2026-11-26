@@ -38,7 +38,10 @@ def _python_path() -> str:
 
 def _check_launcher_health() -> bool:
     try:
-        resp = urllib.request.urlopen(
+        # Loopback only: an empty ProxyHandler keeps a configured HTTP proxy
+        # from swallowing the health check.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        resp = opener.open(
             f"http://127.0.0.1:{LAUNCHER_PORT}/health", timeout=2,
         )
         data = json.loads(resp.read())

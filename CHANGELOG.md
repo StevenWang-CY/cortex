@@ -183,6 +183,18 @@ client audit round, each fix with a regression test.
   connected; announce the selected rating; open the view when asked before it
   was ever shown; wire the desktop-not-focused pulse and Snooze toast.
 
+### Audit follow-ups
+
+- Browser focus sessions match `x.com` as a host. The unanchored pattern also
+  matched dropbox.com, fedex.com, box.com and linux.com, which every preset
+  therefore treated as distractions.
+- The native host, the launcher agent and the launcher installer reach the
+  daemon on loopback without a proxy. With an HTTP proxy configured their
+  health checks read as "not running" and `/shutdown` never arrived.
+- The desktop shell acts on `RAISE_DASHBOARD` in both of its modes. A tap on a
+  macOS banner, or the browser's request to open Cortex, was broadcast to the
+  desktop and dropped.
+
 ### Found by running the installed build
 
 - Ending a session and starting another no longer crashes the app. pynput's

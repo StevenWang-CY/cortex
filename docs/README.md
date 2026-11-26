@@ -5,10 +5,11 @@ optional experimental camera estimates that can corroborate it, and separately
 authorized workspace effects. The default planner is local and execution
 defaults to `suggest_only`.
 
-The [0.5.1 validation record](release/0.5.1-validation.md) is the current review
-entry point. The [October implementation record](implementation-2026-10.md)
-preserves the preceding `0.5.0` work. Both distinguish implemented behavior
-from outstanding release and research requirements. Version 0.6.0's camera
+The [0.6.0 validation record](release/0.6.0-validation.md) is the current review
+entry point; the [0.5.1 record](release/0.5.1-validation.md) and the
+[October implementation record](implementation-2026-10.md) preserve the
+preceding work. Each distinguishes implemented behavior from outstanding
+release and research requirements. Version 0.6.0's camera
 physiology evidence is recorded in the
 [physiology qualification report](research/physiology-qualification.md). A
 local build is not a published or notarized release.

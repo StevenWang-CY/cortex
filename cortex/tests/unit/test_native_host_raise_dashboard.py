@@ -41,7 +41,7 @@ class TestRaiseDashboard:
             native_host, "_read_auth_token", return_value="fake-token"
         ):
             with patch(
-                "urllib.request.urlopen", return_value=_FakeResponse(204)
+                "urllib.request.OpenerDirector.open", return_value=_FakeResponse(204)
             ) as mock_open:
                 result = native_host._raise_dashboard("dashboard")
 
@@ -57,7 +57,7 @@ class TestRaiseDashboard:
     def test_http_error_surfaces_as_ok_false(self) -> None:
         with patch.object(native_host, "_read_auth_token", return_value=""):
             with patch(
-                "urllib.request.urlopen",
+                "urllib.request.OpenerDirector.open",
                 side_effect=RuntimeError("404 Not Found"),
             ):
                 result = native_host._raise_dashboard("dashboard")
@@ -72,7 +72,7 @@ class TestRaiseDashboard:
         # surprise validation.
         with patch.object(native_host, "_read_auth_token", return_value=""):
             with patch(
-                "urllib.request.urlopen", return_value=_FakeResponse(200)
+                "urllib.request.OpenerDirector.open", return_value=_FakeResponse(200)
             ):
                 result = native_host._raise_dashboard("x" * 64)
 

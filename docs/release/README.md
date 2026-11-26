@@ -6,10 +6,11 @@ verification below is present.
 
 ## Current local validation
 
-The current source candidate is **0.5.1**. Its algorithm, UI, protocol, and
-packaging checks are tracked in the [0.5.1 validation record](0.5.1-validation.md).
-The following 0.5.0 results are historical evidence and do not establish a
-signed 0.5.1 release.
+The current source candidate is **0.6.0**. Its algorithm, UI, protocol,
+packaging and installed-app checks are tracked in the
+[0.6.0 validation record](0.6.0-validation.md); the
+[0.5.1 record](0.5.1-validation.md) is kept. The following 0.5.0 results are
+historical evidence and do not establish a signed 0.6.0 release.
 
 The 2026-10-02 review built application version **0.5.0** as an **ad-hoc
 arm64 development artifact** from the changed working tree. Its mounted DMG

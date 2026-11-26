@@ -20,7 +20,7 @@
 <p align="center">
   <a href="https://github.com/StevenWang-CY/cortex/releases/latest">Download</a> ·
   <a href="docs/README.md">Documentation</a> ·
-  <a href="docs/release/0.5.1-validation.md">Current validation</a> ·
+  <a href="docs/release/0.6.0-validation.md">Current validation</a> ·
   <a href="CHANGELOG.md">Changelog</a> ·
   <a href="CONTRIBUTING.md">Contribute</a>
 </p>
@@ -51,7 +51,7 @@ interface, not measured accuracy or a live person's workspace.
 ## Status
 
 The source version is **0.6.0**, with support model **3.0.0** and feature
-schema **support-features-v3.0.0**. The [validation record](docs/release/0.5.1-validation.md)
+schema **support-features-v3.0.0**. The [validation record](docs/release/0.6.0-validation.md)
 separates completed checks from remaining release requirements. The download
 badge describes the latest *published* release; a source tag alone does not
 establish a signed, notarized macOS release.
@@ -207,7 +207,7 @@ notarization check blocks distribution; it is never replaced with a weaker
 signing claim.
 
 The [release guide](docs/release/README.md) explains the build and promotion
-workflows. [Current validation](docs/release/0.5.1-validation.md), the
+workflows. [Current validation](docs/release/0.6.0-validation.md), the
 [changelog](CHANGELOG.md) and [historical audit ledger](audit/findings.md)
 record the evidence and its limits.
 

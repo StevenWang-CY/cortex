@@ -77,6 +77,8 @@ class WebSocketBridge(QObject):
     session_detail_received = Signal(dict)
     trends_received = Signal(dict)
     session_recap_received = Signal(dict)
+    # RAISE_DASHBOARD: a banner tap or the browser's "Open Cortex".
+    raise_dashboard_requested = Signal()
     # P0 §3.4: locally-emitted calibration progress (not received over
     # the WebSocket — the runner is in-process). Lives here so the
     # CortexApp's wiring sites have a single thread-safe queueing point.
@@ -149,6 +151,9 @@ class WebSocketBridge(QObject):
                 "TRENDS_PAYLOAD": lambda payload: self.trends_received.emit(payload),
                 "SESSION_RECAP": lambda payload: (
                     self.session_recap_received.emit(payload)
+                ),
+                "RAISE_DASHBOARD": lambda _payload: (
+                    self.raise_dashboard_requested.emit()
                 ),
             }
         )
@@ -770,6 +775,7 @@ class CortexApp:
         self._bridge.quiet_mode_state_received.connect(self._suggestion_review.quiet_updated)
         self._bridge.quiet_mode_state_received.connect(self._dashboard.apply_quiet_mode_state)
         self._bridge.quiet_mode_state_received.connect(self._on_quiet_mode_state)
+        self._bridge.raise_dashboard_requested.connect(self._show_dashboard)
         self._dashboard.quiet_mode_requested.connect(self._bridge.send_quiet_mode_toggle)
         self._bridge.intervention_restored.connect(self._on_restore)
         if self._dashboard is not None and hasattr(

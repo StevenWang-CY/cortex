@@ -152,7 +152,15 @@ Cortex is a macOS research prototype for local behavioral support and optional e
 
 50. **`jest.requireMock("vscode")` returns a separate automock.** Assert on the module-mapped `vscode` import, which is the object the extension calls. The editor's "legacy recommendation is dropped" test asserted on the automock and could never fail.
 
-Current verification: [0.5.1 validation](docs/release/0.5.1-validation.md).
+51. **A breathing rate needs head movement and a pulse-derived channel to agree.** The envelope and beat-interval channels are both read from the pulse and fail together: on simulated recordings they agreed with each other on a rate 5 /min too low while head movement read the true one, and the wrong rate was published. Two pulse-derived channels are one mechanism, not two witnesses.
+
+52. **A listener thread must never call HIToolbox (`TIS*`/`TSM*`).** pynput's macOS keyboard listener reads the keyboard layout at the top of its thread; on current macOS that traps off the main thread (`SIGTRAP` in `dispatch_assert_queue`). The packaged 0.6.0 build crashed when a session was ended and started again, although the first start had worked. `input_hooks.keyboard_listener_class()` skips the read, which the listening path never uses; build the listener only through it, and re-check `_event_to_key` when pynput is upgraded.
+
+53. **An ad-hoc rebuild is a new app to TCC.** Its signature changes, so camera permission returns to "not determined" and macOS lists no row for it under Privacy & Security → Camera. Guidance for an offline camera must lead to Cortex's own Settings, whose link raises the first-use prompt and falls back to System Settings only for a denied grant. Granting Accessibility always needs the user's Touch ID or password and cannot be scripted.
+
+54. **Test stop-then-start on the installed build, not only start and stop.** Every defect the 0.6.0 live run found (the restart crash, the dead-end camera guidance, Pause left enabled) was invisible to the source test suite and to a single launch.
+
+Current verification: [0.6.0 validation](docs/release/0.6.0-validation.md).
 Implementation history: [October refinement](docs/implementation-2026-10.md).
 
 ---
