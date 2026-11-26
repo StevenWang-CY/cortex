@@ -133,6 +133,17 @@ def mark_shutting_down() -> None:
     _shutdown_event.set()
 
 
+def clear_shutting_down() -> None:
+    """Re-arm the delegate for a daemon starting in this process.
+
+    The latch is process-wide while a daemon's lifetime is not: the
+    in-process desktop shell hot-restarts by composing a new daemon in the
+    same process. Without clearing it, every click after the first Stop was
+    discarded and foreground banners were suppressed until the app quit.
+    """
+    _shutdown_event.clear()
+
+
 def is_shutting_down() -> bool:
     """Query the shutdown guard (test/debug helper)."""
     return _shutdown_event.is_set()
