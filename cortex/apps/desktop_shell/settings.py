@@ -959,9 +959,11 @@ class SettingsDialog(QWidget):
             )
             row.addWidget(day_label, stretch=1)
             combos: list[QComboBox] = []
-            for _ in self._SCHEDULE_SLOTS:
+            for slot in self._SCHEDULE_SLOTS:
                 cb = QComboBox()
                 cb.addItems(["on", "quiet", "off"])
+                # 28 identical combos are only tellable apart by name.
+                set_accessible_name(cb, f"{day.title()} {slot}")
                 cb.setStyleSheet(
                     _COMBO_QSS
                     + f"QComboBox {{ padding: 4px 5px; font-size: {FS_CAPTION}px; }}"
@@ -1120,6 +1122,8 @@ class SettingsDialog(QWidget):
         set_accessible_name(self._quiet_mode, "Quiet mode")
         set_accessible_name(self._quiet_duration, "Quiet duration (minutes)")
         set_accessible_name(self._llm_backend, "LLM backend provider")
+        set_accessible_name(self._budget_daily_spin, "Daily LLM cap (US dollars)")
+        set_accessible_name(self._palette_combo, "Color palette")
         set_accessible_name(self._llm_privacy_mode, "Planner privacy mode")
         set_accessible_description(
             self._llm_privacy_mode,
