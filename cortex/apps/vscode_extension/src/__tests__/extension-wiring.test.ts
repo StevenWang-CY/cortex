@@ -239,6 +239,71 @@ describe("status bar estimate freshness (rule 42)", () => {
     });
 });
 
+describe("desktop-not-focused cue (P0 §3.12)", () => {
+    function toasts(h: Harness): jest.Mock {
+        return h.vscode.window.showInformationMessage as unknown as jest.Mock;
+    }
+
+    async function flush(): Promise<void> {
+        for (let i = 0; i < 6; i++) await Promise.resolve();
+    }
+
+    const away = {
+        intervention_id: "iv-away",
+        level: "simplified_workspace",
+        headline: "Stretch for a minute",
+        desktop_not_focused: true,
+    };
+
+    it("pulses the status bar for five seconds, over the 500 ms state stream", async () => {
+        const h = await activateHarness();
+        connect(h);
+        h.deliver("STATE_UPDATE", FLOW_ESTIMATE);
+        h.deliver("INTERVENTION_TRIGGER", away);
+        expect(h.statusBar().text).toContain("Stretch for a minute");
+        expect(h.statusBar().backgroundColor).toBeDefined();
+
+        jest.advanceTimersByTime(500);
+        h.deliver("STATE_UPDATE", FLOW_ESTIMATE);
+        expect(h.statusBar().text).toContain("Stretch for a minute");
+
+        jest.advanceTimersByTime(4_500);
+        expect(h.statusBar().text).not.toContain("Stretch for a minute");
+        h.deliver("STATE_UPDATE", FLOW_ESTIMATE);
+        expect(h.statusBar().text).toContain("Steady activity");
+    });
+
+    it("offers one toast with Snooze, and Snooze reaches the daemon", async () => {
+        const h = await activateHarness();
+        connect(h);
+        toasts(h).mockImplementationOnce(() => Promise.resolve("Snooze"));
+        h.deliver("INTERVENTION_TRIGGER", away);
+        await flush();
+
+        expect(toasts(h)).toHaveBeenCalledTimes(1);
+        const [message, ...actions] = toasts(h).mock.calls[0];
+        expect(String(message)).toContain("Stretch for a minute");
+        expect(actions).toContain("Snooze");
+        const snooze = h.socket.sent
+            .map((raw) => JSON.parse(raw) as { type: string; payload: Record<string, unknown> })
+            .find((frame) => frame.type === "SNOOZE_REQUEST");
+        expect(snooze?.payload).toMatchObject({
+            intervention_id: "iv-away",
+            duration_minutes: 15,
+            source: "vscode",
+        });
+    });
+
+    it("an overlay_only intervention still raises a single toast", async () => {
+        const h = await activateHarness();
+        connect(h);
+        h.deliver("INTERVENTION_TRIGGER", { ...away, level: "overlay_only" });
+        await flush();
+        expect(toasts(h)).toHaveBeenCalledTimes(1);
+        expect(h.statusBar().text).toContain("Stretch for a minute");
+    });
+});
+
 describe("DISMISS_OVERLAY (P0 §3.21 cross-surface dismiss)", () => {
     it("clears the intervention the daemon dismissed from the panel", async () => {
         const h = await activateHarness();
