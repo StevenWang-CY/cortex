@@ -261,6 +261,43 @@ def _finish_steps(name: str) -> list[str]:
     ]
 
 
+_VERIFIED_NOTE = (
+    "Everything Cortex can check here is ready. The extension popup shows the "
+    "live connection."
+)
+_NOT_CONNECTED_NOTE = "Not connected yet — the checks below say what is missing."
+
+
+def _verification_outcome(
+    name: str,
+    *,
+    host_ok: bool,
+    extension_found: bool,
+    daemon_ok: bool,
+    error: str = "",
+) -> tuple[str, str, list[str]]:
+    """The ``(note, tone, steps)`` verdict for a browser's three checks."""
+    if host_ok and extension_found and daemon_ok:
+        return _VERIFIED_NOTE, "success", []
+    steps: list[str] = []
+    if not host_ok:
+        steps.append(
+            f"Click Connect {name} to repair the browser bridge. "
+            f"Details: {error or 'verification failed'}"
+        )
+    if not extension_found:
+        steps.append(
+            "Load the copied extension folder, then quit the browser fully "
+            "with Cmd+Q and reopen it."
+        )
+    if not daemon_ok:
+        steps.append(
+            "Start a session in Cortex so the extension has something to "
+            "connect to."
+        )
+    return _NOT_CONNECTED_NOTE, "danger", steps
+
+
 _ROW_COPY: dict[str, tuple[str, str, str]] = {
     # key: (done, not done, not checked yet)
     "bridge": (
@@ -638,15 +675,36 @@ class ConnectionsPanel(QWidget):
                 continue
             probe = _probe_bridge(_browser_app_name(name))
             rows: dict[str, bool | None] = {"daemon": daemon_ok}
-            if probe is not None:
-                bridge_ok, extension_found, _error = probe
-                rows["bridge"] = bridge_ok
-                rows["extension"] = extension_found if bridge_ok else None
             entry = getattr(self, "_status_model", {}).get(name, {})
             steps = list(entry.get("steps", []))
-            if probe is not None and not probe[0] and not steps:
-                steps = [f"Click Connect {name} to register the browser bridge."]
-            self._set_status(name, rows=rows, steps=steps)
+            note: str | None = None
+            tone: str | None = None
+            if probe is not None:
+                bridge_ok, extension_found, error = probe
+                rows["bridge"] = bridge_ok
+                rows["extension"] = extension_found if bridge_ok else None
+                all_ok = bridge_ok and extension_found and daemon_ok
+                was_verified = entry.get("note") == _VERIFIED_NOTE
+                # A verdict already on the card (from Verify or an earlier
+                # re-probe) is re-derived from the checks just run, so it can
+                # never sit under rows that contradict it. Mid-setup guidance
+                # from Connect is left alone until every check passes.
+                if all_ok or entry.get("note") in (_VERIFIED_NOTE, _NOT_CONNECTED_NOTE):
+                    note, tone, steps = _verification_outcome(
+                        name,
+                        host_ok=bridge_ok,
+                        extension_found=extension_found,
+                        daemon_ok=daemon_ok,
+                        error=error,
+                    )
+                    if all_ok and not was_verified:
+                        try:
+                            self.connection_verified.emit(name)
+                        except Exception:
+                            logger.debug("connection_verified emit failed", exc_info=True)
+                elif not bridge_ok and not steps:
+                    steps = [f"Click Connect {name} to register the browser bridge."]
+            self._set_status(name, rows=rows, steps=steps, note=note, tone=tone)
         editor_name = getattr(self, "_editor_name", "Editor")
         self._set_status(
             editor_name,
@@ -981,46 +1039,19 @@ class ConnectionsPanel(QWidget):
             "extension": extension_found,
             "daemon": daemon_ok,
         }
+        note, tone, steps = _verification_outcome(
+            name,
+            host_ok=host_ok,
+            extension_found=extension_found,
+            daemon_ok=daemon_ok,
+            error=str(getattr(verification, "error", None) or ""),
+        )
+        self._set_status(name, rows=rows, note=note, tone=tone, steps=steps)
         if host_ok and extension_found and daemon_ok:
-            self._set_status(
-                name,
-                rows=rows,
-                note=(
-                    "Everything Cortex can check here is ready. The extension "
-                    "popup shows the live connection."
-                ),
-                tone="success",
-                steps=[],
-            )
             try:
                 self.connection_verified.emit(name)
             except Exception:
                 logger.debug("connection_verified emit failed", exc_info=True)
-            return
-
-        steps: list[str] = []
-        if not host_ok:
-            detail = getattr(verification, "error", None) or "verification failed"
-            steps.append(
-                f"Click Connect {name} to repair the browser bridge. Details: {detail}"
-            )
-        if not extension_found:
-            steps.append(
-                "Load the copied extension folder, then quit the browser fully "
-                "with Cmd+Q and reopen it."
-            )
-        if not daemon_ok:
-            steps.append(
-                "Start a session in Cortex so the extension has something to "
-                "connect to."
-            )
-        self._set_status(
-            name,
-            rows=rows,
-            note="Not connected yet — the checks below say what is missing.",
-            tone="danger",
-            steps=steps,
-        )
 
     def _native_host_manifest_installed(self, name: str) -> bool:
         """Compatibility wrapper for the strong native-host verification.
