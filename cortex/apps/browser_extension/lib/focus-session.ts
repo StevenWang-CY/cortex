@@ -172,6 +172,16 @@ export function isDistractionForSession(args: {
     return false;
 }
 
+/**
+ * ``YYYY-MM-DD`` of the user's local calendar day. Daily stats are a
+ * "today" figure; the UTC date rolls over mid-day for most users.
+ */
+export function localDateKey(now: Date = new Date()): string {
+    const month = String(now.getMonth() + 1).padStart(2, "0");
+    const day = String(now.getDate()).padStart(2, "0");
+    return `${now.getFullYear()}-${month}-${day}`;
+}
+
 export function emptyDailyStats(date: string): DailyStats {
     return {
         date,
