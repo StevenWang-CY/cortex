@@ -1223,6 +1223,13 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
             for t in transitions
             if isinstance(t, dict) and str(t.get("to_state", "")).upper() == "HYPER"
         ]
+        # The report's real counter. HYPER changes are only a proxy, and the
+        # schema keeps the two apart: neither empty state may deny
+        # interventions the counter recorded.
+        try:
+            triggered = max(0, int(report.get("interventions_triggered") or 0))
+        except (TypeError, ValueError):
+            triggered = 0
 
         # Distractions.
         domains = report.get("top_distraction_domains") or []
@@ -1230,9 +1237,9 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
             domains = []
         self._populate_distractions(
             [str(d) for d in domains[:3]],
-            any_interventions=bool(intervention_rows),
+            any_interventions=bool(intervention_rows) or triggered > 0,
         )
-        self._populate_interventions(intervention_rows)
+        self._populate_interventions(intervention_rows, triggered=triggered)
 
         # Comparison.
         self._populate_comparison(report.get("comparison_to_7day"))
@@ -1395,7 +1402,7 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
             )
             self._distractions_layout.addWidget(row)
 
-    def _populate_interventions(self, rows: list[dict]) -> None:
+    def _populate_interventions(self, rows: list[dict], *, triggered: int = 0) -> None:
         for i in reversed(range(self._interventions_layout.count())):
             item = self._interventions_layout.itemAt(i)
             if item is None:
@@ -1406,7 +1413,11 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
                 w.deleteLater()
         if not rows:
             # Plain language: the shell never prints engine state names.
-            placeholder = QLabel("No interventions recorded in this session.")
+            placeholder = QLabel(
+                f"{triggered} intervention{'s' if triggered != 1 else ''} in this session."
+                if triggered > 0
+                else "No interventions recorded in this session."
+            )
             placeholder.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
             placeholder.setStyleSheet(
                 f"color: {CX_TEXT_TERTIARY}; background: transparent;"
