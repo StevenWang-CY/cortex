@@ -79,6 +79,7 @@ import { mayExtractPageContent } from "./lib/site-access";
 import {
     createFocusSession,
     emptyDailyStats,
+    localDateKey,
     focusSessionSnapshot,
     isDistractionForSession,
     resolveFocusPreset,
@@ -2559,7 +2560,7 @@ function getFocusSessionSnapshot() {
 }
 
 async function saveToDailyStats(session: FocusSession): Promise<void> {
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localDateKey();
     const result = await chrome.storage.local.get("cortex_daily_stats");
     let stats: DailyStats = result.cortex_daily_stats as DailyStats;
     if (!stats || stats.date !== today) {
@@ -5663,7 +5664,10 @@ chrome.runtime.onMessage.addListener(
 
             case "GET_DAILY_STATS":
                 chrome.storage.local.get("cortex_daily_stats", (data) => {
-                    sendResponse(data.cortex_daily_stats || null);
+                    // Only today's totals: a stored earlier day is not
+                    // "today" just because no session has ended since.
+                    const stats = data.cortex_daily_stats as DailyStats | undefined;
+                    sendResponse(stats && stats.date === localDateKey() ? stats : null);
                 });
                 return true; // async
 
