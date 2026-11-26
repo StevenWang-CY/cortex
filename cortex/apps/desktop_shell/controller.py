@@ -380,6 +380,9 @@ class CortexAppController:
         self._bridge = DaemonBridge()
         self._bridge.ui_task.connect(self._run_ui_task)
         self._paused = False
+        # "Turn off suggestions this session" pauses the desktop without a
+        # daemon quiet kind; see ``_on_quiet_mode_state_to_tray``.
+        self._suggestions_off_for_session = False
         self._active_intervention_id: str | None = None
         # Set when "Start session" arrives while a stop is still in
         # flight; the restart runs once the old daemon reports stopped.
@@ -898,6 +901,9 @@ class CortexAppController:
         self._stopping = False
         self._quitting = False
         self._qt_shutdown_started = False
+        # "Turn off suggestions this session" ends with that session; the
+        # new daemon's quiet state decides ``_paused`` from here on.
+        self._suggestions_off_for_session = False
         if self._tray is not None and hasattr(self._tray, "set_starting"):
             self._tray.set_starting()
         if self._dashboard is not None and hasattr(self._dashboard, "set_starting"):
@@ -1628,12 +1634,26 @@ class CortexAppController:
         self.request_quiet_mode(kind, duration_minutes=minutes, source="tray")
 
     def _on_quiet_mode_state_to_tray(self, payload: dict) -> None:
-        """Mirror QUIET_MODE_STATE onto the tray menu's checkable items."""
-        if self._tray is None or not isinstance(payload, dict):
+        """Mirror QUIET_MODE_STATE onto the tray menu's checkable items.
+
+        The daemon's kind is also the source of truth for ``_paused``: a
+        pause or resume made from the dashboard, an extension, a shortcut
+        or a decaying quiet mode must turn the tray item the same way its
+        title now reads, and must not leave every later state frame
+        dropped as "paused". "Turn off suggestions this session" is not a
+        daemon kind, so it holds the pause until the user resumes.
+        """
+        if not isinstance(payload, dict):
             return
         kind = str(payload.get("kind", "off"))
+        off_for_session = bool(getattr(self, "_suggestions_off_for_session", False))
+        self._paused = kind == "pause" or off_for_session
+        if self._tray is None:
+            return
         try:
             self._tray.set_quiet_mode_kind(kind)
+            if off_for_session:
+                self._tray.set_paused(True)
         except Exception:
             logger.debug("tray.set_quiet_mode_kind failed", exc_info=True)
 
@@ -2355,6 +2375,10 @@ class CortexAppController:
 
     def _toggle_pause(self) -> None:
         self._paused = not self._paused
+        if not self._paused:
+            # Resume also ends "Turn off suggestions this session" here, or
+            # the daemon's ``off`` confirmation would re-pause the desktop.
+            self._suggestions_off_for_session = False
         if self._tray is not None:
             self._tray.set_paused(self._paused)
         if self._paused:
@@ -2391,6 +2415,7 @@ class CortexAppController:
                 self._daemon_loop,
             )
         self._paused = True
+        self._suggestions_off_for_session = True
         if self._tray is not None:
             self._tray.set_paused(True)
         self._dismiss_overlay()
