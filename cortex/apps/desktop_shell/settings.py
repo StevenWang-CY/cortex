@@ -2032,6 +2032,12 @@ class SettingsDialog(QWidget):
         try:
             if "quiet_mode" in payload:
                 self._quiet_mode.setChecked(bool(payload["quiet_mode"]))
+                # The daemon's state is now what this checkbox shows, so it
+                # is also the baseline Apply compares against. Without this a
+                # synced tray pause was restated on the next unrelated Apply
+                # (turning it into a 5-minute snooze), and unticking it to
+                # resume was withheld as "untouched".
+                self._quiet_mode_baseline = self._quiet_mode.isChecked()
             if "quiet_duration_minutes" in payload:
                 try:
                     self._quiet_duration.setValue(int(payload["quiet_duration_minutes"]))
