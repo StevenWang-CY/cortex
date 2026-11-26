@@ -4,7 +4,7 @@ All notable changes to Cortex. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [v0.6.0] — 2026-11-25
+## [v0.6.0] — 2026-11-26
 
 Camera physiology becomes optional corroborating evidence for the support
 rules: `deterministic-support` 3.0.0, feature schema `support-features-v3.0.0`,
@@ -273,6 +273,13 @@ of them contradicted a statement the release made about itself.
   calibration seeds the heart-rate and breathing references, and described
   the abstention on two participants as a signal below the noise floor when,
   for one of them in bright light, the pulse was mostly readable.
+
+### Continuous integration
+
+- The arm64 jobs of CI and of the release workflow run on `macos-15`. GitHub
+  retired `macos-14`, which cancelled the arm64 Python gate on every run and
+  kept the release workflow from starting, so no tag could produce a signed
+  DMG. On `macos-15` the arm64 gate passed: 3,863 tests, coverage 72.03 %.
 
 ### Found by the first Intel gate run in six weeks
 
