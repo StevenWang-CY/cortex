@@ -30,12 +30,15 @@ WorkspaceMode = Literal[
 ]
 ActiveApp = Literal["vscode", "chrome", "terminal", "other"]
 
-# App name patterns for classification
+# App name patterns for classification. The short names are whole words:
+# a bare ``code`` matched "Xcode" (so the VS Code extension's file was read
+# as Xcode's), and ``arc``/``edge`` matched names such as "Archive Utility".
 _VSCODE_PATTERNS = re.compile(
-    r"(visual studio code|code|code - oss|codium|cursor)", re.IGNORECASE
+    r"(visual studio code|\bcode\b|code - oss|codium|cursor)", re.IGNORECASE
 )
 _CHROME_PATTERNS = re.compile(
-    r"(google chrome|chrome|chromium|brave|firefox|safari|arc|edge)", re.IGNORECASE
+    r"(google chrome|chrome|chromium|brave|firefox|safari|\barc\b|\bedge\b)",
+    re.IGNORECASE,
 )
 _TERMINAL_PATTERNS = re.compile(
     r"(terminal|iterm|warp|alacritty|kitty|hyper|wezterm|konsole|gnome-terminal|xterm)",
@@ -75,7 +78,11 @@ _COMMUNICATION_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 _SOCIAL_URL_PATTERNS = re.compile(
-    r"(twitter\.com|x\.com|reddit\.com|facebook\.com)",
+    # ``x.com`` is anchored like ``tab_classifier``'s: unanchored it matched
+    # every host ending in "x.com" (dropbox.com, box.com, fedex.com), which
+    # the rule-based plan then offered to close and History listed as
+    # distractions.
+    r"(twitter\.com|(?<![a-z0-9-])x\.com|reddit\.com|facebook\.com)",
     re.IGNORECASE,
 )
 _DISTRACTION_URL_PATTERNS = re.compile(

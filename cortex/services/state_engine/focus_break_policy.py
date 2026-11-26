@@ -24,6 +24,14 @@ class FocusBreakPolicy:
     Long gaps and inactive periods do not count. The policy owns no wall-clock
     decisions and emits at most one recommendation until the user takes a
     break, snoozes, or preferences are reset.
+
+    A break is either a completed guided break (:meth:`record_break_taken`)
+    or *observed* inactivity lasting the suggested break duration. The
+    reminder is a toast with no reply path, so without the second form only a
+    guided break re-armed it and a user who simply stepped away never got a
+    second reminder for the rest of the daemon's life. Unavailable input
+    (``active=None``) and unobserved gaps are not inactivity (AGENTS rule 38)
+    and interrupt a run of it.
     """
 
     def __init__(
@@ -46,6 +54,7 @@ class FocusBreakPolicy:
         self._last_update_at: float | None = None
         self._recommended = False
         self._snoozed_until = 0.0
+        self._inactive_run = 0.0
 
     @property
     def active_elapsed_seconds(self) -> float:
@@ -67,9 +76,10 @@ class FocusBreakPolicy:
     def evaluate(
         self,
         *,
-        active: bool,
+        active: bool | None,
         timestamp: float | None = None,
     ) -> FocusBreakDecision:
+        """Advance elapsed focus; ``active=None`` means input is unavailable."""
         supplied_now = (
             monotonic_seconds(self._clock) if timestamp is None else timestamp
         )
@@ -81,9 +91,20 @@ class FocusBreakPolicy:
         if self._last_update_at is not None:
             delta = now - self._last_update_at
             # Gaps usually mean suspend/sleep or a stopped sensor. They are not
-            # silently counted as focused work.
-            if active and 0.0 < delta <= 30.0:
+            # silently counted as focused work, nor as a break.
+            observed = 0.0 < delta <= 30.0
+            if active is True and observed:
                 self._active_elapsed += delta
+            if active is False and observed:
+                self._inactive_run += delta
+            elif active is not False or delta > 30.0:
+                self._inactive_run = 0.0
+            if self._inactive_run >= self._duration_seconds:
+                # The user stepped away for the suggested break: the focus
+                # interval starts over and the next reminder is earned anew.
+                self._active_elapsed = 0.0
+                self._recommended = False
+                self._inactive_run = 0.0
         self._last_update_at = now
 
         if not self._enabled:
@@ -122,6 +143,7 @@ class FocusBreakPolicy:
         self._recommended = False
         self._snoozed_until = 0.0
         self._last_update_at = None
+        self._inactive_run = 0.0
 
     def snooze(self, minutes: float = 10.0, *, timestamp: float | None = None) -> None:
         if minutes <= 0:

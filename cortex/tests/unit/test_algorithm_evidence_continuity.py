@@ -291,7 +291,8 @@ async def test_runtime_sampler_publishes_unavailability_without_hardware() -> No
     clock = FakeClock()
     fusion = FeatureFusion(clock=clock)
     daemon = SimpleNamespace(_aggregator=FeatureAggregator(InputHooks(clock=clock), clock=clock),
-                             _feature_fusion=fusion, _services=Mock(), _runtime_data=Mock())
+                             _feature_fusion=fusion, _services=Mock(), _runtime_data=Mock(),
+                             _context_engine=Mock())
     for _ in range(100):
         await CortexDaemon._sample_telemetry(daemon)
         clock.advance(monotonic_ns=500_000_000)

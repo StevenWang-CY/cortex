@@ -84,9 +84,15 @@ def build_fallback_plan(context: TaskContext | None = None) -> InterventionPlan:
     ]
     tab_recs: TabRecommendations | None = None
     actions: list[SuggestedAction] = []
+    # Set by either error branch so the tab branch below cannot overwrite
+    # error guidance. A ``summary.startswith("Error")`` test protected only
+    # the terminal branch; the editor branch's "N error(s) in ..." summary
+    # lost its headline to "Focus on <active tab>" whenever a tab was open.
+    error_driven = False
 
     if context is not None:
         if context.terminal_context and context.terminal_context.has_errors:
+            error_driven = True
             summary = f"Error detected: {context.terminal_context.error_summary}"
             headline = "Fix the most recent error first"
             primary_focus = "Address the error in your terminal output"
@@ -95,6 +101,7 @@ def build_fallback_plan(context: TaskContext | None = None) -> InterventionPlan:
                 "Check the file and line mentioned in the error",
             ]
         elif context.editor_context and context.editor_context.error_count > 0:
+            error_driven = True
             summary = f"{context.editor_context.error_count} error(s) in {context.editor_context.file_path}"
             headline = "Resolve editor errors one at a time"
             primary_focus = f"Start with the first error in {context.editor_context.file_path}"
@@ -170,7 +177,7 @@ def build_fallback_plan(context: TaskContext | None = None) -> InterventionPlan:
                 summary=f"{close_count} distraction tab(s) found among {len(tabs)} open tabs",
             )
 
-            if not summary.startswith("Error"):
+            if not error_driven:
                 summary = f"{len(tabs)} tabs open, {close_count} appear distracting"
                 headline = f"Focus on {active_title[:60]}" if active_title else headline
                 primary_focus = "Close distraction tabs to reduce visual clutter"
