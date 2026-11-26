@@ -75,7 +75,11 @@ _COMMUNICATION_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 _SOCIAL_URL_PATTERNS = re.compile(
-    r"(twitter\.com|x\.com|reddit\.com|facebook\.com)",
+    # ``x.com`` is anchored like ``tab_classifier``'s: unanchored it matched
+    # every host ending in "x.com" (dropbox.com, box.com, fedex.com), which
+    # the rule-based plan then offered to close and History listed as
+    # distractions.
+    r"(twitter\.com|(?<![a-z0-9-])x\.com|reddit\.com|facebook\.com)",
     re.IGNORECASE,
 )
 _DISTRACTION_URL_PATTERNS = re.compile(
