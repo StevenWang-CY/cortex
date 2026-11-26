@@ -144,7 +144,7 @@ Cortex is a macOS research prototype for local behavioral support and optional e
 
 46. **A window requirement is a share of the configured window, never its full length.** A 30 fps buffer holds 44.97 s of a 45 s window, so "require 45.0 s" meant no breathing rate was ever published.
 
-47. **RMSSD is not qualified; no rule, suggestion or screen may read it. SDNN is the variability input.** Against ECG, RMSSD reached 22.8 ms mean error with 9 % of values within 15 ms; beat-to-beat differences at 30 fps are dominated by timing noise. SDNN, which averages that noise over a window, reached 8.3 ms.
+47. **RMSSD is not qualified; no rule, suggestion or screen may read it. SDNN is the variability input.** Against ECG, RMSSD reached 22.8 ms mean error with 9 % of values within 15 ms; beat-to-beat differences at 30 fps are dominated by timing noise. SDNN, which averages that noise over a window, reached 8.2 ms.
 
 48. **Physiology is fused only into a state whose own behavior rule is eligible.** Camera evidence alone must never produce an estimate: before this rule, camera evidence alone could become the estimated dominant state. Every physiology value is read against the personal reference, and a physical camera change discards that reference, because a different camera carries a different bias.
 
