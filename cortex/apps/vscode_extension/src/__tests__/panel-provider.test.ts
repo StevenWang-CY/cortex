@@ -396,6 +396,70 @@ describe("CortexPanelProvider – view disposal (A8)", () => {
     });
 });
 
+// ── Reveal before the view was ever resolved ───────────────────────────────
+
+describe("CortexPanelProvider – reveal before the view is resolved", () => {
+    // VS Code resolves a webview view only once the user first makes it
+    // visible. Until then every "show the panel" path — the command palette,
+    // the status-bar click, each toast's View Details / Open Dashboard /
+    // Show Details — went through showPanel(), which returned silently.
+    const mockCommands = vscode.commands as unknown as { executeCommand: jest.Mock };
+
+    beforeEach(() => {
+        mockCommands.executeCommand.mockReset();
+    });
+
+    it("opens the Cortex view through its focus command when no view exists yet", () => {
+        const provider = makeProvider(new FakeWSClient());
+        provider.showPanel();
+        expect(mockCommands.executeCommand).toHaveBeenCalledWith(
+            "cortex.interventionPanel.focus",
+        );
+    });
+
+    it("targets the view id package.json actually contributes", () => {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const manifest = require("../../package.json") as {
+            contributes: { views: Record<string, Array<{ id: string; type?: string }>> };
+        };
+        const views = Object.values(manifest.contributes.views).flat();
+        expect(views).toContainEqual(
+            expect.objectContaining({ id: "cortex.interventionPanel", type: "webview" }),
+        );
+    });
+
+    it("an arriving intervention never opens or focuses an unresolved view", () => {
+        const provider = makeProvider(new FakeWSClient());
+        provider.showIntervention({ intervention_id: "iv-quiet", headline: "h" });
+        expect(mockCommands.executeCommand).not.toHaveBeenCalled();
+    });
+
+    it("delivers a morning briefing requested before the view existed", () => {
+        const provider = makeProvider(new FakeWSClient());
+        const briefing = { summary: "Two things", action_items: ["Reply"] };
+        provider.showMorningBriefing(briefing);
+        expect(mockCommands.executeCommand).toHaveBeenCalledWith(
+            "cortex.interventionPanel.focus",
+        );
+
+        const v = makeView();
+        provider.resolveWebviewView(v.view as never, {} as never, {} as never);
+        expect(v.posted).toContainEqual({ type: "morningBriefing", payload: briefing });
+
+        // Delivered once, not on every later re-resolve.
+        const v2 = makeView();
+        provider.resolveWebviewView(v2.view as never, {} as never, {} as never);
+        expect(v2.posted.some((m) => m.type === "morningBriefing")).toBe(false);
+    });
+
+    it("does nothing once the provider is disposed", () => {
+        const provider = makeProvider(new FakeWSClient());
+        provider.dispose();
+        provider.showPanel();
+        expect(mockCommands.executeCommand).not.toHaveBeenCalled();
+    });
+});
+
 // ── A6: same-id rebroadcast patches instead of rebuilding ───────────────────
 
 describe("CortexPanelProvider – micro-step patch on rebroadcast (A6)", () => {
