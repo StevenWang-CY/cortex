@@ -932,7 +932,12 @@ class CortexDaemon:
             execution_mode=self.intervention_execution_mode,
             clock=self._clock,
         )
-        self._project_launcher = ProjectLauncher(storage_path=self.config.storage.path)
+        self._project_launcher = ProjectLauncher(
+            storage_path=self.config.storage.path,
+            # Audit F12's documented extension point; it was never threaded
+            # through, so every user-added binary stayed unsupported_command.
+            user_command_allowlist=self.config.launcher.user_command_allowlist,
+        )
         self._restore_manager = RestoreManager(
             self._executor,
             timeout_seconds=float(self.config.intervention.timeout_minutes * 60),
