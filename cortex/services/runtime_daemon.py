@@ -7427,6 +7427,18 @@ class CortexDaemon:
             logger.debug("policy terminal observation failed", exc_info=True)
 
         if outcome is None:
+            # A proposal that changed nothing has no RestoreManager session
+            # (one starts only after a verified workspace receipt), so every
+            # close of it lands here. Returning without releasing the slot
+            # left ``_active_intervention_id`` set in the default
+            # suggest_only mode, and every later proposal was refused for
+            # the rest of the session.
+            if (
+                action != "restore"
+                and self._active_intervention_id == intervention_id
+                and self._restore_manager.get_active(intervention_id) is None
+            ):
+                await self._close_effectless_proposal(intervention_id, action)
             return
 
         self._recorder.append("intervention_outcome", outcome.model_dump(mode="json"))
@@ -7458,6 +7470,57 @@ class CortexDaemon:
 
         # Record tab relevance feedback (skip if per-tab feedback was already received)
         await self._record_tab_relevance_feedback(action, outcome, intervention_id)
+
+    # Lifecycle states in which a consumed authorization may have changed the
+    # workspace. Such a transaction closes through receipts and the exact
+    # restore path, never by relabelling the proposal.
+    _EFFECT_POSSIBLE_STATES: frozenset[str] = frozenset(
+        {
+            InterventionLifecycleState.APPLYING.value,
+            InterventionLifecycleState.APPLIED.value,
+            InterventionLifecycleState.PARTIAL.value,
+            InterventionLifecycleState.RESTORING.value,
+            InterventionLifecycleState.RESTORE_FAILED.value,
+        }
+    )
+
+    async def _close_effectless_proposal(self, intervention_id: str, action: str) -> bool:
+        """Release a presented proposal the user closed before any effect.
+
+        Abandons the transaction (pre-effect states only), frees the slot and
+        cached plan, tells every surface the proposal is closed and ends its
+        helpfulness tracking with the user's action. Returns False, keeping
+        everything, when the transaction may already carry an effect.
+        """
+
+        try:
+            abandoned = await self._transaction_coordinator.abandon(
+                intervention_id,
+                f"user_{action}",
+            )
+            if not abandoned:
+                transaction = await self._transaction_coordinator.get_transaction(
+                    intervention_id,
+                )
+                state = getattr(transaction, "state", None)
+                if str(getattr(state, "value", state)) in self._EFFECT_POSSIBLE_STATES:
+                    return False
+        except Exception:
+            logger.exception("Could not close proposal %s", intervention_id)
+            return False
+
+        if self._active_intervention_id == intervention_id:
+            self._active_intervention_id = None
+        async with self._micro_step_lock:
+            if (
+                self._active_plan is not None
+                and self._active_plan.intervention_id == intervention_id
+            ):
+                self._active_plan = None
+                self._micro_step_recovery_fired = False
+        await self._ws_server.send_restore(intervention_id, user_action=action)
+        await self._close_helpfulness_tracking(intervention_id, action)
+        return True
 
     async def _record_tab_relevance_feedback(
         self,
