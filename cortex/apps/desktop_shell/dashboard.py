@@ -1151,8 +1151,11 @@ class _ConsumerTab(QWidget):
             bio_row.addLayout(col, stretch=1)
 
         # Numerics and the status banner share a fixed height so the card
-        # never reflows when the first reading lands.
-        _BIO_SWAP_HEIGHT = 96
+        # never reflows when the first reading lands. 72 px holds the numeral
+        # row (about 55 px) and a three-line status message; the 96 px it
+        # replaced left the body-load line pushing "This session" captions
+        # below the fold at the default window height.
+        _BIO_SWAP_HEIGHT = 72
         self._bio_numerics = QWidget()
         self._bio_numerics.setStyleSheet("background: transparent;")
         self._bio_numerics.setLayout(bio_row)
