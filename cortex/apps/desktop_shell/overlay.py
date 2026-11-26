@@ -431,7 +431,9 @@ class OverlayWindow(QWidget):
         # keyboard focus away from whatever the user is typing into.
         # Escape still works once the user has clicked into the card.
         _safe_call(self, "setAttribute", Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-        _safe_call(self, "setFocusPolicy", Qt.FocusPolicy.StrongFocus)
+        # Click focus, not Tab focus: clicking the card still lets Escape
+        # reach ``keyPressEvent``, but the window is no dead Tab stop.
+        _safe_call(self, "setFocusPolicy", Qt.FocusPolicy.ClickFocus)
         _set_accessible_name(self, "Cortex suggestion")
         _set_accessible_description(
             self,
@@ -962,9 +964,37 @@ class OverlayWindow(QWidget):
         # back to widget-creation order which the cascading micro-step
         # rebuilds in show_intervention can scramble. Causal toggle (if
         # surfaced) comes between the steps and the footer pills.
-        _set_tab_order(self._causal_toggle, self._snooze_btn)
-        _set_tab_order(self._snooze_btn, self._quiet_session_btn)
-        _set_tab_order(self._quiet_session_btn, self._dismiss_btn)
+        self._chain_tab_order()
+
+    def _chain_tab_order(self) -> None:
+        """Pin Tab to the card's visual order, top to bottom.
+
+        Per-proposal controls (step checkboxes, action buttons, inline
+        widgets) are created after construction and Qt appends them wherever
+        it likes, so the chain is re-pinned after every render: from the ×
+        that Review focuses, Tab used to jump to 👍 at the bottom first.
+        """
+        sequence: list[object] = [self._dismiss_btn]
+        sequence.extend(getattr(self, "_step_widgets", []))
+        sequence.extend(getattr(self, "_action_buttons", []))
+        for host in getattr(self, "_inline_widgets", []):
+            find = getattr(host, "findChildren", None)
+            if callable(find):
+                try:
+                    sequence.extend(find(QLineEdit))
+                    sequence.extend(find(QPushButton))
+                except Exception:
+                    pass
+        sequence.extend([
+            self._causal_toggle,
+            self._snooze_btn,
+            self._quiet_session_btn,
+            self._thumbs_up_btn,
+            self._thumbs_down_btn,
+            self._feedback_text,
+        ])
+        for first, second in zip(sequence, sequence[1:], strict=False):
+            _set_tab_order(first, second)
 
     # ------------------------------------------------------------------
     # Public API (preserved byte-identical)
@@ -1142,6 +1172,7 @@ class OverlayWindow(QWidget):
             )
         except Exception:
             logger.debug("Action rendering failed", exc_info=True)
+        self._chain_tab_order()
 
         # The pacer is a breathing guide, so it appears only when the plan
         # is actually about breathing. Any other nudge stays a compact
@@ -1891,6 +1922,7 @@ class OverlayWindow(QWidget):
             self._build_micro_commit_widget(action)
         elif action_type == "suggest_movement_break":
             self._build_movement_break_widget(action)
+        self._chain_tab_order()
         # P0 §3.8: reveal the rating row immediately after engagement.
         self._reveal_feedback_row()
 
