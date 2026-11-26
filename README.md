@@ -75,6 +75,7 @@ beat-to-beat measures did not qualify and are not inputs. See the
 
 - **Local by default.** Deterministic planning needs no account, API key or model-network request. Camera frames are processed in memory.
 - **Evidence-aware support.** Missing sensors abstain; observed inactivity stays distinct from absent data. Finite measurements, elapsed-time smoothing, continuous dwell and explicit unknown states keep the interpretation bounded.
+- **Body-aware pacing, with an optional camera.** Pulse, heart-rate variability, breathing and blink rate are estimated on the Mac and shown against your own usual level. A demanding stretch can prompt one short breathing break. These readings corroborate the behavioral rules and never decide alone; when the camera cannot measure reliably it shows nothing.
 - **User-controlled suggestions.** New and migrated installs use `suggest_only`. A proposal cannot change tabs, editors, windows or files. Any enabled effect requires an exact authorization, a durable receipt, verification and scoped restoration.
 - **Optional external planning.** Bring your own credentials for AWS Bedrock, GCP Vertex, or the direct Anthropic API. Select sources, inspect the exact redacted request and provider caveat, then confirm that request once. Provider credentials alone never enable disclosure.
 - **Connected workspace.** Chrome/Edge MV3 and VS Code integrations provide context, goal support, session summaries and resume cards. LeetCode mode adds stage-aware, user-controlled hints and submission review.
