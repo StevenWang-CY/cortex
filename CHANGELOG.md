@@ -262,6 +262,14 @@ of them contradicted a statement the release made about itself.
   the abstention on two participants as a signal below the noise floor when,
   for one of them in bright light, the pulse was mostly readable.
 
+### Found by the first Intel gate run in six weeks
+
+- Six History time-zone tests added in this release failed on the hosted Intel
+  runner: their fixtures called `time.tzset()`, which that runner's Python
+  build does not provide. The fixtures call it only where it exists; on macOS
+  libc re-reads `TZ` for every local-time conversion. The three cost-ledger
+  season tests, which had been skipped there for the same reason, now run.
+
 ### Dependencies
 
 The dependency audit policy failed on all three ecosystems when this release
@@ -297,7 +305,7 @@ exceptions that expired on 2026-11-22.
 - Align both READMEs, the contributor guide, documentation index,
   limitations, data flow, architecture, calibration, API, privacy, UI and setup
   guides, research protocols and local wiki with the 0.6.0 boundary. AGENTS.md
-  rules 43–58 record the physiology, live-run and review lessons.
+  rules 43–62 record the physiology, live-run, review and Intel lessons.
 
 The camera physiology evidence and its limits are recorded in
 [the qualification report](docs/research/physiology-qualification.md).

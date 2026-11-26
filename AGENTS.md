@@ -168,6 +168,16 @@ Cortex is a macOS research prototype for local behavioral support and optional e
 
 58. **A check that cannot fail is not a gate.** `qualify_physiology` returned 0 whatever it measured; the documents called it a required check. `--check` now exits 1 on a missed criterion or any publication on signal-free input, and a unit test pins that decision.
 
+### Intel and hosted CI (0.6.0)
+
+59. **An early CI step that fails hides every step after it.** The Intel audit exception expired on 2026-10-15; the audit step failed from then on, and the Intel Python gate, which follows it, did not run for six weeks. Nothing was tested on Intel in that time, and this branch could not learn that six of its tests failed there. When a job is red, read which steps did not run.
+
+60. **To change one release's declared dependency, restate that release's metadata.** `override-dependencies` with a platform marker replaces the requirement everywhere: `"protobuf>=5.29.6,<6 ; <Intel marker>"` removed Protobuf from every non-Intel platform. `[[tool.uv.dependency-metadata]]` for `mediapipe` 0.10.21 changes only the release Intel installs. After any lock change, diff the exported requirements; the intended change here was one line.
+
+61. **Tests must not assume `time.tzset`.** The hosted Intel runner's Python build has none. Call it only where it exists: on macOS, libc's `localtime` re-reads `TZ` on every call, and that is what `datetime` uses. Run a zone-dependent fixture with `time.tzset` deleted as well as present.
+
+62. **The Intel Python graph can be reproduced on Apple silicon.** MediaPipe 0.10.21 ships universal2 wheels. Export the lock, keep the lines whose markers hold for `darwin`/`x86_64`/Python 3.12, and install them with `uv pip install --no-deps` into a Python 3.12 environment. That environment has NumPy 1.26 and the Intel Protobuf, runs the real-model test, and audits with `pip-audit -r … --no-deps --disable-pip`. It is not Intel hardware: the hosted Intel job is still the check of record.
+
 Current verification: [0.6.0 validation](docs/release/0.6.0-validation.md).
 Implementation history: [October refinement](docs/implementation-2026-10.md).
 
