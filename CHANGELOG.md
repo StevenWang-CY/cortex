@@ -86,7 +86,8 @@ client audit round, each fix with a regression test.
   The load is a pacing aid, not a measure of stress.
 - Everything that used to be handed RMSSD now receives SDNN or nothing.
   Session reports and multi-day trends record mean SDNN (`avg_hrv_sdnn`);
-  `avg_hrv_rmssd` still decodes in older files but is no longer written. The
+  `avg_hrv_rmssd` still decodes in older files but is no longer written or
+  read into the trend. The
   coding-practice struggle detector stays behavior-led and needs a rising
   strain load, or SDNN below 80 % of the personal reference, to corroborate
   it. The two coach modes that physiology alone would establish stay

@@ -351,7 +351,8 @@ and authorization gates.
 
 - **Session report and multi-day trend.** The session's mean heart rate and
   mean SDNN (`avg_hrv_sdnn`) are recorded. `avg_hrv_rmssd` is kept in the
-  schema so older session files load; it is no longer written.
+  schema so older session files load; it is no longer written, and an older
+  file's value is not read into the trend.
 - **Coding-practice coach (struggle detection).** Both pathways are
   behaviour-led — re-reading with a long dwell on one stage, or repeated wrong
   answers with heavy deletion — and each needs a physiological condition to
