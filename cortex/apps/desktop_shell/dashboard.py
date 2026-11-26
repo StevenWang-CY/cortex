@@ -1254,6 +1254,7 @@ class _ConsumerTab(QWidget):
         self._today_best = QLabel("0s")
         self._today_blocked = QLabel("0")
 
+        self._stat_titles: dict[int, str] = {}
         for val_widget, title in [
             (self._today_focus, "Steady"),
             (self._today_best, "Longest steady"),
@@ -1265,7 +1266,11 @@ class _ConsumerTab(QWidget):
             val_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
             val_widget.setFont(mac_native.system_font(FS_TITLE, "semibold"))
             val_widget.setStyleSheet(f"color: {CX_TEXT}; background: transparent;")
-            _set_accessible_name(val_widget, title)
+            # A label's accessible name replaces its text for assistive
+            # technology, so the name carries the value too and is kept in
+            # step by ``_set_text_if_changed``.
+            self._stat_titles[id(val_widget)] = title
+            _set_accessible_name(val_widget, f"{title}: {val_widget.text()}")
             heading = QLabel(title)
             heading.setWordWrap(True)
             heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1358,6 +1363,9 @@ class _ConsumerTab(QWidget):
             return False
         slot["text"] = text
         widget.setText(text)
+        title = getattr(self, "_stat_titles", {}).get(id(widget))
+        if title:
+            _set_accessible_name(widget, f"{title}: {text}")
         return True
 
     def _set_style_if_changed(self, widget: QWidget, qss: str) -> bool:
