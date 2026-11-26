@@ -756,6 +756,16 @@ describe("CortexPanelProvider – UX polish", () => {
         expect(html).toContain("if (!downPending) return;");
     });
 
+    it("exposes the selected rating to assistive tech, not only as a CSS class", () => {
+        const html = fullHtmlFor({ intervention_id: "iv-a11y", headline: "h" });
+        expect(html).toMatch(/id="thumbs-up"[^>]*aria-pressed="false"/);
+        expect(html).toMatch(/id="thumbs-down"[^>]*aria-pressed="false"/);
+        expect(html).toContain("thumbsUpBtn.setAttribute('aria-pressed', 'true')");
+        expect(html).toContain("thumbsDownBtn.setAttribute('aria-pressed', 'true')");
+        expect(html).toContain("thumbsDownBtn.setAttribute('aria-pressed', 'false')");
+        expect(html).toContain("thumbsUpBtn.setAttribute('aria-pressed', 'false')");
+    });
+
     it("forwards a single thumbs_down with context from the webview", () => {
         const client = new FakeWSClient();
         const provider = makeProvider(client);
