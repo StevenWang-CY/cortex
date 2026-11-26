@@ -30,6 +30,16 @@ import { randomBytes } from "crypto";
 import { CortexWSClient, WhyDetailTimeoutError } from "./ws-client";
 import { PANEL_STATE_LABELS } from "./design-tokens";
 
+/**
+ * Rule 42 (AGENTS.md): a support reading is presented only while updates
+ * keep arriving — 20 missed updates at the daemon's 500 ms cadence, the same
+ * bound the browser surfaces use (``STATE_FRESHNESS_MS``). The WebSocket
+ * heartbeat only notices a dead transport, 45–75 s later, and never trips
+ * while a daemon that has stopped publishing keeps its socket open.
+ */
+export const STATE_FRESHNESS_MS = 10_000;
+export const STALE_STATE_LABEL = "Waiting for fresh signals";
+
 type StepStatus = "pending" | "done" | "skipped";
 interface StepRow {
     text: string;
@@ -59,6 +69,9 @@ export class CortexPanelProvider
     /** Briefing asked for before the view existed; posted once on resolve. */
     private _pendingBriefing: Record<string, unknown> | null = null;
     private _disposed = false;
+    /** True once ``STATE_FRESHNESS_MS`` passed since the last STATE_UPDATE. */
+    private _stateStale = false;
+    private _stateFreshnessTimer: ReturnType<typeof setTimeout> | undefined;
 
     constructor(extensionUri: vscode.Uri, wsClient: CortexWSClient) {
         this._extensionUri = extensionUri;
@@ -80,6 +93,8 @@ export class CortexPanelProvider
         wsClient.onStateUpdate((payload) => {
             try {
                 this._currentState = payload;
+                this._stateStale = false;
+                this._armStateFreshness();
                 this._postStateToWebview();
             } catch (err) {
                 console.error("[CortexPanel] onStateUpdate handler threw:", err);
@@ -105,6 +120,7 @@ export class CortexPanelProvider
                     // "Evidence 84%" indefinitely, as a live reading. Drop the
                     // cache so the bar falls back to "No estimate".
                     this._currentState = {};
+                    this._clearStateFreshness();
                 }
                 // Repaint unconditionally. Gating on ``!this._currentPayload``
                 // meant an intervention-bearing panel never learned it had
@@ -138,6 +154,7 @@ export class CortexPanelProvider
     dispose(): void {
         this._disposed = true;
         this._pendingBriefing = null;
+        this._clearStateFreshness();
         this._disposeViewSubscriptions();
         for (const d of this._disposables.splice(0)) {
             try {
@@ -568,6 +585,33 @@ export class CortexPanelProvider
         if (!this._view) {
             return;
         }
+        const view = this._stateView();
+        this._view.webview.postMessage({
+            type: "state",
+            state: view.stateStr,
+            label: view.label,
+            status: view.status,
+            confidence: view.confidence,
+        });
+    }
+
+    /** The one presentation of ``_currentState`` both render paths share. */
+    private _stateView(): {
+        ready: boolean;
+        stateStr: string;
+        label: string;
+        status: unknown;
+        confidence: number;
+    } {
+        if (this._stateStale) {
+            return {
+                ready: false,
+                stateStr: "UNKNOWN",
+                label: STALE_STATE_LABEL,
+                status: "stale",
+                confidence: 0,
+            };
+        }
         const state = this._currentState;
         const ready = state.status === "estimated";
         const stateStr = ready ? ((state.state as string) ?? "UNKNOWN") : "UNKNOWN";
@@ -577,13 +621,37 @@ export class CortexPanelProvider
             ? "Not enough evidence"
             : PANEL_STATE_LABELS[stateStr] ?? "Status unavailable";
         const confidence = state.confidence as number | undefined;
-        this._view.webview.postMessage({
-            type: "state",
-            state: stateStr,
+        return {
+            ready,
+            stateStr,
             label,
             status: state.status,
             confidence: confidence ?? 0,
-        });
+        };
+    }
+
+    private _armStateFreshness(): void {
+        this._clearStateFreshness();
+        this._stateFreshnessTimer = setTimeout(() => {
+            this._stateFreshnessTimer = undefined;
+            if (Object.keys(this._currentState).length === 0) return;
+            this._stateStale = true;
+            try {
+                this._postStateToWebview();
+            } catch {
+                // Webview mid-teardown; the next render reads _stateStale.
+            }
+        }, STATE_FRESHNESS_MS);
+        // Presentation only: never keep the extension host alive for it.
+        (this._stateFreshnessTimer as { unref?: () => void }).unref?.();
+    }
+
+    private _clearStateFreshness(): void {
+        this._stateStale = false;
+        if (this._stateFreshnessTimer) {
+            clearTimeout(this._stateFreshnessTimer);
+            this._stateFreshnessTimer = undefined;
+        }
     }
 
     /**
@@ -612,19 +680,15 @@ export class CortexPanelProvider
      */
     private _getWebviewContent(): string {
         const nonce = randomBytes(16).toString("base64");
-        const state = this._currentState;
         const payload = this._currentPayload;
 
-        const ready = state.status === "estimated";
-        const stateStr = ready ? ((state.state as string) ?? "UNKNOWN") : "UNKNOWN";
-        const stateLabel = state.status === "warming_up"
-            ? "Still gathering"
-            : state.status === "insufficient_evidence"
-            ? "Not enough evidence"
-            : PANEL_STATE_LABELS[stateStr] ?? "Status unavailable";
-        const confidence = state.confidence as number | undefined;
-        const confPct =
-            confidence !== undefined ? Math.round(confidence * 100) : 0;
+        const {
+            ready,
+            stateStr,
+            label: stateLabel,
+            confidence,
+        } = this._stateView();
+        const confPct = Math.round(confidence * 100);
         const stateAttr = this._escapeHtml(String(stateStr));
 
         // Build intervention section
