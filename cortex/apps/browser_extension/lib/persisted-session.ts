@@ -6,6 +6,7 @@ export interface PersistedSessionState<TFocus, TUndo> {
     dismissedInterventions?: [string, number][];
     dismissedUrlPatterns?: [string, number][];
     quietMode?: boolean;
+    quietModeEndsAt?: number | null;
     tabLastActivated?: [number, number][];
     autoFocusArmed?: boolean;
     autoFocusEndsAt?: number | null;
@@ -22,7 +23,7 @@ export interface DurableAutoFocusState {
 
 const SESSION_KEYS = [
     "focusSession", "undoStack", "dismissedInterventions",
-    "dismissedUrlPatterns", "quietMode", "tabLastActivated",
+    "dismissedUrlPatterns", "quietMode", "quietModeEndsAt", "tabLastActivated",
     "autoFocusArmed", "autoFocusEndsAt", "autoFocusPreset",
     "autoFocusCustomDomains", "badge",
 ] as const;
@@ -109,6 +110,9 @@ export class BrowserSessionStore {
         );
         decoded.tabLastActivated = tabTimestampEntries(raw.tabLastActivated);
         if (typeof raw.quietMode === "boolean") decoded.quietMode = raw.quietMode;
+        if (raw.quietModeEndsAt === null || finiteTimestamp(raw.quietModeEndsAt)) {
+            decoded.quietModeEndsAt = raw.quietModeEndsAt as number | null;
+        }
         if (typeof raw.autoFocusArmed === "boolean") {
             decoded.autoFocusArmed = raw.autoFocusArmed;
         }
