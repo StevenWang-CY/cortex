@@ -396,6 +396,11 @@ class ConsentLadder:
                 # consecutive escalations would silently bleed
                 # earned credit and ratchet the user back to suggest.
                 state["approvals"] = 0
+                # De-escalation counts "3 rejections at current level". Old
+                # rejections (already past the recency window, or escalation
+                # could not have happened) carried over, so one dismissal
+                # right after a promotion could undo it.
+                state["rejections"] = 0
                 logger.info(
                     "Consent escalated for '%s': %s -> %s (after %d approvals)",
                     action_type,
