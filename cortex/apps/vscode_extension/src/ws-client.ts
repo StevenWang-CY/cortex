@@ -210,6 +210,17 @@ export class CortexWSClient {
     private readonly _readToken: () => CapabilityTokenLookup;
 
     /**
+     * F16 parity: the correlation id the daemon stamped on the latest
+     * INTERVENTION_TRIGGER for each intervention. The daemon drops any
+     * USER_ACTION / USER_RATING whose id differs from that stamp, and it
+     * mints a fresh id for a frame that carries none — so omitting it meant
+     * every Dismiss, engage and rating from VS Code was discarded. Bounded
+     * and insertion-ordered so the oldest entry is evicted first.
+     */
+    private readonly _interventionCorrelationIds = new Map<string, string>();
+    private static readonly _MAX_TRACKED_INTERVENTIONS = 64;
+
+    /**
      * A4: the daemon must answer ``AUTH`` with ``AUTH_OK`` before the
      * client counts as connected. If nothing arrives within this window
      * the socket is torn down so the backoff cycle can retry instead of
@@ -402,9 +413,18 @@ export class CortexWSClient {
         this._intentionalDisconnect = false;
 
         try {
-            this._ws = new WebSocket(this._url);
+            const socket = new WebSocket(this._url);
+            this._ws = socket;
+            // disconnect() and setUrl() close a socket gracefully, and the ws
+            // library keeps emitting frames that arrive during the close
+            // handshake. A socket that is no longer ``_ws`` speaks for nobody:
+            // its late STATE_UPDATE repainted a "Disconnected" status bar as a
+            // live reading, and its AUTH_OK marked a freshly dialled,
+            // unauthenticated socket connected and sent IDENTIFY on it.
+            const current = (): boolean => this._ws === socket;
 
-            this._ws.on("open", () => {
+            socket.on("open", () => {
+                if (!current()) return;
                 this._lastInboundSequenceByType.clear();
                 this._seenInboundEventIds.clear();
                 this._seenInboundEventOrder.length = 0;
@@ -412,7 +432,8 @@ export class CortexWSClient {
                 this._onSocketOpen();
             });
 
-            this._ws.on("message", (data: WebSocket.RawData) => {
+            socket.on("message", (data: WebSocket.RawData) => {
+                if (!current()) return;
                 this._handleMessage(data.toString());
             });
 
@@ -420,18 +441,20 @@ export class CortexWSClient {
             // ``websockets`` server auto-pongs every inbound frame-level
             // ping; the timestamp lets ``_checkHeartbeatHealth`` decide
             // whether the connection is alive.
-            this._ws.on("pong", () => {
+            socket.on("pong", () => {
+                if (!current()) return;
                 this._lastPongAt = Date.now();
             });
 
-            this._ws.on("close", (code: number, reason: Buffer | string) => {
+            socket.on("close", (code: number, reason: Buffer | string) => {
+                if (!current()) return;
                 const reasonText = typeof reason === "string"
                     ? reason
                     : (reason ? reason.toString() : "");
                 this._handleDisconnect(code, reasonText);
             });
 
-            this._ws.on("error", () => {
+            socket.on("error", () => {
                 // onclose will follow; no extra handling needed
             });
         } catch {
@@ -764,7 +787,33 @@ export class CortexWSClient {
             },
             timestamp: Date.now() / 1000,
             sequence: ++this._sequence,
+            correlation_id: this._interventionCorrelationIds.get(interventionId),
         });
+    }
+
+    /** Remember the daemon's stamp for an intervention (newest wins). */
+    private _rememberInterventionCorrelation(msg: WSMessage): void {
+        const interventionId = msg.payload.intervention_id;
+        const correlationId = msg.correlation_id;
+        if (
+            typeof interventionId !== "string"
+            || interventionId.length === 0
+            || typeof correlationId !== "string"
+            || correlationId.length === 0
+        ) {
+            return;
+        }
+        this._interventionCorrelationIds.delete(interventionId);
+        this._interventionCorrelationIds.set(interventionId, correlationId);
+        if (
+            this._interventionCorrelationIds.size
+            > CortexWSClient._MAX_TRACKED_INTERVENTIONS
+        ) {
+            const oldest = this._interventionCorrelationIds.keys().next().value;
+            if (oldest !== undefined) {
+                this._interventionCorrelationIds.delete(oldest);
+            }
+        }
     }
 
     /** Send typed per-action apply/compensation/restore receipts. */
@@ -825,6 +874,8 @@ export class CortexWSClient {
             payload,
             timestamp: Date.now() / 1000,
             sequence: ++this._sequence,
+            // The daemon routes ratings through the same stale-ACK check.
+            correlation_id: this._interventionCorrelationIds.get(interventionId),
         });
     }
 
@@ -1022,6 +1073,7 @@ export class CortexWSClient {
                 break;
 
             case "INTERVENTION_TRIGGER":
+                this._rememberInterventionCorrelation(msg);
                 for (const handler of this._interventionHandlers) {
                     try {
                         handler(msg.payload);

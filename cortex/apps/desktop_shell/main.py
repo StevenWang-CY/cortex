@@ -35,7 +35,7 @@ from cortex.apps.desktop_shell.dashboard import DashboardWindow
 from cortex.apps.desktop_shell.font_assets import install_application_fonts
 from cortex.apps.desktop_shell.message_router import DesktopMessageRouter
 from cortex.apps.desktop_shell.onboarding import OnboardingWindow, onboarding_marker_path
-from cortex.apps.desktop_shell.overlay import OverlayWindow
+from cortex.apps.desktop_shell.overlay import OverlayWindow, overlay_close_action
 from cortex.apps.desktop_shell.settings import SettingsDialog
 from cortex.apps.desktop_shell.tokens import FS_FOOTNOTE
 from cortex.apps.desktop_shell.tray import CortexTrayIcon
@@ -119,9 +119,7 @@ class WebSocketBridge(QObject):
         self._message_router = DesktopMessageRouter(
             {
                 "STATE_UPDATE": lambda payload: self.state_updated.emit(payload),
-                "INTERVENTION_TRIGGER": lambda payload: (
-                    self.intervention_triggered.emit(payload)
-                ),
+                "INTERVENTION_TRIGGER": self._on_trigger_frame,
                 "INTERVENTION_RESTORE": lambda payload: (
                     self.intervention_restored.emit(payload)
                 ),
@@ -156,6 +154,24 @@ class WebSocketBridge(QObject):
         )
         # One-release compatibility facade. New code calls router.reset().
         self._last_seq_by_type = self._message_router.sequence_state
+        # intervention_id -> the cid the daemon stamped on its latest
+        # trigger. The daemon drops a USER_ACTION whose cid differs from
+        # it, and mints a fresh one (which never matches) when none is
+        # sent. Bounded; written on the WS thread before the trigger is
+        # emitted, read on the Qt thread when the user acts.
+        self._trigger_cids: dict[str, str] = {}
+
+    _MAX_TRIGGER_CIDS = 32
+
+    def _on_trigger_frame(self, payload: dict[str, Any]) -> None:
+        intervention_id = payload.get("intervention_id")
+        cid = self._message_router.current_correlation_id
+        if isinstance(intervention_id, str) and intervention_id and cid:
+            self._trigger_cids.pop(intervention_id, None)
+            self._trigger_cids[intervention_id] = cid
+            while len(self._trigger_cids) > self._MAX_TRIGGER_CIDS:
+                self._trigger_cids.pop(next(iter(self._trigger_cids)))
+        self.intervention_triggered.emit(payload)
 
     def start(self) -> None:
         """Start the WebSocket listener in a background thread."""
@@ -201,13 +217,44 @@ class WebSocketBridge(QObject):
         """Send a USER_ACTION message to the daemon."""
         if self._loop is None or self._ws is None:
             return
-        msg = json.dumps({
+        envelope: dict[str, Any] = {
             "type": "USER_ACTION",
             "payload": {"action": action, "intervention_id": intervention_id},
             "timestamp": 0,
             "sequence": 0,
-        })
+        }
+        cid = self._trigger_cids.get(intervention_id) if intervention_id else None
+        if cid:
+            envelope["correlation_id"] = cid
+        msg = json.dumps(envelope)
         asyncio.run_coroutine_threadsafe(self._send(msg), self._loop)
+
+    def send_user_rating(
+        self, intervention_id: str, rating: str, text_feedback: str = "",
+    ) -> None:
+        """Send a USER_RATING (👍/👎, optional one-line comment).
+
+        The daemon checks ratings against the trigger cid exactly like
+        USER_ACTION, so the frame echoes it.
+        """
+        if self._loop is None or self._ws is None or not intervention_id:
+            return
+        payload: dict[str, Any] = {
+            "intervention_id": str(intervention_id),
+            "rating": str(rating),
+        }
+        if text_feedback:
+            payload["context"] = str(text_feedback)[:200]
+        envelope: dict[str, Any] = {
+            "type": "USER_RATING",
+            "payload": payload,
+            "timestamp": 0,
+            "sequence": 0,
+        }
+        cid = self._trigger_cids.get(intervention_id)
+        if cid:
+            envelope["correlation_id"] = cid
+        asyncio.run_coroutine_threadsafe(self._send(json.dumps(envelope)), self._loop)
 
     def send_action_execute(
         self,
@@ -478,7 +525,10 @@ class WebSocketBridge(QObject):
                 import websockets
 
                 uri = f"ws://{self._host}:{self._port}"
-                async with websockets.connect(uri) as ws:
+                # Loopback only: websockets defaults to the system or
+                # environment proxy, whose bypass list does not cover
+                # 127.0.0.1, and would hand the AUTH token to the proxy.
+                async with websockets.connect(uri, proxy=None) as ws:
                     self._ws = ws
                     self.connection_changed.emit(True)
                     logger.info(f"Connected to Cortex daemon at {uri}")
@@ -585,6 +635,9 @@ class CortexApp:
         self._onboarding: OnboardingWindow | None = None
         self._bridge: WebSocketBridge | None = None
         self._paused = False
+        # "Turn off suggestions this session" pauses the desktop without a
+        # daemon quiet kind; see ``_on_quiet_mode_state``.
+        self._suggestions_off_for_session = False
         self._quitting = False
         self._quit_filter: QObject | None = None
         self._active_intervention_id: str | None = None
@@ -716,6 +769,7 @@ class CortexApp:
         )
         self._bridge.quiet_mode_state_received.connect(self._suggestion_review.quiet_updated)
         self._bridge.quiet_mode_state_received.connect(self._dashboard.apply_quiet_mode_state)
+        self._bridge.quiet_mode_state_received.connect(self._on_quiet_mode_state)
         self._dashboard.quiet_mode_requested.connect(self._bridge.send_quiet_mode_toggle)
         self._bridge.intervention_restored.connect(self._on_restore)
         if self._dashboard is not None and hasattr(
@@ -763,15 +817,7 @@ class CortexApp:
                 self._on_calibration_apply_waiting
             )
 
-        # Connect overlay dismiss to user action
-        self._overlay.dismissed.connect(self._on_overlay_dismissed)
-        # G4 (audit-prod): overlay action buttons route here. Native
-        # action types execute inline in the desktop shell; browser-bound
-        # ones go to the daemon as an ACTION_EXECUTE with
-        # ``request_dispatch=True`` so the daemon forwards as
-        # ACTION_DISPATCH to the connected chrome / edge client.
-        if hasattr(self._overlay, "action_invoked"):
-            self._overlay.action_invoked.connect(self._on_action_invoked)
+        self._wire_overlay()
 
         # Connect settings changes
         self._settings.settings_changed.connect(self._on_settings_changed)
@@ -1000,11 +1046,38 @@ class CortexApp:
                 }
             )
 
+    def _wire_overlay(self) -> None:
+        """Route the overlay's user gestures to the daemon."""
+        if self._overlay is None:
+            return
+        # Connect overlay dismiss to user action
+        self._overlay.dismissed.connect(self._on_overlay_dismissed)
+        # G4 (audit-prod): overlay action buttons route here. Native
+        # action types execute inline in the desktop shell; browser-bound
+        # ones go to the daemon as an ACTION_EXECUTE with
+        # ``request_dispatch=True`` so the daemon forwards as
+        # ACTION_DISPATCH to the connected chrome / edge client.
+        if hasattr(self._overlay, "action_invoked"):
+            self._overlay.action_invoked.connect(self._on_action_invoked)
+        # P0 §3.8: 👍/👎 and the 👎 comment. The in-process controller
+        # forwards these; this host used to leave the signal unconnected.
+        if hasattr(self._overlay, "rating_invoked"):
+            self._overlay.rating_invoked.connect(self._on_rating_invoked)
+
+    @Slot(str, str, str)
+    def _on_rating_invoked(
+        self, intervention_id: str, rating: str, text_feedback: str,
+    ) -> None:
+        if self._bridge is not None:
+            self._bridge.send_user_rating(intervention_id, rating, text_feedback)
+
     @Slot(str)
     def _on_overlay_dismissed(self, intervention_id: str) -> None:
-        """Handle overlay dismiss by user."""
+        """Report the card's close; only a user's close is a dismissal."""
         if self._bridge is not None:
-            self._bridge.send_user_action("dismissed", intervention_id)
+            self._bridge.send_user_action(
+                overlay_close_action(self._overlay), intervention_id,
+            )
 
     def _on_settings_save_failed(self, reason: str) -> None:
         """Audit-prod fix (P1-2): surface failed save in the dashboard."""
@@ -1822,13 +1895,42 @@ class CortexApp:
                 logger.debug("mark_extensions_connected failed", exc_info=True)
 
     def _toggle_pause(self) -> None:
-        """Toggle pause/resume state."""
+        """Toggle pause/resume state.
+
+        Routed through QUIET_MODE_TOGGLE like the in-process controller, so
+        the daemon actually stops sensing and the QUIET_MODE_STATE
+        broadcast updates every surface; a local flag alone left the
+        browser and editor receiving interventions the desktop dropped.
+        """
         self._paused = not self._paused
+        if not self._paused:
+            self._suggestions_off_for_session = False
         if self._tray is not None:
             self._tray.set_paused(self._paused)
         if self._paused:
             self._dismiss_overlay()
+        if self._bridge is not None:
+            self._bridge.send_quiet_mode_toggle(
+                "pause" if self._paused else "off", source="tray",
+            )
         logger.info(f"Cortex {'paused' if self._paused else 'resumed'}")
+
+    @Slot(dict)
+    def _on_quiet_mode_state(self, payload: dict) -> None:
+        """The daemon's quiet kind is the source of truth for ``_paused``
+        and the tray, whichever surface paused or resumed."""
+        if not isinstance(payload, dict):
+            return
+        kind = str(payload.get("kind", "off"))
+        self._paused = kind == "pause" or self._suggestions_off_for_session
+        if self._tray is None:
+            return
+        try:
+            self._tray.set_quiet_mode_kind(kind)
+            if self._suggestions_off_for_session:
+                self._tray.set_paused(True)
+        except Exception:
+            logger.debug("tray quiet-state mirror failed", exc_info=True)
 
     def _restore_workspace(self) -> None:
         """Restore the current intervention if one is active."""
@@ -1850,6 +1952,7 @@ class CortexApp:
                 "interventions_enabled": False,
             })
         self._paused = True
+        self._suggestions_off_for_session = True
         if self._tray is not None:
             self._tray.set_paused(True)
         self._dismiss_overlay()

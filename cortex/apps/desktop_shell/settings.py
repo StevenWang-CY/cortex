@@ -173,6 +173,10 @@ _SCROLL_QSS = (
     "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
 )
 
+# "Test connection" waits this long for TEST_PROVIDER_RESULT. The daemon caps
+# its own probe at 5 s; nothing answers at all when no session is running.
+_PROVIDER_TEST_TIMEOUT_MS = 15_000
+
 
 def _active_calibration_measured_at() -> float | None:
     """Return the canonical active profile's measurement time in seconds."""
@@ -320,6 +324,13 @@ class SettingsDialog(QWidget):
         self._permission_timer: QTimer = QTimer(self)
         self._permission_timer.setInterval(1500)
         self._permission_timer.timeout.connect(self._refresh_permission_states)
+
+        # Bounds the "Testing…" state of the provider pill (see
+        # ``_PROVIDER_TEST_TIMEOUT_MS``).
+        self._provider_test_timer: QTimer = QTimer(self)
+        self._provider_test_timer.setSingleShot(True)
+        self._provider_test_timer.setInterval(_PROVIDER_TEST_TIMEOUT_MS)
+        self._provider_test_timer.timeout.connect(self._on_provider_test_timeout)
 
     # -- Native chrome ---------------------------------------------------
 
@@ -637,6 +648,9 @@ class SettingsDialog(QWidget):
             mac_native.system_font(FS_CAPTION, "regular"),
         )
         self._distraction_custom_domains.setMaximumHeight(90)
+        # A tab is never part of a domain; let Tab move on instead of
+        # trapping keyboard users in the box.
+        self._distraction_custom_domains.setTabChangesFocus(True)
         self._distraction_custom_domains.setStyleSheet(
             "QPlainTextEdit {"
             f"  background: {CX_SURFACE};"
@@ -945,9 +959,11 @@ class SettingsDialog(QWidget):
             )
             row.addWidget(day_label, stretch=1)
             combos: list[QComboBox] = []
-            for _ in self._SCHEDULE_SLOTS:
+            for slot in self._SCHEDULE_SLOTS:
                 cb = QComboBox()
                 cb.addItems(["on", "quiet", "off"])
+                # 28 identical combos are only tellable apart by name.
+                set_accessible_name(cb, f"{day.title()} {slot}")
                 cb.setStyleSheet(
                     _COMBO_QSS
                     + f"QComboBox {{ padding: 4px 5px; font-size: {FS_CAPTION}px; }}"
@@ -1106,6 +1122,8 @@ class SettingsDialog(QWidget):
         set_accessible_name(self._quiet_mode, "Quiet mode")
         set_accessible_name(self._quiet_duration, "Quiet duration (minutes)")
         set_accessible_name(self._llm_backend, "LLM backend provider")
+        set_accessible_name(self._budget_daily_spin, "Daily LLM cap (US dollars)")
+        set_accessible_name(self._palette_combo, "Color palette")
         set_accessible_name(self._llm_privacy_mode, "Planner privacy mode")
         set_accessible_description(
             self._llm_privacy_mode,
@@ -1128,9 +1146,15 @@ class SettingsDialog(QWidget):
 
         # Phase-3 / Audit-1.2 F5: include the new P0 §3.10 / §3.12
         # controls in the tab order so keyboard users can reach them.
+        # Every focusable control belongs here in visual order: one left out
+        # is pushed behind the whole chain, so the permission links,
+        # Recalibrate and Test connection used to come only after Apply.
         chain_tab_order(
             self._webcam_enabled,
+            self._camera_perm_row["label"],
             self._input_telemetry_enabled,
+            self._accessibility_perm_row["label"],
+            self._recalibrate_btn,
             self._interventions_enabled,
             self._sensitivity_slider,
             self._cooldown_spin,
@@ -1141,6 +1165,7 @@ class SettingsDialog(QWidget):
             self._distraction_custom_domains,
             self._os_notifications,
             self._llm_backend,
+            self._test_provider_btn,
             self._llm_privacy_mode,
             self._external_context_ack,
             self._review_context_btn,
@@ -1371,8 +1396,28 @@ class SettingsDialog(QWidget):
             logger.debug("open System Settings failed", exc_info=True)
 
     def _on_back(self) -> None:
+        self._discard_unapplied_edits()
         self.hide()
         self.back_requested.emit()
+
+    def closeEvent(self, event: object) -> None:  # noqa: D401 - Qt override
+        # The title-bar close button bypasses ``_on_back``; it must not keep
+        # abandoned edits either.
+        self._discard_unapplied_edits()
+        super().closeEvent(event)
+
+    def _discard_unapplied_edits(self) -> None:
+        """Return every control to the saved value when Settings closes.
+
+        The dialog is built once and only hidden, so edits abandoned without
+        Apply stayed in the widgets: reopening showed values the daemon was
+        not running, and the next Apply of anything sent them too. Sources
+        chosen in the review sheet are a remembered selection, not a Settings
+        edit, and are kept.
+        """
+        context_sources = dict(self._saved_context_sources)
+        self._load_persisted_settings()
+        self._saved_context_sources = context_sources
 
     def _show_apply_error(
         self,
@@ -1746,10 +1791,21 @@ class SettingsDialog(QWidget):
             self._provider_status_pill.setStyleSheet(status_pill_qss("info"))
         except Exception:
             pass
+        self._provider_test_timer.start()
         try:
             self.test_provider_requested.emit(provider)
         except Exception:
             logger.debug("test_provider_requested emit failed", exc_info=True)
+
+    def _on_provider_test_timeout(self) -> None:
+        """No result arrived: stop claiming that a test is in flight."""
+        try:
+            self._provider_status_pill.setText(
+                "No answer · start a session, then test again"
+            )
+            self._provider_status_pill.setStyleSheet(status_pill_qss("warning"))
+        except Exception:
+            logger.debug("provider pill timeout update failed", exc_info=True)
 
     def apply_provider_test_result(self, payload: dict) -> None:
         """Render the result of a TEST_PROVIDER round-trip.
@@ -1761,6 +1817,7 @@ class SettingsDialog(QWidget):
         """
         if not isinstance(payload, dict):
             return
+        self._provider_test_timer.stop()
         provider = str(payload.get("provider") or "")
         ok = bool(payload.get("ok"))
         latency = payload.get("latency_ms")
@@ -1898,16 +1955,22 @@ class SettingsDialog(QWidget):
             # the extension; this dialog holds only a persisted preference.
             self._quiet_mode_baseline = self._quiet_mode.isChecked()
             self._quiet_duration.setValue(_get_int("quiet_duration_minutes", 30))
+            # Every control is set on every load, falling back to its
+            # default: this also runs on Close to discard unapplied edits, so
+            # a control left untouched here keeps whatever was abandoned.
             llm_mode = str(self._qs.value("llm_mode", "bedrock"))
             llm_modes = ["bedrock", "vertex", "direct", "rule_based"]
-            if llm_mode in llm_modes:
-                self._llm_backend.setCurrentIndex(llm_modes.index(llm_mode))
+            self._llm_backend.setCurrentIndex(
+                llm_modes.index(llm_mode) if llm_mode in llm_modes else 0
+            )
             planner_mode = str(self._qs.value("llm_planner_mode", "no_llm"))
             planner_modes = ["no_llm", "no_content", "external_redacted"]
-            if planner_mode in planner_modes and llm_mode != "rule_based":
-                self._llm_privacy_mode.setCurrentIndex(
-                    planner_modes.index(planner_mode)
-                )
+            # The offline backend runs the local planner (index 0).
+            self._llm_privacy_mode.setCurrentIndex(
+                planner_modes.index(planner_mode)
+                if planner_mode in planner_modes and llm_mode != "rule_based"
+                else 0
+            )
             self._external_context_ack.setChecked(
                 _get_bool("external_context_enabled", False)
                 and str(
@@ -1944,8 +2007,7 @@ class SettingsDialog(QWidget):
             _preset_index = {
                 "developer": 0, "student": 1, "writer": 2, "custom": 3,
             }
-            if preset in _preset_index:
-                self._distraction_preset.setCurrentIndex(_preset_index[preset])
+            self._distraction_preset.setCurrentIndex(_preset_index.get(preset, 0))
             raw_domains = self._qs.value(
                 "auto_distraction_block_custom_domains", [],
             )
@@ -1989,21 +2051,24 @@ class SettingsDialog(QWidget):
                     schedule_dict = {}
                 for day, combos in self._schedule_combos.items():
                     saved = schedule_dict.get(day, []) if isinstance(schedule_dict, dict) else []
+                    if not isinstance(saved, list):
+                        saved = []
                     for idx, cb in enumerate(combos):
-                        if idx < len(saved):
-                            val = str(saved[idx])
-                            cb_idx = cb.findText(val) if hasattr(cb, "findText") else -1
-                            if cb_idx >= 0:
-                                cb.setCurrentIndex(cb_idx)
+                        # Unsaved slots return to the default ("on", index 0).
+                        val = str(saved[idx]) if idx < len(saved) else "on"
+                        cb_idx = cb.findText(val) if hasattr(cb, "findText") else -1
+                        cb.setCurrentIndex(cb_idx if cb_idx >= 0 else 0)
             except Exception:
                 logger.debug("weekly schedule restore failed", exc_info=True)
             # P0 §3.25 — palette variant.
             try:
                 palette_value = str(self._qs.value("palette_variant", "default"))
+                palette_index = 0
                 for i in range(self._palette_combo.count()):
                     if self._palette_combo.itemData(i) == palette_value:
-                        self._palette_combo.setCurrentIndex(i)
+                        palette_index = i
                         break
+                self._palette_combo.setCurrentIndex(palette_index)
                 # Apply at startup so the runtime helper returns the
                 # right palette from the very first state lookup.
                 from cortex.apps.desktop_shell.palette_runtime import (
@@ -2032,6 +2097,12 @@ class SettingsDialog(QWidget):
         try:
             if "quiet_mode" in payload:
                 self._quiet_mode.setChecked(bool(payload["quiet_mode"]))
+                # The daemon's state is now what this checkbox shows, so it
+                # is also the baseline Apply compares against. Without this a
+                # synced tray pause was restated on the next unrelated Apply
+                # (turning it into a 5-minute snooze), and unticking it to
+                # resume was withheld as "untouched".
+                self._quiet_mode_baseline = self._quiet_mode.isChecked()
             if "quiet_duration_minutes" in payload:
                 try:
                     self._quiet_duration.setValue(int(payload["quiet_duration_minutes"]))
@@ -2084,4 +2155,11 @@ class SettingsDialog(QWidget):
             self._show_apply_error(
                 "Some settings could not be applied. Your changes may not have taken effect.",
             )
-        self._persist_settings(self.get_settings())
+        # Save only what the daemon just stated. A snapshot of every control
+        # would also save edits the user has not applied, and Close would
+        # then "restore" them instead of discarding them.
+        current = self.get_settings()
+        synced = {key for key in payload if key in current}
+        if "sensitivity" in synced:
+            synced.add("entry_threshold")
+        self._persist_settings({key: current[key] for key in synced})

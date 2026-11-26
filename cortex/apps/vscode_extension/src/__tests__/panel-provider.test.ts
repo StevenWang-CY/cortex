@@ -396,6 +396,131 @@ describe("CortexPanelProvider – view disposal (A8)", () => {
     });
 });
 
+// ── Rule 42: the state bar shares the evidence lifetime ────────────────────
+
+describe("CortexPanelProvider – state freshness (rule 42)", () => {
+    beforeEach(() => {
+        jest.useFakeTimers({ doNotFake: ["nextTick", "queueMicrotask", "setImmediate"] });
+    });
+    afterEach(() => {
+        jest.clearAllTimers();
+        jest.useRealTimers();
+    });
+
+    const flow = { state: "FLOW", status: "estimated", confidence: 0.84 };
+
+    function lastState(posted: Record<string, unknown>[]): Record<string, unknown> | undefined {
+        return posted.filter((m) => m.type === "state").pop();
+    }
+
+    it("expires the label and evidence ten seconds after the last update", () => {
+        const client = new FakeWSClient();
+        client.setConnected(true);
+        const provider = makeProvider(client);
+        const v = makeView();
+        provider.resolveWebviewView(v.view as never, {} as never, {} as never);
+
+        client.fireState(flow);
+        expect(lastState(v.posted)).toMatchObject({ label: "Steady activity", status: "estimated" });
+
+        jest.advanceTimersByTime(9_999);
+        expect(lastState(v.posted)).toMatchObject({ label: "Steady activity" });
+
+        jest.advanceTimersByTime(1);
+        const stale = lastState(v.posted);
+        expect(stale).toMatchObject({ state: "UNKNOWN", label: "Waiting for fresh signals" });
+        expect(stale?.status).not.toBe("estimated");
+
+        // A full rebuild while stale must not resurrect the old reading.
+        provider.showIntervention({ intervention_id: "iv-stale", headline: "h" });
+        expect(v.html).toContain("Waiting for fresh signals");
+        expect(v.html).toContain("No estimate");
+        expect(v.html).not.toContain("Evidence 84%");
+
+        client.fireState(flow);
+        expect(lastState(v.posted)).toMatchObject({ label: "Steady activity", status: "estimated" });
+    });
+
+    it("a disconnect cancels the pending expiry", () => {
+        const client = new FakeWSClient();
+        client.setConnected(true);
+        const provider = makeProvider(client);
+        const v = makeView();
+        provider.resolveWebviewView(v.view as never, {} as never, {} as never);
+        client.fireState(flow);
+        client.setConnected(false);
+        client.fireConnection(false);
+        const posts = v.posted.length;
+        jest.advanceTimersByTime(10_000);
+        expect(v.posted.length).toBe(posts);
+        expect(v.html).toContain('data-testid="cx-state-offline"');
+    });
+});
+
+// ── Reveal before the view was ever resolved ───────────────────────────────
+
+describe("CortexPanelProvider – reveal before the view is resolved", () => {
+    // VS Code resolves a webview view only once the user first makes it
+    // visible. Until then every "show the panel" path — the command palette,
+    // the status-bar click, each toast's View Details / Open Dashboard /
+    // Show Details — went through showPanel(), which returned silently.
+    const mockCommands = vscode.commands as unknown as { executeCommand: jest.Mock };
+
+    beforeEach(() => {
+        mockCommands.executeCommand.mockReset();
+    });
+
+    it("opens the Cortex view through its focus command when no view exists yet", () => {
+        const provider = makeProvider(new FakeWSClient());
+        provider.showPanel();
+        expect(mockCommands.executeCommand).toHaveBeenCalledWith(
+            "cortex.interventionPanel.focus",
+        );
+    });
+
+    it("targets the view id package.json actually contributes", () => {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const manifest = require("../../package.json") as {
+            contributes: { views: Record<string, Array<{ id: string; type?: string }>> };
+        };
+        const views = Object.values(manifest.contributes.views).flat();
+        expect(views).toContainEqual(
+            expect.objectContaining({ id: "cortex.interventionPanel", type: "webview" }),
+        );
+    });
+
+    it("an arriving intervention never opens or focuses an unresolved view", () => {
+        const provider = makeProvider(new FakeWSClient());
+        provider.showIntervention({ intervention_id: "iv-quiet", headline: "h" });
+        expect(mockCommands.executeCommand).not.toHaveBeenCalled();
+    });
+
+    it("delivers a morning briefing requested before the view existed", () => {
+        const provider = makeProvider(new FakeWSClient());
+        const briefing = { summary: "Two things", action_items: ["Reply"] };
+        provider.showMorningBriefing(briefing);
+        expect(mockCommands.executeCommand).toHaveBeenCalledWith(
+            "cortex.interventionPanel.focus",
+        );
+
+        const v = makeView();
+        provider.resolveWebviewView(v.view as never, {} as never, {} as never);
+        expect(v.posted).toContainEqual({ type: "morningBriefing", payload: briefing });
+
+        // Delivered once, not on every later re-resolve.
+        const v2 = makeView();
+        provider.resolveWebviewView(v2.view as never, {} as never, {} as never);
+        expect(v2.posted.some((m) => m.type === "morningBriefing")).toBe(false);
+    });
+
+    it("does nothing once the provider is disposed", () => {
+        const provider = makeProvider(new FakeWSClient());
+        provider.dispose();
+        provider.showPanel();
+        expect(mockCommands.executeCommand).not.toHaveBeenCalled();
+    });
+});
+
 // ── A6: same-id rebroadcast patches instead of rebuilding ───────────────────
 
 describe("CortexPanelProvider – micro-step patch on rebroadcast (A6)", () => {
@@ -629,6 +754,16 @@ describe("CortexPanelProvider – UX polish", () => {
         expect(html.match(/command: 'userRating'/g)).toHaveLength(1);
         // 👎 defers the send to Enter/Esc; Enter must not send twice.
         expect(html).toContain("if (!downPending) return;");
+    });
+
+    it("exposes the selected rating to assistive tech, not only as a CSS class", () => {
+        const html = fullHtmlFor({ intervention_id: "iv-a11y", headline: "h" });
+        expect(html).toMatch(/id="thumbs-up"[^>]*aria-pressed="false"/);
+        expect(html).toMatch(/id="thumbs-down"[^>]*aria-pressed="false"/);
+        expect(html).toContain("thumbsUpBtn.setAttribute('aria-pressed', 'true')");
+        expect(html).toContain("thumbsDownBtn.setAttribute('aria-pressed', 'true')");
+        expect(html).toContain("thumbsDownBtn.setAttribute('aria-pressed', 'false')");
+        expect(html).toContain("thumbsUpBtn.setAttribute('aria-pressed', 'false')");
     });
 
     it("forwards a single thumbs_down with context from the webview", () => {

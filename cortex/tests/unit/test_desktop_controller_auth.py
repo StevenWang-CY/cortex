@@ -114,7 +114,9 @@ async def test_bridge_sends_auth_first_after_connect(
 
     class _FakeWebsocketsModule:
         @staticmethod
-        def connect(uri: str) -> Any:  # noqa: ARG004 — uri unused in test
+        def connect(uri: str, *, proxy: object = True) -> Any:  # noqa: ARG004 — unused in test
+            # Mirrors ``websockets.connect``'s keyword; the bridge passes
+            # ``proxy=None`` for its loopback socket.
             return _FakeWS()
 
     monkeypatch.setitem(sys.modules, "websockets", _FakeWebsocketsModule)

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import collections
 import logging
+import re
 import time
 from typing import Any
 
@@ -640,6 +641,11 @@ class _ConsumerTab(QWidget):
         # Qt's restyle / paint chain when the user's state is unchanged.
         # Keyed by id(widget) because QWidget is not hashable on every Qt build.
         self._render_cache: dict[int, dict[str, str]] = {}
+        # Labels whose visible text is live data. Qt exposes a label's
+        # accessible name *in place of* its text, so each of these carries
+        # "<title>: <current text>" and ``_set_text_if_changed`` keeps it in
+        # step; a fixed name would hide the value from VoiceOver.
+        self._spoken_titles: dict[int, str] = {}
         # Phase J-3: empty-state flag. Flips False on the first ``update_state``
         # call so the placeholder paragraph in the biometrics card vanishes
         # and the live numerics take over. Sticky across reconnects.
@@ -718,7 +724,8 @@ class _ConsumerTab(QWidget):
             self._state_label.setToolTip(_CONCEPTS_GLOSSARY["state"])
         except Exception:
             pass
-        _set_accessible_name(self._state_label, "Cortex status")
+        self._spoken_titles[id(self._state_label)] = "Cortex status"
+        _set_accessible_name(self._state_label, "Cortex status: Disconnected")
         badge_layout.addWidget(self._state_label, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         self._state_badge.setStyleSheet(
@@ -949,6 +956,7 @@ class _ConsumerTab(QWidget):
             )
         )
         self._health_banner.setVisible(False)
+        self._spoken_titles[id(self._health_banner)] = "Health warning"
         _set_accessible_name(self._health_banner, "Health warning")
         root.addWidget(self._health_banner)
 
@@ -1265,7 +1273,11 @@ class _ConsumerTab(QWidget):
             val_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
             val_widget.setFont(mac_native.system_font(FS_TITLE, "semibold"))
             val_widget.setStyleSheet(f"color: {CX_TEXT}; background: transparent;")
-            _set_accessible_name(val_widget, title)
+            # A label's accessible name replaces its text for assistive
+            # technology, so the name carries the value too and is kept in
+            # step by ``_set_text_if_changed``.
+            self._spoken_titles[id(val_widget)] = title
+            _set_accessible_name(val_widget, f"{title}: {val_widget.text()}")
             heading = QLabel(title)
             heading.setWordWrap(True)
             heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1358,6 +1370,11 @@ class _ConsumerTab(QWidget):
             return False
         slot["text"] = text
         widget.setText(text)
+        title = getattr(self, "_spoken_titles", {}).get(id(widget))
+        if title:
+            # Rich-text banners carry markup (the Open Settings link).
+            plain = re.sub(r"<[^>]+>", "", text)
+            _set_accessible_name(widget, f"{title}: {plain}")
         return True
 
     def _set_style_if_changed(self, widget: QWidget, qss: str) -> bool:
@@ -1433,6 +1450,7 @@ class _ConsumerTab(QWidget):
         self._cost_last_value = cost
         try:
             self._cost_pill.setText(text)
+            _set_accessible_name(self._cost_pill, f"LLM spend today: {text}")
             color = BRAND_ACCENT_TEXT if ratio >= 0.80 else CX_TEXT_SECONDARY
             self._cost_pill.setStyleSheet(
                 f"QLabel#CortexCostPill {{ {PILL_QSS} color: {color}; }}"
@@ -1632,6 +1650,12 @@ class _ConsumerTab(QWidget):
             label = f"{label} · {duration}m"
         try:
             self._quiet_capsule.setText(label)
+            _set_accessible_name(
+                self._quiet_capsule,
+                "Pause or quiet Cortex"
+                if kind == "off"
+                else f"Pause or quiet Cortex, now {label}",
+            )
         except Exception:
             logger.debug("quiet capsule label update failed", exc_info=True)
         try:
@@ -2196,6 +2220,10 @@ class _ConsumerTab(QWidget):
         # extension row too — they can't possibly be alive without the
         # daemon. This keeps the dashboard's connection story coherent.
         if connected:
+            if self._session_phase == _PHASE_ENDED:
+                # The previous session's daemon stopped; whatever connects
+                # now is a new session (the WebSocket host has no Start).
+                self._begin_session_stats()
             self._ended_by_user = False
             self._enter_phase(_PHASE_LIVE)
             return
@@ -2353,9 +2381,20 @@ class _ConsumerTab(QWidget):
         elif self._session_phase in (_PHASE_ENDED, _PHASE_DISCONNECTED):
             self._request_session_start()
 
+    def _begin_session_stats(self) -> None:
+        """Start "This session" over: zero the accumulators and hide the
+        section until the new session's first estimate arrives."""
+        self._reset_today_stats()
+        self._has_estimate = False
+        try:
+            self._session_stats.setVisible(False)
+        except Exception:
+            pass
+
     def _request_session_start(self) -> None:
         if not self._restart_available:
             return
+        self._begin_session_stats()
         self._enter_phase(_PHASE_STARTING)
         try:
             self.session_start_requested.emit()

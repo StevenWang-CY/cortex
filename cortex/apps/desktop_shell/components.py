@@ -216,6 +216,15 @@ class _ElideFilter(QObject):
         self._label = label
         self._mode = mode
         self._full = label.text()
+        # What this filter last displayed. A label text that differs from it
+        # was set by a caller with plain ``setText`` and becomes the new full
+        # text; without this, every resize restored the install-time text.
+        self._shown = self._full
+        # The label's own tooltip / accessible name, saved while elision
+        # substitutes the full text for them.
+        self._overrode = False
+        self._base_tooltip = ""
+        self._base_name = ""
         # Allow the label to shrink below its natural text width so the
         # layout can hand it a constrained rect (otherwise the minimum
         # size hint pins it to the full string and it clips instead).
@@ -234,23 +243,44 @@ class _ElideFilter(QObject):
         self._apply()
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802
-        if event.type() == QEvent.Type.Resize:
+        etype = event.type()
+        if etype == QEvent.Type.Resize:
+            self._apply()
+        elif etype == QEvent.Type.Paint and self._label.text() != self._shown:
+            # ``setText`` posts no event of its own but always repaints:
+            # adopt and elide the caller's new text before the next frame.
             self._apply()
         return False
 
     def _apply(self) -> None:
         try:
+            current = self._label.text()
+            if current != self._shown:
+                self._full = current
             fm = QFontMetrics(self._label.font())
             avail = max(0, self._label.width())
             elided = fm.elidedText(self._full, self._mode, avail)
-            if elided != self._label.text():
+            self._shown = elided
+            if elided != current:
                 self._label.setText(elided)
-            # Keep full text reachable for mouse-hover + VoiceOver even when
-            # the on-screen text is shortened.
+            # Keep full text reachable for mouse-hover + VoiceOver while the
+            # on-screen text is shortened; restore the label's own tooltip
+            # and name once it fits again.
             if elided != self._full:
+                if not self._overrode:
+                    self._base_tooltip = self._label.toolTip()
+                    self._base_name = self._label.accessibleName()
+                    self._overrode = True
                 self._label.setToolTip(self._full)
                 try:
                     self._label.setAccessibleName(self._full)
+                except Exception:
+                    pass
+            elif self._overrode:
+                self._overrode = False
+                self._label.setToolTip(self._base_tooltip)
+                try:
+                    self._label.setAccessibleName(self._base_name)
                 except Exception:
                     pass
         except Exception:  # pragma: no cover - lightweight stub

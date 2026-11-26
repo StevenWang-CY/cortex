@@ -361,6 +361,20 @@ class _SparklineWidget(QWidget):
             painter.end()
 
 
+def overlay_close_action(overlay: object | None) -> str:
+    """The USER_ACTION a host reports for the card's last close.
+
+    Only a user's close (×, Escape, Cmd+D) is ``"dismissed"``: the daemon
+    records it as a dismissal, trains the dismissal model on it and books
+    a consent rejection. The untouched timeout and the close after a 👍 or
+    a 👎 comment are ``"expired"``, a neutral close, as the browser panel
+    already reports its own timeout.
+    """
+
+    reason = getattr(overlay, "last_dismiss_reason", "user")
+    return "dismissed" if reason == "user" else "expired"
+
+
 class OverlayWindow(QWidget):
     """Frameless always-on-top intervention overlay with native HUD styling."""
 
@@ -412,6 +426,13 @@ class OverlayWindow(QWidget):
         # Idempotency guard: once dismissed (auto or user), subsequent dismiss
         # calls are no-ops. First emitter wins. See F06.
         self._dismissed: bool = False
+        # Why the card last closed: "user" (×, Escape, Cmd+D), "timeout"
+        # (five minutes untouched) or "rated" (the close after 👍 or a 👎
+        # comment). Set before ``dismissed`` is emitted; hosts report only
+        # "user" to the daemon as a dismissal, which it books as a
+        # rejection. The others are a neutral close.
+        self.last_dismiss_reason: str = "user"
+        self._rated_close_id: str = ""
         # P0 §3.8 audit fix: per-intervention rating-row gate. ``True``
         # for guided_mode + simplified_workspace; ``False`` for
         # overlay_only minimal-tone interventions. Set in
@@ -431,7 +452,9 @@ class OverlayWindow(QWidget):
         # keyboard focus away from whatever the user is typing into.
         # Escape still works once the user has clicked into the card.
         _safe_call(self, "setAttribute", Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-        _safe_call(self, "setFocusPolicy", Qt.FocusPolicy.StrongFocus)
+        # Click focus, not Tab focus: clicking the card still lets Escape
+        # reach ``keyPressEvent``, but the window is no dead Tab stop.
+        _safe_call(self, "setFocusPolicy", Qt.FocusPolicy.ClickFocus)
         _set_accessible_name(self, "Cortex suggestion")
         _set_accessible_description(
             self,
@@ -962,9 +985,37 @@ class OverlayWindow(QWidget):
         # back to widget-creation order which the cascading micro-step
         # rebuilds in show_intervention can scramble. Causal toggle (if
         # surfaced) comes between the steps and the footer pills.
-        _set_tab_order(self._causal_toggle, self._snooze_btn)
-        _set_tab_order(self._snooze_btn, self._quiet_session_btn)
-        _set_tab_order(self._quiet_session_btn, self._dismiss_btn)
+        self._chain_tab_order()
+
+    def _chain_tab_order(self) -> None:
+        """Pin Tab to the card's visual order, top to bottom.
+
+        Per-proposal controls (step checkboxes, action buttons, inline
+        widgets) are created after construction and Qt appends them wherever
+        it likes, so the chain is re-pinned after every render: from the ×
+        that Review focuses, Tab used to jump to 👍 at the bottom first.
+        """
+        sequence: list[object] = [self._dismiss_btn]
+        sequence.extend(getattr(self, "_step_widgets", []))
+        sequence.extend(getattr(self, "_action_buttons", []))
+        for host in getattr(self, "_inline_widgets", []):
+            find = getattr(host, "findChildren", None)
+            if callable(find):
+                try:
+                    sequence.extend(find(QLineEdit))
+                    sequence.extend(find(QPushButton))
+                except Exception:
+                    pass
+        sequence.extend([
+            self._causal_toggle,
+            self._snooze_btn,
+            self._quiet_session_btn,
+            self._thumbs_up_btn,
+            self._thumbs_down_btn,
+            self._feedback_text,
+        ])
+        for first, second in zip(sequence, sequence[1:], strict=False):
+            _set_tab_order(first, second)
 
     # ------------------------------------------------------------------
     # Public API (preserved byte-identical)
@@ -1142,6 +1193,7 @@ class OverlayWindow(QWidget):
             )
         except Exception:
             logger.debug("Action rendering failed", exc_info=True)
+        self._chain_tab_order()
 
         # The pacer is a breathing guide, so it appears only when the plan
         # is actually about breathing. Any other nudge stays a compact
@@ -1891,6 +1943,7 @@ class OverlayWindow(QWidget):
             self._build_micro_commit_widget(action)
         elif action_type == "suggest_movement_break":
             self._build_movement_break_widget(action)
+        self._chain_tab_order()
         # P0 §3.8: reveal the rating row immediately after engagement.
         self._reveal_feedback_row()
 
@@ -2174,7 +2227,7 @@ class OverlayWindow(QWidget):
             logger.debug("rating_invoked(thumbs_up) failed", exc_info=True)
         # Once rated, collapse the overlay — the rating completes the
         # interaction (consent: implicit "I'm done").
-        QTimer.singleShot(180, self._auto_dismiss)
+        self._schedule_rated_close(180)
 
     def _on_thumbs_down(self) -> None:
         if not self._intervention_id:
@@ -2210,7 +2263,7 @@ class OverlayWindow(QWidget):
                 )
         self._feedback_text.clear()
         self._feedback_text.hide()
-        QTimer.singleShot(120, self._auto_dismiss)
+        self._schedule_rated_close(120)
 
     # ─────────────────────────────────────────────────────────────────
     # P0 §3.9: structured "Why?" drilldown
@@ -2296,6 +2349,18 @@ class OverlayWindow(QWidget):
     def _auto_dismiss(self) -> None:
         self._dismiss(reason="timeout")
 
+    def _schedule_rated_close(self, delay_ms: int) -> None:
+        self._rated_close_id = self._intervention_id
+        QTimer.singleShot(delay_ms, self._close_after_rating)
+
+    def _close_after_rating(self) -> None:
+        # Only the card that was rated: a newer suggestion shown within the
+        # delay must stay open.
+        rated = self._rated_close_id
+        self._rated_close_id = ""
+        if rated and rated == self._intervention_id:
+            self._dismiss(reason="rated")
+
     def _dismiss(self, *, reason: str) -> None:
         """The one dismiss path (user, timeout, rating completion).
 
@@ -2316,6 +2381,7 @@ class OverlayWindow(QWidget):
             logger.debug("clear inline widgets failed", exc_info=True)
         self.hide()
         dismissed_id = self._intervention_id
+        self.last_dismiss_reason = reason
         self.dismissed.emit(dismissed_id)
         # Audit-prod fix (P2): clear ``_intervention_id`` so a stale
         # button click after dismiss (Qt repaint tail, animation queue)

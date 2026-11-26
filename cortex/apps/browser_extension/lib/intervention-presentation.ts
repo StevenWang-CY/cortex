@@ -12,6 +12,10 @@ const DEFAULT_INTERVENTION_COOLDOWN_MS = 30 * 60 * 1_000;
 const DEFAULT_URL_COOLDOWN_MS = 10 * 60 * 1_000;
 const MAX_COOLDOWN_MS = 24 * 60 * 60 * 1_000;
 const MAX_DISMISSALS = 512;
+// Feedback (a rating, the 👎 comment, a notification click) can name an
+// intervention that is no longer mounted, so its trigger cid is kept a
+// little longer than the mount itself.
+const MAX_REMEMBERED_CIDS = 32;
 
 function boundedCooldown(value: unknown, fallback: number): number {
     return typeof value === "number" && Number.isFinite(value) && value >= 0
@@ -32,6 +36,7 @@ export class InterventionPresentationState {
     private mounted: ActiveInterventionRecord | null = null;
     private readonly interventionDismissals = new Map<string, number>();
     private readonly urlDismissals = new Map<string, number>();
+    private readonly triggerCids = new Map<string, string>();
     private interventionCooldownMs = DEFAULT_INTERVENTION_COOLDOWN_MS;
     private urlCooldownMs = DEFAULT_URL_COOLDOWN_MS;
 
@@ -49,7 +54,29 @@ export class InterventionPresentationState {
             correlation_id: correlationId,
             mountedAt,
         };
+        const interventionId = plan.intervention_id;
+        if (typeof interventionId === "string" && interventionId) {
+            this.triggerCids.delete(interventionId);
+            this.triggerCids.set(interventionId, correlationId);
+            while (this.triggerCids.size > MAX_REMEMBERED_CIDS) {
+                const oldest = this.triggerCids.keys().next().value;
+                if (typeof oldest !== "string") break;
+                this.triggerCids.delete(oldest);
+            }
+        }
         return this.mounted;
+    }
+
+    /**
+     * The cid of the latest trigger mounted for ``interventionId``, even
+     * after it was cleared or superseded. The daemon drops a USER_RATING
+     * or USER_ACTION whose cid differs from the one it stamped on that
+     * intervention's trigger, and a frame without one never matches.
+     */
+    correlationIdFor(interventionId: unknown): string | undefined {
+        return typeof interventionId === "string"
+            ? this.triggerCids.get(interventionId)
+            : undefined;
     }
 
     clear(): ActiveInterventionRecord | null {
