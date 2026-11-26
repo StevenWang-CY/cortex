@@ -52,7 +52,7 @@ This reference contains **204 runtime settings**.
 | `state.estimate_entry_threshold` | `CORTEX_STATE__ESTIMATE_ENTRY_THRESHOLD` | `float` | `0.4` | ≥ 0.0; ≤ 1.0 | — |
 | `state.estimate_exit_threshold` | `CORTEX_STATE__ESTIMATE_EXIT_THRESHOLD` | `float` | `0.25` | ≥ 0.0; ≤ 1.0 | — |
 | `state.inference_mode` | `CORTEX_STATE__INFERENCE_MODE` | `Literal[deterministic, safety_null]` | `"deterministic"` | — | — |
-| `state.physiology_weight` | `CORTEX_STATE__PHYSIOLOGY_WEIGHT` | `float` | `0.35` | ≥ 0.0; ≤ 0.5 | Share of a support score that qualified camera physiology may move when fully observed; 0 makes the rules behaviour-only. The scorer caps the effective value below estimate_entry_threshold so physiology alone cannot establish a state. |
+| `state.physiology_weight` | `CORTEX_STATE__PHYSIOLOGY_WEIGHT` | `float` | `0.35` | ≥ 0.0; ≤ 0.5 | Share of a support score that camera physiology may move when fully observed; 0 makes the rules behaviour-only. Physiology can lower any eligible score but can raise one only if behaviour alone is already past estimate_entry_threshold, so it cannot establish a state. |
 | `state.hyper_dwell_seconds` | `CORTEX_STATE__HYPER_DWELL_SECONDS` | `int` | `30` | ≥ 0 | — |
 | `state.hypo_dwell_seconds` | `CORTEX_STATE__HYPO_DWELL_SECONDS` | `int` | `60` | ≥ 0 | — |
 | `state.flow_dwell_seconds` | `CORTEX_STATE__FLOW_DWELL_SECONDS` | `int` | `120` | ≥ 0 | — |
@@ -138,7 +138,7 @@ This reference contains **204 runtime settings**.
 | `signal.rppg.respiration_high_hz` | `CORTEX_SIGNAL__RPPG__RESPIRATION_HIGH_HZ` | `float` | `0.5` | > 0.0 | — |
 | `signal.rppg.respiration_min_channel_quality` | `CORTEX_SIGNAL__RPPG__RESPIRATION_MIN_CHANNEL_QUALITY` | `float` | `0.35` | ≥ 0.0; ≤ 1.0 | — |
 | `signal.rppg.respiration_max_channel_disagreement_bpm` | `CORTEX_SIGNAL__RPPG__RESPIRATION_MAX_CHANNEL_DISAGREEMENT_BPM` | `float` | `3.0` | > 0.0 | — |
-| `signal.rppg.experimental_respiration_enabled` | `CORTEX_SIGNAL__RPPG__EXPERIMENTAL_RESPIRATION_ENABLED` | `bool` | `true` | — | Publish the camera breathing-rate estimate when its channels agree |
+| `signal.rppg.experimental_respiration_enabled` | `CORTEX_SIGNAL__RPPG__EXPERIMENTAL_RESPIRATION_ENABLED` | `bool` | `true` | — | Publish the camera breathing-rate estimate when head movement and a pulse-derived channel agree |
 | `signal.rppg.fps_clamp_min` | `CORTEX_SIGNAL__RPPG__FPS_CLAMP_MIN` | `float` | `10.0` | — | — |
 | `signal.rppg.fps_clamp_max` | `CORTEX_SIGNAL__RPPG__FPS_CLAMP_MAX` | `float` | `60.0` | — | — |
 | `signal.rppg.stabilize` | `CORTEX_SIGNAL__RPPG__STABILIZE` | `bool` | `true` | — | — |

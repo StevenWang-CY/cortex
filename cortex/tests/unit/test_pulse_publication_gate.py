@@ -17,6 +17,7 @@ from numpy.typing import NDArray
 from cortex.libs.signal.filters import bandpass_filter
 from cortex.services.eval.physio_qualification import (
     METRIC_HEART_RATE,
+    METRIC_RESPIRATION,
     METRIC_RMSSD,
     METRIC_SDNN,
     false_publication_rate,
@@ -358,3 +359,30 @@ def test_signal_free_traces_publish_no_heart_rate_and_no_variability(kind: str, 
     assert rates[METRIC_HEART_RATE] == 0.0
     assert rates[METRIC_RMSSD] == 0.0
     assert rates[METRIC_SDNN] == 0.0
+    # Breathing too: the pulse-amplitude channel abstains without a cardiac
+    # line, and head movement alone is one mechanism, not two. (With that
+    # abstention forced off, these traces published 14 false breathing rates
+    # and every other test stayed green.)
+    assert rates[METRIC_RESPIRATION] == 0.0
+
+
+def test_a_window_below_the_floor_is_rejected_even_on_a_confirmed_track(
+    scripted_snr: Script,
+) -> None:
+    """The 0 dB floor is separate from the confirmed level: a fresh track lets
+    a weak window through, not a window with more noise than signal. (With
+    the floor removed every other test stayed green.)"""
+
+    pipeline = _pipeline()
+    scripted_snr([STRONG_DB, -0.5, 0.5])
+    confirmed = _window(pipeline, _tone(72.0), offset_s=0.0)
+    below_floor = _window(pipeline, _tone(72.0), offset_s=1.0)
+    above_floor = _window(pipeline, _tone(72.0), offset_s=2.0)
+
+    assert _published(confirmed) == pytest.approx(72.0, abs=1.0)
+    # Same rate, track one second old, and still not published.
+    assert below_floor.sqi_components["continues_track"] == 1.0
+    assert _published(below_floor) is None
+    assert not below_floor.signal_present
+    # Just above the floor the same track carries it.
+    assert _published(above_floor) == pytest.approx(72.0, abs=1.0)

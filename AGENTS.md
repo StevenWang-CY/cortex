@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Cortex is a macOS research prototype for local behavioral support and optional experimental camera estimates. Production support inference is driven by observed input/window behavior; qualified camera physiology (heart rate, SDNN, breathing rate, blink rate, eye-closure share) can only corroborate an eligible behavioral reading, with bounded weight and against a personal reference (ADR 0008). The default planner is local and the default execution mode is `suggest_only`; proposals cannot restructure the workspace without a separate exact authorization transaction. It ships as a **macOS .app** (DMG installer) that runs the daemon in-process via PySide6, with a Chrome/Edge extension (Plasmo/React MV3) and optional VS Code extension. The daemon exposes FastAPI on port 9472 and WebSocket on port 9473.
+Cortex is a macOS research prototype for local behavioral support and optional experimental camera estimates. Production support inference is driven by observed input/window behavior; camera physiology (heart rate and SDNN, qualified against ECG; breathing rate, blink rate and eye-closure share, admitted without a reference check) can only corroborate an eligible behavioral reading, with bounded weight (ADR 0008). The default planner is local and the default execution mode is `suggest_only`; proposals cannot restructure the workspace without a separate exact authorization transaction. It ships as a **macOS .app** (DMG installer) that runs the daemon in-process via PySide6, with a Chrome/Edge extension (Plasmo/React MV3) and optional VS Code extension. The daemon exposes FastAPI on port 9472 and WebSocket on port 9473.
 
 ## Key File Paths
 
@@ -136,7 +136,7 @@ Cortex is a macOS research prototype for local behavioral support and optional e
 
 ### Camera physiology (0.6.0)
 
-43. **An estimator change re-runs the qualification in the same change.** A change to a pulse, HRV or respiration estimator, gate or window must re-run `python -m cortex.scripts.qualify_physiology` (`synthetic` always; `dataset-4tu` when the dataset is available) and update [the qualification report](docs/research/physiology-qualification.md) and [the model card](docs/model-cards/deterministic-support-v3.md) in the same change. A metric's admission to the rules rests on that report; the 0.5.1 estimator, which no reference gate had ever measured, published about 8 % of windows when replayed against ECG and could not publish a breathing rate at all.
+43. **An estimator change re-runs the qualification in the same change.** A change to a pulse, HRV or respiration estimator, gate or window must re-run `python -m cortex.scripts.qualify_physiology` (`synthetic` always, through `make qualify-physiology`, which fails when an admitted metric misses its criterion and is a step of `make verify`; `dataset-4tu` when the dataset is available) and update [the qualification report](docs/research/physiology-qualification.md) and [the model card](docs/model-cards/deterministic-support-v3.md) in the same change. A metric's admission to the rules rests on that report; the 0.5.1 estimator, which no reference gate had ever measured, published about 8 % of windows when replayed against ECG and could not publish a breathing rate at all.
 
 44. **The publication gate is harmonic SNR, and the second harmonic counts only up to half the fundamental.** Uncapped, a weak line at half the true rate was confirmed by the real pulse counted as its harmonic: recording P2LC3 published 51 BPM for a 101 BPM heart. The in-band to out-of-band ratio it replaced had the same median for right and wrong rates.
 
@@ -159,6 +159,14 @@ Cortex is a macOS research prototype for local behavioral support and optional e
 53. **An ad-hoc rebuild is a new app to TCC.** Its signature changes, so camera permission returns to "not determined" and macOS lists no row for it under Privacy & Security → Camera. Guidance for an offline camera must lead to Cortex's own Settings, whose link raises the first-use prompt and falls back to System Settings only for a denied grant. Granting Accessibility always needs the user's Touch ID or password and cannot be scripted.
 
 54. **Test stop-then-start on the installed build, not only start and stop.** Every defect the 0.6.0 live run found (the restart crash, the dead-end camera guidance, Pause left enabled) was invisible to the source test suite and to a single launch.
+
+55. **Physiology may lower any eligible score, and raise only one that behavior alone already carried past the entry threshold.** Mixing with a fixed weight let a 0.35 behavior score reach 0.58 on full camera evidence (0.65 × 0.35 + 0.35) and become the estimate: a weak or ambiguous reading that the behavior rules alone would have left at `unknown`. "Eligible" (score above zero) is not "established".
+
+56. **A derived value ends with the signal it came from.** The SDNN window was anchored at the newest accepted beat, so the last value was re-published unchanged for minutes after the person left the camera, and a strain load built earlier could offer a break to an empty chair. Anchor windows at the current time, refuse to publish when the newest input is stale, and require a recent reading before acting on an accumulated quantity.
+
+57. **An input no reference sensor checked may only accompany one that was.** Blink rate and eye-closure share enter the physiology block only while heart rate or SDNN is usable in the same evaluation. Before this rule they moved scores with no pulse at all, which made "no pulse means behavior-only" false.
+
+58. **A check that cannot fail is not a gate.** `qualify_physiology` returned 0 whatever it measured; the documents called it a required check. `--check` now exits 1 on a missed criterion or any publication on signal-free input, and a unit test pins that decision.
 
 Current verification: [0.6.0 validation](docs/release/0.6.0-validation.md).
 Implementation history: [October refinement](docs/implementation-2026-10.md).

@@ -142,7 +142,7 @@ describe("proposal-only workspace authority", () => {
         await new Promise((resolve) => setTimeout(resolve, 0));
         expect(suggested()).toHaveLength(0);
 
-        const reason = "Your heart and breathing have run above your usual level for a while.";
+        const reason = "Your camera readings have stayed away from your usual level for a while.";
         socket!.__deliver({
             type: "BREAK_RECOMMENDATION",
             payload: { basis: "physiological_strain", reason, duration_seconds: 180 },

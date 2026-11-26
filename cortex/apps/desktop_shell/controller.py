@@ -2298,8 +2298,8 @@ class CortexAppController:
         box.setInformativeText(
             f"Source: {provenance} · Camera: {camera_name}. "
             "Cortex will apply observed work and head/neck baselines now. "
-            "Webcam heart and breathing estimates remain experimental and "
-            "will not affect scoring."
+            "The profile's webcam heart and breathing levels are not used: "
+            "Cortex learns your usual level for those during each session."
         )
         box.setDetailedText("\n".join(lines) or "No metrics were available.")
         box.setStandardButtons(

@@ -863,9 +863,9 @@ class _ConsumerTab(QWidget):
         self._cost_last_value: float = -1.0
         self._cost_budget_warned: bool = False
 
-        # Opt-in elapsed-focus reminder. Hidden unless the user's preferred
-        # interval is reached; no biometric or inferred-stress input can
-        # surface this control.
+        # Break offer: the opt-in elapsed-focus reminder, or the strain-load
+        # suggestion. Hidden until the daemon sends one of the two for the
+        # live session; a click starts the guided breathing session.
         self._break_pill = QPushButton("Take a break?")
         try:
             self._break_pill.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1725,6 +1725,12 @@ class _ConsumerTab(QWidget):
         if basis not in ("elapsed_focus", "physiological_strain"):
             self._clear_break_pill()
             return
+        # A recommendation queued behind Stop must not surface afterwards: a
+        # click on it in the next session would start a break that session
+        # never earned.
+        if getattr(self, "_session_phase", _PHASE_LIVE) != _PHASE_LIVE:
+            self._clear_break_pill()
+            return
         self._break_recommendation_payload = dict(payload)
         try:
             try:
@@ -1734,10 +1740,9 @@ class _ConsumerTab(QWidget):
             if basis == "physiological_strain":
                 self._break_pill.setText(f"Take a breather? · {breathe} min")
                 self._break_pill.setToolTip(
-                    "Your pulse, its variability or your breathing have been "
-                    "away from your usual level for a while. A few minutes of "
-                    "paced breathing may help; this is a suggestion, not a "
-                    "health reading."
+                    "Your camera readings have been away from your usual "
+                    "level for a while. A few minutes of paced breathing may "
+                    "help; this is a suggestion, not a health reading."
                 )
             else:
                 try:
@@ -2152,14 +2157,14 @@ class _ConsumerTab(QWidget):
         if ratio is None:
             label.setVisible(False)
             return
+        # The label states the load and nothing else. Whether a break is
+        # then suggested depends on the user's switch, quiet mode, pause and
+        # the interruption gate, none of which this widget knows; "a short
+        # break would help" and "nearing a break" promised one regardless.
         percent = int(round(min(ratio, 9.99) * 100))
-        if ratio >= 1.0:
-            text = f"Body load {percent}% · a short break would help"
-        elif ratio >= 0.8:
-            text = f"Body load {percent}% · nearing a break"
-        else:
-            text = f"Body load {percent}% of your break level"
+        text = f"Body load {percent}% of your break level"
         self._set_text_if_changed(label, text)
+        _set_accessible_name(label, text)
         label.setVisible(True)
 
     def expire_state(self) -> None:
@@ -2460,6 +2465,9 @@ class _ConsumerTab(QWidget):
                 self._bio_empty_state.setText(message)
             if phase != _PHASE_LIVE:
                 self._health_banner.hide()
+        # A break offer belongs to the live session that produced it.
+        if phase != _PHASE_LIVE:
+            self._clear_break_pill()
         # Pause/quiet act on a running session. With sensing already off the
         # control has nothing to pause, so it is disabled, not left looking
         # live beside "Session ended".

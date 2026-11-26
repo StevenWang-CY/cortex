@@ -13,7 +13,7 @@ EXT_DIR       := cortex/apps/browser_extension
 
 .PHONY: help setup dev test test-unit test-eval lint format typecheck \
         codegen codegen-check config-sync contracts version-sync version-check audit ci verify ext ext-dev \
-        ext-edge dmg clean wiki precommit
+        ext-edge dmg clean wiki precommit qualify-physiology
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -91,6 +91,9 @@ audit: ## Emit and enforce Python/browser/VS Code dependency audit reports
 	cd cortex/apps/vscode_extension && (npm audit --json > ../../../audit-results/vscode.json || true)
 	$(PY) cortex/scripts/verify_dependency_audit.py --ecosystem npm --report audit-results/vscode.json --summary-out audit-results/vscode-summary.json
 
+qualify-physiology: ## Camera physiology against simulated truth; fails if an admitted metric misses its criterion
+	$(PY) -m cortex.scripts.qualify_physiology synthetic --check --markdown
+
 ci: lint typecheck test codegen-check version-check contracts ## Run local Python/contract CI gates
 
 verify: ## Full local release checks: Python, contracts, browser/editor builds, replay, audits
@@ -101,6 +104,7 @@ verify: ## Full local release checks: Python, contracts, browser/editor builds, 
 	$(PYTEST) cortex/tests/performance/test_bundle_size.py -q
 	cd cortex/apps/vscode_extension && npm run lint && npm run compile && npm test && npm run package:vsix
 	$(PY) -m cortex.services.eval.regression_harness
+	$(MAKE) qualify-physiology
 	$(MAKE) audit
 
 # ─── Browser extension ────────────────────────────────────────────────

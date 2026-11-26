@@ -289,3 +289,20 @@ def test_a_later_calibration_replaces_a_session_learned_level() -> None:
     assert adopted.heart_rate.source == "calibration"
     assert adopted.heart_rate.center == 66.0
     assert adopted.sdnn == learned.sdnn
+
+
+def test_warm_up_centre_is_a_median_and_shrugs_off_outliers() -> None:
+    """Symmetric warm-up data cannot tell a median from a mean. With a few
+    wild readings (a mislocked rate, a burst of motion) the centre must stay
+    with the bulk: the mean of these samples is 77, the median 70."""
+
+    tracker = PhysiologyBaselineTracker(warmup_seconds=10.0, warmup_samples=20)
+    samples = [70.0] * 18 + [140.0, 140.0]
+    for tick, value in enumerate(samples):
+        tracker.observe(PhysiologyMetricName.HEART_RATE, value, 1.0 * tick)
+    reference = tracker.reference().heart_rate
+    assert reference.ready
+    assert reference.center == pytest.approx(70.0)
+    # The spread is the scaled median absolute deviation (0 here), floored;
+    # a standard deviation of these samples would be about 21.
+    assert reference.spread == pytest.approx(max(3.0, 0.05 * 70.0))

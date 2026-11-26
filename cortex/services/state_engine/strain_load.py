@@ -34,6 +34,7 @@ STRAIN_FLOOR = 0.15
 MIN_PHYSIOLOGY_COVERAGE = 0.30
 # A gap longer than this is not observed time and earns neither load nor recovery.
 MAX_INTEGRATION_GAP_SECONDS = 30.0
+# Share of the threshold from which the dashboard says a break is near.
 WARNING_RATIO = 0.80
 
 
@@ -69,6 +70,7 @@ class StrainLoadTracker:
         self.update_sensitivity(sensitivity)
         self._load = 0.0
         self._last_timestamp: float | None = None
+        self._last_reading_at: float | None = None
         self._warning_emitted = False
         self._break_emitted = False
         self._peak_load = 0.0
@@ -110,6 +112,8 @@ class StrainLoadTracker:
         if previous is not None and timestamp <= previous:
             return self._load
         self._last_timestamp = timestamp
+        if reading is not None:
+            self._last_reading_at = timestamp
         if reading is None or previous is None:
             return self._load
         elapsed = timestamp - previous
@@ -135,6 +139,19 @@ class StrainLoadTracker:
             return False
         self._warning_emitted = True
         return True
+
+    def has_recent_reading(self, timestamp: float) -> bool:
+        """Whether physiology was actually read within the integration gap.
+
+        The load holds while nothing is observed, so a crossing can stay owed
+        across a pause. It may only be acted on while the body is still being
+        read: a suggestion "because of your readings" with the camera off
+        would describe a state nobody measured.
+        """
+
+        if self._last_reading_at is None or not isfinite(timestamp):
+            return False
+        return 0.0 <= timestamp - self._last_reading_at <= MAX_INTEGRATION_GAP_SECONDS
 
     def should_break(self) -> bool:
         """True once per crossing of the threshold."""
@@ -166,6 +183,7 @@ class StrainLoadTracker:
     def reset(self) -> None:
         self._load = 0.0
         self._last_timestamp = None
+        self._last_reading_at = None
         self._warning_emitted = False
         self._break_emitted = False
 

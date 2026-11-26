@@ -38,7 +38,7 @@ FEATURE_SCHEMA_VERSION = "support-features-v3.0.0"
 
 ORDERED_FEATURES: tuple[FeatureDefinition, ...] = (
     FeatureDefinition(
-        FeatureName.HEART_RATE_BPM, "physio", "beats/min", 10_000,
+        FeatureName.HEART_RATE_BPM, "physio", "beats/min", 20_000,
         "personal-z-v1", "production_rule",
         ("support_likely", "flow_like", "under_engaged"),
     ),

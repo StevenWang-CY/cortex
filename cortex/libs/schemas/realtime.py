@@ -613,8 +613,9 @@ class BiometricsSummary(BaseModel):
     hrv_rmssd: float | None = Field(
         None,
         description=(
-            "RMSSD of camera pulse intervals (ms, trailing two minutes); "
-            "interpret as a change against the personal reference"
+            "Not populated. RMSSD of camera pulse intervals did not agree "
+            "with ECG and is not sent; the field is kept so older clients "
+            "still decode. Use hrv_sdnn."
         ),
     )
     hrv_sdnn: float | None = Field(
@@ -703,7 +704,11 @@ class BiometricsSummary(BaseModel):
         deprecated=True,
     )
     respiration_rate: float | None = Field(
-        None, description="Breathing rate in breaths/min when two channels agree"
+        None,
+        description=(
+            "Breathing rate in breaths/min, published when head movement and a "
+            "pulse-derived channel agree"
+        ),
     )
     thrashing_score: float | None = Field(
         None,

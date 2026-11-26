@@ -273,12 +273,22 @@ class RuleScorer:
             SupportState.FLOW_LIKE: flow_coverage,
         }
 
-        # Physiology corroborates or tempers a behavioural reading; it is
-        # fused into a state only where that state's own behaviour rule
-        # produced a positive eligible score. Where the rule abstained or was
-        # gated to zero the state stays at zero, so a camera can never be the
-        # sole basis of an estimate -- not even of the runner-up.
+        # Physiology corroborates or tempers a behavioural reading; it never
+        # establishes one. Two bounds hold for every state:
+        #
+        # * it is fused only where the state's own behaviour rule produced a
+        #   positive eligible score; an abstaining or gated rule stays at
+        #   zero;
+        # * it may lower any eligible score, but may raise one only if
+        #   behaviour alone has already carried it past the smoother's entry
+        #   threshold.
+        #
+        # Without the second bound a behaviour score of 0.08 plus a strained
+        # camera reached the entry threshold (0.65 * 0.08 + 0.35 >= 0.40),
+        # and an ambiguous reading -- flow 0.47, support 0.23 -- came out as a
+        # committed support-likely label "explained" by heart rate.
         weight = self.physiology_weight
+        entry_threshold = float(self._config.estimate_entry_threshold)
         observed_physiology = (
             evaluate_physiology(features, self._physiology_reference)
             if weight > 0.0
@@ -293,14 +303,15 @@ class RuleScorer:
             for item in observed_physiology.contributions
             if fusable.get(item.support_state, False)
         )
-        fused = {
-            state: (
-                fuse(eligible[state], observed_physiology.block(state), weight)
-                if fusable[state]
-                else 0.0
-            )
-            for state in eligible
-        }
+        fused: dict[SupportState, float] = {}
+        for state, behaviour_score in eligible.items():
+            if not fusable[state]:
+                fused[state] = 0.0
+                continue
+            mixed = fuse(behaviour_score, observed_physiology.block(state), weight)
+            if behaviour_score < entry_threshold:
+                mixed = min(mixed, behaviour_score)
+            fused[state] = mixed
         coverage_by_state = {
             **{
                 state: (

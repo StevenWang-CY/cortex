@@ -28,10 +28,12 @@ outline minus eyes, brows and lips), applies the POS projection over a 20 s
 window with measured sample time and quality/motion/face-loss gates, and
 publishes a rate only when the harmonic signal-to-noise ratio shows a cardiac
 line. Beats are timed on a narrow band around that rate. SDNN comes from the
-accepted beat intervals over the trailing three minutes. Breathing rate is
-published only when two of three camera channels agree. All of these are
+accepted beat intervals over the trailing three minutes, and is withheld once
+the newest beat is more than ten seconds old. Breathing rate is published only
+when head movement and a pulse-derived channel agree. All of these are
 experimental; heart rate and SDNN were checked against ECG on one participant,
-and breathing rate has only simulated truth behind it. RMSSD, LF/HF and the
+breathing rate has only simulated truth behind it, and blink rate and
+eye-closure share were not checked against anything. RMSSD, LF/HF and the
 other beat-to-beat measures did not qualify and stay research-only; “screen
 apnea” detection and the old stress integral are not provided. Head/neck
 measurements are comfort proxies only.
@@ -43,13 +45,16 @@ deterministic and has no fitted training data. It combines
 mouse, keyboard, tab, reread, and focus-transition features with fixed
 denominators and explicit evidence coverage. Insufficient, weak, warming, or
 ambiguous evidence returns `unknown`. Camera heart rate, SDNN, breathing rate,
-blink rate and eye-closure share are read against the person's own reference
-(from calibration, or learned over the first two minutes of a session) and
-mixed only into a state whose behavioral rule is already eligible, with a
-weight of at most 0.35. They can strengthen or temper a reading; they cannot
-create one. With no camera, no face or no reference the score is exactly the
-behavior-only score. Scores are not probabilities and state names are not
-diagnoses.
+blink rate and eye-closure share are mixed only into a state whose behavioral
+rule is already eligible, with a default weight of 0.35. The first four are
+read against the person's own reference, learned over the first two minutes of
+valid readings in a session; eye-closure share is read as an absolute
+fraction, and the two eye inputs count only while a pulse is being read.
+Physiology can lower any eligible score and raise one only when the behavioral
+score alone already reaches the entry threshold: it can strengthen or temper a
+reading and cannot create one. With no camera, no face, no pulse or no
+reference the score is exactly the behavior-only score. Scores are not
+probabilities and state names are not diagnoses.
 
 Scores are smoothed with a per-sample exponential moving average, then entry/exit
 hysteresis and elapsed candidate dwell. Duplicate or regressed observation times
@@ -81,9 +86,11 @@ is missing; changing the goal clears the prior file history. These are heuristic
 prompts, not measurements of mind-wandering or a biological need for a break.
 
 A strain load accumulates while the physiology points to strain against the
-person's own reference and drains during calm. Crossing its threshold suggests
-one three-minute breathing break through the same gates as every other
-suggestion; turn it off with `intervention.enable_strain_break_suggestions`.
+person's own reference and drains during calm. Crossing its threshold while
+camera readings are still arriving suggests one three-minute breathing break
+through the same gates as every other suggestion, on the desktop app and the
+client in front; turn it off with
+`intervention.enable_strain_break_suggestions`.
 The load is a pacing aid, not a measure of stress, fatigue or health.
 
 ## 5. Build a proposal

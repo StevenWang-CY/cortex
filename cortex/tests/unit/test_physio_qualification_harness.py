@@ -8,13 +8,16 @@ import numpy as np
 import pytest
 
 from cortex.services.eval.physio_qualification import (
+    ACCEPTANCE_CRITERIA,
     METRIC_HEART_RATE,
     METRIC_RESPIRATION,
     METRIC_RMSSD,
     METRIC_SDNN,
     TOLERANCES,
+    MetricReport,
     StrideRecord,
     WindowedValue,
+    assess,
     collect_pairs,
     false_publication_rate,
     merge_reports,
@@ -216,6 +219,92 @@ def test_score_pairs_arithmetic() -> None:
     assert report.p95_abs_error == pytest.approx(3.7)
     assert report.pearson_r is not None and -1.0 <= report.pearson_r <= 1.0
     assert report.to_dict()["metric"] == METRIC_HEART_RATE
+
+
+def test_pearson_r_is_the_correlation_of_published_and_true_values() -> None:
+    """A constant in place of the correlation left every test green."""
+
+    rising = [(60.0 + i, 61.0 + i) for i in range(20)]
+    assert score_pairs(METRIC_HEART_RATE, rising, attempted=20, tolerance=5.0).pearson_r == (
+        pytest.approx(1.0)
+    )
+    opposed = [(60.0 + i, 90.0 - i) for i in range(20)]
+    assert score_pairs(METRIC_HEART_RATE, opposed, attempted=20, tolerance=5.0).pearson_r == (
+        pytest.approx(-1.0)
+    )
+    # (published, truth) pairs with a hand-computed r of 0.5.
+    half = [(1.0, 1.0), (2.0, 3.0), (3.0, 2.0)]
+    assert score_pairs(METRIC_HEART_RATE, half, attempted=3, tolerance=5.0).pearson_r == (
+        pytest.approx(0.5)
+    )
+    # No variation in the truth: a correlation is undefined, not perfect.
+    flat = [(70.0 + i, 72.0) for i in range(10)]
+    assert score_pairs(METRIC_HEART_RATE, flat, attempted=10, tolerance=5.0).pearson_r is None
+
+
+def _report(metric: str, **overrides: object) -> MetricReport:
+    values: dict[str, object] = {
+        "metric": metric,
+        "attempted": 400,
+        "published": 200,
+        "coverage": 0.5,
+        "mae": 1.0,
+        "rmse": 1.5,
+        "bias": 0.0,
+        "loa_lower": -3.0,
+        "loa_upper": 3.0,
+        "p95_abs_error": 3.0,
+        "pearson_r": 0.95,
+        "within_tolerance": 0.95,
+        "tolerance": 5.0,
+    }
+    values.update(overrides)
+    return MetricReport(**values)  # type: ignore[arg-type]
+
+
+def test_assess_accepts_a_report_that_meets_every_criterion() -> None:
+    criterion = ACCEPTANCE_CRITERIA[METRIC_HEART_RATE]
+    passed, reasons = assess(
+        _report(
+            METRIC_HEART_RATE,
+            mae=criterion.max_mae,
+            within_tolerance=criterion.min_within_tolerance,
+            pearson_r=criterion.min_correlation,
+            published=criterion.min_published,
+        )
+    )
+    assert passed is True and reasons == []
+
+
+@pytest.mark.parametrize(
+    ("override", "fragment"),
+    [
+        ({"mae": 3.01}, "MAE"),
+        ({"mae": None}, "MAE"),
+        ({"within_tolerance": 0.849}, "share within"),
+        ({"within_tolerance": None}, "share within"),
+        ({"pearson_r": 0.899}, "correlation"),
+        ({"pearson_r": None}, "correlation"),
+        ({"published": 99}, "published estimates"),
+    ],
+)
+def test_assess_rejects_each_shortfall_and_says_which(
+    override: dict[str, object], fragment: str
+) -> None:
+    passed, reasons = assess(_report(METRIC_HEART_RATE, **override))
+    assert passed is False
+    assert len(reasons) == 1 and fragment in reasons[0], reasons
+
+
+def test_assess_uses_each_metrics_own_criterion() -> None:
+    # 10 ms mean error is fine for SDNN (limit 12) and far outside heart rate's (3).
+    assert assess(_report(METRIC_SDNN, mae=10.0, tolerance=15.0))[0] is True
+    assert assess(_report(METRIC_HEART_RATE, mae=10.0))[0] is False
+    # RMSSD as measured against ECG (MAE 22.8, 9 % within tolerance) does not qualify.
+    passed, reasons = assess(
+        _report(METRIC_RMSSD, mae=22.8, within_tolerance=0.09, pearson_r=0.84, tolerance=15.0)
+    )
+    assert passed is False and len(reasons) == 2
 
 
 def test_score_pairs_counts_abstentions_and_handles_degenerate_input() -> None:

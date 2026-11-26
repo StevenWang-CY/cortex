@@ -969,7 +969,6 @@ class CortexDaemon:
         self._rebound_detector = ParasympatheticReboundDetector()
         self._last_leetcode_problem_id: str | None = None
         self._last_leetcode_allostatic_load = 0.0
-        self._last_leetcode_hrv_sdnn: float | None = None
         self._leetcode_action_signatures: dict[str, float] = {}
 
         self._rgb_observations: ObservationBuffer[NumericObservation] = (
@@ -3008,15 +3007,12 @@ class CortexDaemon:
             self._causal_attributor = prepared.causal_attributor
             self._active_calibration_profile = profile
             self._baseline_snapshot = prepared.baselines
-            # A new calibration's measured levels replace the corresponding
-            # personal physiology references; metrics it did not measure keep
-            # what the session has learned.
-            physiology_baseline: PhysiologyBaselineTracker | None = getattr(
-                self, "_physiology_baseline", None
-            )
-            if physiology_baseline is not None:
-                physiology_baseline.seed_from_calibration(prepared.baselines)
             self._camera_calibration_valid = prepared.camera_calibration_valid
+            # A new calibration's measured levels replace the corresponding
+            # personal physiology references, when it was taken through the
+            # camera now in use; metrics it did not measure keep what the
+            # session has learned.
+            self._seed_physiology_reference_from_calibration()
             self._latest_respiration_evidence = None
             self._latest_estimate = None
             self._latest_biometrics = None
@@ -3332,6 +3328,7 @@ class CortexDaemon:
         self._active_camera_identity_key = identity.identity_key
         self._active_camera_geometry = new_geometry
         self._active_camera_source_instance_id = source_id
+        self._seed_physiology_reference_from_calibration()
         self._services.register("camera_identity", identity.model_dump(mode="json"))
         self._services.register("camera_calibration_valid", self._camera_calibration_valid)
 
@@ -3886,9 +3883,27 @@ class CortexDaemon:
             self, "_physiology_baseline", None
         )
         if tracker is None:
-            tracker = PhysiologyBaselineTracker(self._load_baselines())
+            tracker = PhysiologyBaselineTracker(
+                self._load_baselines() if self._camera_calibration_valid else None
+            )
             self._physiology_baseline = tracker
         return tracker
+
+    def _seed_physiology_reference_from_calibration(self) -> None:
+        """Adopt calibrated levels only for the camera they were measured through.
+
+        A level calibrated through another camera carries that camera's
+        bias; seeding the reference with it would read the bias as a change
+        in the person.
+        """
+
+        if not self._camera_calibration_valid:
+            return
+        tracker: PhysiologyBaselineTracker | None = getattr(
+            self, "_physiology_baseline", None
+        )
+        if tracker is not None:
+            tracker.seed_from_calibration(self._load_baselines())
 
     def _strain_load_tracker(self) -> StrainLoadTracker:
         tracker: StrainLoadTracker | None = getattr(self, "_strain_load", None)
@@ -3940,10 +3955,21 @@ class CortexDaemon:
         intervention = self.config.intervention
         if not intervention.enable_strain_break_suggestions:
             return
+        # The load holds while nothing is read, so a crossing can stay owed
+        # through a pause. It is acted on only while physiology is still
+        # being observed; otherwise the camera could be off when it fires.
+        if not tracker.has_recent_reading(timestamp):
+            return
+        # A refused crossing stays owed, but the gate is asked again at most
+        # every 30 s: asking on every 500 ms tick logged a refusal each time
+        # for the whole of a quiet period.
+        if timestamp < getattr(self, "_strain_break_retry_at", 0.0):
+            return
         if not tracker.should_break():
             return
         if not self._interruption_allowed(surface="strain_break", current_time=timestamp):
             tracker.defer()
+            self._strain_break_retry_at = timestamp + 30.0
             return
         from cortex.libs.schemas.realtime import BreakRecommendation
 
@@ -3958,8 +3984,10 @@ class CortexDaemon:
         ):
             pattern = "coherent"
         recommendation = BreakRecommendation(
+            # The load mixes heart rate, variability, breathing and blink;
+            # any of them may be the one that moved, so the words name none.
             reason=(
-                "Your heart and breathing have run above your usual level "
+                "Your camera readings have stayed away from your usual level "
                 "for a while. A short break may help."
             ),
             urgency="medium",
@@ -3972,6 +4000,7 @@ class CortexDaemon:
         await self._ws_server.send_message(
             MessageType.BREAK_RECOMMENDATION.value,
             recommendation.model_dump(mode="json"),
+            target_client_types=self._strain_break_targets(),
         )
         self._trigger_policy.record_intervention(timestamp=timestamp)
         logger.info(
@@ -3980,6 +4009,26 @@ class CortexDaemon:
             tracker.threshold,
             pattern,
         )
+
+    def _strain_break_targets(self) -> list[str]:
+        """Where one strain suggestion is shown: the desktop, plus the client in front.
+
+        Broadcasting it to every client raised a browser toast, an editor
+        notification and the desktop pill for one crossing. The desktop pill
+        is the only surface that can start the breathing session, so it
+        always gets the message; one further client gets it only when its
+        application is the one the user is looking at.
+        """
+
+        targets = ["desktop"]
+        app = self._current_app_name().strip().lower()
+        if "edge" in app:
+            targets.append("edge")
+        elif "chrome" in app:
+            targets.append("chrome")
+        elif app in {"code", "code - insiders", "cursor", "vscodium"} or "visual studio code" in app:
+            targets.append("vscode")
+        return targets
 
     async def _state_loop(self) -> None:
         try:
@@ -4230,7 +4279,8 @@ class CortexDaemon:
                         "heart_rate": vector.hr,
                         "hr_delta": vector.hr_delta,
                         "pulse_quality": vector.physio_sqi,
-                        "hrv_rmssd": vector.hrv_rmssd,
+                        # RMSSD did not agree with ECG: it is not sent.
+                        "hrv_rmssd": None,
                         "hrv_sdnn": vector.hrv_sdnn,
                         "respiration_rate": vector.respiration_rate,
                         "perclos": vector.perclos_60s,
@@ -7763,7 +7813,6 @@ class CortexDaemon:
         if context.problem_id != self._last_leetcode_problem_id:
             self._last_leetcode_problem_id = context.problem_id
             self._last_leetcode_allostatic_load = 0.0
-            self._last_leetcode_hrv_sdnn = None
             self._leetcode_action_signatures.clear()
             self._amygdala_detector.reset()
             self._destructive_detector.reset()
@@ -7987,8 +8036,13 @@ class CortexDaemon:
                 current_time=timestamp,
             )
 
+            # The resolver's PANIC and FATIGUE modes compare
+            # ``stress_integral`` with a threshold made for the retired
+            # stress integral. The field now carries the strain load in
+            # different units, and the load holds while the camera is off, so
+            # the resolver keeps seeing None, as it did before 0.6.0.
             mode_estimate = self._leetcode_mode_resolver.resolve(
-                estimate,
+                estimate.model_copy(update={"stress_integral": None}),
                 context,
                 aai_score=aai_score,
                 destructive=destructive,
@@ -8073,8 +8127,6 @@ class CortexDaemon:
                     logger.debug("LeetCode action %s failed: %s", action_name, result.error)
 
             self._last_leetcode_allostatic_load = current_load
-            if vector.hrv_sdnn is not None:
-                self._last_leetcode_hrv_sdnn = float(vector.hrv_sdnn)
 
             stale_before = timestamp - 600.0
             self._leetcode_action_signatures = {

@@ -37,13 +37,15 @@ or validated estimator of a person's cognitive state.
   occlusion, and individual characteristics.
 - Camera heart rate, SDNN, breathing rate, blink rate and eye-closure share
   are optional corroborating inputs to the support rules
-  ([ADR 0008](../docs/adr/0008-qualified-camera-physiology.md)). Each is read
-  against a personal reference and mixed only into a state whose behavioral
-  rule is eligible, with weight `state.physiology_weight` (default 0.35).
-  Heart rate and SDNN were checked against ECG on one participant; the
-  estimator published nothing for the two participants with intermediate and
-  dark skin tone; there is no held-out data; breathing rate has no reference
-  sensor. See the [qualification report](../docs/research/physiology-qualification.md).
+  ([ADR 0008](../docs/adr/0008-qualified-camera-physiology.md)). They are
+  mixed only into a state whose behavioral rule is eligible, with weight
+  `state.physiology_weight` (default 0.35), and can raise a score only when
+  the behavioral score alone already reaches the entry threshold. Heart rate
+  and SDNN were checked against ECG on one participant; the estimator
+  published nothing for the two participants with intermediate and dark skin
+  tone; there is no held-out data; breathing rate has no reference sensor, and
+  blink rate and eye closure were not checked. See the
+  [qualification report](../docs/research/physiology-qualification.md).
 - RMSSD, pNN50, SD1/SD2, LF/HF and sample entropy did not qualify. They are
   computed for research only and are not inputs. Breath-pause (“screen
   apnea”) detection and the former stress integral are not provided.
@@ -129,8 +131,8 @@ requires an exact checksummed study epoch.
 |---|---|
 | camera pulse/BPM | experimental, quality-gated wellness estimate; corroborating support input; checked against ECG on one participant |
 | HRV as SDNN | experimental wellness estimate; corroborating support input; checked against ECG on one participant |
-| breathing rate | published only when two camera channels agree; low-weight corroborating input; simulated truth only |
-| blink rate and PERCLOS | low-weight corroborating inputs against a personal reference; not externally validated |
+| breathing rate | published only when head movement and a pulse-derived channel agree; low-weight corroborating input; simulated truth only |
+| blink rate and PERCLOS | corroborating inputs, read only while heart rate or SDNN is usable; not checked against any reference |
 | head/neck pose proxy | local diagnostics only; not support-inference inputs or a posture diagnosis |
 | input/window telemetry | observed local behavioral evidence; unavailable channels abstain |
 | RMSSD/pNN50/SD1/SD2/LF-HF/entropy | did not qualify; research-only, never read by rules, suggestions or screens |

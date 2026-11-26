@@ -22,6 +22,7 @@ JSON report and, with ``--markdown``, the tables the qualification document
 quotes.
 
     python -m cortex.scripts.qualify_physiology synthetic --output out.json
+    python -m cortex.scripts.qualify_physiology synthetic --check
     python -m cortex.scripts.qualify_physiology dataset-4tu \\
         --root "/path/to/Public Benchmark Dataset for Testing rPPG Algorithm Performance" \\
         --cache /path/to/trace-cache --output out.json --markdown
@@ -64,6 +65,10 @@ from cortex.services.eval.physio_synthetic import (
 FACE_FRACTION = 0.29
 CAPTURE_SIZE = (640, 480)
 Pairs = dict[str, tuple[list[tuple[float, float]], int]]
+METRIC_RESPIRATION = "respiration_rate_bpm"
+# The metrics the support rules may read.  RMSSD is measured and reported, and
+# is deliberately absent: it does not meet its criterion and nothing reads it.
+ADMITTED_METRICS: tuple[str, ...] = (METRIC_HEART_RATE, METRIC_SDNN, METRIC_RESPIRATION)
 
 
 def _report_rows(reports: dict[str, MetricReport]) -> dict[str, Any]:
@@ -337,6 +342,31 @@ def run_dataset_4tu(root: Path, cache: Path, workers: int) -> dict[str, Any]:
     }
 
 
+def synthetic_gate_failures(synthetic: dict[str, Any]) -> list[str]:
+    """Why a simulated run does not support the admitted metrics; empty when it does.
+
+    Every admitted metric must meet its acceptance criterion, and nothing at
+    all may be published on a recording that contains no pulse.
+    """
+    failures: list[str] = []
+    metrics = synthetic.get("metrics", {})
+    for metric in ADMITTED_METRICS:
+        row = metrics.get(metric)
+        if row is None:
+            failures.append(f"{metric}: no result")
+        elif not row.get("qualified"):
+            reasons = "; ".join(row.get("reasons") or ["criterion not met"])
+            failures.append(f"{metric}: {reasons}")
+    for kind, rates in sorted(synthetic.get("false_publication_rate", {}).items()):
+        for metric, rate in sorted(rates.items()):
+            if rate > 0.0:
+                failures.append(
+                    f"{metric}: published on {rate:.2%} of strides of signal-free "
+                    f"'{kind}' recordings"
+                )
+    return failures
+
+
 # --- output ------------------------------------------------------------------
 
 
@@ -351,7 +381,7 @@ def _markdown_table(title: str, rows: dict[str, Any]) -> str:
     def _number(value: float | None, digits: int = 2) -> str:
         return "—" if value is None else f"{value:.{digits}f}"
 
-    for metric in (METRIC_HEART_RATE, METRIC_SDNN, METRIC_RMSSD, "respiration_rate_bpm"):
+    for metric in (METRIC_HEART_RATE, METRIC_SDNN, METRIC_RMSSD, METRIC_RESPIRATION):
         row = rows.get(metric)
         if row is None:
             continue
@@ -373,6 +403,14 @@ def main(argv: list[str] | None = None) -> int:
     dataset.add_argument("--root", type=Path, required=True)
     dataset.add_argument("--cache", type=Path, required=True)
     dataset.add_argument("--workers", type=int, default=6)
+    synthetic.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "exit 1 unless heart rate, SDNN and breathing rate meet their criteria "
+            "and nothing is published on signal-free recordings"
+        ),
+    )
     for item in (synthetic, dataset):
         item.add_argument("--output", type=Path)
         item.add_argument("--markdown", action="store_true")
@@ -407,9 +445,20 @@ def main(argv: list[str] | None = None) -> int:
             for label, rows in data["by_participant"].items():
                 print()
                 print(_markdown_table(f"Participant {label}", rows))
-    elif args.output is None:
+    elif args.output is None and not getattr(args, "check", False):
         json.dump(result, sys.stdout, indent=2, sort_keys=True)
         sys.stdout.write("\n")
+    if getattr(args, "check", False):
+        failures = synthetic_gate_failures(result["synthetic"])
+        if failures:
+            for failure in failures:
+                print(f"physiology qualification failed: {failure}", file=sys.stderr)
+            return 1
+        print(
+            "physiology qualification (simulated): "
+            + ", ".join(ADMITTED_METRICS)
+            + " meet their criteria; nothing published on signal-free recordings"
+        )
     return 0
 
 

@@ -16,10 +16,11 @@ flow, apnea, productivity, or any medical/cognitive condition. Production
 support scores are heuristic telemetry summaries with an explicit `unknown`
 state. Camera heart rate, heart-rate variability (SDNN), breathing rate, blink
 rate and eye-closure share can corroborate a behavioral reading that is
-already eligible, read against the person's own reference and with bounded
-weight; they cannot produce one alone. Heart rate and SDNN were checked against
-ECG on one participant, and the estimator published nothing for the two
-participants with intermediate and dark skin tone. RMSSD, LF/HF and
+already eligible, with bounded weight; they cannot produce one alone. Only
+heart rate and SDNN were checked against a reference (ECG, one participant);
+the estimator published nothing for the two participants with intermediate and
+dark skin tone, and breathing, blink and eye closure were not checked against
+a sensor. RMSSD, LF/HF and
 breath-pause detection are not product inputs. A strain-load breathing-break
 suggestion is a pacing aid, not a stress measurement.
 

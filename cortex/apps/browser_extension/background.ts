@@ -1881,7 +1881,7 @@ async function handleMessage(raw: string): Promise<void> {
             const reason = typeof msg.payload.reason === "string"
                 ? msg.payload.reason
                 : strain
-                    ? "Your heart and breathing have run above your usual level for a while."
+                    ? "Your camera readings have stayed away from your usual level for a while."
                     : "You've reached your preferred focus interval.";
             injectToast(strain ? "Breathing break?" : "Break reminder", reason);
             broadcastToPopup({ type: "BREAK_SUGGESTED", reason });

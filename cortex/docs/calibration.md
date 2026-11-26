@@ -85,16 +85,16 @@ with no movement can contribute an observed zero. A low mouse-variance baseline
 can still be unsuitable for normalization: the support scorer abstains on that
 feature below its documented 1,000 px²/s² readiness floor.
 
-Since 0.6.0 the measured resting heart rate, resting breathing rate and working
-blink rate seed the personal reference that the support rules read camera
-physiology against. Only measured levels seed it; population placeholders never
-do. A new calibration replaces the corresponding references, and metrics it did
-not measure keep what the session has learned. Calibration does not measure
-SDNN, so the variability reference is always learned in the session (sixty
-valid values over at least two minutes); without calibration the other metrics
-are learned the same way. A different physical camera discards the reference,
-including calibrated levels, because a different camera carries a different
-bias. These summaries remain experimental: a reference makes a deviation
+Since 0.6.0 the support rules read camera physiology against a personal
+reference. Calibration seeds one part of it: the working blink rate, and only
+while the camera in use is the one the profile was measured through. Resting
+heart rate and breathing rate are recorded in the profile for review at
+*experimental* maturity, which the profile does not promote, and SDNN is not
+measured at all; those three references are learned in each session (sixty
+valid values over at least two minutes). Population placeholders never seed a
+reference. A different physical camera discards the reference, including the
+calibrated blink level, because a different camera carries a different bias.
+These summaries remain experimental: a reference makes a deviation
 interpretable for one person through one camera, not accurate against an
 independent sensor. Head/neck references calibrate a diagnostic proxy only.
 None of these references can establish attention, comprehension or support
