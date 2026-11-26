@@ -20,6 +20,11 @@ exclude = [
   # ``verify_repository_contracts.check_local_markdown_links``, which does
   # resolve "wiki/Setup" to "wiki/Setup.md".
   "^file:.*/wiki/[^/.]+$",
+  # Absolute links to this repository's own files (the wiki must use them).
+  # github.com answers them from CI runners with HTTP 503 for hours at a
+  # time; ``check_local_markdown_links`` verifies every one against the
+  # checked-out tree instead, which is the exact commit under test.
+  "^https://github\\.com/StevenWang-CY/cortex/(blob|tree)/main/",
   "^https://github\\.com/StevenWang-CY/cortex/security/advisories/new$"
 ]
 exclude_path = [

@@ -28,6 +28,15 @@ from cortex.scripts import (
 _ROOT = Path(__file__).resolve().parents[2]
 _PROJECT = _ROOT / "cortex"
 _MARKDOWN_LINK_RE = re.compile(r"!?\[[^\]]*\]\((?P<target><[^>]+>|[^\s)]+)(?:\s+[^)]*)?\)")
+# Links from the published wiki (a separate repository) to this repository's
+# own files must be absolute.  They are checked here against the checked-out
+# tree, the exact commit under test, and excluded from the external link
+# check (``.lychee.toml``): github.com answers that check from CI runners with
+# HTTP 503 for hours at a time, and a live check can only see a link broken by
+# a commit after that commit reaches main.
+_SELF_LINK_RE = re.compile(
+    r"^https://github\.com/StevenWang-CY/cortex/(?:blob|tree)/main/(?P<path>[^?#]+)"
+)
 _ENV_ASSIGNMENT_RE = re.compile(r"^\s*#?\s*([A-Z][A-Z0-9_]*)\s*=", re.MULTILINE)
 
 
@@ -63,10 +72,14 @@ def check_local_markdown_links() -> list[str]:
         )
         for match in _MARKDOWN_LINK_RE.finditer(searchable):
             raw = match.group("target").strip("<>")
+            self_link = _SELF_LINK_RE.match(raw)
             parts = urlsplit(raw)
-            if parts.scheme or parts.netloc or raw.startswith(("#", "mailto:")):
+            if self_link is not None:
+                target_text = "/" + unquote(self_link.group("path")).rstrip("/")
+            elif parts.scheme or parts.netloc or raw.startswith(("#", "mailto:")):
                 continue
-            target_text = unquote(parts.path)
+            else:
+                target_text = unquote(parts.path)
             if not target_text:
                 continue
             candidate = (
@@ -102,7 +115,8 @@ def check_local_markdown_links() -> list[str]:
 
             if not any(is_repository_content(item) for item in candidates):
                 line = searchable.count("\n", 0, match.start()) + 1
-                problems.append(f"{document.relative_to(_ROOT)}:{line}: missing local link {raw!r}")
+                kind = "repository link" if self_link is not None else "local link"
+                problems.append(f"{document.relative_to(_ROOT)}:{line}: missing {kind} {raw!r}")
     return problems
 
 
