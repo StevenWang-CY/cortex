@@ -445,6 +445,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
     });
 
+    // --- P0 §3.21: DISMISS_OVERLAY — the cross-surface dismiss cue ---
+    // Cmd+Shift+D (desktop or browser) dismisses the active intervention on
+    // every surface. The daemon broadcasts only this cue — no
+    // INTERVENTION_RESTORE follows — so ignoring it left the dismissed card
+    // in the VS Code panel. Presentation only; restore receipts are owned by
+    // the transaction adapter and are untouched. A cue naming another
+    // intervention must not wipe a newer one; one without an id clears
+    // whatever is shown.
+    client.onMessage((msg) => {
+        if (msg.type !== "DISMISS_OVERLAY") return;
+        const dismissedId = typeof msg.payload.intervention_id === "string"
+            && msg.payload.intervention_id.length > 0
+            ? msg.payload.intervention_id
+            : undefined;
+        panelProvider?.clearIntervention(dismissedId);
+    });
+
     // Compatibility-only: reject unsupported HRV/stress-derived claims.
     client.onMessage((msg) => {
         if (msg.type === 'BREAK_RECOMMENDATION') {
