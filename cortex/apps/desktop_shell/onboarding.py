@@ -1162,17 +1162,34 @@ class OnboardingWindow(QWidget):
         # we walk the BYOK card → Connect Extensions → Get Started
         # explicitly so the keyboard user lands on the primary actions
         # without bouncing through every non-interactive label.
+        # Each step's "Why?" disclosure and Grant button belong in the chain
+        # too: Qt moves chained widgets ahead of unchained ones, so leaving
+        # them out put the step 4-6 explanations after Get Started.
+        def _why(step: QWidget | None) -> QWidget | None:
+            return getattr(step, "_cortex_why_btn", None)
+
+        def _action(step: QWidget | None) -> QWidget | None:
+            return getattr(step, "_cortex_action_btn", None)
+
         chain_targets = [
             w
             for w in (
+                _why(self._camera_step),
+                _action(self._camera_step),
+                _why(self._accessibility_step),
+                _action(self._accessibility_step),
+                _why(self._llm_step),
                 getattr(self, "_region_combo", None),
                 getattr(self, "_key_input", None),
                 getattr(self, "_save_key_btn", None),
                 getattr(self, "_skip_llm_btn", None),
+                _why(self._calibration_step),
                 getattr(self, "_begin_calibration_btn", None),
                 getattr(self, "_skip_calibration_btn", None),
+                _why(ext_frame),
                 connect_btn,
                 skip_ext_btn,
+                _why(notif_frame),
                 notif_btn,
                 finish_btn,
             )
@@ -1621,6 +1638,7 @@ class OnboardingWindow(QWidget):
         # Stash the refresh closure on the frame so the polling timer can
         # call it without re-resolving widgets by index.
         frame._cortex_set_state = _set_state  # type: ignore[attr-defined]
+        frame._cortex_action_btn = btn  # type: ignore[attr-defined]
         return frame
 
     # ------------------------------------------------------------------
