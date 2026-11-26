@@ -188,6 +188,7 @@ function armStatusBarFreshness(): void {
         if (!statusBarItem || !statusBarConnected) return;
         // Quiet mode outranks the estimate, and so outranks its expiry.
         if (renderQuietModeStatus()) return;
+        if (osNotifPulseTimeout !== undefined) return;
         statusBarItem.text = `$(ellipsis) Cortex: ${STALE_STATE_LABEL}`;
         statusBarItem.tooltip =
             `Cortex — no update from the daemon for ${STATE_FRESHNESS_MS / 1000} s. `
@@ -421,29 +422,37 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     osNotifPulseTimeout = undefined;
     let lastOsNotifShownHeadline = "";
     let lastOsNotifShownAt = 0;
-    client.onMessage((msg) => {
-        if (msg.type !== 'INTERVENTION_TRIGGER') return;
-        const payload = msg.payload as Record<string, unknown> | undefined;
+    // Registered on the trigger stream itself. This used to be a generic
+    // ``onMessage`` listener, but the client dispatches INTERVENTION_TRIGGER
+    // only to ``onInterventionTrigger`` handlers, so neither the pulse nor
+    // the Snooze toast ever ran.
+    client.onInterventionTrigger((payload) => {
         if (!payload || payload.desktop_not_focused !== true) return;
-        if (!statusBarItem) return;
         const headline = String(payload.headline || 'Cortex');
-        statusBarItem.text = `$(pulse) Cortex — ${headline}`.slice(0, 64);
-        statusBarItem.backgroundColor = new vscode.ThemeColor(
-            "statusBarItem.warningBackground",
-        );
-        if (osNotifPulseTimeout) clearTimeout(osNotifPulseTimeout);
-        osNotifPulseTimeout = setTimeout(() => {
-            if (statusBarItem) {
-                statusBarItem.backgroundColor = undefined;
-                // Restore whatever the bar should actually say, rather than
-                // hardcoding the connected label over a disconnected or
-                // quiet-mode state.
-                if (!renderQuietModeStatus()) {
-                    applyStatusBarConnection(statusBarConnected);
+        if (statusBarItem) {
+            statusBarItem.text = `$(pulse) Cortex — ${headline}`.slice(0, 64);
+            statusBarItem.backgroundColor = new vscode.ThemeColor(
+                "statusBarItem.warningBackground",
+            );
+            if (osNotifPulseTimeout) clearTimeout(osNotifPulseTimeout);
+            // updateStatusBar() yields to the pulse while this is armed;
+            // otherwise the next 500 ms STATE_UPDATE painted over it.
+            osNotifPulseTimeout = setTimeout(() => {
+                osNotifPulseTimeout = undefined;
+                if (statusBarItem) {
+                    statusBarItem.backgroundColor = undefined;
+                    // Restore whatever the bar should actually say, rather than
+                    // hardcoding the connected label over a disconnected or
+                    // quiet-mode state.
+                    if (!renderQuietModeStatus()) {
+                        applyStatusBarConnection(statusBarConnected);
+                    }
                 }
-            }
-            osNotifPulseTimeout = undefined;
-        }, 5000);
+            }, 5000);
+        }
+        // handleIntervention() already toasts an overlay_only proposal; one
+        // toast per intervention, not two.
+        if (payload.level === "overlay_only" && payload.headline) return;
         const interventionId = String(payload.intervention_id || '');
         // A6: de-dup by intervention_id (the daemon echoes the same
         // trigger after every micro-step toggle). Payloads without an id
@@ -462,12 +471,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         lastOsNotifInterventionId = interventionId || null;
         lastOsNotifShownHeadline = headline;
         lastOsNotifShownAt = now;
+        // "View Details", not "Open Dashboard": the action reveals this
+        // window's Cortex panel; it never raised the desktop dashboard.
         void Promise.resolve(vscode.window.showInformationMessage(
             `Cortex · ${headline}`,
-            'Open Dashboard',
+            'View Details',
             'Snooze',
         )).then((choice) => {
-            if (choice === 'Open Dashboard') {
+            if (choice === 'View Details') {
                 panelProvider?.showPanel();
             } else if (choice === 'Snooze') {
                 // Phase-3 / Audit-1.2 F11: surface a warning instead
@@ -680,6 +691,10 @@ function updateStatusBar(payload: Record<string, unknown>): void {
     // than a second and the user saw a normal bar while interventions were
     // suppressed.
     if (renderQuietModeStatus()) {
+        return;
+    }
+    // The five-second desktop-not-focused pulse owns the bar until it ends.
+    if (osNotifPulseTimeout !== undefined) {
         return;
     }
 
