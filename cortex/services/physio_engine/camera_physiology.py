@@ -296,6 +296,7 @@ class CameraPhysiologyProcessor:
                 boot_id=boot_id,
                 head_vertical_face_units=respiration_window.head_vertical_face_units,
                 beat_intervals=pulse.intervals,
+                cardiac_signal_present=pulse.signal_present,
             )
             self._latest_respiration = respiration.fused
         else:

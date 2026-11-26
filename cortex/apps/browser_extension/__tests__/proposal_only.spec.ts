@@ -122,4 +122,37 @@ describe("proposal-only workspace authority", () => {
         expect(globalThis.__cortexChrome.tabs.remove).not.toHaveBeenCalled();
         expect(globalThis.__cortexChrome.tabs.update).not.toHaveBeenCalled();
     });
+
+    it("surfaces a strain-load break suggestion and still drops the legacy basis", async () => {
+        await import("../background");
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const socket = getLatestSocket();
+        expect(socket).not.toBeNull();
+        globalThis.__cortexChrome.runtime.sendMessage.mockClear();
+        const suggested = () => globalThis.__cortexChrome.runtime.sendMessage.mock.calls
+            .map(([message]) => message as { type?: unknown; reason?: unknown })
+            .filter((message) => message?.type === "BREAK_SUGGESTED");
+
+        socket!.__deliver({
+            type: "BREAK_RECOMMENDATION",
+            payload: { basis: "legacy_stress_integral", reason: "legacy", duration_seconds: 240 },
+            timestamp: Date.now() / 1000,
+            sequence: 20,
+        });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(suggested()).toHaveLength(0);
+
+        const reason = "Your heart and breathing have run above your usual level for a while.";
+        socket!.__deliver({
+            type: "BREAK_RECOMMENDATION",
+            payload: { basis: "physiological_strain", reason, duration_seconds: 180 },
+            timestamp: Date.now() / 1000,
+            sequence: 21,
+        });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(suggested()).toEqual([{ type: "BREAK_SUGGESTED", reason }]);
+        // A suggestion is words only: it never touches tabs.
+        expect(globalThis.__cortexChrome.tabs.remove).not.toHaveBeenCalled();
+        expect(globalThis.__cortexChrome.tabs.update).not.toHaveBeenCalled();
+    });
 });

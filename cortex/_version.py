@@ -1,3 +1,3 @@
 """Generated project version. Run ``python -m cortex.scripts.sync_versions --apply``."""
 
-VERSION = "0.5.1"
+VERSION = "0.6.0"

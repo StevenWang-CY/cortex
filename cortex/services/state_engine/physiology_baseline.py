@@ -227,7 +227,10 @@ class PhysiologyBaselineTracker:
         for metric, keys in (
             (PhysiologyMetricName.HEART_RATE, ("heart_rate_bpm", "hr")),
             (PhysiologyMetricName.SDNN, ("hrv_sdnn_ms", "hrv_sdnn")),
-            (PhysiologyMetricName.RESPIRATION, ("respiration_rate_bpm", "respiration_rate")),
+            (
+                PhysiologyMetricName.RESPIRATION,
+                ("respiration_rate_bpm", "respiration_rate", "resp_rate"),
+            ),
             (PhysiologyMetricName.BLINK_RATE, ("blink_rate_per_min", "blink_rate")),
         ):
             for key in keys:

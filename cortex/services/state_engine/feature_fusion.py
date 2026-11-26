@@ -276,14 +276,33 @@ class FeatureFusion:
             and self._telemetry is not None
             and self._telemetry.window_focus_source_available
         )
+        # The pulse window is 20 s once filled and 10 s before that; stamp the
+        # span the published rate actually describes.
+        pulse_evidence = self._physio.pulse_evidence if self._physio is not None else None
+        pulse_window_ms = (
+            max(
+                1,
+                int(
+                    round(
+                        (
+                            pulse_evidence.window_end_mono_ns
+                            - pulse_evidence.window_start_mono_ns
+                        )
+                        / 1_000_000.0
+                    )
+                ),
+            )
+            if pulse_evidence is not None
+            else 20_000
+        )
         named_features: dict[FeatureName, FeatureValue] = {
             FeatureName.HEART_RATE_BPM: self._feature_value(
                 hr,
                 source_present=not physio_missing,
                 quality=quality.physio,
                 age_ms=physio_age,
-                source_window_ms=10_000,
-                algorithm_version="webcam-pulse-display-v2",
+                source_window_ms=pulse_window_ms,
+                algorithm_version="camera-pulse-v3",
             ),
             # Dispersion (SDNN) is the variability measure that qualified
             # against ECG; beat-to-beat measures such as RMSSD did not and

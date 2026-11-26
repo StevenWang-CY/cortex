@@ -71,8 +71,12 @@ def test_dashboard_construction_creates_no_stray_top_level_windows(qapp):
             if w is not window
         ]
         assert stray == [], [type(w).__name__ for w in stray]
-        # The biometric card no longer carries an orphaned HRV slot.
-        assert not hasattr(window._consumer, "_hrv_label")
+        # The variability, breathing and body-load readouts live inside the
+        # biometric card: a label without a parent opens as its own window.
+        for name in ("_hrv_label", "_resp_label", "_strain_label"):
+            label = getattr(window._consumer, name)
+            assert label.parent() is not None
+            assert not label.isWindow()
     finally:
         window.deleteLater()
 

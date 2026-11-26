@@ -96,14 +96,17 @@ function enqueueEditorTransaction(operation: () => Promise<void>): void {
 }
 
 function handleLegacyBreakRecommendation(payload: unknown): void {
-    // Only the explicit elapsed-focus reminder is product-eligible. Legacy
-    // HRV/stress payloads remain a silent decode sink.
+    // The elapsed-focus reminder and the qualified strain-load suggestion
+    // are product-eligible. A payload with no basis, or with the legacy
+    // stress-integral basis, remains a silent decode sink.
     if (typeof payload !== "object" || payload === null) return;
     const p = payload as Record<string, unknown>;
-    if (p.basis !== "elapsed_focus") return;
+    if (p.basis !== "elapsed_focus" && p.basis !== "physiological_strain") return;
     const reason = typeof p.reason === "string"
         ? p.reason
-        : "You've reached your preferred focus interval.";
+        : p.basis === "physiological_strain"
+            ? "Your heart and breathing have run above your usual level for a while."
+            : "You've reached your preferred focus interval.";
     void Promise.resolve(vscode.window.showInformationMessage(
         `Cortex · ${reason}`,
         "Open Cortex",

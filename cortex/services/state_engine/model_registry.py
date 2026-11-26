@@ -76,7 +76,7 @@ class SupportModelRegistry:
             DETERMINISTIC_SUPPORT_VERSION: RegisteredModel(
                 identity=deterministic_support_identity(),
                 kind="deterministic",
-                model_card="docs/model-cards/deterministic-support-v2.md",
+                model_card="docs/model-cards/deterministic-support-v3.md",
                 production_eligible=True,
             ),
             NO_INFERENCE_VERSION: RegisteredModel(

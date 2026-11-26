@@ -3,7 +3,7 @@
 //
 // Source of truth: cortex/libs/schemas/*.py (Pydantic v2 models).
 // Schema package: cortex-wire/2.0
-// Source SHA-256: 692c7926e37b4a83b38d570d47750d2f61879d5cc5bd01e822261b2e0ab97939
+// Source SHA-256: 10af4e9adb40df938776ccfec56d018b1bd88b1bf1cc008e31113d36c0a458f5
 // Drift-gate: a pre-commit hook and the GitHub Actions CI run
 //   `python -m cortex.scripts.generate_ts_schemas --check`
 // and fail if this file is out of sync with the Python models.
@@ -4426,7 +4426,7 @@ export interface BiometricsSummary {
    */
   hrv_rmssd?: number | null;
   /**
-   * SDNN of camera pulse intervals (ms, trailing five minutes)
+   * SDNN of camera pulse intervals (ms, trailing three minutes)
    */
   hrv_sdnn?: number | null;
   /**

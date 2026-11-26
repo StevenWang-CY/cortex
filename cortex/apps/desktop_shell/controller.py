@@ -266,9 +266,12 @@ class DaemonBridge(QObject):
             logger.debug("on_stop_focus_auto emit failed", exc_info=True)
 
     def on_break_recommendation(self, payload: dict) -> None:
-        """Decode-only compatibility sink for an unsupported metric claim."""
+        """Queue a BREAK_RECOMMENDATION so the dashboard can offer the break."""
 
-        del payload
+        try:
+            self.break_recommendation_received.emit(dict(payload) if payload else {})
+        except Exception:
+            logger.debug("break_recommendation_received emit failed", exc_info=True)
 
     def on_intervention_failed(self, payload: dict) -> None:
         """P1-FC-INTERVENTION-FAILED: a total mutation failure was
@@ -538,8 +541,13 @@ class CortexAppController:
         self._bridge.quiet_mode_state_received.connect(
             self._on_quiet_mode_state_to_tray,
         )
-        # BREAK_RECOMMENDATION remains a decode-only compatibility message;
-        # unsupported HRV/stress claims are never connected to product UI.
+        # A break recommendation (the user's own focus interval, or the
+        # strain load crossing its threshold) surfaces as the dashboard pill;
+        # clicking it starts the guided breathing session.
+        if hasattr(self._dashboard, "apply_break_recommendation"):
+            self._bridge.break_recommendation_received.connect(
+                self._dashboard.apply_break_recommendation,
+            )
 
         self._overlay.dismissed.connect(self._on_overlay_dismissed)
         # Overlay buttons are proposal gestures. The controller forwards the
@@ -1094,6 +1102,7 @@ class CortexAppController:
                 MessageType.QUIET_MODE_STATE.value: bridge.on_quiet_mode_state,
                 MessageType.START_FOCUS_AUTO.value: bridge.on_start_focus_auto,
                 MessageType.STOP_FOCUS_AUTO.value: bridge.on_stop_focus_auto,
+                MessageType.BREAK_RECOMMENDATION.value: bridge.on_break_recommendation,
                 MessageType.INTERVENTION_FAILED.value: bridge.on_intervention_failed,
                 MessageType.INTERVENTION_TRANSACTION_STATE.value: (
                     bridge.on_intervention_transaction_state
@@ -1919,9 +1928,36 @@ class CortexAppController:
 
     @Slot(dict)
     def _on_break_pill_clicked(self, payload: dict) -> None:
-        """Legacy pill callbacks cannot start an unvalidated biology break."""
+        """Start the guided breathing session the pill offered.
 
-        del payload
+        The click is the user's choice to take the break; the daemon owns
+        the session (audio muting on a recent call, the break record, the
+        strain load it pays back).
+        """
+
+        if self._daemon is None or self._daemon_loop is None:
+            return
+        try:
+            duration = int(float(payload.get("duration_seconds", 180) or 180))
+        except (TypeError, ValueError):
+            duration = 180
+        pattern = payload.get("breathing_pattern")
+        basis = str(payload.get("basis") or "elapsed_focus")
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._daemon.start_biology_break(
+                    duration_seconds=max(60, min(1800, duration)),
+                    breathing_pattern=pattern if isinstance(pattern, str) else None,
+                    reason=(
+                        "physiological_strain"
+                        if basis == "physiological_strain"
+                        else "preferred_focus_interval_reached"
+                    ),
+                ),
+                self._daemon_loop,
+            )
+        except Exception:
+            logger.debug("guided break start failed", exc_info=True)
 
     @Slot(str)
     def _on_undo_action_requested(self, intervention_id: str) -> None:

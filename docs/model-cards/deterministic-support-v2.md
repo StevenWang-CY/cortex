@@ -1,5 +1,9 @@
 # Model card: deterministic support rules v2.6.0
 
+> **Superseded.** The current rules are
+> [v3.0.0](deterministic-support-v3.md). This card is kept as the record of the
+> behaviour-only rules shipped through Cortex 0.5.1.
+
 ## Status and ownership
 
 | Field | Value |
