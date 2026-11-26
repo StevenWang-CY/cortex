@@ -1205,12 +1205,6 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
         # Hourly heatmap derived from state_transitions.
         self._render_heatmap_from_transitions(report)
 
-        # Distractions.
-        domains = report.get("top_distraction_domains") or []
-        if not isinstance(domains, list):
-            domains = []
-        self._populate_distractions([str(d) for d in domains[:3]])
-
         # Interventions: state_transitions with to_state=="HYPER".
         transitions = report.get("state_transitions") or []
         if not isinstance(transitions, list):
@@ -1220,6 +1214,15 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
             for t in transitions
             if isinstance(t, dict) and str(t.get("to_state", "")).upper() == "HYPER"
         ]
+
+        # Distractions.
+        domains = report.get("top_distraction_domains") or []
+        if not isinstance(domains, list):
+            domains = []
+        self._populate_distractions(
+            [str(d) for d in domains[:3]],
+            any_interventions=bool(intervention_rows),
+        )
         self._populate_interventions(intervention_rows)
 
         # Comparison.
@@ -1342,7 +1345,9 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
                     buckets = [total / 24.0] * 24
         self._heatmap.set_hourly_flow(buckets)
 
-    def _populate_distractions(self, domains: list[str]) -> None:
+    def _populate_distractions(
+        self, domains: list[str], *, any_interventions: bool = False,
+    ) -> None:
         # Tear down and rebuild — these are at most 3 rows; rebuilding
         # avoids cache key churn.
         for i in reversed(range(self._distractions_layout.count())):
@@ -1355,9 +1360,13 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
                 w.deleteLater()
         if not domains:
             # P2-8: per-session detail empty state — sessions exist but this
-            # one had no distraction domains detected.
+            # one had no distraction domains detected. The calm copy also
+            # says there were no interventions, which is only true when the
+            # Interventions section below is empty too.
             placeholder = QLabel(
-                "No interventions in this session — focus held steady."
+                "No distracting sites recorded in this session."
+                if any_interventions
+                else "No interventions in this session — focus held steady."
             )
             placeholder.setObjectName("CortexDetailDistractionsEmpty")
             placeholder.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
