@@ -435,7 +435,7 @@ class MessageType(str, Enum):  # noqa: UP042 — pydantic-to-typescript requires
     the triggering message so the client can match the reply to its
     pending request."""
 
-    # ─── LeetCode adapter cues (Daemon → Chrome, target_client_types=["chrome"]) ─
+    # ─── LeetCode adapter cues (Daemon → browser, target_client_types=["chrome", "edge"]) ─
     # Emitted by ``LeetCodeAdapter.execute`` via
     # ``runtime_daemon._send_leetcode_ws_message`` → ``WebSocketServer.send_message``
     # → ``WSMessage(type=...)``. These literals MUST be enumerated here or
