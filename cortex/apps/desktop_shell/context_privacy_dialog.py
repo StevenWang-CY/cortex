@@ -239,6 +239,7 @@ class ContextPrivacyDialog(QDialog):
             f"QPlainTextEdit {{ background: {CX_SURFACE}; border: 1px solid {CX_BORDER_DEFAULT};"
             f" border-radius: {RADIUS_BUTTON}px; color: {CX_TEXT}; padding: 7px; }}"
         )
+        set_accessible_name(self._extra_note, "Optional note to the planner")
         set_accessible_description(
             self._extra_note,
             "Optional text that will be secret-scanned, redacted, capped, and shown in the exact request preview.",
@@ -339,6 +340,7 @@ class ContextPrivacyDialog(QDialog):
             f"QPlainTextEdit {{ background: {CX_BG_SECONDARY}; border: none;"
             f" border-radius: {RADIUS_BUTTON}px; color: {CX_TEXT_SECONDARY}; padding: 8px; }}"
         )
+        set_accessible_name(self._disclosure_preview, "Included and redacted fields")
         layout.addWidget(self._disclosure_preview)
 
         footer = QHBoxLayout()
