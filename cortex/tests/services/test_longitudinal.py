@@ -74,7 +74,9 @@ def _write_session_at(
         time_in_hyper_seconds=time_in_hyper_seconds,
         flow_percentage=(time_in_flow_seconds / duration_seconds) * 100.0,
         avg_hr_bpm=avg_hr_bpm,
-        avg_hrv_rmssd=avg_hrv_rmssd,
+        # Production writes SDNN since 0.6.0; the parameter keeps its older
+        # name for the call sites below.
+        avg_hrv_sdnn=avg_hrv_rmssd,
         top_distraction_domains=top_distraction_domains or [],
         state_transitions=transitions,
     )
@@ -607,9 +609,10 @@ class _PatchedDatetime:
 
 
 
-def test_session_facts_read_sdnn_and_still_load_older_rmssd_files(tmp_path: Path) -> None:
-    """Session files written since 0.6.0 carry ``avg_hrv_sdnn``; older files
-    carry only ``avg_hrv_rmssd``. Both load, and SDNN wins when both exist."""
+def test_session_facts_read_sdnn_and_ignore_an_older_rmssd_value(tmp_path: Path) -> None:
+    """Session files written since 0.6.0 carry ``avg_hrv_sdnn``. A file from
+    before carries only ``avg_hrv_rmssd``: it still loads, but RMSSD is not
+    read into the variability trend."""
 
     import json
 
@@ -617,24 +620,30 @@ def test_session_facts_read_sdnn_and_still_load_older_rmssd_files(tmp_path: Path
 
     sessions_dir = tmp_path / "sessions"
     _write_session_at(
-        sessions_dir, "older", start=_utc_noon(date(2026, 5, 20)), avg_hrv_rmssd=61.0
+        sessions_dir, "current", start=_utc_noon(date(2026, 5, 20)), avg_hrv_rmssd=38.0
     )
-    older = _load_session_facts(sessions_dir / "session_older.json")
-    assert older is not None and older.has_hrv_sample
-    assert older.avg_hrv_rmssd == pytest.approx(61.0)
-
     current_path = sessions_dir / "session_current.json"
-    payload = json.loads((sessions_dir / "session_older.json").read_text(encoding="utf-8"))
-    payload["session_id"] = "current"
-    payload["avg_hrv_sdnn"] = 38.0
-    payload["avg_hrv_rmssd"] = 99.0
-    current_path.write_text(json.dumps(payload), encoding="utf-8")
+    payload = json.loads(current_path.read_text(encoding="utf-8"))
+    assert payload["avg_hrv_sdnn"] == 38.0 and payload["avg_hrv_rmssd"] is None
     current = _load_session_facts(current_path)
     assert current is not None and current.has_hrv_sample
-    assert current.avg_hrv_rmssd == pytest.approx(38.0)
+    assert current.avg_hrv_ms == pytest.approx(38.0)
 
+    # An older file: RMSSD only.
+    payload["session_id"] = "older"
     payload["avg_hrv_sdnn"] = None
-    payload["avg_hrv_rmssd"] = None
-    current_path.write_text(json.dumps(payload), encoding="utf-8")
-    absent = _load_session_facts(current_path)
-    assert absent is not None and not absent.has_hrv_sample
+    payload["avg_hrv_rmssd"] = 61.0
+    older_path = sessions_dir / "session_older.json"
+    older_path.write_text(json.dumps(payload), encoding="utf-8")
+    older = _load_session_facts(older_path)
+    assert older is not None, "an older session file must still load"
+    assert not older.has_hrv_sample
+    assert older.avg_hrv_ms is None
+    assert older.avg_hr_bpm == current.avg_hr_bpm
+
+    # Both present: SDNN is the value, whatever RMSSD says.
+    payload["avg_hrv_sdnn"] = 42.0
+    payload["avg_hrv_rmssd"] = 99.0
+    older_path.write_text(json.dumps(payload), encoding="utf-8")
+    both = _load_session_facts(older_path)
+    assert both is not None and both.avg_hrv_ms == pytest.approx(42.0)

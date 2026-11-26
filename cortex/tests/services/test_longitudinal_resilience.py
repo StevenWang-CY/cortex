@@ -39,7 +39,7 @@ def _write_session(
         time_in_flow_seconds=400.0,
         time_in_hyper_seconds=60.0,
         avg_hr_bpm=72.0,
-        avg_hrv_rmssd=50.0,
+        avg_hrv_sdnn=50.0,
     )
     sessions_dir.mkdir(parents=True, exist_ok=True)
     (sessions_dir / f"session_{session_id}.json").write_text(

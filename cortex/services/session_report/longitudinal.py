@@ -207,7 +207,8 @@ class _SessionFacts:
     time_in_flow_seconds: float
     time_in_hyper_seconds: float
     avg_hr_bpm: float | None
-    avg_hrv_rmssd: float | None
+    # Mean SDNN of the session in ms; None for files written before 0.6.0.
+    avg_hrv_ms: float | None
     has_hr_sample: bool
     has_hrv_sample: bool
     interventions: int
@@ -280,10 +281,10 @@ def _load_session_facts(path: Path) -> _SessionFacts | None:
         time_in_hyper = 0.0
 
     avg_hr = data.get("avg_hr_bpm")
-    # SDNN since 0.6.0; the RMSSD field is read only for older session files.
+    # SDNN, recorded since 0.6.0. An older file's ``avg_hrv_rmssd`` is not
+    # read: RMSSD did not agree with ECG and is not comparable with SDNN, so
+    # mixing the two into one trend would describe neither.
     avg_hrv = data.get("avg_hrv_sdnn")
-    if avg_hrv is None:
-        avg_hrv = data.get("avg_hrv_rmssd")
     try:
         avg_hr_val: float | None = float(avg_hr) if avg_hr is not None else None
     except (TypeError, ValueError):
@@ -342,7 +343,7 @@ def _load_session_facts(path: Path) -> _SessionFacts | None:
         time_in_flow_seconds=time_in_flow,
         time_in_hyper_seconds=time_in_hyper,
         avg_hr_bpm=avg_hr_val,
-        avg_hrv_rmssd=avg_hrv_val,
+        avg_hrv_ms=avg_hrv_val,
         has_hr_sample=avg_hr_val is not None,
         has_hrv_sample=avg_hrv_val is not None,
         interventions=interventions,
@@ -670,7 +671,7 @@ class LongitudinalAggregator:
 
         if has_hrv_sample:
             hrv_baseline = sum(
-                (f.avg_hrv_rmssd or 0.0) * f.duration_seconds
+                (f.avg_hrv_ms or 0.0) * f.duration_seconds
                 for f in facts
                 if f.has_hrv_sample
             ) / hrv_weight
