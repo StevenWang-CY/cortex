@@ -1143,6 +1143,10 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
         try:
             self._loading_label.setVisible(self._loading)
             if self._loading:
+                # Loading blanks what is on screen, so the next payload must
+                # render even if it equals the last one (two rows timing out
+                # give identical error payloads).
+                self._current_payload_hash = ""
                 self._error_label.setVisible(False)
                 if self._scroll_widget is not None:
                     self._scroll_widget.setVisible(False)
@@ -1185,6 +1189,10 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
             self._set_text_if_changed(self._subhead, "")
             self._error_label.setText(msg)
             self._error_label.setVisible(True)
+            # No report was loaded: the body's empty states ("No
+            # interventions…") would describe a session nobody has seen.
+            if self._scroll_widget is not None:
+                self._scroll_widget.setVisible(False)
             self._render_segments([])
             self._heatmap.set_hourly_flow([0.0] * 24)
             self._populate_distractions([])
@@ -1192,6 +1200,8 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
             self._populate_comparison(None)
             return
         self._error_label.setVisible(False)
+        if self._scroll_widget is not None:
+            self._scroll_widget.setVisible(True)
 
         # Headline.
         start = str(report.get("start_time") or "")
