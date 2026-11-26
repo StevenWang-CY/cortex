@@ -1583,6 +1583,12 @@ class TriggerPolicy:
             self._quiet_mode_indefinite = True
             self._quiet_mode_until = 0.0
             self._quiet_mode_deadline = None
+            # Persist now: the loader and the daemon's startup reconcile
+            # restore a pause only from this record, and nothing else wrote
+            # it while paused (quiet mode blocks the proposals whose
+            # dismissal or approval would have), so a restart reopened the
+            # camera and reported "not paused".
+            self._persist_quiet_mode_history()
             return
         self._quiet_mode_indefinite = False
         minutes = duration_minutes or self._config.quiet_mode_minutes
@@ -1592,12 +1598,18 @@ class TriggerPolicy:
             self._clock,
             int(duration_seconds * 1_000),
         )
+        # Record that any persisted pause is over. A user's timed snooze is
+        # not written as a window: the daemon does not restore it either, so
+        # a restart must not leave an invisible policy-side quiet behind.
+        self._persist_quiet_mode_history(include_window=False)
 
     def clear_quiet_mode(self) -> None:
         """Disable quiet mode immediately."""
         self._quiet_mode_until = 0.0
         self._quiet_mode_deadline = None
         self._quiet_mode_indefinite = False
+        # Without this, a resumed pause came back on the next launch.
+        self._persist_quiet_mode_history()
 
     @property
     def quiet_mode_indefinite(self) -> bool:
@@ -1642,19 +1654,23 @@ class TriggerPolicy:
                 self._quiet_mode_history_path,
             )
 
-    def _persist_quiet_mode_history(self) -> None:
+    def _persist_quiet_mode_history(self, *, include_window: bool = True) -> None:
         """Write the current quiet-mode escalation record (F26).
 
         Crash-safe via ``atomic_write_json``. Lock-guarded so a snapshot
         read inside ``reset_quiet_mode`` cannot interleave with the
-        record_dismissal writer.
+        record_dismissal writer. ``include_window=False`` writes the
+        escalation memory and pause flag without the active timed window.
         """
         with self._quiet_mode_history_lock:
             now = monotonic_seconds(self._clock)
             deadline_record = (
                 self._quiet_mode_deadline.to_record()
-                if self._quiet_mode_deadline is not None
+                if include_window and self._quiet_mode_deadline is not None
                 else None
+            )
+            window_remaining = (
+                max(0.0, self._quiet_mode_until - now) if include_window else 0.0
             )
             # ``quiet_mode_until`` is in the future, so the remainder is
             # ``until - now`` (positive while the window is still open).
@@ -1672,10 +1688,7 @@ class TriggerPolicy:
             record = {
                 "version": QUIET_MODE_HISTORY_VERSION,
                 "quiet_mode_count": int(self._quiet_mode_count),
-                "quiet_mode_until_monotonic_delta": max(
-                    0.0,
-                    self._quiet_mode_until - now,
-                ),
+                "quiet_mode_until_monotonic_delta": window_remaining,
                 "quiet_mode_indefinite": bool(self._quiet_mode_indefinite),
                 "quiet_mode_deadline": deadline_record,
                 "last_escalation_age_seconds": max(
