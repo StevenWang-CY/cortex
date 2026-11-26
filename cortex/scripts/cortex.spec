@@ -281,8 +281,9 @@ app = BUNDLE(
         "CFBundleVersion": CORTEX_VERSION,
         "CFBundleShortVersionString": CORTEX_VERSION,
         "NSCameraUsageDescription": (
-            "Cortex needs camera access to monitor focus and attention "
-            "via remote photoplethysmography."
+            "Cortex uses the camera to estimate your pulse, breathing and "
+            "blink rate on this Mac. Frames are analysed in memory and are "
+            "not saved or sent anywhere."
         ),
         # macOS 14+ requires this declaration when AVFoundation enumerates a
         # Continuity Camera. Cortex still rejects iPhone/iPad devices during

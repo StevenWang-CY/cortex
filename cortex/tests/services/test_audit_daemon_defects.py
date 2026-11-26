@@ -258,7 +258,7 @@ async def test_d5_leetcode_actions_pass_the_shared_gate(
     monkeypatch.setattr(daemon._consent_ladder, "check", allow)
     monkeypatch.setattr(CortexDaemon, "workspace_mutation_allowed", property(lambda self: True))
     estimate = _estimate("HYPER")
-    vector = SimpleNamespace(hrv_rmssd=None)
+    vector = SimpleNamespace(hrv_sdnn=None)
 
     daemon._trigger_policy.activate_quiet_mode(duration_minutes=15, current_time=1_000.0)
     await daemon._maybe_trigger_leetcode_interventions(estimate, vector, 1_000.0)

@@ -121,8 +121,10 @@ class BreakRecommendation(BaseModel):
     breathing_pattern: Literal["4-7-8", "box", "coherent"] = Field(
         "box",
         description=(
-            "Optional user-facing pacer cadence; it is not selected from "
-            "biometrics."
+            "Pacer cadence for the guided session. An elapsed-focus break "
+            "uses the default; a strain-load break uses ``coherent`` when "
+            "SDNN is clearly below the personal reference and ``box`` "
+            "otherwise."
         ),
     )
 

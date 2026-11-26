@@ -34,6 +34,7 @@ from cortex.libs.schemas.physiology import PhysiologyMetric, SignalEstimate
 from cortex.services.capture_service.observation_buffer import NumericObservation
 from cortex.services.physio_engine.camera_physiology import (
     CameraPhysiologyProcessor,
+    PhysiologyUpdate,
     build_rgb_observation_buffer,
 )
 from cortex.services.physio_engine.v2.engine import PhysiologyEngineV2
@@ -87,8 +88,13 @@ def replay_trace(
     valid_mask: NDArray[np.bool_] | None = None,
     motion_face_widths_per_second: NDArray[np.float64] | None = None,
     boot_id: UUID | None = None,
+    on_update: Callable[[float, PhysiologyUpdate], None] | None = None,
 ) -> list[StrideRecord]:
     """Feed a trace through the production processor at the production stride.
+
+    ``on_update`` receives every stride's full processor output with its
+    capture time, for callers that drive later stages (feature fusion, the
+    rules) from the same replay.
 
     ``sample_times_s`` are the capture instants of each row of ``rgb``.  A
     ``False`` entry in ``valid_mask`` is delivered as a rejected observation
@@ -173,6 +179,8 @@ def replay_trace(
             continue
         last_stride_ns = mono_ns
         update = processor.process(buffer.snapshot(), boot_id=boot)
+        if on_update is not None:
+            on_update(float(stamp_s), update)
         hrv = update.pulse.hrv_estimates if update.pulse is not None else {}
         extra: dict[str, float] = {}
         for metric in (

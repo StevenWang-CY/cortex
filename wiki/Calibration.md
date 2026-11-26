@@ -1,19 +1,25 @@
 # Calibration
 
-Calibration establishes local acquisition and behavior baselines. It does not
-train a cognitive-state model, diagnose a condition, or validate camera-derived
-HRV/respiration.
+Calibration establishes local acquisition, behavior and personal physiology
+baselines. It does not train a cognitive-state model, diagnose a condition, or
+validate camera-derived heart rate, variability or breathing.
 
 ## What is measured
 
 - camera timing/availability, face/ROI quality, motion and lighting quality;
-- experimental pulse baseline when a quality-valid window exists;
+- experimental resting pulse and breathing levels when quality-valid windows
+  exist;
 - local blink and camera-relative head/neck proxy baselines;
 - user interaction baselines used by deterministic telemetry rules.
 
-Unsupported HRV, LF/HF, respiration, breath-pause, stress-integral, and
-physiology-triggered-break fields remain unavailable regardless of calibration.
-Camera features remain excluded from the production support score.
+The measured pulse, breathing and blink levels seed the personal reference the
+support rules read camera physiology against; without calibration the
+reference is learned during the session. Calibration does not measure
+heart-rate variability, so its reference is always learned in the session. A
+different physical camera discards the reference. Camera physiology only
+corroborates a behavioral reading that is already eligible; calibration cannot
+make it establish one. RMSSD, LF/HF and breath-pause detection are not product
+inputs regardless of calibration.
 
 Mouse samples enter the measured baseline only while the mouse source is
 available. A stationary, observed mouse can legitimately contribute zero;
@@ -30,10 +36,11 @@ new profile is committed atomically only after review; cancel/failure preserves
 the previous profile. Reload verifies the exact committed profile ID.
 
 Acquisition/profile versions and the production behavioral model version are
-separate. Model `2.6.0` uses feature schema `support-features-v2.2.0`; calibrating
+separate. Model `3.0.0` uses feature schema `support-features-v3.0.0`; calibrating
 does not train that model or validate its labels. The production scorer uses
-the calibrated mouse-variance baseline where applicable; measured camera
-diagnostics do not gain authority over support or reading-check-in eligibility.
+the calibrated mouse-variance baseline where applicable; measured camera levels
+serve only as the personal physiology reference, and blink baselines cannot
+change reading-check-in timing.
 
 Camera opening follows macOS-specific safeguards: automatic selection unless a
 device override is explicit, live re-enumeration after open to reject a

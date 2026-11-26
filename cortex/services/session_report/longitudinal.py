@@ -280,7 +280,10 @@ def _load_session_facts(path: Path) -> _SessionFacts | None:
         time_in_hyper = 0.0
 
     avg_hr = data.get("avg_hr_bpm")
-    avg_hrv = data.get("avg_hrv_rmssd")
+    # SDNN since 0.6.0; the RMSSD field is read only for older session files.
+    avg_hrv = data.get("avg_hrv_sdnn")
+    if avg_hrv is None:
+        avg_hrv = data.get("avg_hrv_rmssd")
     try:
         avg_hr_val: float | None = float(avg_hr) if avg_hr is not None else None
     except (TypeError, ValueError):

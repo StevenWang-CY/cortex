@@ -33,9 +33,13 @@ has released every resource.
 - privacy status, exact context preview, one-time confirm/cancel;
 - scoped storage export/delete and authenticated shutdown.
 
-Compatibility routes for HRV, respiration, stress integral, or biological
-break status return explicit unavailable/legacy responses. They are not
-evidence and cannot trigger a product action.
+Compatibility routes for the old stress integral or biological break status
+(`GET /api/stress-integral`) return explicit unavailable/legacy responses. They
+are not evidence and cannot trigger a product action. Camera SDNN, breathing
+rate and the 0.6.0 strain load travel in `STATE_UPDATE` biometrics, and a
+strain-load break suggestion is a `BREAK_RECOMMENDATION` with
+`basis: physiological_strain`; a message with the legacy stress-integral basis
+is still ignored.
 
 ## WebSocket contract
 

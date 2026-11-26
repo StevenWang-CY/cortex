@@ -604,3 +604,37 @@ class _PatchedDatetime:
 
     def __call__(self, *args: Any, **kwargs: Any) -> datetime:
         return self._real_cls(*args, **kwargs)
+
+
+
+def test_session_facts_read_sdnn_and_still_load_older_rmssd_files(tmp_path: Path) -> None:
+    """Session files written since 0.6.0 carry ``avg_hrv_sdnn``; older files
+    carry only ``avg_hrv_rmssd``. Both load, and SDNN wins when both exist."""
+
+    import json
+
+    from cortex.services.session_report.longitudinal import _load_session_facts
+
+    sessions_dir = tmp_path / "sessions"
+    _write_session_at(
+        sessions_dir, "older", start=_utc_noon(date(2026, 5, 20)), avg_hrv_rmssd=61.0
+    )
+    older = _load_session_facts(sessions_dir / "session_older.json")
+    assert older is not None and older.has_hrv_sample
+    assert older.avg_hrv_rmssd == pytest.approx(61.0)
+
+    current_path = sessions_dir / "session_current.json"
+    payload = json.loads((sessions_dir / "session_older.json").read_text(encoding="utf-8"))
+    payload["session_id"] = "current"
+    payload["avg_hrv_sdnn"] = 38.0
+    payload["avg_hrv_rmssd"] = 99.0
+    current_path.write_text(json.dumps(payload), encoding="utf-8")
+    current = _load_session_facts(current_path)
+    assert current is not None and current.has_hrv_sample
+    assert current.avg_hrv_rmssd == pytest.approx(38.0)
+
+    payload["avg_hrv_sdnn"] = None
+    payload["avg_hrv_rmssd"] = None
+    current_path.write_text(json.dumps(payload), encoding="utf-8")
+    absent = _load_session_facts(current_path)
+    assert absent is not None and not absent.has_hrv_sample

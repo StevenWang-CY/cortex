@@ -39,10 +39,16 @@ showed:
 | Metric | Decision |
 | --- | --- |
 | Heart rate, SDNN | Production inputs; carry most of the physiology block |
-| Breathing rate | Production input at low weight; published only on two-channel agreement |
+| Breathing rate | Production input at low weight; published only when head movement and a pulse-derived channel agree |
 | Blink rate, eye-closure share | Production inputs at low weight |
 | RMSSD, pNN50, SD1/SD2, LF/HF, sample entropy | Not admitted; computed for research only |
 | Head/neck flexion | Unchanged: a comfort proxy, not an input |
+
+Everything downstream that used to be handed RMSSD — the session report, the
+multi-day trend and the coding-practice struggle detector — now receives SDNN
+or nothing. Two coding-practice modes that physiology would establish by
+itself (an immediate heart-rate reaction to a submission, and a post-success
+recovery window) stay contained: their physiological inputs remain zero.
 
 The bounds that make this acceptable on narrow evidence are structural, not
 statistical:

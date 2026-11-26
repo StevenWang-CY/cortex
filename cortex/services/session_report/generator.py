@@ -206,10 +206,10 @@ class SessionReportGenerator:
         if hr_bpm > 0:
             self._hr_samples.append(hr_bpm)
 
-    def record_hrv(self, hrv_rmssd: float) -> None:
-        """Record an HRV sample."""
-        if hrv_rmssd > 0:
-            self._hrv_samples.append(hrv_rmssd)
+    def record_hrv(self, hrv_sdnn_ms: float) -> None:
+        """Record a heart-rate variability sample (SDNN, milliseconds)."""
+        if hrv_sdnn_ms > 0:
+            self._hrv_samples.append(hrv_sdnn_ms)
 
     def record_stress(self, stress_integral: float) -> None:
         """Record peak stress integral."""
@@ -400,7 +400,7 @@ class SessionReportGenerator:
             golden_hour_start=golden_start,
             golden_hour_end=golden_end,
             avg_hr_bpm=round(sum(self._hr_samples) / len(self._hr_samples), 1) if self._hr_samples else None,
-            avg_hrv_rmssd=round(sum(self._hrv_samples) / len(self._hrv_samples), 1) if self._hrv_samples else None,
+            avg_hrv_sdnn=round(sum(self._hrv_samples) / len(self._hrv_samples), 1) if self._hrv_samples else None,
             comparison_to_7day=comparison,
             goal_title=self._goal_title,
         )

@@ -13,7 +13,7 @@ measured, against what, how well it agreed, and where it did not.
 | Heart rate | ECG, 21 public recordings | MAE 1.8 BPM, 94 % within 5 BPM, r = 0.99, on the 33 % of windows it published | Shown; corroborates the rules |
 | Heart-rate variability, SDNN | ECG, same recordings | MAE 8.3 ms, 88 % within 15 ms, r = 0.96, on 22 % of windows | Shown; corroborates the rules |
 | Heart-rate variability, RMSSD | ECG, same recordings | MAE 22.8 ms, 9 % within 15 ms | **Not qualified.** Computed for research; no rule, suggestion or screen reads it |
-| Breathing rate | Simulated truth only | MAE 0.2 /min on simulated recordings; no reference sensor | Shown; low weight in the rules |
+| Breathing rate | Simulated truth only | MAE 0.1 /min on simulated recordings; no reference sensor | Shown; low weight in the rules |
 | Blink rate, eye closure | Not measured here | Landmark geometry, unchanged from 0.5.1 | Low weight in the rules |
 
 Three limits matter more than any number above and are repeated in
@@ -54,9 +54,11 @@ this qualification.
   trailing three minutes (at least 90 s and 40 intervals, at most 25 %
   rejected). RMSSD uses the trailing two minutes.
 - **Breathing rate.** Three channels — pulse-amplitude envelope, vertical head
-  movement, and beat-interval modulation — each estimate a rate; a value is
-  published only when at least two agree, and the envelope channel abstains
-  when the window has no cardiac line.
+  movement, and beat-interval modulation — each estimate a rate. A value is
+  published only when head movement and at least one of the two pulse-derived
+  channels agree; the two pulse-derived channels alone are one mechanism, not
+  two (see [Findings](#findings-that-changed-the-estimator)). The envelope
+  channel abstains when the window has no cardiac line.
 
 ## Method
 
@@ -126,7 +128,7 @@ barely varies, is not meaningful.
 | Heart rate (BPM) | 4843 / 5093 | 0.95 | 0.32 | −0.02 | 0.94 | 1.00 | 1.00 (±5) | yes |
 | SDNN (ms) | 3448 / 5093 | 0.68 | 7.69 | 3.44 | 20.38 | 0.89 | 0.82 (±15) | yes |
 | RMSSD (ms) | 2402 / 5093 | 0.47 | 12.62 | −12.02 | 62.57 | 0.73 | 0.73 (±15) | no |
-| Breathing rate (/min) | 3894 / 5093 | 0.76 | 0.19 | −0.09 | 0.34 | 0.96 | 0.99 (±3) | yes |
+| Breathing rate (/min) | 3862 / 5093 | 0.76 | 0.10 | 0.00 | 0.32 | 1.00 | 1.00 (±3) | yes |
 
 On the eighteen recordings without a pulse, no heart rate, SDNN, RMSSD or
 breathing rate was published (0 of about 4,300 strides).
@@ -186,6 +188,12 @@ breathing rate at all. The causes, each fixed and covered by a regression test:
   harmonic's contribution removed them at a cost of two correct windows.
 - **Skin region.** Forehead-and-cheek patches gave a weaker pulse than the whole
   facial skin with eyes, brows and lips removed.
+- **Two pulse-derived channels are not two witnesses.** With any two of three
+  breathing channels allowed to agree, 9 of about 960 published rates on six
+  simulated recordings were 5 /min too low: the envelope and beat-interval
+  channels followed the same slow rhythm together while head movement read
+  the true rate. Agreement must now include the head-movement channel; the
+  wrong rates disappeared and nine other published values were lost.
 
 RMSSD did not qualify under any variant tried (wider or narrower beat band,
 noise correction on or off): beat-to-beat differences at 30 frames per second
@@ -221,8 +229,10 @@ did.
   trims genuine large swings. The rules standardise against the same person's
   recent level, which removes a constant bias but not a changing one.
 - **Breathing rate has no reference sensor behind it.** The dataset has no
-  respiration channel. It is published only on two-channel agreement and has
-  the lowest weight of the cardiac inputs.
+  respiration channel. It is published only when head movement and a
+  pulse-derived channel agree, and has the lowest weight of the cardiac
+  inputs. When the head moves for other reasons — typing, nodding — no rate is
+  published.
 - **Meaning.** The rules use the directions of well-replicated group-level
   findings: under mental load heart rate and breathing rise and variability
   falls. In one person at one moment the same changes follow from posture,
@@ -245,6 +255,8 @@ Described fully in the
   drains during calm; crossing its threshold produces one suggestion for a
   short breathing break, through the same interruption gate as every other
   suggestion.
+- Session reports and multi-day trends store mean heart rate and mean SDNN.
+  Nothing stores, displays or acts on RMSSD.
 
 ## Switches
 

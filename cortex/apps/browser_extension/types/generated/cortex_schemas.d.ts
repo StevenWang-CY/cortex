@@ -3,7 +3,7 @@
 //
 // Source of truth: cortex/libs/schemas/*.py (Pydantic v2 models).
 // Schema package: cortex-wire/2.0
-// Source SHA-256: 10af4e9adb40df938776ccfec56d018b1bd88b1bf1cc008e31113d36c0a458f5
+// Source SHA-256: 8c1e5fff0169741e6d6643af85632d301d2395f291f8b1107b01d88569c0332c
 // Drift-gate: a pre-commit hook and the GitHub Actions CI run
 //   `python -m cortex.scripts.generate_ts_schemas --check`
 // and fail if this file is out of sync with the Python models.
@@ -3026,7 +3026,7 @@ export interface PhysioFeatures {
    */
   pulse_variability_proxy?: number | null;
   /**
-   * SDNN of camera pulse intervals in ms (trailing 5 min)
+   * SDNN of camera pulse intervals in ms (trailing 3 min)
    */
   hrv_sdnn?: number | null;
   /**
@@ -3346,6 +3346,7 @@ export interface SessionReport {
   golden_hour_start?: number | null;
   golden_hour_end?: number | null;
   avg_hr_bpm?: number | null;
+  avg_hrv_sdnn?: number | null;
   avg_hrv_rmssd?: number | null;
   comparison_to_7day?: ComparisonStats | null;
 }
@@ -4529,7 +4530,7 @@ export interface BreakRecommendation {
    */
   duration_seconds: number;
   /**
-   * Optional user-facing pacer cadence; it is not selected from biometrics.
+   * Pacer cadence for the guided session. An elapsed-focus break uses the default; a strain-load break uses ``coherent`` when SDNN is clearly below the personal reference and ``box`` otherwise.
    */
   breathing_pattern?: "4-7-8" | "box" | "coherent";
 }
@@ -4921,6 +4922,7 @@ export interface SessionReport1 {
   golden_hour_start?: number | null;
   golden_hour_end?: number | null;
   avg_hr_bpm?: number | null;
+  avg_hrv_sdnn?: number | null;
   avg_hrv_rmssd?: number | null;
   comparison_to_7day?: ComparisonStats | null;
 }

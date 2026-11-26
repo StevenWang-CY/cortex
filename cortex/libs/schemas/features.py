@@ -186,7 +186,7 @@ class PhysioFeatures(BaseModel):
         ),
     )
     hrv_sdnn: float | None = Field(
-        None, ge=0.0, description="SDNN of camera pulse intervals in ms (trailing 5 min)"
+        None, ge=0.0, description="SDNN of camera pulse intervals in ms (trailing 3 min)"
     )
     hrv_pnn50: float | None = Field(
         None, ge=0.0, le=1.0,

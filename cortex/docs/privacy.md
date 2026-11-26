@@ -112,9 +112,13 @@ The broker also preserves each field's origin and classification in the
 disclosure manifest. Text remains untrusted even after redaction; prompt
 instructions cannot grant a capability.
 
-The separately selected support estimate comes from behavioral inference,
-currently model `2.6.0` / `support-features-v2.2.0`. Camera pulse, blink and
-head/neck proxies cannot contribute to that score. Unavailable input channels
+The separately selected support estimate comes from support inference,
+currently model `3.0.0` / `support-features-v3.0.0`. Camera heart rate, SDNN,
+breathing rate, blink rate and eye-closure share can corroborate that score
+where its behavioral rule is eligible, so a disclosed state label can reflect
+them. The disclosed fields remain the label, its evidence strength and dwell;
+no physiological value, reference or strain load is a planner field, and
+head/neck proxies cannot contribute to the score. Unavailable input channels
 remain missing evidence and may yield `unknown`; a disconnected input source
 must not be presented or disclosed as measured inactivity.
 

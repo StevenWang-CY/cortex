@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Cortex is a macOS research prototype for local behavioral support and optional experimental camera estimates. Production support inference uses observed input/window behavior; camera physiology is diagnostic-only. The default planner is local and the default execution mode is `suggest_only`; proposals cannot restructure the workspace without a separate exact authorization transaction. It ships as a **macOS .app** (DMG installer) that runs the daemon in-process via PySide6, with a Chrome/Edge extension (Plasmo/React MV3) and optional VS Code extension. The daemon exposes FastAPI on port 9472 and WebSocket on port 9473.
+Cortex is a macOS research prototype for local behavioral support and optional experimental camera estimates. Production support inference is driven by observed input/window behavior; qualified camera physiology (heart rate, SDNN, breathing rate, blink rate, eye-closure share) can only corroborate an eligible behavioral reading, with bounded weight and against a personal reference (ADR 0008). The default planner is local and the default execution mode is `suggest_only`; proposals cannot restructure the workspace without a separate exact authorization transaction. It ships as a **macOS .app** (DMG installer) that runs the daemon in-process via PySide6, with a Chrome/Edge extension (Plasmo/React MV3) and optional VS Code extension. The daemon exposes FastAPI on port 9472 and WebSocket on port 9473.
 
 ## Key File Paths
 
@@ -133,6 +133,24 @@ Cortex is a macOS research prototype for local behavioral support and optional e
 41. **Final Qt quit must reach the event loop.** Intercept explicit Quit for the recap flow, then remove the filter before the final `QApplication.quit()`. Ordinary dashboard close must not stop the session in either desktop mode. Test actual Qt event loops; mocked `quit()` cannot prove exit.
 
 42. **Presentation must share evidence lifetime.** Desktop/popup/new-tab signal display expires after ten seconds without updates and clears on disconnect or invalid data. Hidden windows still expire, and queued state cannot repopulate an ended session. Dashboard Review explicitly focuses the current suggestion; arrival itself must not steal focus. Keep completed task diagnostics bounded and value-only, while retaining ownership of unfinished cleanup tasks.
+
+### Camera physiology (0.6.0)
+
+43. **An estimator change re-runs the qualification in the same change.** A change to a pulse, HRV or respiration estimator, gate or window must re-run `python -m cortex.scripts.qualify_physiology` (`synthetic` always; `dataset-4tu` when the dataset is available) and update [the qualification report](docs/research/physiology-qualification.md) and [the model card](docs/model-cards/deterministic-support-v3.md) in the same change. A metric's admission to the rules rests on that report; the 0.5.1 estimator, which no reference gate had ever measured, published about 8 % of windows when replayed against ECG and could not publish a breathing rate at all.
+
+44. **The publication gate is harmonic SNR, and the second harmonic counts only up to half the fundamental.** Uncapped, a weak line at half the true rate was confirmed by the real pulse counted as its harmonic: recording P2LC3 published 51 BPM for a 101 BPM heart. The in-band to out-of-band ratio it replaced had the same median for right and wrong rates.
+
+45. **Window quality is signal strength times acquisition quality.** Never multiply raw per-frame scores (exposure, sharpness, landmark confidence) into it: they rarely exceed 0.6, and the product rejected about half of the windows that were otherwise ready.
+
+46. **A window requirement is a share of the configured window, never its full length.** A 30 fps buffer holds 44.97 s of a 45 s window, so "require 45.0 s" meant no breathing rate was ever published.
+
+47. **RMSSD is not qualified; no rule, suggestion or screen may read it. SDNN is the variability input.** Against ECG, RMSSD reached 22.8 ms mean error with 9 % of values within 15 ms; beat-to-beat differences at 30 fps are dominated by timing noise. SDNN, which averages that noise over a window, reached 8.3 ms.
+
+48. **Physiology is fused only into a state whose own behavior rule is eligible.** Camera evidence alone must never produce an estimate: before this rule, camera evidence alone could become the estimated dominant state. Every physiology value is read against the personal reference, and a physical camera change discards that reference, because a different camera carries a different bias.
+
+49. **The 4TU dataset license forbids redistribution.** Never commit the videos or any trace derived from them (color traces, caches, per-window values); only aggregate agreement may enter the repository.
+
+50. **`jest.requireMock("vscode")` returns a separate automock.** Assert on the module-mapped `vscode` import, which is the object the extension calls. The editor's "legacy recommendation is dropped" test asserted on the automock and could never fail.
 
 Current verification: [0.5.1 validation](docs/release/0.5.1-validation.md).
 Implementation history: [October refinement](docs/implementation-2026-10.md).

@@ -340,3 +340,21 @@ def test_retired_overlay_rejects_a_queued_action_click(app):
         assert overlay._intervention_id == ""
     finally:
         overlay.deleteLater()
+
+
+def test_pause_control_is_disabled_once_the_session_has_ended(dashboard, app):
+    """Found on the installed 0.6.0 build: "Pause" stayed clickable beside
+    "Session ended", although nothing was running to pause."""
+    from cortex.apps.desktop_shell import dashboard as dashboard_module
+
+    tab = dashboard._consumer
+    tab._enter_phase(dashboard_module._PHASE_LIVE)
+    assert tab._quiet_capsule.isEnabled()
+    tab._enter_phase(dashboard_module._PHASE_STOPPING)
+    assert not tab._quiet_capsule.isEnabled()
+    tab._enter_phase(dashboard_module._PHASE_ENDED)
+    assert not tab._quiet_capsule.isEnabled()
+    tab._enter_phase(dashboard_module._PHASE_STARTING)
+    assert tab._quiet_capsule.isEnabled()
+    tab._enter_phase(dashboard_module._PHASE_LIVE)
+    assert tab._quiet_capsule.isEnabled()

@@ -151,6 +151,14 @@ BEAT_INTERVAL_RESAMPLE_HZ = 4.0
 # Longest stretch without an accepted beat interval the resampling may bridge.
 BEAT_INTERVAL_MAX_GAP_SECONDS = 3.0
 CHANNEL_NAMES = ("color_envelope", "head_motion", "beat_interval")
+# Two of the three channels are read from the pulse: its amplitude envelope
+# and its beat intervals. They share beat detection and the slower
+# blood-pressure rhythm near 0.1 Hz, so they fail together: on simulated
+# recordings they agreed with each other on a rate 5 /min too low while head
+# movement read the true one, and that rate was published. Agreement
+# therefore has to span two mechanisms -- the motion channel and at least one
+# pulse-derived channel.
+MOTION_CHANNELS = frozenset({"head_motion"})
 
 
 def _beat_interval_signal(
@@ -261,9 +269,13 @@ class RespirationFusionV2:
             ),
             "fusion": SignalAlgorithmIdentity(
                 name="agreement-gated-respiration-fusion",
-                version="3.0.0",
+                version="3.1.0",
                 implementation_sha256=code_sha256(
-                    (RespirationFusionV2.process_window, _spectral_channel),
+                    (
+                        RespirationFusionV2.process_window,
+                        RespirationFusionV2._largest_agreeing_set,
+                        _spectral_channel,
+                    ),
                     dependency_sha256=(
                         code_sha256(
                             (_color_envelope, _spectral_channel),
@@ -374,7 +386,7 @@ class RespirationFusionV2:
         elif len(agreeing) < 2:
             fused = self._unavailable(
                 "fusion",
-                "independent respiration channels disagree",
+                "head movement and the pulse-derived channels disagree",
                 boot_id,
                 start_ns,
                 end_ns,
@@ -421,10 +433,11 @@ class RespirationFusionV2:
     def _largest_agreeing_set(
         self, usable: dict[str, _ChannelEstimate]
     ) -> dict[str, _ChannelEstimate]:
-        """Largest group of channels whose rates all lie within the tolerance.
+        """Largest group of agreeing channels that spans both mechanisms.
 
-        With three usable channels, two that agree outvote one that does not;
-        ties between pairs go to the pair with the higher combined quality.
+        A group counts only if it holds the head-movement channel and at
+        least one pulse-derived channel, with all rates within the tolerance.
+        Ties between pairs go to the pair with the higher combined quality.
         """
 
         names = sorted(usable)
@@ -433,6 +446,11 @@ class RespirationFusionV2:
         for size in range(len(names), 1, -1):
             for start in range(len(names)):
                 for combo in _combinations(names, size, start):
+                    members = frozenset(combo)
+                    if not (members & MOTION_CHANNELS and members - MOTION_CHANNELS):
+                        # Both pulse-derived channels alone are one
+                        # mechanism, not two (see MOTION_CHANNELS).
+                        continue
                     rates = [usable[name].rate_bpm for name in combo]
                     if max(rates) - min(rates) > self._max_disagreement:
                         continue

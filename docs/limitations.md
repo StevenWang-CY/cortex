@@ -1,6 +1,6 @@
 # Product and evidence limitations
 
-Last reviewed: 2026-10-11. Cortex 0.5.1 is an alpha research prototype for
+Last reviewed: 2026-11-25. Cortex 0.6.0 is an alpha research prototype for
 local, user-controlled workspace support. It is not a medical device, clinical
 tool, productivity judge, accessibility accommodation, or validated estimator
 of cognition.
@@ -8,21 +8,23 @@ of cognition.
 ## What the current output means
 
 The production `deterministic-support` rules summarize recent mouse, keyboard,
-browser, and focus-transition aggregates into heuristic support hypotheses.
-They can abstain as `unknown`. Scores are bounded evidence strengths, not
-probabilities. Names such as `support_likely` and `flow_like` describe rule
-patterns; they do not measure overwhelm, flow, stress, fatigue, attention,
-arousal, intent, ability, or health.
+browser, and focus-transition aggregates into heuristic support hypotheses,
+optionally corroborated by camera physiology. They can abstain as `unknown`.
+Scores are bounded evidence strengths, not probabilities. Names such as
+`support_likely` and `flow_like` describe rule patterns; they do not measure
+overwhelm, flow, stress, fatigue, attention, arousal, intent, ability, or
+health.
 
-The current registry version is `2.6.0`, with feature schema
-`support-features-v2.2.0`. Missing input sources abstain; silence counts only
+The current registry version is `3.0.0`, with feature schema
+`support-features-v3.0.0`. Missing input sources abstain; silence counts only
 while the corresponding listeners are observed and available. Duplicate or
 regressed timestamps cannot advance smoothing/dwell, and observation gaps
 longer than three seconds restart confirmation. These are evidence-integrity
 checks, not empirical validation of the inferred hypotheses. The model digest
-covers eleven behavioral acquisition/aggregation/schema/fusion/scoring/
-smoothing components; it does not identify the full runtime, configuration,
-personal baselines, or intervention policy.
+covers twenty-one components: behavioral acquisition, aggregation, schema,
+fusion, scoring and smoothing, the physiology evidence and personal reference,
+and the camera physiology estimators. It does not identify the full runtime,
+configuration, personal baselines, or intervention policy.
 
 The rules have no training data and no population accuracy claim. They may
 behave differently with assistive technology, voice/touch input, keyboard-only
@@ -30,28 +32,65 @@ or mouse-only work, remote desktops, unusual key mappings, different motor
 patterns, and tasks whose normal mechanics resemble “thrashing.” Calibration
 supplies local acquisition and behavioral baselines; it does not validate or
 diagnose a state.
-See the [model card](model-cards/deterministic-support-v2.md) and
+See the [model card](model-cards/deterministic-support-v3.md) and
 [study protocol](research/support-inference-study-protocol.md).
 
 ## Camera and physiological signals
 
 Webcam pulse is experimental and sensitive to lighting, motion, occlusion,
 camera processing, skin/camera interaction, frame timing, distance, glasses,
-and device differences. It has not passed the required synchronized reference-
-sensor and participant-held-out product gate. It is displayed only as an
-experimental wellness signal and cannot affect production support scores.
+and device differences. Since 0.6.0, camera heart rate, heart-rate variability
+as SDNN, breathing rate, blink rate and eye-closure share are optional
+corroborating inputs to the support rules
+([ADR 0008](adr/0008-qualified-camera-physiology.md)). Each is read as a
+deviation from the same person's reference through the same camera, and is
+mixed only into a state whose behavioral rule is already eligible, with a
+weight of at most `state.physiology_weight` (default 0.35). Camera evidence
+alone cannot produce an estimate. With no camera, no face or no reference the
+scores equal the behavior-only scores; `state.physiology_weight: 0` restores
+behavior-only scoring.
 
-Camera-derived HRV, RMSSD/SDNN/pNN50/LF-HF/nonlinear measures, respiration,
-breath-pause or “screen apnea,” and the former stress integral are unavailable
-in product mode. Blink and camera-relative head/neck pose remain local comfort
-proxies, not cognitive evidence. No output is suitable for diagnosis,
-treatment, emergency detection, medication decisions, or clinical monitoring.
+The evidence behind this is narrow. The
+[qualification report](research/physiology-qualification.md) states it in
+full:
 
-The repository contains a checksum/license/reference-bound replay harness and
-protocol. No participant dataset or passing external validation report is
-committed. A future report must publish abstention coverage, error and agreement
-by preregistered condition/subgroup, reference hardware and alignment, sealed
-participant splits, exclusions, and uncertainty.
+- Heart rate (mean error 1.8 BPM, on the 33 % of windows it published) and
+  SDNN (8.3 ms, on 22 % of windows) were checked against ECG on 21 public
+  recordings. Every published value came from **one participant**.
+- For the two participants with intermediate and dark skin tone the estimator
+  published nothing. For such users, on comparable footage, the camera adds
+  nothing and the rules are behavior-only. This is an unequal benefit, not a
+  settled state.
+- The publication gate was designed with the same recordings in view. There is
+  no held-out data; agreement on new people, cameras and rooms may be lower.
+- Breathing rate has only simulated truth behind it. Blink rate and eye
+  closure were not checked against a reference.
+- Head movement and low light cause gaps: with head movement 3 % of windows
+  published a rate, and at 5 lux a third did. Typing and talking at a desk
+  resemble the movement recordings more than the still ones.
+- Agreement with a reference sensor shows that a value tracks the body, not
+  that it indicates a need for support. Heart rate and variability change with
+  posture, caffeine, conversation and exercise as well as with work.
+
+RMSSD, pNN50, SD1/SD2, LF/HF and sample entropy did not meet the reference
+criterion. They are computed for research only; no rule, suggestion or screen
+reads them. Breath-pause or “screen apnea” detection is not provided.
+Camera-relative head/neck pose remains a local comfort proxy, not cognitive
+evidence.
+
+The strain load and its breathing-break suggestion are pacing aids built from
+the same physiology. They are not measurements of stress, fatigue or health.
+No output is suitable for diagnosis, treatment, emergency detection,
+medication decisions, or clinical monitoring.
+
+The repository contains the qualification script, its acceptance criteria and
+a checksum/license/reference-bound replay harness. The ECG-referenced dataset
+is public but its license forbids redistribution, so neither its videos nor
+traces derived from them are committed; only aggregate agreement is. What the
+qualification does not deliver remains owed: participant-held-out evaluation,
+more people across skin tones and cameras, a reference respiration sensor, and
+the prospective study that would show whether a fused score predicts a need for
+support.
 
 ### Historical synthetic checks of the pulse publication gate
 
@@ -63,6 +102,14 @@ and [`rppg.py`](../cortex/services/physio_engine/rppg.py). They describe synthet
 windows, not participants, physical cameras, clinical accuracy, or a new
 external validation performed during the October refinement. Residual failure
 modes remain.
+
+Version 0.6.0 replaced the gate these paragraphs describe. The
+[qualification report](research/physiology-qualification.md) found that its
+in-band to out-of-band ratio had the same median for windows whose rate was
+right and wrong. The current gate is a harmonic signal-to-noise ratio with a
+capped second harmonic, and a weaker window may only continue a rate that a
+strong window established within the last 60 s. Where the text below says
+"now", it means v0.5.0.
 
 **Signal-free publication fell on the recorded synthetic fixtures.** Before v0.5.0
 the publication gate tested only a composite quality score whose acquisition

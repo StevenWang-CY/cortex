@@ -39,7 +39,9 @@ class TestSessionReportGenerator:
         assert report.breaks_taken == 1
         assert report.breaks_recommended == 1
         assert report.avg_hr_bpm == 73.5
-        assert report.avg_hrv_rmssd == 45.0
+        assert report.avg_hrv_sdnn == 45.0
+        # RMSSD did not qualify against ECG and is no longer recorded.
+        assert report.avg_hrv_rmssd is None
         assert len(report.state_transitions) == 2
         assert len(report.top_activities) == 1
         assert report.top_distraction_domains == ["reddit.com"]
@@ -67,6 +69,7 @@ class TestSessionReportGenerator:
         assert report.duration_seconds >= 0
         assert report.time_in_flow_seconds == 0.0
         assert report.avg_hr_bpm is None
+        assert report.avg_hrv_sdnn is None
         assert report.avg_hrv_rmssd is None
         assert report.longest_flow_streak_seconds == 0.0
 

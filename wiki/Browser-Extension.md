@@ -15,7 +15,10 @@ nonce, mode, and idempotency, then returns a typed receipt for verification and
 restore.
 
 Production policy is deterministic. The extension does not run a contextual
-bandit, infer biology-driven breaks, or autonomously restructure tabs.
+bandit, infer breaks itself, or autonomously restructure tabs. It presents a
+daemon break message only when its basis is the opt-in focus interval or the
+0.6.0 strain load ("Breathing break?"); a legacy stress-integral message is
+ignored.
 
 Applying a proposal is one explicit flow with one state machine shared by the
 popup and the in-page panel: *Applying…* (the button is disabled), *Applied ·
@@ -34,9 +37,11 @@ The popup and Pulse Room share the same presentation rules. Hydration includes
 biometrics, camera availability, storage status and the age of the worker's
 original sample. A disconnect clears current readings immediately. Ten seconds
 without a new state update changes the display to “Waiting for fresh signals”
-and hides held pulse/blink values; rereading the cache cannot renew them. A
-missing face, stopped frames, stale capture or unavailable pulse hides the
-corresponding measurement. Behavioral support may remain available without pulse.
+and hides held pulse, HRV (SDNN), breathing and blink values; rereading the
+cache cannot renew them. A missing face, stopped frames, stale capture or
+unavailable pulse hides the corresponding measurement, and the "Body load N% of
+your break level" line goes with the pulse. Behavioral support may remain
+available without pulse.
 
 The ten-second deadline concerns UI continuity, not physiological accuracy or
 the inference engine's separate three-second evidence-gap reset.

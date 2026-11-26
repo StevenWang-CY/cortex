@@ -48,8 +48,9 @@ management; they do not make Cortex a clinical system.
 
 Define the intended deployment population and supported hardware before power
 analysis. Recruit across operating-system versions, camera/input hardware,
-workflows, experience levels, accessibility needs, skin tones if any camera
-metric is separately studied, lighting conditions, and task categories.
+workflows, experience levels, accessibility needs, skin tones (camera
+physiology is an optional production input), lighting conditions, and task
+categories.
 Record recruitment source and non-participation. Avoid a convenience sample of
 only project developers or one institution.
 
@@ -99,8 +100,8 @@ analyses.
 
 ## 5. Feature and measurement plan
 
-The current candidate is `support-features-v2.2.0` with deterministic support
-model `2.6.0`; freeze its exact identity before the first confirmatory
+The current candidate is `support-features-v3.0.0` with deterministic support
+model `3.0.0`; freeze its exact identity before the first confirmatory
 participant. Earlier schema data must retain its original version and cannot
 be silently pooled across changed availability/typing-interval semantics. For
 every feature, publish unit, source, aggregation window, minimum observation
@@ -117,12 +118,19 @@ Record these bounds with the frozen configuration. The behavioral implementation
 digest does not include intervention helpers or personal calibration, so preserve
 the application revision, configuration and calibration identities separately.
 
-Primary production-candidate inputs are behavior aggregates only. Camera pulse,
-blink, and head/neck proxies remain diagnostic-only and excluded from the
-primary predictive model. A separate measurement study must compare any camera
-metric against an appropriate synchronized reference across participants,
-devices, lighting, motion, face visibility, and missingness. Passing a signal
-measurement gate still would not prove that the signal predicts support need.
+The production candidate is driven by behavior aggregates. Since model `3.0.0`
+camera heart rate, SDNN, breathing rate, blink rate and eye-closure share are
+optional corroborating inputs: read against a personal reference, mixed only
+into a state whose behavioral rule is eligible, with weight
+`state.physiology_weight` (default 0.35)
+([ADR 0008](../adr/0008-qualified-camera-physiology.md)). Head/neck proxies,
+RMSSD and the other beat-to-beat measures remain excluded. Camera heart rate and SDNN were checked against ECG on one participant
+and published nothing for two participants with intermediate and dark skin
+tone ([qualification report](physiology-qualification.md)). A separate
+measurement study must still compare any camera metric against an appropriate
+synchronized reference across participants, devices, lighting, motion, face
+visibility, and missingness. Passing a signal measurement gate still would not
+prove that the signal predicts support need.
 
 No raw frames, key contents, document contents, URLs, or window titles enter the
 inference dataset. Store only consented aggregates necessary for the protocol,

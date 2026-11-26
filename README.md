@@ -6,7 +6,7 @@
 
 <p align="center">
   A macOS app that turns local activity and workspace context into conservative,
-  user-controlled suggestions. Optional camera estimates stay separate from support decisions.
+  user-controlled suggestions. Optional camera estimates can corroborate, never establish, a support reading.
 </p>
 
 <p align="center">
@@ -50,19 +50,26 @@ interface, not measured accuracy or a live person's workspace.
 
 ## Status
 
-The source version is **0.5.1**, with behavioral model **2.6.0** and feature
-schema **support-features-v2.2.0**. The [validation record](docs/release/0.5.1-validation.md)
+The source version is **0.6.0**, with support model **3.0.0** and feature
+schema **support-features-v3.0.0**. The [validation record](docs/release/0.5.1-validation.md)
 separates completed checks from remaining release requirements. The download
 badge describes the latest *published* release; a source tag alone does not
 establish a signed, notarized macOS release.
 
 Cortex remains **alpha research software**. Its support scores are explainable
 heuristics, not calibrated probabilities or validated measures of stress,
-attention or productivity. Webcam pulse is experimental and sensitive to
-lighting, movement, camera and individual conditions. HRV, respiration, LF/HF,
-apnea detection and physiology-triggered interventions remain disabled pending
-reference-sensor validation. See [limitations](docs/limitations.md) and the
-[model card](docs/model-cards/deterministic-support-v2.md).
+attention or productivity. Since 0.6.0, camera heart rate, heart-rate
+variability (SDNN), breathing rate, blink rate and eye-closure share are
+optional corroborating inputs: each is read against the person's own
+reference and is mixed into a score only where the behavioral rule is already
+eligible, with a weight of at most 0.35. Heart rate and SDNN were checked
+against ECG on one participant; for the two participants with intermediate and
+dark skin tone the estimator published nothing, there is no held-out data, and
+breathing rate has no reference sensor behind it. RMSSD, LF/HF and the other
+beat-to-beat measures did not qualify and are not inputs. See the
+[qualification report](docs/research/physiology-qualification.md),
+[limitations](docs/limitations.md) and the
+[model card](docs/model-cards/deterministic-support-v3.md).
 
 ## Key features
 
@@ -85,7 +92,8 @@ flowchart TD
   F --> G[Suggestion for user review]
   G --> H[Exact authorization for any enabled effect]
   H --> I[Transaction, receipt, verification and restoration]
-  J[Optional camera] --> K[Quality-gated experimental display]
+  J[Optional camera] --> K[Quality-gated physiology against a personal reference]
+  K -.->|corroborates eligible rules only| C
 ```
 
 The PySide6 app hosts the daemon in-process. Browser/editor clients use
@@ -93,7 +101,11 @@ capability-authenticated HTTP (`127.0.0.1:9472`) and WebSocket
 (`127.0.0.1:9473`). Internal services communicate through typed application
 interfaces. SQLite stores transactional authority and session records.
 
-Camera physiology never establishes a support state or grants authority.
+Camera physiology never establishes a support state or grants authority. It
+can strengthen or temper a reading the behavioral rules already support; with
+no camera, no face or no personal reference the score is exactly the
+behavior-only score. A strain load built from the same physiology can suggest
+one short breathing break through the usual interruption gate.
 The behavior model uses fixed-denominator scores: removing evidence cannot
 increase its contribution. Duplicate observations do not count again, gaps
 above three seconds reset temporal confirmation, and display values expire

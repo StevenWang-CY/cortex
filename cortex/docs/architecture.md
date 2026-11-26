@@ -16,13 +16,13 @@ produce a proposal; receipt of a proposal is never authority to mutate a tab,
 editor, window, or file.
 
 ```text
-camera -> quality-gated experimental diagnostics
-
 input/window telemetry -> availability + aggregation
                                    |
                                    v
-              abstaining deterministic support estimates
-                                   |
+              abstaining deterministic support estimates <-- camera physiology:
+                                   |                         per-metric gates,
+                                   |                         personal reference,
+                                   |                         eligible rules only
                                    v
                   eligibility / interruption gates
                                    |
@@ -42,15 +42,25 @@ describes the reviewed changes and verification boundaries. The earlier
 
 1. **Observation.** `capture_service`, `physio_engine`,
    `kinematics_engine`, and `telemetry_engine` create local signals.
-   Quality-gated camera pulse is experimental. Unsupported HRV, respiration,
-   breath-pause, and stress-integral fields are forced unavailable before
-   state scoring and publication.
+   Camera heart rate, SDNN and breathing rate are experimental and each is
+   published only when its own gate passes (a confirmed cardiac line, enough
+   accepted beats, two agreeing breathing channels). RMSSD and the other
+   beat-to-beat measures are computed for research and never read by a rule,
+   suggestion or screen. Breath-pause detection is not provided.
 2. **Support inference.** `state_engine` currently applies deterministic
    fixed-denominator behavior rules, explicit abstention, smoothing, and
    hysteresis. Outputs are heuristic evidence strengths, not probabilities or
-   diagnostic states. The registered model is `deterministic-support@2.6.0`
-   with `support-features-v2.2.0`. Camera signals are diagnostic-only for this
-   decision and cannot change reading-check-in eligibility.
+   diagnostic states. The registered model is `deterministic-support@3.0.0`
+   with `support-features-v3.0.0`. `physiology_baseline.py` keeps a personal
+   reference per metric, and `physiology_evidence.py` mixes the camera
+   physiology block into a state only where that state's behavioral rule is
+   eligible, with weight `state.physiology_weight` (default 0.35); camera
+   evidence alone cannot produce an estimate
+   ([ADR 0008](../../docs/adr/0008-qualified-camera-physiology.md)).
+   `strain_load.py` integrates the same block into the load behind the
+   breathing-break suggestion. Reading check-ins read no camera value
+   directly; the `under_engaged` estimate they require may be corroborated by
+   blink rate and eye-closure share.
 3. **Eligibility and context.** trigger gates decide whether to assemble
    browser/editor context. The terminal parser has no shipping live producer.
    Missing evidence should suppress or abstain; named validity and coverage
@@ -120,11 +130,12 @@ application does not disappear merely because it has not changed for 60 seconds.
 Goal check-ins read the foreground editor's nested file metadata or active
 browser title; unavailable foreground metadata causes abstention, and a new goal
 clears the previous goal's file history. See the
-[model card](../../docs/model-cards/deterministic-support-v2.md) for exact rules.
+[model card](../../docs/model-cards/deterministic-support-v3.md) for exact rules.
 
-The generated behavioral implementation digest covers eleven schema,
-acquisition, aggregation, fusion, scoring and smoothing components. It does not
-hash the whole daemon, intervention helpers, configuration or calibration.
+The generated implementation digest covers twenty-one components: schema,
+acquisition, aggregation, fusion, scoring and smoothing, the physiology
+evidence and personal reference, and the camera physiology estimators. It does
+not hash the whole daemon, intervention helpers, configuration or calibration.
 Reproducing a proposal requires those inputs and the application revision too.
 
 ## Evidence boundary
@@ -132,8 +143,9 @@ Reproducing a proposal requires those inputs and the application revision too.
 The following compatibility fields or bounded research surfaces remain for
 decoded historical data or explicitly gated analysis:
 
-- expanded camera-derived HRV and respiration algorithms;
-- legacy stress-integral/report fields, emitted as unavailable or neutral;
+- camera-derived variability measures that did not qualify (RMSSD, pNN50,
+  SD1/SD2, LF/HF, sample entropy), computed for research only;
+- `GET /api/stress-integral`, which always reports unavailable;
 - legacy AMIP diagnostic replay (the retired policy implementations and
   unregistered per-user classifier have been deleted);
 - action adapters and undo helpers.
@@ -141,7 +153,11 @@ decoded historical data or explicitly gated analysis:
 Their existence is not evidence that their output is valid or release-ready.
 The former stress-integral implementation, physiology-triggered break
 controller, adaptive bandit/AMIP implementations, and unregistered classifier
-have been deleted. Compatibility routes and fields cannot restore them.
+have been deleted. Compatibility routes and fields cannot restore them. The
+0.6.0 strain load is a separate, specified implementation: it reuses the
+`stress_integral` field name and the `BREAK_RECOMMENDATION` message with
+`basis: physiological_strain`, and a message with the legacy basis is still
+ignored.
 Production policy selection is deterministic and non-learning. Every v2 action
 or no-action decision has one durable outcome window and at most one versioned
 reward. Separately consented research mode is restricted to a fixed two-arm
@@ -220,10 +236,11 @@ tests.
 - `cortex/libs/schemas`: canonical process-boundary models
 - `cortex/libs/store`: current Redis/in-memory abstraction
 - `cortex/services/capture_service`: camera, tracking, ROI, and quality
-- `cortex/services/physio_engine`: experimental rPPG pipeline
+- `cortex/services/physio_engine`: experimental rPPG pulse, variability and breathing pipeline
 - `cortex/services/kinematics_engine`: blink and head/neck proxies
 - `cortex/services/telemetry_engine`: input/window/focus telemetry
-- `cortex/services/state_engine`: registered behavioral inference, smoothing and check-in eligibility
+- `cortex/services/state_engine`: registered support inference, personal physiology reference, strain load, smoothing and check-in eligibility
+- `cortex/services/eval`: synthetic physiology truth, dataset replay and the qualification harness behind `cortex.scripts.qualify_physiology`
 - `cortex/services/context_engine`: workspace context adapters
 - `cortex/services/llm_engine`: planning transports and validation
 - `cortex/services/intervention_engine`: proposal and contained action code

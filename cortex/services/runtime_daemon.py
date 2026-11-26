@@ -969,7 +969,7 @@ class CortexDaemon:
         self._rebound_detector = ParasympatheticReboundDetector()
         self._last_leetcode_problem_id: str | None = None
         self._last_leetcode_allostatic_load = 0.0
-        self._last_leetcode_hrv_rmssd: float | None = None
+        self._last_leetcode_hrv_sdnn: float | None = None
         self._leetcode_action_signatures: dict[str, float] = {}
 
         self._rgb_observations: ObservationBuffer[NumericObservation] = (
@@ -4195,7 +4195,7 @@ class CortexDaemon:
                     if vector.hr is not None:
                         self._longitudinal.accumulate(
                             hr=vector.hr,
-                            hrv=vector.hrv_rmssd,
+                            hrv=vector.hrv_sdnn,
                             resp=vector.respiration_rate,
                             state=estimate.state,
                         )
@@ -4214,8 +4214,8 @@ class CortexDaemon:
                         )
                         if vector.hr:
                             self._session_report.record_hr(float(vector.hr))
-                        if vector.hrv_rmssd:
-                            self._session_report.record_hrv(float(vector.hrv_rmssd))
+                        if vector.hrv_sdnn:
+                            self._session_report.record_hrv(float(vector.hrv_sdnn))
                         if estimate.stress_integral is not None:
                             self._session_report.record_stress(
                                 float(estimate.stress_integral)
@@ -4342,8 +4342,8 @@ class CortexDaemon:
                         # v2.0: Check zombie reading
                         active_app = self._current_app_name()
                         kinematics = self._latest_kinematics
-                        # Blink remains diagnostic-only: reading reminders
-                        # cannot change with camera values or camera freshness.
+                        # The reading check-in reads no camera value of its
+                        # own; blink reaches it only through the estimate.
                         # Click availability certifies the mouse source even
                         # when no moves occurred (velocity variance needs two
                         # moves, but measured silence is a valid quiet window).
@@ -4353,8 +4353,8 @@ class CortexDaemon:
                             if mouse_feature is not None and mouse_feature.valid else None
                         )
                         # Behavioral check-ins share the support estimate's
-                        # evidence gate. Camera quality and blink measurements
-                        # are diagnostic-only and cannot make them eligible.
+                        # evidence gate; camera quality cannot make them
+                        # eligible by itself.
                         # Receptivity, quiet mode, cooldown and hourly limits
                         # are also checked by _trigger_special_intervention.
                         signal_ok = bool(
@@ -4428,7 +4428,10 @@ class CortexDaemon:
                         if kinematics.slump_score is not None and (
                             self._shutdown_detector.should_handover(
                                 posture_slump=kinematics.slump_score,
-                                hrv=vector.hrv_rmssd,
+                                # SDNN is the qualified variability measure.
+                                # Before this path is activated its baseline
+                                # must become an SDNN level as well.
+                                hrv=vector.hrv_sdnn,
                                 error_count=(
                                     context.total_errors
                                     if hasattr(context, "total_errors")
@@ -7760,7 +7763,7 @@ class CortexDaemon:
         if context.problem_id != self._last_leetcode_problem_id:
             self._last_leetcode_problem_id = context.problem_id
             self._last_leetcode_allostatic_load = 0.0
-            self._last_leetcode_hrv_rmssd = None
+            self._last_leetcode_hrv_sdnn = None
             self._leetcode_action_signatures.clear()
             self._amygdala_detector.reset()
             self._destructive_detector.reset()
@@ -7903,11 +7906,13 @@ class CortexDaemon:
             if not context.problem_id or estimate.confidence < 0.45:
                 return
 
-            baselines = self._scorer.baselines
             telemetry = self._current_telemetry()
-            # Biology-derived mode inputs are contained until their separate
-            # reference/label validation gates pass. Domain behavior (typing,
-            # submissions, rereads) remains available.
+            # The two physiology-led modes stay contained: an immediate
+            # heart-rate reaction to a submission (the 20 s pulse window
+            # cannot resolve one) and the post-success rebound. Their inputs
+            # are zero/None. Domain behaviour (typing, submissions, rereads)
+            # remains available, and the behaviour-led struggle detector
+            # below takes qualified physiology as corroboration.
             blink_delta = 0.0
 
             key_velocity = min(max(float(context.chars_per_min) / 240.0, 0.0), 1.0)
@@ -7935,12 +7940,21 @@ class CortexDaemon:
                 current_time=timestamp,
             )
 
-            current_load = 0.0
-            hrv_current = (
-                float(vector.hrv_rmssd)
-                if vector.hrv_rmssd is not None
-                else float(baselines.hrv_baseline)
-            )
+            # Struggle detection is behaviour-led (rereads and time on a
+            # stage; wrong answers and deletion) and needs physiology to
+            # corroborate it. Both corroborating inputs are qualified ones
+            # read against the personal reference: the strain load, and SDNN
+            # against its own level. With no camera, no face or no ready
+            # reference neither condition can hold and the detector stays
+            # silent, as it was before 0.6.0.
+            current_load = float(self._strain_load_tracker().load_ratio)
+            sdnn_reference = self._physiology_baseline_tracker().reference().sdnn
+            if vector.hrv_sdnn is not None and sdnn_reference.ready:
+                hrv_current = float(vector.hrv_sdnn)
+                hrv_level = float(sdnn_reference.center)
+            else:
+                hrv_current = 0.0
+                hrv_level = 0.0
             wa_timestamps: list[float] = []
             if wa_timestamp is not None and context.wrong_answer_count > 0:
                 wa_timestamps = [wa_timestamp] * int(context.wrong_answer_count)
@@ -7951,8 +7965,8 @@ class CortexDaemon:
                 stage_dwell_s=float(context.time_elapsed_s),
                 allostatic_load=current_load,
                 allostatic_load_prev=self._last_leetcode_allostatic_load,
-                hrv_rmssd=hrv_current,
-                hrv_baseline=float(baselines.hrv_baseline),
+                hrv_ms=hrv_current,
+                hrv_baseline_ms=hrv_level,
                 wa_timestamps=wa_timestamps,
                 current_time=timestamp,
             )
@@ -7966,7 +7980,7 @@ class CortexDaemon:
             rebound = self._rebound_detector.update(
                 accepted=accepted,
                 hr=None,
-                hr_baseline=float(baselines.hr_baseline),
+                hr_baseline=float(self._scorer.baselines.hr_baseline),
                 hrv_current=None,
                 hrv_prev=None,
                 last_submission_ts=submission_monotonic if accepted else None,
@@ -8059,8 +8073,8 @@ class CortexDaemon:
                     logger.debug("LeetCode action %s failed: %s", action_name, result.error)
 
             self._last_leetcode_allostatic_load = current_load
-            if vector.hrv_rmssd is not None:
-                self._last_leetcode_hrv_rmssd = float(vector.hrv_rmssd)
+            if vector.hrv_sdnn is not None:
+                self._last_leetcode_hrv_sdnn = float(vector.hrv_sdnn)
 
             stale_before = timestamp - 600.0
             self._leetcode_action_signatures = {

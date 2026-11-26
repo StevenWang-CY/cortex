@@ -68,16 +68,24 @@ Don't hand-edit generated declarations; regenerate them from their Python source
 ## Algorithm, UI and lifecycle changes
 
 Read the [current validation record](docs/release/0.5.1-validation.md),
-[model card](docs/model-cards/deterministic-support-v2.md) and
+[model card](docs/model-cards/deterministic-support-v3.md),
+[physiology qualification](docs/research/physiology-qualification.md) and
 [UI contract](cortex/docs/ui-design.md) before changing their invariants.
 
 - Input availability is distinct from measured zero. Observation gaps cannot
-  satisfy dwell, and camera physiology remains outside behavioral inference.
+  satisfy dwell. Camera physiology may only corroborate a state whose
+  behavioral rule is eligible, read against the personal reference; RMSSD is
+  not qualified and must not be read by a rule, suggestion or screen.
   Reject non-finite values before transport. Smoothing uses elapsed monotonic
   time; keep its 500 ms nominal behavior and test alternate cadences and boots.
 - After changing a declared behavioral component, regenerate/check
   `cortex.scripts.generate_support_model_identity` using the locked interpreter;
   review whether the model version, feature schema and model card must change.
+- After changing a pulse, HRV or respiration estimator, gate or window, re-run
+  `python -m cortex.scripts.qualify_physiology synthetic` (and `dataset-4tu`
+  when the dataset is available) and update the qualification report and model
+  card in the same change. Never commit the dataset videos or traces derived
+  from them; its license forbids redistribution.
 - Design tokens come from `cortex/libs/design/tokens.yaml`; regenerate with
   `cortex.scripts.sync_design_tokens`. Generated configuration references come
   from `make config-sync`. Do not hand-edit generated output.

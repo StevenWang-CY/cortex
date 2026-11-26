@@ -1,21 +1,27 @@
 # Cortex
 
-Cortex 0.5.1 is a macOS alpha research prototype for local, user-controlled
+Cortex 0.6.0 is a macOS alpha research prototype for local, user-controlled
 workspace support. It combines bounded activity telemetry, optional
 experimental camera signals, browser/editor context, and a deterministic or
 schema-validated planner to present conservative suggestions.
 
-This wiki source reflects the 2026-10-11 implementation review. The application
-version is `0.5.1`; its deterministic behavioral model is `2.6.0`, with feature
-schema `support-features-v2.2.0`. These version numbers identify different
-contracts. Local edits to `wiki/` do not publish the GitHub wiki or a release.
+This wiki source reflects the 2026-11-25 camera-physiology review. The
+application version is `0.6.0`; its deterministic support model is `3.0.0`,
+with feature schema `support-features-v3.0.0`. These version numbers identify
+different contracts. Local edits to `wiki/` do not publish the GitHub wiki or a
+release.
 
 It does **not** diagnose or measure stress, overwhelm, attention, fatigue,
 flow, apnea, productivity, or any medical/cognitive condition. Production
 support scores are heuristic telemetry summaries with an explicit `unknown`
-state. Camera-derived HRV, respiration, LF/HF, breath-pause detection, and
-physiology-triggered breaks are unavailable. Webcam pulse is experimental and
-does not affect the production support decision.
+state. Camera heart rate, heart-rate variability (SDNN), breathing rate, blink
+rate and eye-closure share can corroborate a behavioral reading that is
+already eligible, read against the person's own reference and with bounded
+weight; they cannot produce one alone. Heart rate and SDNN were checked against
+ECG on one participant, and the estimator published nothing for the two
+participants with intermediate and dark skin tone. RMSSD, LF/HF and
+breath-pause detection are not product inputs. A strain-load breathing-break
+suggestion is a pacing aid, not a stress measurement.
 
 The default `suggest_only` mode cannot close/hide tabs, fold or edit code,
 rearrange windows, or otherwise change a workspace. Optional effects require
@@ -52,7 +58,8 @@ Stop action follow the shutdown path.
 Current refinements distinguish unavailable input from observed inactivity,
 reset inference dwell across evidence gaps, scale smoothing by elapsed time,
 reject non-finite observations, and expire desktop and browser signal displays
-when updates stop. Pulse Room has persistent motion pause and respects reduced
+when updates stop. Camera physiology is published only when each metric's own
+gate passes and is mixed only into an eligible behavioral reading. Pulse Room has persistent motion pause and respects reduced
 motion. Shutdown remains pending until the helper verifies process exit; an
 unconfirmed stop remains visible as an error.
 
@@ -60,5 +67,6 @@ See [README.md](https://github.com/StevenWang-CY/cortex/blob/main/README.md) for
 [IMPLEMENTATION.md](https://github.com/StevenWang-CY/cortex/blob/main/IMPLEMENTATION.md) for the implementation history.
 The current checkout's `docs/release/0.5.1-validation.md` records the latest review,
 design decisions, completed changes, validation and remaining release/research
-requirements. A verified local ad-hoc arm64 build is not a published, notarized
-release or physiological validation.
+requirements. `docs/research/physiology-qualification.md` records the camera
+physiology evidence added in 0.6.0 and its limits. A verified local ad-hoc
+arm64 build is not a published, notarized release or physiological validation.
