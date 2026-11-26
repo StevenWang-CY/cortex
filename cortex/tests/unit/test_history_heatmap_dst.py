@@ -20,10 +20,24 @@ from PySide6.QtWidgets import QApplication
 from cortex.apps.desktop_shell import history_tab as ht
 
 
+def _reread_zone() -> None:
+    """Apply a changed ``TZ`` where the interpreter can; libc does the rest.
+
+    Some CPython builds have no ``time.tzset`` (the hosted Intel runner's is
+    one; these fixtures failed there with ``AttributeError``).  The History
+    tab converts through ``datetime``, whose local conversions go through
+    libc's ``localtime``, and that re-reads ``TZ`` on every call on macOS.
+    """
+
+    tzset = getattr(time, "tzset", None)
+    if tzset is not None:
+        tzset()
+
+
 def _pin_zone(zone: str) -> Iterator[None]:
     previous = os.environ.get("TZ")
     os.environ["TZ"] = zone
-    time.tzset()
+    _reread_zone()
     try:
         yield
     finally:
@@ -31,7 +45,7 @@ def _pin_zone(zone: str) -> Iterator[None]:
             os.environ.pop("TZ", None)
         else:
             os.environ["TZ"] = previous
-        time.tzset()
+        _reread_zone()
 
 
 @pytest.fixture()

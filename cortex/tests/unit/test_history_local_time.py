@@ -26,12 +26,26 @@ def qapp() -> Iterator[QApplication]:
     yield app  # type: ignore[misc]
 
 
+def _reread_zone() -> None:
+    """Apply a changed ``TZ`` where the interpreter can; libc does the rest.
+
+    Some CPython builds have no ``time.tzset`` (the hosted Intel runner's is
+    one; this fixture failed there with ``AttributeError``).  The History tab
+    converts through ``datetime``, whose local conversions go through libc's
+    ``localtime``, and that re-reads ``TZ`` on every call on macOS.
+    """
+
+    tzset = getattr(time, "tzset", None)
+    if tzset is not None:
+        tzset()
+
+
 @pytest.fixture()
 def utc_minus_five() -> Iterator[None]:
     """Pin the process zone to a fixed UTC-5 (POSIX sign is inverted)."""
     previous = os.environ.get("TZ")
     os.environ["TZ"] = "Etc/GMT+5"
-    time.tzset()
+    _reread_zone()
     try:
         yield
     finally:
@@ -39,7 +53,7 @@ def utc_minus_five() -> Iterator[None]:
             os.environ.pop("TZ", None)
         else:
             os.environ["TZ"] = previous
-        time.tzset()
+        _reread_zone()
 
 
 def test_list_and_headline_time_is_local(utc_minus_five: None) -> None:
