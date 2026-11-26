@@ -939,6 +939,17 @@ function CortexPopup(): React.ReactElement {
             }));
         setMicroSteps(normaliseMicroSteps(p.micro_steps));
         setApplyState(IDLE_APPLY_STATE);
+        // Shared by the live trigger and the GET_STATE hydration (the usual
+        // path: the badge lights, then the user opens the popup), so the
+        // card carries its explanation, Why? and rating either way.
+        setCausalExplanation(String(p.causal_explanation || ""));
+        const level = String(p.level || "");
+        setInterventionLevel(
+            level === "guided_mode" || level === "simplified_workspace"
+                ? level
+                : "overlay_only",
+        );
+        setCausalSignals(toCausalSignalViews(p.causal_signals));
     }, []);
 
     useEffect(() => {
@@ -1101,14 +1112,6 @@ function CortexPopup(): React.ReactElement {
             case "INTERVENTION_TRIGGER": {
                 const p = msg.payload as Record<string, unknown>;
                 adoptIntervention(p);
-                setCausalExplanation(String(p.causal_explanation || ""));
-                const level = String(p.level || "");
-                setInterventionLevel(
-                    level === "guided_mode" || level === "simplified_workspace"
-                        ? level
-                        : "overlay_only",
-                );
-                setCausalSignals(toCausalSignalViews(p.causal_signals));
                 setRating(null);
                 setRatingTextOpen(false);
                 setRatingText("");
