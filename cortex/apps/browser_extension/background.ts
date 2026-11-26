@@ -322,6 +322,15 @@ function currentStateAgeMs(): number | null {
 const interventionPresentation = new InterventionPresentationState();
 const browserContextCollector = new BrowserContextCollector();
 let quietMode = false;
+// Wall-clock end of a timed quiet window (ms), or null when indefinite. The
+// daemon reports a lapse only to clients connected at that moment and a
+// restarted daemon lets the window lapse silently, so ``quietModeActive``
+// ends it here at the same instant the daemon's own state reads "off".
+let quietModeEndsAt: number | null = null;
+
+function quietModeActive(now = Date.now()): boolean {
+    return quietMode && (quietModeEndsAt === null || now < quietModeEndsAt);
+}
 
 type ExecutionMode = "suggest_only" | "authorized" | "research_autonomous";
 let currentExecutionMode: ExecutionMode = "suggest_only";
@@ -829,6 +838,7 @@ function persistedSessionSnapshot(): PersistedSessionState<FocusSession, UndoEnt
         dismissedInterventions: cooldowns.interventions,
         dismissedUrlPatterns: cooldowns.urls,
         quietMode,
+        quietModeEndsAt,
         tabLastActivated: tabActivationTelemetry.entries(),
         autoFocusArmed,
         autoFocusEndsAt,
@@ -855,6 +865,7 @@ async function restoreState(): Promise<void> {
         urls: data.dismissedUrlPatterns,
     });
     if (data.quietMode !== undefined) quietMode = data.quietMode;
+    if (data.quietModeEndsAt !== undefined) quietModeEndsAt = data.quietModeEndsAt;
     if (data.tabLastActivated) {
         tabActivationTelemetry.hydrate(data.tabLastActivated);
     }
@@ -1675,7 +1686,7 @@ async function handleMessage(raw: string): Promise<void> {
             // when no surface is on screen.
             const notFocused = plan.desktop_not_focused;
             void handleIntervention(msg.payload).then((overlayShown) => {
-                if (overlayShown || quietMode) return;
+                if (overlayShown || quietModeActive()) return;
                 setInterventionBadge(true);
                 if (!notFocused) return;
                 try {
@@ -1720,6 +1731,15 @@ async function handleMessage(raw: string): Promise<void> {
             // ("paused"/"snoozed") without a separate WS hop.
             const kind = (msg.payload.kind as string | undefined) || "off";
             quietMode = kind !== "off";
+            const endsAtMs = msg.payload.ends_at_unix_ms;
+            const endsAtSeconds = msg.payload.ends_at;
+            quietModeEndsAt = !quietMode
+                ? null
+                : typeof endsAtMs === "number" && Number.isFinite(endsAtMs)
+                    ? endsAtMs
+                    : typeof endsAtSeconds === "number" && Number.isFinite(endsAtSeconds)
+                        ? endsAtSeconds * 1000
+                        : null;
             schedulePersist();
             // Phase-3 P0-2: cache the full envelope so a popup
             // mounted AFTER the broadcast (or after SW eviction)
@@ -1786,6 +1806,7 @@ async function handleMessage(raw: string): Promise<void> {
 
         case "SETTINGS_SYNC":
             quietMode = Boolean(msg.payload.quiet_mode);
+            if (!quietMode) quietModeEndsAt = null;
             currentExecutionMode = parseExecutionMode(
                 msg.payload.execution_mode,
             );
@@ -6561,7 +6582,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 // ``{status: "ok" | "unavailable", error?: string}``.
 function handleCommandPauseCortex(): void {
     if (!connected || !ws) return;
-    const next = quietMode ? "off" : "pause";
+    const next = quietModeActive() ? "off" : "pause";
     try {
         send({
             type: "QUIET_MODE_TOGGLE",

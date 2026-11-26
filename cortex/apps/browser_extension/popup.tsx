@@ -571,14 +571,27 @@ function CortexPopup(): React.ReactElement {
         const tick = () => {
             const remainingMs = quietModeEndsAt - Date.now();
             if (remainingMs <= 0) {
-                setQuietModeDurationMin(0);
+                // The window is over. The daemon reports its lapse only to
+                // clients connected at that moment (and a restarted daemon
+                // not at all), and its own state reads a passed end as
+                // "off", so the popup must not keep showing it active.
+                setQuietModeKind("off");
+                setQuietMode(false);
+                setQuietModeEndsAt(null);
                 return;
             }
             setQuietModeDurationMin(Math.max(0, Math.round(remainingMs / 60000)));
         };
         tick();
         const handle = setInterval(tick, 30_000);
-        return () => clearInterval(handle);
+        const lapse = setTimeout(
+            tick,
+            Math.min(Math.max(0, quietModeEndsAt - Date.now()) + 50, 2_147_483_647),
+        );
+        return () => {
+            clearInterval(handle);
+            clearTimeout(lapse);
+        };
     }, [quietModeEndsAt, quietMode]);
     const [launching, setLaunching] = useState(false);
     const [launchError, setLaunchError] = useState(false);
