@@ -229,6 +229,33 @@ class WebSocketBridge(QObject):
         msg = json.dumps(envelope)
         asyncio.run_coroutine_threadsafe(self._send(msg), self._loop)
 
+    def send_user_rating(
+        self, intervention_id: str, rating: str, text_feedback: str = "",
+    ) -> None:
+        """Send a USER_RATING (👍/👎, optional one-line comment).
+
+        The daemon checks ratings against the trigger cid exactly like
+        USER_ACTION, so the frame echoes it.
+        """
+        if self._loop is None or self._ws is None or not intervention_id:
+            return
+        payload: dict[str, Any] = {
+            "intervention_id": str(intervention_id),
+            "rating": str(rating),
+        }
+        if text_feedback:
+            payload["context"] = str(text_feedback)[:200]
+        envelope: dict[str, Any] = {
+            "type": "USER_RATING",
+            "payload": payload,
+            "timestamp": 0,
+            "sequence": 0,
+        }
+        cid = self._trigger_cids.get(intervention_id)
+        if cid:
+            envelope["correlation_id"] = cid
+        asyncio.run_coroutine_threadsafe(self._send(json.dumps(envelope)), self._loop)
+
     def send_action_execute(
         self,
         intervention_id: str,
@@ -790,15 +817,7 @@ class CortexApp:
                 self._on_calibration_apply_waiting
             )
 
-        # Connect overlay dismiss to user action
-        self._overlay.dismissed.connect(self._on_overlay_dismissed)
-        # G4 (audit-prod): overlay action buttons route here. Native
-        # action types execute inline in the desktop shell; browser-bound
-        # ones go to the daemon as an ACTION_EXECUTE with
-        # ``request_dispatch=True`` so the daemon forwards as
-        # ACTION_DISPATCH to the connected chrome / edge client.
-        if hasattr(self._overlay, "action_invoked"):
-            self._overlay.action_invoked.connect(self._on_action_invoked)
+        self._wire_overlay()
 
         # Connect settings changes
         self._settings.settings_changed.connect(self._on_settings_changed)
@@ -1026,6 +1045,31 @@ class CortexApp:
                     "profile_id": self._pending_calibration_profile_id,
                 }
             )
+
+    def _wire_overlay(self) -> None:
+        """Route the overlay's user gestures to the daemon."""
+        if self._overlay is None:
+            return
+        # Connect overlay dismiss to user action
+        self._overlay.dismissed.connect(self._on_overlay_dismissed)
+        # G4 (audit-prod): overlay action buttons route here. Native
+        # action types execute inline in the desktop shell; browser-bound
+        # ones go to the daemon as an ACTION_EXECUTE with
+        # ``request_dispatch=True`` so the daemon forwards as
+        # ACTION_DISPATCH to the connected chrome / edge client.
+        if hasattr(self._overlay, "action_invoked"):
+            self._overlay.action_invoked.connect(self._on_action_invoked)
+        # P0 §3.8: 👍/👎 and the 👎 comment. The in-process controller
+        # forwards these; this host used to leave the signal unconnected.
+        if hasattr(self._overlay, "rating_invoked"):
+            self._overlay.rating_invoked.connect(self._on_rating_invoked)
+
+    @Slot(str, str, str)
+    def _on_rating_invoked(
+        self, intervention_id: str, rating: str, text_feedback: str,
+    ) -> None:
+        if self._bridge is not None:
+            self._bridge.send_user_rating(intervention_id, rating, text_feedback)
 
     @Slot(str)
     def _on_overlay_dismissed(self, intervention_id: str) -> None:
