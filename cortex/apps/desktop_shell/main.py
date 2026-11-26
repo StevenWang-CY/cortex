@@ -498,7 +498,10 @@ class WebSocketBridge(QObject):
                 import websockets
 
                 uri = f"ws://{self._host}:{self._port}"
-                async with websockets.connect(uri) as ws:
+                # Loopback only: websockets defaults to the system or
+                # environment proxy, whose bypass list does not cover
+                # 127.0.0.1, and would hand the AUTH token to the proxy.
+                async with websockets.connect(uri, proxy=None) as ws:
                     self._ws = ws
                     self.connection_changed.emit(True)
                     logger.info(f"Connected to Cortex daemon at {uri}")
