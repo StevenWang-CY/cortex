@@ -240,7 +240,10 @@ class StateEstimate(BaseModel):
     stress_integral: float | None = Field(
         None,
         ge=0.0,
-        description="Compatibility field; unavailable pending reference validation",
+        description=(
+            "Cumulative physiological strain load in strain-seconds; None "
+            "until camera physiology has been observed"
+        ),
     )
     calibrated_probabilities: StateScores | None = Field(
         None,

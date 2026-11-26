@@ -8,7 +8,7 @@ from uuid import UUID
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.signal import find_peaks, welch
+from scipy.signal import find_peaks, hilbert, welch
 
 from cortex.libs.schemas.physiology import (
     BeatCandidate,
@@ -24,6 +24,16 @@ from cortex.libs.schemas.physiology import (
 from cortex.libs.signal.filters import bandpass_filter
 from cortex.libs.signal.peak_detection import compute_physio_sqi
 from cortex.services.physio_engine.v2.backends import ResolvedBackend
+from cortex.services.physio_engine.v2.beat_timing import (
+    BEAT_BAND_FILTER_ORDER,
+    BEAT_BAND_HALF_WIDTH_HZ,
+    BEAT_MIN_RELATIVE_AMPLITUDE,
+    BEAT_NOISE_HARMONIC_GUARD_HZ,
+    BEAT_NOISE_SEARCH_HALF_WIDTH_HZ,
+    beat_band,
+    equivalent_noise_bandwidth_hz,
+    timing_noise_correlation,
+)
 from cortex.services.physio_engine.v2.beats import BeatLedger
 from cortex.services.physio_engine.v2.hrv import build_hrv_estimates
 from cortex.services.physio_engine.v2.provenance import (
@@ -85,19 +95,36 @@ PRIOR_MAX_AGE_SECONDS = 30.0
 # Widening it is close to free because the ratio separates the populations by
 # two orders of magnitude -- genuine rates in the newly audited span
 # (84-109 BPM published) measure 0.002-0.018 against a 0.30 threshold.
-# In-band SNR above which the peak-concentration term is waived. Concentration
-# answers "is the selected peak trustworthy?", which is not the same question
-# as "is a cardiac signal present?". When the HR prior deliberately selects a
-# non-dominant peak to keep continuity across windows, concentration measured
-# at that peak is low even though the spectrum is unambiguous -- a clean
-# two-tone window scores 21 dB SNR and 0.68 NSQI, and rejecting it as "no
-# cardiac signal above the noise floor" would be simply false. The waiver is
-# safe because the nuisance this term exists to catch cannot reach it: the
-# highest SNR observed across 600 signal-free windows was 3.05 dB (drift), so
-# 6.0 dB sits at twice the worst observed noise. Measured, the waiver changes
-# neither specificity nor sensitivity on the synthetic corpus; it only stops
-# the gate contradicting itself on strong signals.
-UNAMBIGUOUS_CARDIAC_SNR_DB = 6.0
+# --- Signal presence ---------------------------------------------------------
+# Whether a window carries a cardiac signal is decided by the harmonic
+# signal-to-noise ratio of the selected rate (de Haan & Jeanne, 2013): the
+# power within HARMONIC_SNR_HALF_WIDTH_HZ of the candidate fundamental and of
+# its second harmonic, over the rest of the analysis band.  It asks the
+# question directly — is there a periodic component at this rate? — where the
+# earlier in-band/out-of-band ratio mostly measured how much slow drift the
+# backend left behind.  On the 4TU reference videos that earlier ratio had the
+# same median for windows whose rate was right and wrong; the harmonic ratio
+# separates them (see docs/research/physiology-qualification.md).
+#
+# Between the floor and the "confirmed" level one window is not enough: a
+# persistent non-cardiac line (a harmonic of breathing-linked head movement is
+# typical) can clear a low floor window after window. Such a window may only
+# extend a rate that a confirmed window established; see the track constants.
+HARMONIC_SNR_HALF_WIDTH_HZ = 0.12
+HARMONIC_SNR_CONFIRMED_DB = 3.0
+# A published rate forms a track. A weak window continues it only while the
+# track is fresh, the rate has not jumped, and a strong window confirmed the
+# track recently enough.
+TRACK_TOLERANCE_BPM = 8.0
+TRACK_CONTINUITY_SECONDS = 10.0
+TRACK_CONFIRMATION_MAX_AGE_SECONDS = 60.0
+SIGNAL_QUALITY_ZERO_DB = -4.0
+SIGNAL_QUALITY_FULL_DB = 7.0
+# Weakest per-frame capture score above which frames are simply "fine".
+# Typical good frames score 0.4-0.6 (the score is the minimum of exposure,
+# sharpness, stillness and a landmark-geometry confidence that rarely exceeds
+# 0.6), so anything from the knee up carries no penalty.
+ACQUISITION_QUALITY_KNEE = 0.40
 
 SUBHARMONIC_AUDIT_LOW_HZ = 0.40
 SUBHARMONIC_AUDIT_MARGIN = 1.30
@@ -222,6 +249,62 @@ def subharmonic_power_ratio(
     if at_published <= 1e-18:
         return 0.0
     return max(float(_peak_near(target) / at_published) for target in targets)
+
+
+def signal_quality_from_snr(cardiac_snr_db: float) -> float:
+    """Map harmonic SNR to a [0, 1] signal quality.
+
+    Linear between SIGNAL_QUALITY_ZERO_DB and SIGNAL_QUALITY_FULL_DB. The
+    lower anchor sits below the publication floor so a just-publishable
+    window has a small but non-zero quality; the upper one is where the
+    cardiac line holds about five-sixths of the in-band power and more of it
+    no longer improves the estimate.
+    """
+
+    if not np.isfinite(cardiac_snr_db):
+        return 0.0
+    return float(
+        np.clip(
+            (cardiac_snr_db - SIGNAL_QUALITY_ZERO_DB)
+            / (SIGNAL_QUALITY_FULL_DB - SIGNAL_QUALITY_ZERO_DB),
+            0.0,
+            1.0,
+        )
+    )
+
+
+def harmonic_snr_db(
+    filtered: NDArray[np.float64],
+    *,
+    fs: float,
+    cardiac_hz: float,
+    low_hz: float,
+    high_hz: float,
+) -> float:
+    """Power at the candidate rate and its second harmonic over the rest (dB).
+
+    ``filtered`` is the band-passed waveform.  Returns ``-99.0`` when the
+    window is too short to analyse or carries no power.
+    """
+
+    count = len(filtered)
+    if count < max(8, int(fs * 4.0)) or cardiac_hz <= 0.0:
+        return -99.0
+    nfft = max(count, 2 ** int(np.ceil(np.log2(count * 4))))
+    frequencies, power = welch(
+        filtered, fs=fs, window="hann", nperseg=count, noverlap=0,
+        nfft=nfft, detrend="constant",
+    )
+    band = (frequencies >= low_hz) & (frequencies <= high_hz)
+    cardiac = band & (
+        (np.abs(frequencies - cardiac_hz) <= HARMONIC_SNR_HALF_WIDTH_HZ)
+        | (np.abs(frequencies - 2.0 * cardiac_hz) <= HARMONIC_SNR_HALF_WIDTH_HZ)
+    )
+    signal = float(np.sum(power[cardiac]))
+    noise = float(np.sum(power[band & ~cardiac]))
+    if signal <= 1e-18 or noise <= 1e-18:
+        return -99.0 if signal <= 1e-18 else 99.0
+    return float(10.0 * np.log10(signal / noise))
 
 
 @dataclass(frozen=True)
@@ -369,11 +452,10 @@ class PulsePipelineV2:
         max_motion_face_widths_per_second: float = 0.75,
         minimum_window_quality: float = 0.30,
         nsqi_threshold: float = 0.293,
-        min_cardiac_snr_db: float = 2.0,
-        min_peak_concentration: float = 0.40,
-        experimental_hrv_enabled: bool = False,
-        hrv_min_window_seconds: float = 180.0,
-        hrv_min_valid_ibi: int = 120,
+        min_cardiac_snr_db: float = 0.0,
+        experimental_hrv_enabled: bool = True,
+        hrv_min_window_seconds: float = 60.0,
+        hrv_min_valid_ibi: int = 40,
     ) -> None:
         if max_motion_face_widths_per_second <= 0:
             raise ValueError("max_motion_face_widths_per_second must be positive")
@@ -388,7 +470,6 @@ class PulsePipelineV2:
         self._minimum_window_quality = float(minimum_window_quality)
         self._nsqi_threshold = float(nsqi_threshold)
         self._min_cardiac_snr_db = float(min_cardiac_snr_db)
-        self._min_peak_concentration = float(min_peak_concentration)
         self._experimental_hrv_enabled = bool(experimental_hrv_enabled)
         self._hrv_min_window_seconds = float(hrv_min_window_seconds)
         self._hrv_min_valid_ibi = int(hrv_min_valid_ibi)
@@ -406,14 +487,23 @@ class PulsePipelineV2:
             "minimum_window_quality": self._minimum_window_quality,
             "nsqi_threshold": self._nsqi_threshold,
             "min_cardiac_snr_db": self._min_cardiac_snr_db,
-            "min_peak_concentration": self._min_peak_concentration,
-            "unambiguous_cardiac_snr_db": UNAMBIGUOUS_CARDIAC_SNR_DB,
+            "harmonic_snr_half_width_hz": HARMONIC_SNR_HALF_WIDTH_HZ,
+            "harmonic_snr_confirmed_db": HARMONIC_SNR_CONFIRMED_DB,
+            "track_tolerance_bpm": TRACK_TOLERANCE_BPM,
+            "track_continuity_seconds": TRACK_CONTINUITY_SECONDS,
+            "track_confirmation_max_age_seconds": TRACK_CONFIRMATION_MAX_AGE_SECONDS,
+            "signal_quality_zero_db": SIGNAL_QUALITY_ZERO_DB,
+            "signal_quality_full_db": SIGNAL_QUALITY_FULL_DB,
+            "acquisition_quality_knee": ACQUISITION_QUALITY_KNEE,
             "subharmonic_audit_low_hz": SUBHARMONIC_AUDIT_LOW_HZ,
             "subharmonic_audit_margin": SUBHARMONIC_AUDIT_MARGIN,
             "subharmonic_audit_divisors": ",".join(
                 str(k) for k in SUBHARMONIC_AUDIT_DIVISORS
             ),
             "subharmonic_ratio_threshold": SUBHARMONIC_RATIO_THRESHOLD,
+            "beat_band_half_width_hz": BEAT_BAND_HALF_WIDTH_HZ,
+            "beat_band_filter_order": BEAT_BAND_FILTER_ORDER,
+            "beat_min_relative_amplitude": BEAT_MIN_RELATIVE_AMPLITUDE,
             "prior_half_life_seconds": PRIOR_HALF_LIFE_SECONDS,
             "prior_max_age_seconds": PRIOR_MAX_AGE_SECONDS,
             "experimental_hrv_enabled": self._experimental_hrv_enabled,
@@ -422,13 +512,19 @@ class PulsePipelineV2:
         }
         self._algorithm_identity = SignalAlgorithmIdentity(
             name=f"pulse-v2:{backend.identity.name}",
-            version="pulse-v2/2.3.0",
+            version="pulse-v2/3.0.0",
             implementation_sha256=code_sha256(
                 (
                     PulsePipelineV2.process_window,
                     PulsePipelineV2._beat_candidates,
+                    PulsePipelineV2._beat_band_noise_sigma,
+                    timing_noise_correlation,
+                    beat_band,
+                    equivalent_noise_bandwidth_hz,
                     _spectral_hr,
                     subharmonic_power_ratio,
+                    harmonic_snr_db,
+                    signal_quality_from_snr,
                     _quadratic_peak_offset,
                     prior_weight,
                     motion_penalty_from_face_widths,
@@ -448,6 +544,9 @@ class PulsePipelineV2:
         )
         self._prior_hr_bpm: float | None = None
         self._prior_set_at_mono_ns: int | None = None
+        self._track_bpm: float | None = None
+        self._track_at_mono_ns: int | None = None
+        self._confirmed_at_mono_ns: int | None = None
 
     @property
     def backend(self) -> ResolvedBackend:
@@ -481,6 +580,9 @@ class PulsePipelineV2:
         self._ledger.reset()
         self._prior_hr_bpm = None
         self._prior_set_at_mono_ns = None
+        self._track_bpm = None
+        self._track_at_mono_ns = None
+        self._confirmed_at_mono_ns = None
 
     def process_window(
         self,
@@ -554,13 +656,23 @@ class PulsePipelineV2:
             motion_penalty=motion_penalty,
             face_presence_ratio=face_presence_ratio,
         )
-        # Acquisition and signal quality are conjunctive evidence. A clean
-        # spectrum cannot erase a motion/coverage failure upstream.
-        quality = float(
-            np.clip(physio_sqi * observation_quality, 0.0, 1.0)
+        # Acquisition quality: how complete and how still the window was.
+        # Individual frames have already passed the capture gate (exposure,
+        # blur, motion), so what is left to judge is coverage and movement.
+        # ``observation_quality`` is the weakest per-frame capture score; it
+        # only counts against the window when the frames were marginal.
+        acquisition_quality = float(
+            np.clip(face_presence_ratio, 0.0, 1.0)
+            * (1.0 - motion_penalty)
+            * np.clip(observation_quality / ACQUISITION_QUALITY_KNEE, 0.0, 1.0)
         )
         if motion_gate_exceeded:
-            quality = 0.0
+            acquisition_quality = 0.0
+        sqi_components = {
+            **sqi_components,
+            "composite_sqi": float(physio_sqi),
+            "acquisition_quality": acquisition_quality,
+        }
         prior_age = self.prior_age_seconds(end_ns)
         weight = prior_weight(prior_age) if self._prior_hr_bpm is not None else 0.0
         peak = _spectral_hr(
@@ -575,48 +687,55 @@ class PulsePipelineV2:
         hr_confidence = peak.concentration
         bin_width_hz = peak.bin_width_hz
 
-        # Signal presence is tested on the raw, un-normalised spectrum terms,
-        # NOT on ``quality``. ``compute_physio_sqi`` is an additive blend in
-        # which the acquisition terms alone contribute 0.25 of a possible
-        # 1.0 (``0.15 * motion_term + 0.10 * face_term``), so a still, fully
-        # visible face scores above the 0.30 publication gate before any
-        # cardiac evidence is considered at all. Measured over 200 windows
-        # per condition on the packaged POS backend, signal-free input scored
-        # 0.334-0.449 (white noise) and 0.443-0.684 (1/f and drift noise):
-        # every single signal-free window cleared the gate, and the pipeline
-        # published a fabricated rate for all of them.
-        #
-        # Normalising SNR to [0, 1] is what destroys the discrimination --
-        # ``(snr_db + 10) / 20`` compresses the whole decision range into the
-        # middle of the scale, where averaging dilutes it further. Thresholding
-        # the raw decibel value keeps it: ``snr_db >= 2.0`` rejected 98.5-100%
-        # of signal-free windows across all three noise models. ``nsqi`` adds
-        # no discrimination against 1/f noise (it passes ~94% of it) but costs
-        # no sensitivity either and rejects 100% of white noise, so it is kept
-        # as a cheap guard on the degenerate flat-spectrum case.
-        # A third term for the one nuisance the first two do not separate.
-        # ``snr_db >= 2.0`` rejects 100% of white and 99.5% of 1/f signal-free
-        # windows, but only 98.5% of drift-dominated ones -- and drift is the
-        # realistic webcam nuisance. Peak concentration is already computed for
-        # the uncertainty interval and measures whether the in-band power sits
-        # in one peak or is smeared, which is exactly what distinguishes a
-        # cardiac line from wandering illumination.
-        #
-        # 0.40, not higher: measured over 200 windows per condition, adding
-        # this term cuts drift false-publication from 1.5% to 0.5% at a cost of
-        # 25% relative sensitivity at a realistic 0.3% modulation depth
-        # (0.340 -> 0.255). A 0.50 floor observed 0/200 on drift but more than
-        # halved that sensitivity (to 0.160), and 0/200 is not distinguishable
-        # from 0.005 at this sample size -- so the stricter floor buys noise
-        # and costs real measurements.
+        # Signal presence: harmonic SNR of the selected rate; below the
+        # confirmed level the window must continue an established track (see
+        # the constants above). ``nsqi`` stays as a cheap guard against a
+        # flat spectrum.
         nsqi = float(sqi_components.get("nsqi", 0.0))
-        snr_db = float(sqi_components.get("snr_db", -99.0))
+        cardiac_snr_db = (
+            harmonic_snr_db(
+                filtered,
+                fs=sample_rate_hz,
+                cardiac_hz=hr_bpm / 60.0,
+                low_hz=self._low_hz,
+                high_hz=self._high_hz,
+            )
+            if hr_bpm is not None
+            else -99.0
+        )
+        # A weak window may extend a rate that a strong window established;
+        # it may not establish one. Persistent non-cardiac lines exist (a
+        # harmonic of breathing-linked head movement is typical) and pass an
+        # agreement test on their own, but they do not start from a window in
+        # which the cardiac line was unmistakable.
+        continues_track = (
+            hr_bpm is not None
+            and self._track_bpm is not None
+            and self._track_at_mono_ns is not None
+            and self._confirmed_at_mono_ns is not None
+            and abs(hr_bpm - self._track_bpm) <= TRACK_TOLERANCE_BPM
+            and end_ns - self._track_at_mono_ns
+            <= int(TRACK_CONTINUITY_SECONDS * 1e9)
+            and end_ns - self._confirmed_at_mono_ns
+            <= int(TRACK_CONFIRMATION_MAX_AGE_SECONDS * 1e9)
+        )
+        sqi_components = {
+            **sqi_components,
+            "harmonic_snr_db": cardiac_snr_db,
+            "continues_track": float(continues_track),
+        }
+        # Window quality is conjunctive: the strength of the cardiac line
+        # times the acquisition quality. A clean spectrum cannot erase a
+        # motion or coverage failure, and a complete, still window says
+        # nothing if there is no pulse in it.
+        quality = float(
+            np.clip(signal_quality_from_snr(cardiac_snr_db) * acquisition_quality, 0.0, 1.0)
+        )
         signal_present = (
             nsqi >= self._nsqi_threshold
-            and snr_db >= self._min_cardiac_snr_db
+            and cardiac_snr_db >= self._min_cardiac_snr_db
             and (
-                snr_db >= UNAMBIGUOUS_CARDIAC_SNR_DB
-                or hr_confidence >= self._min_peak_concentration
+                cardiac_snr_db >= HARMONIC_SNR_CONFIRMED_DB or continues_track
             )
         )
 
@@ -688,16 +807,32 @@ class PulsePipelineV2:
                 window_end_mono_ns=end_ns,
                 boot_id=boot_id,
             )
+            self._track_bpm = float(hr_bpm)
+            self._track_at_mono_ns = end_ns
+            if cardiac_snr_db >= HARMONIC_SNR_CONFIRMED_DB:
+                self._confirmed_at_mono_ns = end_ns
             if quality >= 0.45:
                 self._prior_hr_bpm = float(hr_bpm)
                 self._prior_set_at_mono_ns = end_ns
 
+        # Beats are read only from windows that carry a cardiac line, and
+        # around that line.  A window that fails the signal-presence test has
+        # no rate to centre the band on, and band-limiting noise would return
+        # a perfectly plausible beat train.
         candidates = self._beat_candidates(
-            filtered,
+            waveform,
             times,
             sample_rate_hz=sample_rate_hz,
             window_id=window_id,
             window_quality=quality,
+            cardiac_hz=(
+                hr_bpm / 60.0
+                if hr_bpm is not None
+                and signal_present
+                and self._min_hr_bpm <= hr_bpm <= self._max_hr_bpm
+                and subharmonic_ratio < SUBHARMONIC_RATIO_THRESHOLD
+                else None
+            ),
         )
         boundary_margin_ns = int(0.75 * 1_000_000_000)
         events, intervals = self._ledger.ingest(
@@ -713,7 +848,7 @@ class PulsePipelineV2:
             boot_id=boot_id,
             enabled=self._experimental_hrv_enabled,
             rmssd_min_seconds=self._hrv_min_window_seconds,
-            sdnn_min_seconds=max(300.0, self._hrv_min_window_seconds),
+            sdnn_min_seconds=max(90.0, 1.5 * self._hrv_min_window_seconds),
             min_valid_ibi=self._hrv_min_valid_ibi,
         )
         window_events = [item for item in events if window_id in item.source_window_ids]
@@ -778,58 +913,157 @@ class PulsePipelineV2:
 
     def _beat_candidates(
         self,
-        signal: NDArray[np.float64],
+        waveform: NDArray[np.float64],
         times: NDArray[np.int64],
         *,
         sample_rate_hz: float,
         window_id: str,
         window_quality: float,
+        cardiac_hz: float | None,
     ) -> tuple[BeatCandidate, ...]:
-        signal_range = float(np.ptp(signal))
-        if signal_range <= 1e-12:
+        """Locate beats from the phase of the narrow-band cardiac component.
+
+        ``waveform`` is the backend output before the publication bandpass and
+        ``cardiac_hz`` the rate selected for this window (``None`` when the
+        window carries no usable cardiac line, which yields no candidates).
+        A beat is the instant the analytic signal's phase completes a cycle,
+        interpolated between the two samples that bracket it.
+        """
+
+        if cardiac_hz is None or len(waveform) < max(16, int(sample_rate_hz * 4.0)):
             return ()
-        minimum_distance = max(
-            1, int(np.floor(sample_rate_hz * 60.0 / self._max_hr_bpm))
+        band = beat_band(cardiac_hz, low_hz=self._low_hz, high_hz=self._high_hz)
+        if band is None:
+            return ()
+        low, high = band
+        try:
+            narrow = bandpass_filter(
+                waveform,
+                low_hz=low,
+                high_hz=high,
+                fs=sample_rate_hz,
+                order=BEAT_BAND_FILTER_ORDER,
+            )
+        except ValueError:
+            return ()
+        analytic = hilbert(narrow)
+        envelope = np.abs(analytic)
+        reference_amplitude = float(np.median(envelope))
+        if reference_amplitude <= 1e-12:
+            return ()
+        noise_sigma = self._beat_band_noise_sigma(
+            waveform,
+            sample_rate_hz=sample_rate_hz,
+            cardiac_hz=cardiac_hz,
+            band=(low, high),
         )
-        indices, properties = find_peaks(
-            signal,
-            distance=minimum_distance,
-            prominence=0.10 * signal_range,
-        )
-        prominences = np.asarray(properties.get("prominences", []), dtype=np.float64)
-        max_prominence = float(np.max(prominences)) if len(prominences) else 1.0
+        cycles = np.unwrap(np.angle(analytic)) / (2.0 * np.pi)
+        whole = np.floor(cycles)
+        crossings = np.flatnonzero(whole[1:] > whole[:-1])
         boundary_margin_ns = 750_000_000
+        start_ns = int(times[0])
+        end_ns = int(times[-1])
         result: list[BeatCandidate] = []
-        for position, index in enumerate(indices):
-            refined_index = float(index) + _quadratic_peak_offset(signal, int(index))
+        previous_ns: int | None = None
+        for index in crossings:
+            step = float(cycles[index + 1] - cycles[index])
+            if step <= 1e-9:
+                continue
+            fraction = float(np.clip((whole[index + 1] - cycles[index]) / step, 0.0, 1.0))
             absolute_ns = int(
                 round(
-                    float(
-                        np.interp(
-                            refined_index,
-                            np.arange(len(times), dtype=np.float64),
-                            times.astype(np.float64),
-                        )
-                    )
+                    float(times[index])
+                    + fraction * float(times[index + 1] - times[index])
                 )
             )
-            prominence = float(prominences[position]) if position < len(prominences) else 0.0
-            normalized_prominence = prominence / max(max_prominence, 1e-12)
-            candidate_quality = float(
-                np.clip(window_quality * (0.40 + 0.60 * normalized_prominence), 0.0, 1.0)
+            if previous_ns is not None and absolute_ns <= previous_ns:
+                continue
+            previous_ns = absolute_ns
+            amplitude = float(
+                envelope[index] + fraction * (envelope[index + 1] - envelope[index])
             )
+            relative = amplitude / reference_amplitude
+            # Full credit at the window's typical amplitude, none once the
+            # carrier has collapsed.
+            strength = float(
+                np.clip(
+                    (relative - BEAT_MIN_RELATIVE_AMPLITUDE)
+                    / (1.0 - BEAT_MIN_RELATIVE_AMPLITUDE),
+                    0.0,
+                    1.0,
+                )
+            )
+            candidate_quality = float(
+                np.clip(window_quality * (0.40 + 0.60 * strength), 0.0, 1.0)
+            )
+            if relative < BEAT_MIN_RELATIVE_AMPLITUDE:
+                candidate_quality = 0.0
             near_boundary = (
-                absolute_ns - int(times[0]) < boundary_margin_ns
-                or int(times[-1]) - absolute_ns < boundary_margin_ns
+                absolute_ns - start_ns < boundary_margin_ns
+                or end_ns - absolute_ns < boundary_margin_ns
+            )
+            # Narrow-band noise of standard deviation ``noise_sigma`` on a
+            # carrier of amplitude A perturbs its phase by noise_sigma / A
+            # radians, i.e. the beat instant by that over 2*pi*f.
+            timing_sigma_ms = (
+                1_000.0 * noise_sigma / (amplitude * 2.0 * np.pi * cardiac_hz)
+                if noise_sigma is not None and amplitude > 1e-12
+                else None
             )
             result.append(
                 BeatCandidate(
                     candidate_id=_stable_id("candidate", window_id, absolute_ns),
                     absolute_mono_ns=absolute_ns,
-                    prominence=prominence,
+                    prominence=amplitude,
                     quality=candidate_quality,
                     source_window_id=window_id,
                     near_window_boundary=near_boundary,
+                    timing_sigma_ms=timing_sigma_ms,
                 )
             )
         return tuple(result)
+
+    def _beat_band_noise_sigma(
+        self,
+        waveform: NDArray[np.float64],
+        *,
+        sample_rate_hz: float,
+        cardiac_hz: float,
+        band: tuple[float, float],
+    ) -> float | None:
+        """Standard deviation of the noise that passes the beat filter.
+
+        The noise density is the median of the spectrum beside the cardiac
+        line: within :data:`BEAT_NOISE_SEARCH_HALF_WIDTH_HZ` of it, outside
+        the beat band, and clear of the second and third harmonics.  The
+        median ignores whatever narrow lines remain.  Returns ``None`` when
+        too little spectrum is left to estimate from.
+        """
+
+        count = len(waveform)
+        nfft = max(count, 2 ** int(np.ceil(np.log2(count * 2))))
+        frequencies, density = welch(
+            waveform, fs=sample_rate_hz, window="hann", nperseg=count,
+            noverlap=0, nfft=nfft, detrend="constant", scaling="density",
+        )
+        low, high = band
+        nyquist_guard = sample_rate_hz / 2.0 - 0.5
+        beside = (
+            (np.abs(frequencies - cardiac_hz) <= BEAT_NOISE_SEARCH_HALF_WIDTH_HZ)
+            & ((frequencies < low - 0.1) | (frequencies > high + 0.1))
+            & (frequencies >= 0.45)
+            & (frequencies <= nyquist_guard)
+        )
+        for harmonic in (2.0, 3.0):
+            beside &= (
+                np.abs(frequencies - harmonic * cardiac_hz)
+                > BEAT_NOISE_HARMONIC_GUARD_HZ
+            )
+        if int(np.sum(beside)) < 6:
+            return None
+        # Periodogram ordinates of noise are exponentially distributed, whose
+        # median is ln(2) times its mean; undo that so the median estimates
+        # the density itself.
+        noise_density = float(np.median(density[beside])) / float(np.log(2.0))
+        variance = noise_density * equivalent_noise_bandwidth_hz(band, sample_rate_hz)
+        return float(np.sqrt(max(variance, 0.0)))

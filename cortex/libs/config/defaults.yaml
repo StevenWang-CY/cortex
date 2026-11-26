@@ -60,6 +60,10 @@ state:
   estimate_exit_threshold: 0.25
   # Set to safety_null for an operational fail-closed rollback.
   inference_mode: deterministic
+  # Share of a support score that qualified camera physiology (heart rate,
+  # pulse-rate variability, breathing, blinking) may move when fully observed.
+  # 0 makes the rules behaviour-only.
+  physiology_weight: 0.35
 
   # Dwell times (seconds before state transition)
   hyper_dwell_seconds: 30
@@ -111,6 +115,14 @@ intervention:
   focus_break_interval_minutes: 50
   focus_break_duration_seconds: 300
   focus_break_inactivity_pause_seconds: 60.0
+
+  # Body-aware break suggestion: offered when sustained physiological strain
+  # (heart rate up, variability down, breathing fast, each against your own
+  # reference) has accumulated past the threshold. Needs the camera.
+  enable_strain_break_suggestions: true
+  strain_break_threshold_seconds: 600.0
+  strain_recovery_half_life_seconds: 600.0
+  strain_break_duration_seconds: 180
   guided_break_audio_mute_after_mic_seconds: 300.0
 
   # P0 §3.10 — Auto-armed distraction blocking on sustained HYPER.
@@ -136,6 +148,7 @@ telemetry:
 signal:
   rppg:
     window_seconds: 10
+    long_window_seconds: 20
     stride_seconds: 1
     backend: pos
     backend_expected_sha256: null
@@ -144,20 +157,21 @@ signal:
     bandpass_high: 3.5
     bandpass_order: 4
     nsqi_threshold: 0.293
-    min_cardiac_snr_db: 2.0
+    min_cardiac_snr_db: 0.0
+    skin_region: face
     max_head_jitter_deg: 7.5
     min_valid_coverage: 0.80
     max_interpolation_gap_ms: 250.0
     max_motion_rejected_fraction: 0.10
-    hrv_min_window_seconds: 180
-    hrv_min_valid_ibi: 120
-    experimental_hrv_enabled: false
+    hrv_min_window_seconds: 60
+    hrv_min_valid_ibi: 40
+    experimental_hrv_enabled: true
     respiration_window_seconds: 45
     respiration_low_hz: 0.08
     respiration_high_hz: 0.50
     respiration_min_channel_quality: 0.35
     respiration_max_channel_disagreement_bpm: 3.0
-    experimental_respiration_enabled: false
+    experimental_respiration_enabled: true
     # Sampling-rate correctness (B1): derive fps from real frame
     # timestamps instead of trusting the configured rate.
     fps_clamp_min: 10.0

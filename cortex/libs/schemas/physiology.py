@@ -174,6 +174,14 @@ class BeatCandidate(BaseModel):
     quality: float = Field(..., ge=0.0, le=1.0)
     source_window_id: str = Field(..., min_length=1)
     near_window_boundary: bool = False
+    timing_sigma_ms: float | None = Field(
+        None,
+        ge=0.0,
+        description=(
+            "Estimated standard deviation of this beat instant from the "
+            "narrow-band signal-to-noise ratio; None when not estimated"
+        ),
+    )
 
 
 class BeatEvent(BaseModel):
@@ -188,6 +196,7 @@ class BeatEvent(BaseModel):
     quality: float = Field(..., ge=0.0, le=1.0)
     prominence: float = Field(..., ge=0.0)
     source_window_ids: tuple[str, ...] = Field(..., min_length=1)
+    timing_sigma_ms: float | None = Field(None, ge=0.0)
 
     @model_validator(mode="after")
     def _rejection_is_explicit(self) -> BeatEvent:
@@ -214,6 +223,11 @@ class InterBeatInterval(BaseModel):
     rejection_reason: BeatRejectionReason | None = None
     correction: Literal["none"] = "none"
     quality: float = Field(..., ge=0.0, le=1.0)
+    timing_sigma_ms: float | None = Field(
+        None,
+        ge=0.0,
+        description="Mean timing standard deviation of the two bounding beats",
+    )
 
     @model_validator(mode="after")
     def _validate_interval(self) -> InterBeatInterval:

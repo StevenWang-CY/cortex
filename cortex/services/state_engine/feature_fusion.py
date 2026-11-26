@@ -23,6 +23,7 @@ from cortex.libs.schemas.features import (
     TelemetryFeatures,
 )
 from cortex.libs.schemas.observations import MissingReason
+from cortex.libs.schemas.physiology import SignalEstimate
 from cortex.libs.schemas.state import SignalQuality
 from cortex.libs.schemas.temporal import EventTime
 
@@ -284,6 +285,43 @@ class FeatureFusion:
                 source_window_ms=10_000,
                 algorithm_version="webcam-pulse-display-v2",
             ),
+            # Dispersion (SDNN) is the variability measure that qualified
+            # against ECG; beat-to-beat measures such as RMSSD did not and
+            # stay display-only.
+            FeatureName.HRV_SDNN_MS: self._feature_value(
+                hrv_sdnn,
+                source_present=not physio_missing,
+                quality=self._evidence_quality(
+                    self._physio.hrv_evidence.get("sdnn")
+                    if self._physio is not None
+                    else None,
+                    now,
+                ),
+                age_ms=physio_age,
+                source_window_ms=180_000,
+                algorithm_version="camera-pulse-variability-v3",
+            ),
+            FeatureName.RESPIRATION_RATE_BPM: self._feature_value(
+                respiration_rate,
+                source_present=not physio_missing,
+                quality=self._evidence_quality(
+                    self._physio.respiration_evidence
+                    if self._physio is not None
+                    else None,
+                    now,
+                ),
+                age_ms=physio_age,
+                source_window_ms=45_000,
+                algorithm_version="agreement-gated-respiration-v3",
+            ),
+            FeatureName.PERCLOS: self._feature_value(
+                perclos_60s,
+                source_present=self._kinematics is not None,
+                quality=quality.kinematics,
+                age_ms=kinematics_age,
+                source_window_ms=60_000,
+                algorithm_version="elapsed-blink-v2",
+            ),
             FeatureName.BLINK_RATE_PER_MIN: self._feature_value(
                 blink_rate,
                 source_present=self._kinematics is not None,
@@ -445,6 +483,22 @@ class FeatureFusion:
         )
 
         return vector, quality
+
+    def _evidence_quality(self, estimate: SignalEstimate | None, now: float) -> float:
+        """Quality of one physiology estimate, aged like its channel.
+
+        Pulse-rate variability and breathing rate each carry their own
+        evidence quality; the channel's pulse quality describes a different
+        measurement and must not stand in for them.
+        """
+
+        if estimate is None or estimate.value is None:
+            return 0.0
+        quality = float(estimate.quality)
+        staleness = now - self._physio_timestamp
+        if staleness > 3.0:
+            quality *= max(0.0, 1.0 - (staleness - 3.0) / 10.0)
+        return min(1.0, max(0.0, quality))
 
     @staticmethod
     def _source_age_ms(now: float, observed_at: float) -> int:

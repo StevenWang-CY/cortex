@@ -39,6 +39,14 @@ IMPLEMENTATION_COMPONENTS: tuple[str, ...] = (
     "services/state_engine/model_registry.py",
     "services/state_engine/rule_scorer.py",
     "services/state_engine/support_inference.py",
+    "services/state_engine/physiology_evidence.py",
+    "services/state_engine/physiology_baseline.py",
+    "services/physio_engine/camera_physiology.py",
+    "services/physio_engine/v2/pulse.py",
+    "services/physio_engine/v2/beat_timing.py",
+    "services/physio_engine/v2/beats.py",
+    "services/physio_engine/v2/hrv.py",
+    "services/physio_engine/v2/respiration.py",
 )
 MANIFEST_SCHEMA_VERSION = "1.0"
 

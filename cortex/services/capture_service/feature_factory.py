@@ -39,7 +39,9 @@ def build_production_camera_feature_components(
     """Construct the exact estimator set used by runtime and calibration."""
 
     return ProductionCameraFeatureComponents(
-        roi_extractor=RoiExtractor(config.landmarks),
+        roi_extractor=RoiExtractor(
+            config.landmarks, skin_region=config.signal.rppg.skin_region
+        ),
         physiology=PhysiologyEngineV2(
             config.signal.rppg,
             max_motion_face_widths_per_second=(

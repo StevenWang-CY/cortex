@@ -199,9 +199,24 @@ async def _drive_frames(daemon: Any, blink_scores: list[float], n_per_frame: int
         sustained_flexion_seconds=0.0,
         proxy_available=False,
     )
+    from cortex.libs.schemas.physiology import SignalEstimate
+
     pulse_summary = MagicMock()
-    pulse_summary.hr = SimpleNamespace(value=72.0)
+    # A real estimate: the shared processor builds validated PhysioFeatures
+    # from it, so a stand-in object would not survive.
+    pulse_summary.hr = SignalEstimate(
+        metric="heart_rate",
+        value=72.0,
+        unit="bpm",
+        status="experimental",
+        quality=0.8,
+        algorithm=daemon._physiology_v2.pulse.algorithm_identity,
+        window_start_mono_ns=0,
+        window_end_mono_ns=10_000_000_000,
+        boot_id=daemon._clock.boot_id,
+    )
     pulse_summary.quality = 0.8
+    pulse_summary.window_end_mono_ns = 10_000_000_000
     pulse_summary.model_dump.return_value = {}
     pulse_result = SimpleNamespace(
         waveform=np.zeros(n_per_frame, dtype=np.float64),
@@ -209,6 +224,7 @@ async def _drive_frames(daemon: Any, blink_scores: list[float], n_per_frame: int
         hrv_estimates={},
         beat_events=(),
         intervals=(),
+        sqi_components={},
     )
 
     with (

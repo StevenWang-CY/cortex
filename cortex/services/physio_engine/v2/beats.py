@@ -42,6 +42,46 @@ class _BeatCluster:
         )
 
     @property
+    def consensus_mono_ns(self) -> int:
+        """Quality-weighted beat instant across the windows that saw it.
+
+        Each overlapping window locates the same beat independently.  A window
+        that only saw the beat near its edge is the least reliable witness, so
+        interior observations decide whenever one exists.
+        """
+
+        observations = list(self.candidates.values())
+        interior = [item for item in observations if not item.near_window_boundary]
+        chosen = interior or observations
+        weights = np.asarray([max(item.quality, 1e-6) for item in chosen])
+        origin = min(item.absolute_mono_ns for item in chosen)
+        offsets = np.asarray(
+            [item.absolute_mono_ns - origin for item in chosen], dtype=np.float64
+        )
+        return origin + int(round(float(np.average(offsets, weights=weights))))
+
+    @property
+    def timing_sigma_ms(self) -> float | None:
+        """Timing uncertainty of the consensus instant.
+
+        Overlapping windows read the same samples, so their errors are not
+        independent and averaging them buys no sqrt(n); the quality-weighted
+        mean of their individual estimates is the honest figure.
+        """
+
+        observations = list(self.candidates.values())
+        interior = [item for item in observations if not item.near_window_boundary]
+        chosen = [
+            item for item in (interior or observations)
+            if item.timing_sigma_ms is not None
+        ]
+        if not chosen:
+            return None
+        weights = np.asarray([max(item.quality, 1e-6) for item in chosen])
+        values = np.asarray([item.timing_sigma_ms for item in chosen], dtype=np.float64)
+        return float(np.average(values, weights=weights))
+
+    @property
     def source_window_ids(self) -> tuple[str, ...]:
         return tuple(sorted({item.source_window_id for item in self.candidates.values()}))
 
@@ -239,12 +279,13 @@ class BeatLedger:
         candidate = cluster.canonical
         return BeatEvent(
             beat_id=cluster.beat_id,
-            absolute_mono_ns=candidate.absolute_mono_ns,
+            absolute_mono_ns=cluster.consensus_mono_ns,
             status=cluster.status,
             rejection_reason=cluster.rejection_reason,
             quality=candidate.quality,
             prominence=candidate.prominence,
             source_window_ids=cluster.source_window_ids,
+            timing_sigma_ms=cluster.timing_sigma_ms,
         )
 
     def _derive_intervals(
@@ -281,6 +322,17 @@ class BeatLedger:
                     status=(BeatStatus.ACCEPTED if reason is None else BeatStatus.REJECTED),
                     rejection_reason=reason,
                     quality=min(left.quality, right.quality),
+                    timing_sigma_ms=(
+                        float(
+                            np.sqrt(
+                                (left.timing_sigma_ms**2 + right.timing_sigma_ms**2)
+                                / 2.0
+                            )
+                        )
+                        if left.timing_sigma_ms is not None
+                        and right.timing_sigma_ms is not None
+                        else None
+                    ),
                 )
             )
         return tuple(intervals)

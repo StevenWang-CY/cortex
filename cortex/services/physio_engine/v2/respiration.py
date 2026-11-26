@@ -1,5 +1,13 @@
 """Long-window, multi-channel respiratory-rate estimation.
 
+Breathing reaches the camera three independent ways, the same three a contact
+pulse sensor offers: it modulates the *amplitude* of the pulse wave (the
+colour-envelope channel), it moves the head a little (the head-motion
+channel), and it modulates the *interval* between beats — respiratory sinus
+arrhythmia (the beat-interval channel).  Each is weak or absent in some people
+and conditions, so a rate is published only when at least two of them
+independently find the same one.
+
 This module estimates a breathing-rate proxy. It does not diagnose apnea or
 infer a medical condition. Cross-channel disagreement causes abstention.
 """
@@ -14,7 +22,9 @@ from numpy.typing import NDArray
 from scipy.signal import detrend, hilbert, welch
 
 from cortex.libs.schemas.physiology import (
+    BeatStatus,
     EvidenceStatus,
+    InterBeatInterval,
     PhysiologyMetric,
     SignalAlgorithmIdentity,
     SignalEstimate,
@@ -33,6 +43,17 @@ class _ChannelEstimate:
     rate_bpm: float
     quality: float
     resolution_bpm: float
+
+
+def _combinations(names: list[str], size: int, start: int) -> list[tuple[str, ...]]:
+    """Combinations of ``size`` names whose first element is ``names[start]``."""
+
+    from itertools import combinations
+
+    return [
+        (names[start], *rest)
+        for rest in combinations(names[start + 1 :], size - 1)
+    ]
 
 
 @dataclass(frozen=True)
@@ -124,8 +145,51 @@ def _color_envelope(
     return np.asarray(detrend(envelope, type="linear"), dtype=np.float64)
 
 
+# The beat-interval series is resampled to this rate before spectral analysis;
+# breathing is far below its Nyquist frequency.
+BEAT_INTERVAL_RESAMPLE_HZ = 4.0
+# Longest stretch without an accepted beat interval the resampling may bridge.
+BEAT_INTERVAL_MAX_GAP_SECONDS = 3.0
+CHANNEL_NAMES = ("color_envelope", "head_motion", "beat_interval")
+
+
+def _beat_interval_signal(
+    intervals: tuple[InterBeatInterval, ...] | None,
+    *,
+    start_ns: int,
+    end_ns: int,
+) -> NDArray[np.float64] | None:
+    """Uniformly resampled interval series (ms) covering the window, or None."""
+
+    if not intervals:
+        return None
+    inside = [
+        item
+        for item in intervals
+        if item.status == BeatStatus.ACCEPTED.value
+        and item.start_mono_ns >= start_ns
+        and item.end_mono_ns <= end_ns
+    ]
+    if len(inside) < 12:
+        return None
+    stamps = np.asarray(
+        [(item.end_mono_ns - start_ns) / 1e9 for item in inside], dtype=np.float64
+    )
+    durations = np.asarray([item.duration_ms for item in inside], dtype=np.float64)
+    window_s = (end_ns - start_ns) / 1e9
+    gaps = np.diff(np.concatenate(([0.0], stamps, [window_s])))
+    if float(np.max(gaps)) > BEAT_INTERVAL_MAX_GAP_SECONDS:
+        return None
+    median = float(np.median(durations))
+    keep = np.abs(durations - median) <= 0.30 * median
+    if int(np.sum(keep)) < 12:
+        return None
+    grid = np.arange(0.0, window_s, 1.0 / BEAT_INTERVAL_RESAMPLE_HZ)
+    return np.asarray(np.interp(grid, stamps[keep], durations[keep]), dtype=np.float64)
+
+
 class RespirationFusionV2:
-    """Fuse color-envelope and face-normalized vertical-motion channels."""
+    """Fuse colour-envelope, head-motion and beat-interval breathing channels."""
 
     def __init__(
         self,
@@ -184,9 +248,20 @@ class RespirationFusionV2:
                 parameters=common_parameters,
                 selection_mode="fixed",
             ),
+            "beat_interval": SignalAlgorithmIdentity(
+                name="beat-interval-respiration",
+                version="1.0.0",
+                implementation_sha256=code_sha256(
+                    (_beat_interval_signal, _spectral_channel),
+                    dependency_sha256=(backend.identity.implementation_sha256,),
+                ),
+                configuration_sha256=configuration_sha256(common_parameters),
+                parameters=common_parameters,
+                selection_mode="fixed",
+            ),
             "fusion": SignalAlgorithmIdentity(
                 name="agreement-gated-respiration-fusion",
-                version="2.0.0",
+                version="3.0.0",
                 implementation_sha256=code_sha256(
                     (RespirationFusionV2.process_window, _spectral_channel),
                     dependency_sha256=(
@@ -197,6 +272,7 @@ class RespirationFusionV2:
                             ),
                         ),
                         code_sha256((_spectral_channel,)),
+                        code_sha256((_beat_interval_signal, _spectral_channel)),
                     ),
                 ),
                 configuration_sha256=configuration_sha256(common_parameters),
@@ -213,6 +289,7 @@ class RespirationFusionV2:
         sample_rate_hz: float,
         boot_id: UUID,
         head_vertical_face_units: NDArray[np.float64] | None,
+        beat_intervals: tuple[InterBeatInterval, ...] | None = None,
     ) -> RespirationProcessingResult:
         rgb = np.asarray(rgb_window, dtype=np.float64)
         times = np.asarray(sample_times_mono_ns, dtype=np.int64)
@@ -226,7 +303,7 @@ class RespirationFusionV2:
             reason = f"requires at least {self._min_window_seconds:.0f} seconds"
             channels = {
                 name: self._unavailable(name, reason, boot_id, start_ns, end_ns)
-                for name in ("color_envelope", "head_motion")
+                for name in CHANNEL_NAMES
             }
             return RespirationProcessingResult(
                 channels=channels,
@@ -255,6 +332,13 @@ class RespirationFusionV2:
                 high_hz=self._high_hz,
                 min_window_seconds=self._min_window_seconds,
             ),
+            "beat_interval": _spectral_channel(
+                _beat_interval_signal(beat_intervals, start_ns=start_ns, end_ns=end_ns),
+                fs=BEAT_INTERVAL_RESAMPLE_HZ,
+                low_hz=self._low_hz,
+                high_hz=self._high_hz,
+                min_window_seconds=self._min_window_seconds,
+            ),
         }
         channels = {
             name: self._channel_result(name, estimate, boot_id, start_ns, end_ns)
@@ -266,62 +350,86 @@ class RespirationFusionV2:
             if estimate is not None
             and estimate.quality >= self._minimum_channel_quality
         }
+        agreeing = self._largest_agreeing_set(usable)
         if len(usable) < 2:
             fused = self._unavailable(
                 "fusion",
-                "requires two quality-qualified independent channels",
+                "needs two independent breathing channels of sufficient quality",
                 boot_id,
                 start_ns,
                 end_ns,
             )
+        elif len(agreeing) < 2:
+            fused = self._unavailable(
+                "fusion",
+                "independent respiration channels disagree",
+                boot_id,
+                start_ns,
+                end_ns,
+            )
+        elif not self._publication_enabled:
+            fused = self._unavailable(
+                "fusion",
+                "breathing-rate estimation is turned off in settings",
+                boot_id,
+                start_ns,
+                end_ns,
+                quality=min(item.quality for item in agreeing.values()),
+            )
         else:
-            rates = [item.rate_bpm for item in usable.values()]
+            rates = [item.rate_bpm for item in agreeing.values()]
             disagreement = max(rates) - min(rates)
-            if disagreement > self._max_disagreement:
-                fused = self._unavailable(
-                    "fusion",
-                    "independent respiration channels disagree",
-                    boot_id,
-                    start_ns,
-                    end_ns,
-                )
-            elif not self._publication_enabled:
-                fused = self._unavailable(
-                    "fusion",
-                    "disabled pending simultaneous reference-respiration validation",
-                    boot_id,
-                    start_ns,
-                    end_ns,
-                    quality=min(item.quality for item in usable.values()),
-                )
-            else:
-                weights = np.asarray([item.quality for item in usable.values()])
-                values = np.asarray(rates)
-                rate = float(np.average(values, weights=weights))
-                half_width = max(
-                    1.5,
-                    disagreement / 2.0,
-                    max(item.resolution_bpm for item in usable.values()),
-                )
-                fused = SignalEstimate(
-                    metric=PhysiologyMetric.RESPIRATION_RATE,
-                    value=rate,
-                    unit="breaths/min",
-                    status=EvidenceStatus.EXPERIMENTAL,
-                    quality=float(min(item.quality for item in usable.values())),
-                    algorithm=self._identities["fusion"],
-                    # Deterministic heuristic bound (disagreement and spectral
-                    # resolution), not a statistical interval; see uncertainty.py.
-                    uncertainty=heuristic_interval(
-                        lower=max(0.0, rate - half_width),
-                        upper=rate + half_width,
-                        method="channel-agreement-and-spectral-resolution-bound",
-                    ),
-                    window_start_mono_ns=start_ns,
-                    window_end_mono_ns=end_ns,
-                    boot_id=boot_id,
-                )
+            weights = np.asarray([item.quality for item in agreeing.values()])
+            rate = float(np.average(np.asarray(rates), weights=weights))
+            half_width = max(
+                1.5,
+                disagreement / 2.0,
+                max(item.resolution_bpm for item in agreeing.values()),
+            )
+            fused = SignalEstimate(
+                metric=PhysiologyMetric.RESPIRATION_RATE,
+                value=rate,
+                unit="breaths/min",
+                status=EvidenceStatus.EXPERIMENTAL,
+                quality=float(min(item.quality for item in agreeing.values())),
+                algorithm=self._identities["fusion"],
+                # Deterministic heuristic bound (disagreement and spectral
+                # resolution), not a statistical interval; see uncertainty.py.
+                uncertainty=heuristic_interval(
+                    lower=max(0.0, rate - half_width),
+                    upper=rate + half_width,
+                    method="channel-agreement-and-spectral-resolution-bound",
+                ),
+                window_start_mono_ns=start_ns,
+                window_end_mono_ns=end_ns,
+                boot_id=boot_id,
+            )
         return RespirationProcessingResult(channels=channels, fused=fused)
+
+    def _largest_agreeing_set(
+        self, usable: dict[str, _ChannelEstimate]
+    ) -> dict[str, _ChannelEstimate]:
+        """Largest group of channels whose rates all lie within the tolerance.
+
+        With three usable channels, two that agree outvote one that does not;
+        ties between pairs go to the pair with the higher combined quality.
+        """
+
+        names = sorted(usable)
+        best: tuple[str, ...] = ()
+        best_quality = -1.0
+        for size in range(len(names), 1, -1):
+            for start in range(len(names)):
+                for combo in _combinations(names, size, start):
+                    rates = [usable[name].rate_bpm for name in combo]
+                    if max(rates) - min(rates) > self._max_disagreement:
+                        continue
+                    quality = sum(usable[name].quality for name in combo)
+                    if quality > best_quality:
+                        best, best_quality = combo, quality
+            if best:
+                break
+        return {name: usable[name] for name in best}
 
     def _channel_result(
         self,

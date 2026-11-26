@@ -1,9 +1,10 @@
 """Frozen feature catalog for deterministic and future model inference.
 
-The catalog is the sole owner of feature order. It deliberately separates
-measurement availability from production eligibility: camera-derived values
-remain useful diagnostics, but are excluded from Level-A support rules until
-the preregistered validation protocol has been completed.
+The catalog is the sole owner of feature order. It separates measurement
+availability from production eligibility: behaviour features form the primary
+block of every support rule, qualified camera physiology forms a
+corroborating block fused with it (see ``physiology_evidence``), and the
+camera-relative head/neck proxy stays a comfort signal outside the rules.
 """
 
 from __future__ import annotations
@@ -33,23 +34,36 @@ class FeatureDefinition:
     exclusion_reason: str | None = None
 
 
-FEATURE_SCHEMA_VERSION = "support-features-v2.2.0"
+FEATURE_SCHEMA_VERSION = "support-features-v3.0.0"
 
 ORDERED_FEATURES: tuple[FeatureDefinition, ...] = (
     FeatureDefinition(
         FeatureName.HEART_RATE_BPM, "physio", "beats/min", 10_000,
-        "identity-v1", "diagnostic_only", (),
-        "Webcam pulse has not passed the reference-sensor product gate.",
+        "personal-z-v1", "production_rule",
+        ("support_likely", "flow_like", "under_engaged"),
+    ),
+    FeatureDefinition(
+        FeatureName.HRV_SDNN_MS, "physio", "ms", 180_000,
+        "personal-z-v1", "production_rule", ("support_likely", "flow_like"),
+    ),
+    FeatureDefinition(
+        FeatureName.RESPIRATION_RATE_BPM, "physio", "breaths/min", 45_000,
+        "personal-z-v1", "production_rule",
+        ("support_likely", "flow_like", "under_engaged"),
     ),
     FeatureDefinition(
         FeatureName.BLINK_RATE_PER_MIN, "kinematics", "blinks/min", 60_000,
-        "identity-v1", "diagnostic_only", (),
-        "No participant-held-out evidence links this proxy to support need.",
+        "personal-ratio-v1", "production_rule",
+        ("support_likely", "flow_like", "under_engaged"),
+    ),
+    FeatureDefinition(
+        FeatureName.PERCLOS, "kinematics", "ratio", 60_000,
+        "identity-v1", "production_rule", ("under_engaged",),
     ),
     FeatureDefinition(
         FeatureName.HEAD_NECK_FLEXION_SCORE, "kinematics", "ratio", 5_000,
         "identity-v1", "diagnostic_only", (),
-        "Camera-relative comfort proxy is not a cognitive-state feature.",
+        "Camera-relative comfort proxy; it informs posture reminders, not the support state.",
     ),
     FeatureDefinition(
         FeatureName.MOUSE_VELOCITY_MEAN, "telemetry", "px/s", 15_000,
