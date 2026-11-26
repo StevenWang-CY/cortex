@@ -8,6 +8,7 @@ error (a fixed offset borrowed from "now") cannot hide in ``_local_date``.
 
 from __future__ import annotations
 
+import sys
 import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -22,17 +23,31 @@ from cortex.services.llm_engine.cost_tracker import CostTracker, _today_iso
 _ZONE = "America/New_York"
 
 
+def _reread_zone() -> None:
+    """Apply a changed ``TZ`` where the interpreter can; libc does the rest.
+
+    The hosted Intel runner's Python build has no ``time.tzset``, and these
+    tests were skipped there.  The ledger's day key comes from ``datetime``,
+    whose local conversions go through libc's ``localtime``; on macOS that
+    re-reads ``TZ`` on every call, so the zone can be pinned without it.
+    """
+
+    tzset = getattr(time, "tzset", None)
+    if tzset is not None:
+        tzset()
+
+
 @pytest.fixture
 def new_york_local_time(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    if not hasattr(time, "tzset"):
-        pytest.skip("time.tzset is unavailable on this platform")
+    if sys.platform == "win32":
+        pytest.skip("the process time zone cannot be pinned through TZ on Windows")
     monkeypatch.setenv("TZ", _ZONE)
-    time.tzset()
+    _reread_zone()
     try:
         yield
     finally:
         monkeypatch.undo()
-        time.tzset()
+        _reread_zone()
 
 
 def _unix_ms(value: datetime) -> int:
