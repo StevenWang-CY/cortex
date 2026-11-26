@@ -360,6 +360,66 @@ def false_publication_rate(records: Sequence[StrideRecord]) -> dict[str, float]:
     }
 
 
+@dataclass(frozen=True)
+class AcceptanceCriterion:
+    """What a metric must show against a reference sensor to be relied on.
+
+    These are net-benefit thresholds for a decision-support signal that is
+    read as a change against a personal reference, not clinical accuracy
+    limits: the estimate must track the reference closely enough that a
+    change in it means a change in the person.
+    """
+
+    metric: str
+    max_mae: float
+    min_within_tolerance: float
+    min_correlation: float
+    min_published: int = 100
+
+
+ACCEPTANCE_CRITERIA: dict[str, AcceptanceCriterion] = {
+    # 5 BPM is the usual consumer heart-rate tolerance.
+    METRIC_HEART_RATE: AcceptanceCriterion(
+        METRIC_HEART_RATE, max_mae=3.0, min_within_tolerance=0.85, min_correlation=0.90
+    ),
+    METRIC_SDNN: AcceptanceCriterion(
+        METRIC_SDNN, max_mae=12.0, min_within_tolerance=0.70, min_correlation=0.80
+    ),
+    METRIC_RMSSD: AcceptanceCriterion(
+        METRIC_RMSSD, max_mae=12.0, min_within_tolerance=0.70, min_correlation=0.80
+    ),
+    METRIC_RESPIRATION: AcceptanceCriterion(
+        METRIC_RESPIRATION, max_mae=2.0, min_within_tolerance=0.80, min_correlation=0.80
+    ),
+}
+
+
+def assess(report: MetricReport) -> tuple[bool, list[str]]:
+    """Whether ``report`` meets its metric's criterion, with the reasons if not."""
+
+    criterion = ACCEPTANCE_CRITERIA[report.metric]
+    reasons: list[str] = []
+    if report.published < criterion.min_published:
+        reasons.append(
+            f"only {report.published} published estimates (need {criterion.min_published})"
+        )
+    if report.mae is None or report.mae > criterion.max_mae:
+        reasons.append(f"MAE {report.mae} exceeds {criterion.max_mae}")
+    if (
+        report.within_tolerance is None
+        or report.within_tolerance < criterion.min_within_tolerance
+    ):
+        reasons.append(
+            f"share within {report.tolerance:g} is {report.within_tolerance}, "
+            f"below {criterion.min_within_tolerance}"
+        )
+    if report.pearson_r is None or report.pearson_r < criterion.min_correlation:
+        reasons.append(
+            f"correlation {report.pearson_r} below {criterion.min_correlation}"
+        )
+    return (not reasons, reasons)
+
+
 def reports_to_json(reports: dict[str, MetricReport]) -> str:
     return json.dumps(
         {name: report.to_dict() for name, report in reports.items()},

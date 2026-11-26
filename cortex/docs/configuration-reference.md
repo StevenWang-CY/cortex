@@ -4,7 +4,7 @@
 
 `CortexConfig` is the runtime source of truth. YAML uses dotted paths below; environment overrides use the corresponding `CORTEX_…` name and double underscores. Secrets are deliberately not fields on `CortexConfig`.
 
-This reference contains **198 runtime settings**.
+This reference contains **204 runtime settings**.
 
 | YAML path | Environment variable | Type | Default | Constraints | Description |
 | --- | --- | --- | --- | --- | --- |
@@ -52,6 +52,7 @@ This reference contains **198 runtime settings**.
 | `state.estimate_entry_threshold` | `CORTEX_STATE__ESTIMATE_ENTRY_THRESHOLD` | `float` | `0.4` | ≥ 0.0; ≤ 1.0 | — |
 | `state.estimate_exit_threshold` | `CORTEX_STATE__ESTIMATE_EXIT_THRESHOLD` | `float` | `0.25` | ≥ 0.0; ≤ 1.0 | — |
 | `state.inference_mode` | `CORTEX_STATE__INFERENCE_MODE` | `Literal[deterministic, safety_null]` | `"deterministic"` | — | — |
+| `state.physiology_weight` | `CORTEX_STATE__PHYSIOLOGY_WEIGHT` | `float` | `0.35` | ≥ 0.0; ≤ 0.5 | Share of a support score that qualified camera physiology may move when fully observed; 0 makes the rules behaviour-only. The scorer caps the effective value below estimate_entry_threshold so physiology alone cannot establish a state. |
 | `state.hyper_dwell_seconds` | `CORTEX_STATE__HYPER_DWELL_SECONDS` | `int` | `30` | ≥ 0 | — |
 | `state.hypo_dwell_seconds` | `CORTEX_STATE__HYPO_DWELL_SECONDS` | `int` | `60` | ≥ 0 | — |
 | `state.flow_dwell_seconds` | `CORTEX_STATE__FLOW_DWELL_SECONDS` | `int` | `120` | ≥ 0 | — |
@@ -89,6 +90,10 @@ This reference contains **198 runtime settings**.
 | `intervention.focus_break_interval_minutes` | `CORTEX_INTERVENTION__FOCUS_BREAK_INTERVAL_MINUTES` | `int` | `50` | ≥ 15; ≤ 180 | — |
 | `intervention.focus_break_duration_seconds` | `CORTEX_INTERVENTION__FOCUS_BREAK_DURATION_SECONDS` | `int` | `300` | ≥ 60; ≤ 1800 | — |
 | `intervention.focus_break_inactivity_pause_seconds` | `CORTEX_INTERVENTION__FOCUS_BREAK_INACTIVITY_PAUSE_SECONDS` | `float` | `60.0` | ≥ 5.0; ≤ 900.0 | — |
+| `intervention.enable_strain_break_suggestions` | `CORTEX_INTERVENTION__ENABLE_STRAIN_BREAK_SUGGESTIONS` | `bool` | `true` | — | — |
+| `intervention.strain_break_threshold_seconds` | `CORTEX_INTERVENTION__STRAIN_BREAK_THRESHOLD_SECONDS` | `float` | `600.0` | ≥ 120.0; ≤ 7200.0 | — |
+| `intervention.strain_recovery_half_life_seconds` | `CORTEX_INTERVENTION__STRAIN_RECOVERY_HALF_LIFE_SECONDS` | `float` | `600.0` | ≥ 60.0; ≤ 7200.0 | — |
+| `intervention.strain_break_duration_seconds` | `CORTEX_INTERVENTION__STRAIN_BREAK_DURATION_SECONDS` | `int` | `180` | ≥ 60; ≤ 1800 | — |
 | `intervention.guided_break_audio_mute_after_mic_seconds` | `CORTEX_INTERVENTION__GUIDED_BREAK_AUDIO_MUTE_AFTER_MIC_SECONDS` | `float` | `300.0` | — | — |
 | `intervention.enable_auto_distraction_block` | `CORTEX_INTERVENTION__ENABLE_AUTO_DISTRACTION_BLOCK` | `bool` | `false` | — | — |
 | `intervention.auto_distraction_block_confidence` | `CORTEX_INTERVENTION__AUTO_DISTRACTION_BLOCK_CONFIDENCE` | `float` | `0.85` | — | — |
@@ -108,7 +113,8 @@ This reference contains **198 runtime settings**.
 | `api.expose_api_docs` | `CORTEX_API__EXPOSE_API_DOCS` | `bool` | `false` | — | Serve FastAPI's /docs, /redoc and /openapi.json. These are mounted by FastAPI itself, outside the public-liveness and capability-gated routers, so they published the whole local API surface — every mutating route, its parameters and its response shapes — to any local process without a capability token. Off by default; enable only for local development. |
 | `telemetry.mouse_sample_hz` | `CORTEX_TELEMETRY__MOUSE_SAMPLE_HZ` | `int` | `60` | — | — |
 | `telemetry.window_seconds` | `CORTEX_TELEMETRY__WINDOW_SECONDS` | `int` | `15` | — | — |
-| `signal.rppg.window_seconds` | `CORTEX_SIGNAL__RPPG__WINDOW_SECONDS` | `int` | `10` | ≥ 8; ≤ 60 | — |
+| `signal.rppg.window_seconds` | `CORTEX_SIGNAL__RPPG__WINDOW_SECONDS` | `int` | `10` | ≥ 8; ≤ 60 | Shortest pulse analysis window; used until long_window_seconds of observations have accumulated |
+| `signal.rppg.long_window_seconds` | `CORTEX_SIGNAL__RPPG__LONG_WINDOW_SECONDS` | `int` | `20` | ≥ 8; ≤ 40 | Preferred pulse analysis window once enough observations exist. Twice the span halves the spectral noise under the cardiac line: on the 4TU reference videos it took heart-rate MAE from 2.6 to 1.6 BPM at the same publication level |
 | `signal.rppg.stride_seconds` | `CORTEX_SIGNAL__RPPG__STRIDE_SECONDS` | `int` | `1` | ≥ 1 | — |
 | `signal.rppg.backend` | `CORTEX_SIGNAL__RPPG__BACKEND` | `Literal[pos, chrom, green]` | `"pos"` | — | — |
 | `signal.rppg.backend_expected_sha256` | `CORTEX_SIGNAL__RPPG__BACKEND_EXPECTED_SHA256` | `str | NoneType` | `null` | pattern ^[0-9a-f]{64}$ | Optional expected checksum of the packaged backend implementation |
@@ -117,22 +123,22 @@ This reference contains **198 runtime settings**.
 | `signal.rppg.bandpass_high` | `CORTEX_SIGNAL__RPPG__BANDPASS_HIGH` | `float` | `3.5` | > 0.0 | — |
 | `signal.rppg.bandpass_order` | `CORTEX_SIGNAL__RPPG__BANDPASS_ORDER` | `int` | `4` | ≥ 1; ≤ 8 | — |
 | `signal.rppg.nsqi_threshold` | `CORTEX_SIGNAL__RPPG__NSQI_THRESHOLD` | `float` | `0.293` | ≥ 0.0; ≤ 1.0 | Minimum normalized spectral quality index for a window to count as carrying a cardiac signal |
-| `signal.rppg.min_cardiac_snr_db` | `CORTEX_SIGNAL__RPPG__MIN_CARDIAC_SNR_DB` | `float` | `2.0` | — | Minimum in-band to out-of-band SNR in dB for a window to count as carrying a cardiac signal; the dominant guard against publishing a heart rate read out of noise |
-| `signal.rppg.min_peak_concentration` | `CORTEX_SIGNAL__RPPG__MIN_PEAK_CONCENTRATION` | `float` | `0.4` | ≥ 0.0; ≤ 1.0 | Minimum share of in-band power concentrated at the selected spectral peak for a window to count as carrying a cardiac signal; separates a cardiac line from wandering illumination drift |
+| `signal.rppg.min_cardiac_snr_db` | `CORTEX_SIGNAL__RPPG__MIN_CARDIAC_SNR_DB` | `float` | `0.0` | — | Minimum harmonic SNR in dB (power at the candidate rate and its second harmonic over the rest of the band) for a window to count as carrying a cardiac signal. Windows between this floor and 3 dB are published only when they continue an established rate |
+| `signal.rppg.skin_region` | `CORTEX_SIGNAL__RPPG__SKIN_REGION` | `Literal[face, patches]` | `"face"` | — | Where the skin colour is sampled: 'face' averages the whole facial skin inside the face outline (eyes, brows and lips removed); 'patches' is the earlier forehead-and-cheeks sample |
 | `signal.rppg.minimum_window_quality` | `CORTEX_SIGNAL__RPPG__MINIMUM_WINDOW_QUALITY` | `float` | `0.3` | ≥ 0.0; ≤ 1.0 | Minimum composite acquisition quality (motion, face coverage and spectrum) for a pulse window to be published |
 | `signal.rppg.max_head_jitter_deg` | `CORTEX_SIGNAL__RPPG__MAX_HEAD_JITTER_DEG` | `float` | `7.5` | > 0.0 | — |
 | `signal.rppg.min_valid_coverage` | `CORTEX_SIGNAL__RPPG__MIN_VALID_COVERAGE` | `float` | `0.8` | ≥ 0.0; ≤ 1.0 | — |
 | `signal.rppg.max_interpolation_gap_ms` | `CORTEX_SIGNAL__RPPG__MAX_INTERPOLATION_GAP_MS` | `float` | `250.0` | > 0.0 | — |
 | `signal.rppg.max_motion_rejected_fraction` | `CORTEX_SIGNAL__RPPG__MAX_MOTION_REJECTED_FRACTION` | `float` | `0.1` | ≥ 0.0; ≤ 1.0 | — |
-| `signal.rppg.hrv_min_window_seconds` | `CORTEX_SIGNAL__RPPG__HRV_MIN_WINDOW_SECONDS` | `int` | `180` | ≥ 180 | — |
-| `signal.rppg.hrv_min_valid_ibi` | `CORTEX_SIGNAL__RPPG__HRV_MIN_VALID_IBI` | `int` | `120` | ≥ 120 | — |
-| `signal.rppg.experimental_hrv_enabled` | `CORTEX_SIGNAL__RPPG__EXPERIMENTAL_HRV_ENABLED` | `bool` | `false` | — | — |
+| `signal.rppg.hrv_min_window_seconds` | `CORTEX_SIGNAL__RPPG__HRV_MIN_WINDOW_SECONDS` | `int` | `60` | ≥ 30; ≤ 300 | Clean beat coverage required before beat-to-beat variability (RMSSD, pNN50, SD1) is published; dispersion metrics need twice this |
+| `signal.rppg.hrv_min_valid_ibi` | `CORTEX_SIGNAL__RPPG__HRV_MIN_VALID_IBI` | `int` | `40` | ≥ 20 | Accepted beat intervals required before RMSSD is published |
+| `signal.rppg.experimental_hrv_enabled` | `CORTEX_SIGNAL__RPPG__EXPERIMENTAL_HRV_ENABLED` | `bool` | `true` | — | Publish camera pulse-rate variability when its evidence gates pass |
 | `signal.rppg.respiration_window_seconds` | `CORTEX_SIGNAL__RPPG__RESPIRATION_WINDOW_SECONDS` | `int` | `45` | ≥ 30; ≤ 60 | — |
 | `signal.rppg.respiration_low_hz` | `CORTEX_SIGNAL__RPPG__RESPIRATION_LOW_HZ` | `float` | `0.08` | > 0.0 | — |
 | `signal.rppg.respiration_high_hz` | `CORTEX_SIGNAL__RPPG__RESPIRATION_HIGH_HZ` | `float` | `0.5` | > 0.0 | — |
 | `signal.rppg.respiration_min_channel_quality` | `CORTEX_SIGNAL__RPPG__RESPIRATION_MIN_CHANNEL_QUALITY` | `float` | `0.35` | ≥ 0.0; ≤ 1.0 | — |
 | `signal.rppg.respiration_max_channel_disagreement_bpm` | `CORTEX_SIGNAL__RPPG__RESPIRATION_MAX_CHANNEL_DISAGREEMENT_BPM` | `float` | `3.0` | > 0.0 | — |
-| `signal.rppg.experimental_respiration_enabled` | `CORTEX_SIGNAL__RPPG__EXPERIMENTAL_RESPIRATION_ENABLED` | `bool` | `false` | — | — |
+| `signal.rppg.experimental_respiration_enabled` | `CORTEX_SIGNAL__RPPG__EXPERIMENTAL_RESPIRATION_ENABLED` | `bool` | `true` | — | Publish the camera breathing-rate estimate when its channels agree |
 | `signal.rppg.fps_clamp_min` | `CORTEX_SIGNAL__RPPG__FPS_CLAMP_MIN` | `float` | `10.0` | — | — |
 | `signal.rppg.fps_clamp_max` | `CORTEX_SIGNAL__RPPG__FPS_CLAMP_MAX` | `float` | `60.0` | — | — |
 | `signal.rppg.stabilize` | `CORTEX_SIGNAL__RPPG__STABILIZE` | `bool` | `true` | — | — |

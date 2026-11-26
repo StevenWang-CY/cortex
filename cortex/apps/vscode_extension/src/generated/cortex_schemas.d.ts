@@ -3,7 +3,7 @@
 //
 // Source of truth: cortex/libs/schemas/*.py (Pydantic v2 models).
 // Schema package: cortex-wire/2.0
-// Source SHA-256: 3f1dc9afb1a381d6913b3808ea1177e98fdb4323d5a56a5f9949ea7ace618591
+// Source SHA-256: 692c7926e37b4a83b38d570d47750d2f61879d5cc5bd01e822261b2e0ab97939
 // Drift-gate: a pre-commit hook and the GitHub Actions CI run
 //   `python -m cortex.scripts.generate_ts_schemas --check`
 // and fail if this file is out of sync with the Python models.
@@ -518,6 +518,10 @@ export interface BeatCandidate {
   quality: number;
   source_window_id: string;
   near_window_boundary?: boolean;
+  /**
+   * Estimated standard deviation of this beat instant from the narrow-band signal-to-noise ratio; None when not estimated
+   */
+  timing_sigma_ms?: number | null;
 }
 /**
  * Canonical, overlap-reconciled beat and its provenance.
@@ -533,6 +537,7 @@ export interface BeatEvent {
    * @minItems 1
    */
   source_window_ids: [string, ...string[]];
+  timing_sigma_ms?: number | null;
 }
 /**
  * Context from browser extension.
@@ -1597,7 +1602,7 @@ export interface StateEstimate {
    */
   dwell_seconds?: number;
   /**
-   * Compatibility field; unavailable pending reference validation
+   * Cumulative physiological strain load in strain-seconds; None until camera physiology has been observed
    */
   stress_integral?: number | null;
   /**
@@ -2017,11 +2022,11 @@ export interface FeatureVector {
    */
   hr?: number | null;
   /**
-   * Compatibility field; unavailable in product
+   * RMSSD of camera pulse intervals (ms)
    */
   hrv_rmssd?: number | null;
   /**
-   * Compatibility field; unavailable in product
+   * SDNN of camera pulse intervals (ms)
    */
   hrv_sdnn?: number | null;
   /**
@@ -2101,7 +2106,7 @@ export interface FeatureVector {
    */
   scroll_back_rate_per_min?: number | null;
   /**
-   * Compatibility field; unavailable in product
+   * Breathing rate in breaths/min
    */
   respiration_rate?: number | null;
   /**
@@ -2476,6 +2481,10 @@ export interface InterBeatInterval {
   rejection_reason?: BeatRejectionReason | null;
   correction?: "none";
   quality: number;
+  /**
+   * Mean timing standard deviation of the two bounding beats
+   */
+  timing_sigma_ms?: number | null;
 }
 /**
  * Daemon-to-adapter command emitted only after atomic auth consumption.
@@ -3013,31 +3022,31 @@ export interface PhysioFeatures {
    */
   pulse_quality: number;
   /**
-   * Compatibility field; unavailable in product pending validation
+   * RMSSD of camera pulse intervals in ms over the trailing two minutes, with estimated beat-timing noise removed
    */
   pulse_variability_proxy?: number | null;
   /**
-   * Compatibility field; unavailable in product
+   * SDNN of camera pulse intervals in ms (trailing 5 min)
    */
   hrv_sdnn?: number | null;
   /**
-   * Compatibility field; unavailable in product
+   * Share of successive interval differences above 50 ms
    */
   hrv_pnn50?: number | null;
   /**
-   * Compatibility field; unavailable in product
+   * Poincare SD1 in ms (short-term variability)
    */
   hrv_sd1?: number | null;
   /**
-   * Compatibility field; unavailable in product
+   * Poincare SD2 in ms (long-term variability)
    */
   hrv_sd2?: number | null;
   /**
-   * Compatibility field; unavailable in product
+   * LF/HF power ratio of the interval series
    */
   hrv_lf_hf_ratio?: number | null;
   /**
-   * Compatibility field; unavailable in product
+   * Sample entropy of the interval series
    */
   hrv_sample_entropy?: number | null;
   /**
@@ -3055,7 +3064,7 @@ export interface PhysioFeatures {
    */
   hr_delta_5s?: number | null;
   /**
-   * Compatibility field; unavailable in product pending validation
+   * Breathing rate in breaths/min when two channels agree
    */
   respiration_rate_bpm?: number | null;
   /**
@@ -4413,9 +4422,29 @@ export interface BiometricsSummary {
    */
   heart_rate?: number | null;
   /**
-   * Compatibility field; unavailable in product
+   * RMSSD of camera pulse intervals (ms, trailing two minutes); interpret as a change against the personal reference
    */
   hrv_rmssd?: number | null;
+  /**
+   * SDNN of camera pulse intervals (ms, trailing five minutes)
+   */
+  hrv_sdnn?: number | null;
+  /**
+   * Quality of the current pulse window
+   */
+  pulse_quality?: number | null;
+  /**
+   * Share of the observed physiology that currently points to strain against the personal reference; None while physiology is too sparse
+   */
+  strain?: number | null;
+  /**
+   * Cumulative strain load as a fraction of the break threshold
+   */
+  strain_load_ratio?: number | null;
+  /**
+   * True once a personal reference exists for at least one metric
+   */
+  physiology_reference_ready?: boolean;
   /**
    * Heart-rate delta versus baseline; sign carries direction (positive = above baseline).
    */
@@ -4455,7 +4484,7 @@ export interface BiometricsSummary {
    */
   forward_lean_angle?: number | null;
   /**
-   * Compatibility field; unavailable in product
+   * Breathing rate in breaths/min when two channels agree
    */
   respiration_rate?: number | null;
   /**
@@ -4463,16 +4492,17 @@ export interface BiometricsSummary {
    */
   thrashing_score?: number | null;
   /**
-   * Compatibility field; unavailable pending validation
+   * Cumulative physiological strain load in strain-seconds
    */
   stress_integral?: number | null;
 }
 /**
- * Opt-in elapsed-focus BREAK_RECOMMENDATION wire payload.
+ * BREAK_RECOMMENDATION wire payload.
  *
- * The old HRV-integral fields remain optional decode aliases for one release;
- * production recommendations use ``basis``, elapsed time, and the user's
- * preferred interval.
+ * ``basis`` says why the break is suggested: ``elapsed_focus`` when the
+ * user's preferred focus interval has passed, ``physiological_strain`` when
+ * the cumulative strain load crossed its threshold (``stress_load`` and
+ * ``threshold`` then carry the load, in strain-seconds).
  */
 export interface BreakRecommendation {
   /**
@@ -4483,17 +4513,15 @@ export interface BreakRecommendation {
    * Presentation tone only; elapsed-time reminders use low.
    */
   urgency?: "low" | "medium" | "high";
-  basis?: "elapsed_focus" | "legacy_stress_integral";
+  basis?: "elapsed_focus" | "physiological_strain" | "legacy_stress_integral";
   focus_elapsed_seconds?: number | null;
   preferred_interval_seconds?: number | null;
   /**
-   * @deprecated
-   * Legacy compatibility field; never populated in production.
+   * Strain load in strain-seconds for a physiological_strain break.
    */
   stress_load?: number | null;
   /**
-   * @deprecated
-   * Legacy compatibility field; never populated in production.
+   * Strain-load threshold that was crossed.
    */
   threshold?: number | null;
   /**
