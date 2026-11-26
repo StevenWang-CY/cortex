@@ -279,6 +279,14 @@ exceptions that expired on 2026-11-22.
 - Editor extension: overrides move glob to 14.0.6, minimatch to 11.0.9 and qs
   to 6.17.1, and `@azure/msal-node` resolves to 7.2.3. All four are build and
   test tooling.
+- Intel: Protobuf moves from 4.25.9 to 5.29.6, which closes `PYSEC-2026-1805`
+  (CVE-2026-0994, fixed only in 5.29.6 and 6.33.5). MediaPipe 0.10.21, the
+  last release with a macOS Intel wheel, declares `protobuf<5`; the project
+  restates that release's requirements with the patched range. The Intel-only
+  audit exception, which had expired on 2026-10-15 and kept the Intel audit
+  step and therefore the Intel Python gate from passing on `main` since then,
+  is removed. Every other platform keeps Protobuf 7.36.0. The real-model test
+  asserts the new range on Intel.
 
 ### Documentation
 

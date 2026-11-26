@@ -256,12 +256,12 @@ attest those external settings. See the [privacy disclosure](../cortex/docs/priv
   CI-verified only, while independent review requires both. MediaPipe's
   capped OpenCV contrib dependency is the sole `cv2` provider so wheel install
   order cannot silently change the runtime OpenCV major. That final Intel
-  MediaPipe wheel also constrains Protobuf to a release affected by
-  `PYSEC-2026-1805`; Cortex does not expose the affected Protobuf JSON parser,
-  and a real-model smoke plus an Intel-only audit exception constrain the risk.
-  The exception is re-reviewed on a dated schedule (currently through
-  2026-10-15) and is never extended silently; Intel release support must
-  change or adopt a compatible patched backend before it lapses.
+  MediaPipe wheel declares a Protobuf range in which every release is affected
+  by `PYSEC-2026-1805`. Since 0.6.0 the project resolves the patched 5.x
+  series on Intel instead, against MediaPipe's declared pin; a real-model test
+  in the Intel CI job is the evidence that the combination works, and no Intel
+  Mac has run the packaged app with it. Cortex does not expose the affected
+  Protobuf JSON parser either way.
 - **Dependency audit results are scoped snapshots.** The October local arm64
   Python and VS Code audits reported no known findings. The browser build
   chain retains eleven reviewed exceptions (nine low/moderate, two high
