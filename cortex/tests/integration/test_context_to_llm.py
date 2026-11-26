@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 
 from cortex.libs.schemas.context import (
     BrowserContext,
@@ -565,6 +566,29 @@ class TestPrivacy:
 # ============================================================================
 
 
+def _fastest_mean_seconds(
+    call: Callable[[int], object], *, batches: int = 5, calls: int = 100
+) -> float:
+    """Mean time per call in the fastest of several batches.
+
+    A hosted runner can stop a process for hundreds of milliseconds at any
+    moment.  The mean of a single batch then measures the runner: the Intel
+    job once reported 6.93 ms against a 5 ms budget for a scoring call that
+    takes 0.2 ms under coverage.  The fastest batch estimates what the code
+    costs, which is what a budget is for.  The budgets are unchanged.
+    """
+
+    best = float("inf")
+    index = 0
+    for _ in range(batches):
+        start = time.perf_counter()
+        for _ in range(calls):
+            call(index)
+            index += 1
+        best = min(best, (time.perf_counter() - start) / calls)
+    return best
+
+
 class TestPerformance:
     """Performance benchmarks for pipeline stages."""
 
@@ -576,10 +600,7 @@ class TestPerformance:
         fusion.update_kinematics(_flow_kinematics(), ts)
         fusion.update_telemetry(_flow_telemetry(), ts)
 
-        start = time.monotonic()
-        for i in range(100):
-            fusion.fuse(ts + i)
-        elapsed = (time.monotonic() - start) / 100
+        elapsed = _fastest_mean_seconds(lambda i: fusion.fuse(ts + i))
 
         assert elapsed < 0.010, f"Fusion: {elapsed*1000:.2f}ms (budget: 10ms)"
 
@@ -596,10 +617,7 @@ class TestPerformance:
             tab_switch_frequency=5.0,
         )
 
-        start = time.monotonic()
-        for _ in range(100):
-            scorer.compute_scores(vector)
-        elapsed = (time.monotonic() - start) / 100
+        elapsed = _fastest_mean_seconds(lambda _i: scorer.compute_scores(vector))
 
         assert elapsed < 0.005, f"Scoring: {elapsed*1000:.2f}ms (budget: 5ms)"
 
@@ -608,10 +626,7 @@ class TestPerformance:
         ctx = _make_coding_context()
         state = _make_state_estimate()
 
-        start = time.monotonic()
-        for _ in range(100):
-            build_messages(ctx, state)
-        elapsed = (time.monotonic() - start) / 100
+        elapsed = _fastest_mean_seconds(lambda _i: build_messages(ctx, state))
 
         assert elapsed < 0.005, f"Prompt: {elapsed*1000:.2f}ms (budget: 5ms)"
 
@@ -619,10 +634,7 @@ class TestPerformance:
         """JSON parsing + validation should complete in < 5ms."""
         raw = _valid_llm_json()
 
-        start = time.monotonic()
-        for _ in range(100):
-            parse_and_validate(raw)
-        elapsed = (time.monotonic() - start) / 100
+        elapsed = _fastest_mean_seconds(lambda _i: parse_and_validate(raw))
 
         assert elapsed < 0.005, f"Parsing: {elapsed*1000:.2f}ms (budget: 5ms)"
 
