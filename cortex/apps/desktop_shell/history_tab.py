@@ -2176,7 +2176,7 @@ class HistoryTab(QWidget):
         except Exception:
             pass
         if isinstance(report, dict) and report.get("session_id"):
-            self.apply_session_detail({"report": dict(report)})
+            self._render_session_detail({"report": dict(report)})
             return
         self._on_row_clicked(session_id)
 
@@ -2281,6 +2281,25 @@ class HistoryTab(QWidget):
         self._today_panel.apply_payload(payload)
 
     def apply_session_detail(self, payload: dict) -> None:
+        # A reply nobody is waiting for -- the user went Back or switched
+        # segment, or opened another session since -- must not pop the
+        # overlay back up or replace the session being loaded.
+        pending = self._pending_detail_id
+        if pending is None:
+            logger.debug("ignoring unrequested SESSION_DETAIL")
+            return
+        report = payload.get("report") if isinstance(payload, dict) else None
+        if isinstance(report, dict):
+            replied_id = str(report.get("session_id") or "")
+            if replied_id and replied_id != pending:
+                logger.debug(
+                    "ignoring SESSION_DETAIL for %s while %s is pending",
+                    replied_id, pending,
+                )
+                return
+        self._render_session_detail(payload)
+
+    def _render_session_detail(self, payload: dict) -> None:
         # Phase 4.B fix (#13): cancel the detail-request timeout now
         # that the response (or an error envelope) has arrived. The
         # panel's apply_payload clears the loading flag itself.
