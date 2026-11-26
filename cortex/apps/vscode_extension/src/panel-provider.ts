@@ -56,6 +56,9 @@ export class CortexPanelProvider
     private _whyDetailInFlight: string | null = null;
     /** A12: mirror of ``workbench.reduceMotion === "on"``. */
     private _reduceMotion = false;
+    /** Briefing asked for before the view existed; posted once on resolve. */
+    private _pendingBriefing: Record<string, unknown> | null = null;
+    private _disposed = false;
 
     constructor(extensionUri: vscode.Uri, wsClient: CortexWSClient) {
         this._extensionUri = extensionUri;
@@ -133,6 +136,8 @@ export class CortexPanelProvider
 
     /** A8/A10: drop the view and every subscription this provider owns. */
     dispose(): void {
+        this._disposed = true;
+        this._pendingBriefing = null;
         this._disposeViewSubscriptions();
         for (const d of this._disposables.splice(0)) {
             try {
@@ -188,6 +193,11 @@ export class CortexPanelProvider
         );
 
         this._updatePanel();
+
+        if (this._pendingBriefing) {
+            this._post({ type: "morningBriefing", payload: this._pendingBriefing });
+            this._pendingBriefing = null;
+        }
     }
 
     /** intervention_id of the intervention currently on screen, if any. */
@@ -221,14 +231,38 @@ export class CortexPanelProvider
         this._whyDetailInFlight = null;
         this._updatePanel();
 
-        // Ensure panel is visible
-        this.showPanel();
+        // Reveal an already-resolved view without taking focus. Arrival never
+        // opens an unresolved view: that would switch the sidebar away from
+        // whatever the user had open.
+        this._revealResolvedView();
     }
 
     /**
-     * Focus/reveal the side panel.
+     * Focus/reveal the side panel on an explicit user request.
+     *
+     * VS Code resolves a webview view only once it is first made visible, so
+     * until the user has opened the Cortex sidebar there is no view to
+     * ``show()``. The command palette entry, the status-bar click and every
+     * toast's View Details / Open Dashboard / Show Details used to return
+     * silently here; they now open the view through the focus command VS Code
+     * registers for it, which resolves it.
      */
     showPanel(): void {
+        if (this._disposed) return;
+        if (this._view) {
+            this._revealResolvedView();
+            return;
+        }
+        try {
+            void Promise.resolve(
+                vscode.commands.executeCommand("cortex.interventionPanel.focus"),
+            ).catch(() => undefined);
+        } catch {
+            // Host without the command (tests, torn-down workbench).
+        }
+    }
+
+    private _revealResolvedView(): void {
         if (!this._view) return;
         try {
             this._view.show(true);
@@ -238,6 +272,12 @@ export class CortexPanelProvider
     }
 
     public showMorningBriefing(payload: Record<string, unknown>): void {
+        if (!this._view) {
+            // Rendered by message only, so keep it until the view resolves.
+            this._pendingBriefing = payload;
+            this.showPanel();
+            return;
+        }
         this.showPanel();
         this._post({
             type: "morningBriefing",
