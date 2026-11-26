@@ -18,6 +18,14 @@ from cortex.services.session_report.models import (
 
 logger = logging.getLogger(__name__)
 
+# The daemon records a state every 500 ms, so a longer silence between two
+# records (or before the report is composed) means the machine slept or the
+# loop stalled. Unobserved time is not credited to the last label (AGENTS
+# rule 39): an overnight lid-close in FLOW otherwise reported eight hours of
+# flow and an eight-hour "longest flow streak". Generous so sparse,
+# transition-style callers (tests record minutes apart) keep their meaning.
+_MAX_CREDITED_GAP_S: float = 600.0
+
 
 class SessionReportGenerator:
     """Accumulates session events and generates a final report.
@@ -115,6 +123,10 @@ class SessionReportGenerator:
         """
         now = timestamp
         unchanged = self._current_state == state
+        unobserved_gap = (
+            self._current_state is not None
+            and now - self._current_state_start > _MAX_CREDITED_GAP_S
+        )
         if self._current_state is not None:
             # P0 Pipeline B: clamp negative dt to defend against NTP
             # backjumps (system clock leaping backwards while the daemon
@@ -145,7 +157,15 @@ class SessionReportGenerator:
                     "dt_seconds": raw_dt,
                     "state": self._current_state,
                 })
-            dt = max(0.0, raw_dt)
+            if unobserved_gap:
+                self._clock_anomalies.append({
+                    "timestamp": now,
+                    "kind": "unobserved_gap",
+                    "raw_dt_seconds": raw_dt,
+                    "dt_seconds": raw_dt,
+                    "state": self._current_state,
+                })
+            dt = 0.0 if unobserved_gap else max(0.0, raw_dt)
             self._state_durations[self._current_state] += dt
 
             # Track hourly flow (use UTC consistently — F26).
@@ -161,10 +181,19 @@ class SessionReportGenerator:
                     timestamp=datetime.fromtimestamp(now, tz=UTC),
                 ))
 
-        # Track flow streaks
-        if state == "FLOW" and self._current_state != "FLOW":
+        # Track flow streaks. A streak interrupted by an unobserved gap ends
+        # at the last observed record, and a new one starts after it.
+        in_flow = self._current_state == "FLOW"
+        if unobserved_gap and in_flow:
+            if self._current_flow_start is not None:
+                self._flow_streaks.append(
+                    max(0.0, self._current_state_start - self._current_flow_start)
+                )
+            self._current_flow_start = None
+            in_flow = False
+        if state == "FLOW" and not in_flow:
             self._current_flow_start = now
-        elif state != "FLOW" and self._current_state == "FLOW":
+        elif state != "FLOW" and in_flow:
             if self._current_flow_start is not None:
                 self._flow_streaks.append(now - self._current_flow_start)
             self._current_flow_start = None
@@ -297,8 +326,16 @@ class SessionReportGenerator:
         hourly_total = dict(self._hourly_total)
         hourly_flow = dict(self._hourly_flow)
         flow_streaks = list(self._flow_streaks)
+        # The open segment ends at ``end_ts`` unless the report is composed
+        # after an unobserved gap; then it ends at the last observed record.
+        open_segment_end = end_ts
+        if (
+            self._current_state is not None
+            and end_ts - self._current_state_start > _MAX_CREDITED_GAP_S
+        ):
+            open_segment_end = self._current_state_start
         if self._current_state is not None:
-            dt = end_ts - self._current_state_start
+            dt = open_segment_end - self._current_state_start
             if dt > 0:
                 state_durations[self._current_state] = (
                     state_durations.get(self._current_state, 0.0) + dt
@@ -308,7 +345,7 @@ class SessionReportGenerator:
                 if self._current_state == "FLOW":
                     hourly_flow[hour] = hourly_flow.get(hour, 0.0) + dt
         if self._current_state == "FLOW" and self._current_flow_start is not None:
-            streak = end_ts - self._current_flow_start
+            streak = open_segment_end - self._current_flow_start
             if streak > 0:
                 flow_streaks.append(streak)
 

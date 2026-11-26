@@ -12,6 +12,7 @@ import asyncio
 import copy
 import json
 import logging
+import math
 import os
 import queue
 import threading
@@ -460,6 +461,10 @@ _AUTO_FOCUS_DEBOUNCE_S: float = 30.0
 # nightly tick. Daily baselines older than this are pruned from
 # ``storage/chronotype/daily/*.json``.
 _CHRONOTYPE_WINDOW_DAYS: int = 90
+# The neutral value of the desktop sensitivity slider's ``entry_threshold``
+# (``0.85 + (3 - sensitivity) * 0.05``); only its offset from this anchor is
+# meaningful to the trigger gate.
+_SENSITIVITY_SCALE_ANCHOR: float = 0.85
 
 _EXECUTION_MODES = frozenset(
     {
@@ -734,6 +739,9 @@ class CortexDaemon:
     ) -> None:
         self.config = config or get_config()
         self._clock = clock or SYSTEM_CLOCK
+        # The Settings sensitivity slider moves the trigger gate around the
+        # configured base; captured once so repeated Applies cannot drift.
+        self._default_overlay_threshold = float(self.config.intervention.overlay_threshold)
         storage_root = Path(self.config.storage.path).expanduser()
         self._database = SQLiteDatabase(
             storage_root / self.config.storage.sqlite_filename,
@@ -916,7 +924,12 @@ class CortexDaemon:
             execution_mode=self.intervention_execution_mode,
             clock=self._clock,
         )
-        self._project_launcher = ProjectLauncher(storage_path=self.config.storage.path)
+        self._project_launcher = ProjectLauncher(
+            storage_path=self.config.storage.path,
+            # Audit F12's documented extension point; it was never threaded
+            # through, so every user-added binary stayed unsupported_command.
+            user_command_allowlist=self.config.launcher.user_command_allowlist,
+        )
         self._restore_manager = RestoreManager(
             self._executor,
             timeout_seconds=float(self.config.intervention.timeout_minutes * 60),
@@ -2110,6 +2123,7 @@ class CortexDaemon:
         # native extension call it can lead to a segfault on resume.
         self._install_loop_signal_handlers()
         self._register_services()
+        self._bind_os_notification_actions()
         self._restore_quiet_mode_from_policy()
         ws_started = await self._ws_server.start()
         if not ws_started:
@@ -2321,6 +2335,8 @@ class CortexDaemon:
             from cortex.libs.utils import macos_notifications as _mn
 
             _mn.mark_shutting_down()
+            # Drop this daemon's receiver; a successor binds its own.
+            _mn.set_user_action_handler(None)
         except Exception:
             logger.debug(
                 "macos_notifications.mark_shutting_down failed",
@@ -3672,6 +3688,10 @@ class CortexDaemon:
         self._services.register("latest_telemetry", features)
         self._runtime_data.publish_telemetry(features)
         self._feature_fusion.update_telemetry(features)
+        # Window thrashing is one of the seven workspace-complexity factors.
+        # Nothing fed it, so it was a constant zero and rapid window switching
+        # never moved the complexity score or its trigger gate.
+        self._context_engine.set_window_switch_rate(features.window_switch_rate)
 
     async def _refresh_context(self) -> None:
         """Build and publish one context snapshot."""
@@ -4062,12 +4082,17 @@ class CortexDaemon:
                     # and the user's declared interval; the strain-based
                     # suggestion below is separate and has its own switch.
                     inactivity_feature = vector.features.get(FeatureName.INACTIVITY_SECONDS)
-                    input_is_active = bool(
-                        inactivity_feature is not None
+                    # Unavailable input is not observed inactivity (rule 38):
+                    # ``None`` neither accrues focus nor counts toward a break.
+                    input_is_active: bool | None = (
+                        bool(
+                            inactivity_feature.value
+                            < self.config.intervention.focus_break_inactivity_pause_seconds
+                        )
+                        if inactivity_feature is not None
                         and inactivity_feature.valid
                         and inactivity_feature.value is not None
-                        and inactivity_feature.value
-                        < self.config.intervention.focus_break_inactivity_pause_seconds
+                        else None
                     )
                     self._focus_break_policy.update_preferences(
                         enabled=(self.config.intervention.enable_focus_break_reminders),
@@ -6271,10 +6296,14 @@ class CortexDaemon:
         if not intervention_id:
             return None
         cached = self._causal_signals_by_intervention.get(intervention_id)
-        if cached:
+        # An empty cached list is the trigger-time answer "no strong observed
+        # contributor", not a miss. Treating it as a miss answered the Why?
+        # panel (which asks exactly when the plan carried no signals) with
+        # whatever was abnormal at the moment of the click.
+        if cached is not None:
             return list(cached)
         # Fall back to live attribution against the most recent feature
-        # vector + baselines if available.
+        # vector + baselines if available (an unknown or evicted id).
         try:
             latest_features = self._current_feature_vector()
             if latest_features is None:
@@ -6609,6 +6638,69 @@ class CortexDaemon:
         except Exception:
             logger.debug("desktop focus probe raised", exc_info=True)
             return True
+
+    def _bind_os_notification_actions(self) -> None:
+        """Route macOS banner buttons into this daemon (P0 §3.12).
+
+        Banners carry "Open" and "Snooze 15" buttons; the delegate forwards a
+        click to whatever handler is registered, and nothing registered one,
+        so both buttons did nothing. Called from :meth:`start` with the
+        daemon loop running. Clicks arrive on the AppKit main thread and are
+        marshalled onto that loop. Also re-arms the process-wide shutdown
+        latch a previous in-process daemon's :meth:`stop` left set.
+        """
+        try:
+            from cortex.libs.utils import macos_notifications as _mn
+        except ImportError:
+            return
+        loop = asyncio.get_running_loop()
+
+        def _on_click(intervention_id: str, action_id: str) -> None:
+            try:
+                loop.call_soon_threadsafe(
+                    self._schedule_os_notification_action,
+                    intervention_id,
+                    action_id,
+                )
+            except RuntimeError:
+                # The loop already closed; the click has no daemon to reach.
+                logger.debug("notification click after loop close ignored")
+
+        _mn.clear_shutting_down()
+        _mn.set_user_action_handler(_on_click)
+
+    def _schedule_os_notification_action(
+        self, intervention_id: str, action_id: str,
+    ) -> None:
+        """Loop-thread half of a banner click; never runs during stop."""
+        if self._stop_started:
+            return
+        self._spawn_background_task(
+            self._handle_os_notification_action(intervention_id, action_id),
+            name="cortex-notification-action",
+        )
+
+    async def _handle_os_notification_action(
+        self, intervention_id: str, action_id: str,
+    ) -> None:
+        """Apply one banner click: "snooze" snoozes, a tap or "open" raises."""
+        if action_id == "snooze":
+            await self.set_quiet_mode(
+                "snooze_15", duration_minutes=15, source="os_notification",
+            )
+            return
+        try:
+            await self._ws_server.send_message(
+                MessageType.RAISE_DASHBOARD.value,
+                {"target": None},
+                target_client_types=["desktop"],
+            )
+        except Exception:
+            logger.debug(
+                "RAISE_DASHBOARD for notification %s failed",
+                intervention_id,
+                exc_info=True,
+            )
 
     async def _dispatch_os_notification(self, plan: InterventionPlan) -> None:
         """P0 §3.12: fire a macOS UNUserNotification for an intervention.
@@ -7392,6 +7484,18 @@ class CortexDaemon:
             logger.debug("policy terminal observation failed", exc_info=True)
 
         if outcome is None:
+            # A proposal that changed nothing has no RestoreManager session
+            # (one starts only after a verified workspace receipt), so every
+            # close of it lands here. Returning without releasing the slot
+            # left ``_active_intervention_id`` set in the default
+            # suggest_only mode, and every later proposal was refused for
+            # the rest of the session.
+            if (
+                action != "restore"
+                and self._active_intervention_id == intervention_id
+                and self._restore_manager.get_active(intervention_id) is None
+            ):
+                await self._close_effectless_proposal(intervention_id, action)
             return
 
         self._recorder.append("intervention_outcome", outcome.model_dump(mode="json"))
@@ -7423,6 +7527,57 @@ class CortexDaemon:
 
         # Record tab relevance feedback (skip if per-tab feedback was already received)
         await self._record_tab_relevance_feedback(action, outcome, intervention_id)
+
+    # Lifecycle states in which a consumed authorization may have changed the
+    # workspace. Such a transaction closes through receipts and the exact
+    # restore path, never by relabelling the proposal.
+    _EFFECT_POSSIBLE_STATES: frozenset[str] = frozenset(
+        {
+            InterventionLifecycleState.APPLYING.value,
+            InterventionLifecycleState.APPLIED.value,
+            InterventionLifecycleState.PARTIAL.value,
+            InterventionLifecycleState.RESTORING.value,
+            InterventionLifecycleState.RESTORE_FAILED.value,
+        }
+    )
+
+    async def _close_effectless_proposal(self, intervention_id: str, action: str) -> bool:
+        """Release a presented proposal the user closed before any effect.
+
+        Abandons the transaction (pre-effect states only), frees the slot and
+        cached plan, tells every surface the proposal is closed and ends its
+        helpfulness tracking with the user's action. Returns False, keeping
+        everything, when the transaction may already carry an effect.
+        """
+
+        try:
+            abandoned = await self._transaction_coordinator.abandon(
+                intervention_id,
+                f"user_{action}",
+            )
+            if not abandoned:
+                transaction = await self._transaction_coordinator.get_transaction(
+                    intervention_id,
+                )
+                state = getattr(transaction, "state", None)
+                if str(getattr(state, "value", state)) in self._EFFECT_POSSIBLE_STATES:
+                    return False
+        except Exception:
+            logger.exception("Could not close proposal %s", intervention_id)
+            return False
+
+        if self._active_intervention_id == intervention_id:
+            self._active_intervention_id = None
+        async with self._micro_step_lock:
+            if (
+                self._active_plan is not None
+                and self._active_plan.intervention_id == intervention_id
+            ):
+                self._active_plan = None
+                self._micro_step_recovery_fired = False
+        await self._ws_server.send_restore(intervention_id, user_action=action)
+        await self._close_helpfulness_tracking(intervention_id, action)
+        return True
 
     async def _record_tab_relevance_feedback(
         self,
@@ -7559,10 +7714,11 @@ class CortexDaemon:
         payload = message.get("payload")
         if not message_type:
             return
+        # Edge runs the same extension and identifies as ``"edge"``.
         await self._ws_server.send_message(
             message_type,
             payload if isinstance(payload, dict) else {},
-            target_client_types=["chrome"],
+            target_client_types=["chrome", "edge"],
         )
 
     async def _handle_leetcode_context_update(self, payload: dict[str, Any]) -> None:
@@ -8430,7 +8586,16 @@ class CortexDaemon:
         if "entry_threshold" in settings:
             threshold = float(settings["entry_threshold"])
             self.config.state.entry_threshold = threshold
-            self.config.intervention.overlay_threshold = threshold
+            # The dialog sends ``0.85 + (3 - sensitivity) * 0.05``, a scale
+            # anchored at the retired 0.85 state default. Copying it into
+            # the trigger gate (default 0.70) raised the threshold to 0.85
+            # on every Apply with the slider untouched, and even the most
+            # sensitive position (0.75) was stricter than the default. Apply
+            # the slider's offset to the configured base instead.
+            offset = threshold - _SENSITIVITY_SCALE_ANCHOR
+            self.config.intervention.overlay_threshold = min(
+                1.0, max(0.0, self._default_overlay_threshold + offset),
+            )
             # Audit-2 fix: preserve cooldown / dwell state across a
             # live settings change. Re-creating ``TriggerPolicy`` reset
             # every counter and let interventions fire immediately even
@@ -8539,7 +8704,19 @@ class CortexDaemon:
         if "quiet_mode" in settings:
             requested_on = bool(settings["quiet_mode"])
             duration = int(settings.get("quiet_duration_minutes") or 0)
-            if requested_on:
+            if requested_on and self._quiet_mode_kind == "pause":
+                # The pause's own SETTINGS_SYNC tells the dialog
+                # ``quiet_mode: true``, so its next Apply sends the checkbox
+                # back checked. Honouring that as "snooze" turned an
+                # indefinite pause into a timed snooze and reopened the
+                # camera the user had just released. Quiet is already on;
+                # only the dedicated quiet controls change its kind.
+                logger.info(
+                    "settings_sync quiet_mode=true ignored while paused "
+                    "(source=%s)",
+                    settings.get("source") or "settings_sync",
+                )
+            elif requested_on:
                 # Honour an explicit duration; otherwise leave at the
                 # default for snooze_15.
                 await self.set_quiet_mode(
@@ -8616,6 +8793,24 @@ class CortexDaemon:
             self.config.intervention.enable_os_notifications = bool(
                 settings["enable_os_notifications"]
             )
+        # P0 §3.15: the Settings "Daily LLM cap" (USD; 0 = unlimited). The
+        # dialog sends it in every Apply and nothing read it, so spend ran to
+        # the built-in default whatever cap the user chose. A non-finite or
+        # unparsable value is ignored rather than read as "unlimited".
+        if "daily_llm_budget_usd" in settings:
+            try:
+                requested_budget = float(settings["daily_llm_budget_usd"])
+            except (TypeError, ValueError):
+                requested_budget = float("nan")
+            if math.isfinite(requested_budget):
+                budget = max(0.0, requested_budget)
+                self.config.llm.daily_cost_budget_usd = budget
+                tracker = getattr(self._llm_client, "_cost_tracker", None)
+                set_kill_usd = getattr(tracker, "set_kill_usd", None)
+                if callable(set_kill_usd):
+                    set_kill_usd(budget)
+            else:
+                logger.warning("Ignoring non-finite daily_llm_budget_usd setting")
         # External model transport is a separate, revision-bound privacy
         # choice from provider selection.  Every update rebuilds the planner
         # once and burns pending previews from the prior configuration.
@@ -8688,6 +8883,14 @@ class CortexDaemon:
         # validated configuration even if a compromised client attempted to
         # smuggle a more-authoritative value in SETTINGS_SYNC.
         applied["execution_mode"] = self.intervention_execution_mode
+        # Quiet state is the daemon's, not the sender's. Echoing the raw
+        # payload reported ``quiet_mode: false`` for a pause the daemon kept,
+        # and a partial payload (the browser's ``{webcam_enabled: true}``)
+        # carried no key at all, which the browser reads as "not quiet" —
+        # dropping its own notification gate and inverting its pause
+        # shortcut. Report what ``set_quiet_mode`` broadcasts.
+        applied["quiet_mode"] = self._quiet_mode_kind != "off"
+        applied["quiet_mode_kind"] = self._quiet_mode_kind
         await self._ws_server.broadcast_settings(applied)
 
     # ------------------------------------------------------------------

@@ -1834,7 +1834,17 @@ async def launch_project(
             errors=["No project launcher available"],
         )
     try:
-        await _asyncio.wait_for(launcher.launch(project_name), timeout=20.0)
+        result = await _asyncio.wait_for(launcher.launch(project_name), timeout=20.0)
+        # ``ProjectLauncher.launch`` reports an unknown project by returning
+        # ``success: False`` rather than raising, which this route used to
+        # answer with ``launched: true``.
+        if isinstance(result, dict) and result.get("success") is False:
+            return LaunchProjectResponse.from_clock(
+                _get_clock(request),
+                launched=False,
+                project_name=project_name,
+                errors=["project_not_found"],
+            )
         return LaunchProjectResponse.from_clock(
             _get_clock(request),
             launched=True,
@@ -2112,13 +2122,14 @@ async def submit_feedback(
         stamp = ts.strftime("%Y%m%dT%H%M%S")
         path = feedback_dir / f"{stamp}_{report_id}.json"
         atomic_write_json(path, record)
-    except OSError:
+    except OSError as exc:
         logger.exception("POST /api/feedback failed to persist")
-        return FeedbackResponse.from_clock(
-            _get_clock(request),
-            ok=False,
-            report_id=report_id,
-        )
+        # A failure status, not ``200 {ok: false}``: the popup decides
+        # "saved" from the HTTP status, so a full disk or an unwritable
+        # feedback directory cleared the user's report while telling them
+        # it was saved, and the offline queue dropped its retries the same
+        # way. A non-2xx keeps the text in the dialog and the item queued.
+        raise HTTPException(status_code=503, detail="storage_unavailable") from exc
 
     return FeedbackResponse.from_clock(
         _get_clock(request),

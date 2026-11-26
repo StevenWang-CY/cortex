@@ -120,6 +120,10 @@ hiddenimports = [
     # ``import UserNotifications`` because PyObjC frameworks are
     # resolved through the dynamic ``objc.loadBundle`` machinery.
     "UserNotifications",
+    # The microphone receptivity probe (``libs/utils/receptivity.py``)
+    # imports CoreAudio lazily inside the probe; name it so the frozen app
+    # cannot silently lose the mic-active gate.
+    "CoreAudio",
 
     # MediaPipe
     "mediapipe",

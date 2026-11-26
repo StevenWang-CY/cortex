@@ -20,6 +20,7 @@ import json
 import logging
 from collections import deque
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -93,6 +94,16 @@ AUTH_DEADLINE_SECONDS: float = 30.0
 # the bound exists so one hostile or corrupted frame cannot pin the socket's
 # high-water mark at a number no honest apply can ever exceed.
 _MAX_SETTINGS_VERSION: int = 2**31
+
+# Whether the frame being dispatched carried its own correlation id.
+# ``_process_message`` mints an id for every cid-less frame so log lines and
+# replies correlate, but a minted id says nothing about which plan the client
+# saw. The stale-ACK guard reads this to keep honouring cid-less frames as
+# legacy clients; direct handler calls (tests, in-process callers) default to
+# "supplied", the guard's historical behaviour.
+_CLIENT_SUPPLIED_CID: ContextVar[bool] = ContextVar(
+    "cortex_ws_client_supplied_cid", default=True,
+)
 
 
 def _receipt_has_restorable_effect(receipt: Any) -> bool:
@@ -1050,10 +1061,14 @@ class WebSocketServer:
                 "Replacing malformed correlation id from %s", client.client_id,
             )
             msg.correlation_id = None
-        with correlation_scope(msg.correlation_id) as cid:
-            if msg.correlation_id is None:
-                msg.correlation_id = cid
-            await self._dispatch_message(client, msg)
+        supplied_token = _CLIENT_SUPPLIED_CID.set(msg.correlation_id is not None)
+        try:
+            with correlation_scope(msg.correlation_id) as cid:
+                if msg.correlation_id is None:
+                    msg.correlation_id = cid
+                await self._dispatch_message(client, msg)
+        finally:
+            _CLIENT_SUPPLIED_CID.reset(supplied_token)
 
     async def _dispatch_message(
         self, client: WebSocketClient, msg: WSMessage,
@@ -1420,10 +1435,17 @@ class WebSocketServer:
         on the extension side (atomic-swap by latest cid). Log a warning
         and drop the message without invoking the callback so the
         dismissal model is not poisoned by stale ACKs.
+
+        A correlation id minted by ``_process_message`` is not an echo of
+        any plan, so such a frame counts as cid-less here. Comparing the
+        minted id instead dropped every USER_RATING and every cid-less
+        USER_ACTION (the browser's rating relay, VS Code dismiss/engage,
+        desktop WS mode) as stale.
         """
         action = msg.payload.get("action")
         intervention_id = msg.payload.get("intervention_id")
         incoming_cid = msg.correlation_id
+        echoed_cid = incoming_cid if _CLIENT_SUPPLIED_CID.get() else None
 
         if isinstance(intervention_id, str) and intervention_id:
             active_cid = self._active_intervention_cid.get(intervention_id)
@@ -1431,7 +1453,7 @@ class WebSocketServer:
             # incoming cid is treated as a legacy client and honoured;
             # a missing active cid means we never emitted a trigger for
             # this intervention_id (e.g. on test fixtures), also honoured.
-            if active_cid and incoming_cid and active_cid != incoming_cid:
+            if active_cid and echoed_cid and active_cid != echoed_cid:
                 logger.warning(
                     "Dropping stale USER_ACTION action=%s intervention_id=%s "
                     "cid=%s active_cid=%s client=%s",
