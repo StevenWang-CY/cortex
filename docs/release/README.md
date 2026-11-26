@@ -95,8 +95,8 @@ Developer Account Holder to review the team's agreements in the Developer
 portal and App Store Connect. Rotating passwords or bypassing notarization
 does not resolve this account condition. After the agreement is accepted,
 rerun the failed release workflow; retain the same source tag and evidence
-requirements. The preceding v0.5.0 workflow encountered this condition on both
-architectures.
+requirements. The v0.5.0, v0.5.1 and v0.6.0 workflows all stopped at this
+condition.
 
 The scrubbed key-free environment consumed by PyInstaller and any developer
 environment backup are also staged in the runner temporary directory, outside
