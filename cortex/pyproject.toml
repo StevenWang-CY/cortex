@@ -286,6 +286,31 @@ required-environments = [
     "sys_platform == 'darwin' and platform_machine == 'x86_64'",
 ]
 
+# MediaPipe 0.10.21 is the last release with a macOS Intel wheel and is
+# installed on Intel only.  It declares ``protobuf<5,>=4.25.3``, and every 4.x
+# release is affected by PYSEC-2026-1805 (CVE-2026-0994), fixed only in 5.29.6
+# and 6.33.5.  This entry restates that one release's requirements with the
+# Protobuf line moved to the patched 5.x series; nothing else differs from
+# what PyPI publishes.  The real-model test in
+# ``tests/integration/test_mediapipe_runtime_boundary.py`` is the evidence
+# that the FaceLandmarker still loads and runs with it on Intel.
+[[tool.uv.dependency-metadata]]
+name = "mediapipe"
+version = "0.10.21"
+requires-dist = [
+    "absl-py",
+    "attrs>=19.1.0",
+    "flatbuffers>=2.0",
+    "jax",
+    "jaxlib",
+    "matplotlib",
+    "numpy<2",
+    "opencv-contrib-python",
+    "protobuf>=5.29.6,<6",
+    "sentencepiece",
+    "sounddevice>=0.4.4",
+]
+
 [tool.coverage.run]
 branch = true
 source = ["cortex"]
