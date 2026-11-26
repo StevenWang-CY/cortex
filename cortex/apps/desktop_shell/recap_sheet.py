@@ -590,6 +590,13 @@ class RecapSheet(QWidget):
         except Exception:
             pass
 
+    def focusNextPrevChild(self, next: bool) -> bool:  # noqa: A002, D401 - Qt override
+        # Tab / Shift-Tab between the buttons is a keyboard user's hover:
+        # they are choosing, so the autohide must not close the sheet under
+        # them. Qt routes Tab here before any keyPressEvent sees it.
+        self._autohide.stop()
+        return bool(super().focusNextPrevChild(next))
+
     def mousePressEvent(self, event: Any) -> None:  # noqa: D401 - Qt override
         # Any click anywhere on the card cancels the autohide too.
         self._autohide.stop()
