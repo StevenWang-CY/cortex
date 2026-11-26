@@ -154,6 +154,59 @@ afterEach(() => {
     jest.useRealTimers();
 });
 
+const FLOW_ESTIMATE = {
+    state: "FLOW",
+    status: "estimated",
+    confidence: 0.84,
+    evidence_coverage: 0.9,
+};
+
+describe("status bar quiet mode lifetime", () => {
+    it("stops masking the estimate once a timed mode's end time has passed", async () => {
+        const h = await activateHarness();
+        connect(h);
+        h.deliver("QUIET_MODE_STATE", {
+            kind: "snooze_15",
+            duration_minutes: 1,
+            ends_at_unix_ms: Date.now() + 60_000,
+            source: "vscode",
+        });
+        h.deliver("STATE_UPDATE", FLOW_ESTIMATE);
+        expect(h.statusBar().text).toContain("Snoozed");
+
+        // The daemon lapses a timed snooze on restart without broadcasting
+        // "off", and a decay frame sent while this window was disconnected is
+        // never replayed. The daemon itself treats a passed end time as off.
+        jest.setSystemTime(Date.now() + 61_000);
+        h.deliver("STATE_UPDATE", FLOW_ESTIMATE);
+        expect(h.statusBar().text).not.toContain("Snoozed");
+        expect(h.statusBar().text).toContain("Steady activity");
+    });
+
+    it("an indefinite pause stays until the daemon says otherwise", async () => {
+        const h = await activateHarness();
+        connect(h);
+        h.deliver("QUIET_MODE_STATE", { kind: "pause", source: "dashboard" });
+        jest.setSystemTime(Date.now() + 6 * 60 * 60 * 1000);
+        h.deliver("STATE_UPDATE", FLOW_ESTIMATE);
+        expect(h.statusBar().text).toContain("Paused");
+    });
+
+    it("remembers a mode that arrived while the status bar was hidden", async () => {
+        const h = await activateHarness({ "cortex.showStatusBar": false });
+        connect(h);
+        h.deliver("QUIET_MODE_STATE", { kind: "pause", source: "dashboard" });
+
+        const mockWorkspace = h.vscode.workspace as unknown as {
+            __setConfig(key: string, value: unknown): void;
+            __fireConfigChange(keys: string[]): void;
+        };
+        mockWorkspace.__setConfig("cortex.showStatusBar", true);
+        mockWorkspace.__fireConfigChange(["cortex.showStatusBar"]);
+        expect(h.statusBar().text).toContain("Paused");
+    });
+});
+
 describe("DISMISS_OVERLAY (P0 §3.21 cross-surface dismiss)", () => {
     it("clears the intervention the daemon dismissed from the panel", async () => {
         const h = await activateHarness();

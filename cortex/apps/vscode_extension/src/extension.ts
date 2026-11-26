@@ -38,6 +38,21 @@ let quietModeEndsAtSeconds: number | undefined;
 
 /** Paint the quiet-mode label. Returns false when quiet mode is off. */
 function renderQuietModeStatus(): boolean {
+    if (
+        quietModeKind !== "off"
+        && typeof quietModeEndsAtSeconds === "number"
+        && Date.now() >= quietModeEndsAtSeconds * 1000
+    ) {
+        // A timed mode whose end has passed is over, exactly as the daemon's
+        // own get_quiet_mode_state() re-normalises it. Waiting for an "off"
+        // frame instead kept "Snoozed" over the live estimate indefinitely
+        // whenever that frame never came: the daemon lapses a timed mode on
+        // restart without broadcasting, and a decay frame sent while this
+        // window was disconnected is not replayed.
+        quietModeKind = "off";
+        quietModeLabel = "Cortex";
+        quietModeEndsAtSeconds = undefined;
+    }
     if (!statusBarItem || quietModeKind === "off") return false;
     statusBarItem.text = `$(circle-slash) ${quietModeLabel}`;
     if (typeof quietModeEndsAtSeconds === "number") {
@@ -210,6 +225,7 @@ function ensureStatusBar(context: vscode.ExtensionContext): void {
             100,
         );
         applyStatusBarConnection(statusBarConnected, !statusBarConnected);
+        if (statusBarConnected) renderQuietModeStatus();
         statusBarItem.show();
         context.subscriptions.push(statusBarItem);
     } else if (!show && statusBarItem) {
@@ -226,6 +242,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     lastOverlayToastInterventionId = null;
     lastOsNotifInterventionId = null;
     statusBarConnected = false;
+    quietModeKind = "off";
+    quietModeLabel = "Cortex";
+    quietModeEndsAtSeconds = undefined;
     const config = vscode.workspace.getConfiguration("cortex");
     const daemonUrl = config.get<string>("daemonUrl", DEFAULT_DAEMON_URL);
 
@@ -333,7 +352,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     client.onMessage((msg) => {
         if (msg.type !== 'QUIET_MODE_STATE') return;
         const payload = msg.payload as Record<string, unknown> | undefined;
-        if (!statusBarItem || !payload) return;
+        // Record the mode even while the status bar is hidden, so turning
+        // it back on shows the truth rather than a normal bar.
+        if (!payload) return;
         const kind = (payload.kind as string | undefined) || "off";
         const labels: Record<string, string> = {
             off: "Cortex",
