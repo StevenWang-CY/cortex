@@ -173,6 +173,10 @@ _SCROLL_QSS = (
     "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
 )
 
+# "Test connection" waits this long for TEST_PROVIDER_RESULT. The daemon caps
+# its own probe at 5 s; nothing answers at all when no session is running.
+_PROVIDER_TEST_TIMEOUT_MS = 15_000
+
 
 def _active_calibration_measured_at() -> float | None:
     """Return the canonical active profile's measurement time in seconds."""
@@ -320,6 +324,13 @@ class SettingsDialog(QWidget):
         self._permission_timer: QTimer = QTimer(self)
         self._permission_timer.setInterval(1500)
         self._permission_timer.timeout.connect(self._refresh_permission_states)
+
+        # Bounds the "Testing…" state of the provider pill (see
+        # ``_PROVIDER_TEST_TIMEOUT_MS``).
+        self._provider_test_timer: QTimer = QTimer(self)
+        self._provider_test_timer.setSingleShot(True)
+        self._provider_test_timer.setInterval(_PROVIDER_TEST_TIMEOUT_MS)
+        self._provider_test_timer.timeout.connect(self._on_provider_test_timeout)
 
     # -- Native chrome ---------------------------------------------------
 
@@ -1766,10 +1777,21 @@ class SettingsDialog(QWidget):
             self._provider_status_pill.setStyleSheet(status_pill_qss("info"))
         except Exception:
             pass
+        self._provider_test_timer.start()
         try:
             self.test_provider_requested.emit(provider)
         except Exception:
             logger.debug("test_provider_requested emit failed", exc_info=True)
+
+    def _on_provider_test_timeout(self) -> None:
+        """No result arrived: stop claiming that a test is in flight."""
+        try:
+            self._provider_status_pill.setText(
+                "No answer · start a session, then test again"
+            )
+            self._provider_status_pill.setStyleSheet(status_pill_qss("warning"))
+        except Exception:
+            logger.debug("provider pill timeout update failed", exc_info=True)
 
     def apply_provider_test_result(self, payload: dict) -> None:
         """Render the result of a TEST_PROVIDER round-trip.
@@ -1781,6 +1803,7 @@ class SettingsDialog(QWidget):
         """
         if not isinstance(payload, dict):
             return
+        self._provider_test_timer.stop()
         provider = str(payload.get("provider") or "")
         ok = bool(payload.get("ok"))
         latency = payload.get("latency_ms")
