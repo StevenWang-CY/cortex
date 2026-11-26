@@ -4072,12 +4072,17 @@ class CortexDaemon:
                     # and the user's declared interval. They do not consume
                     # pulse, HRV, state labels, or the retired stress integral.
                     inactivity_feature = vector.features.get(FeatureName.INACTIVITY_SECONDS)
-                    input_is_active = bool(
-                        inactivity_feature is not None
+                    # Unavailable input is not observed inactivity (rule 38):
+                    # ``None`` neither accrues focus nor counts toward a break.
+                    input_is_active: bool | None = (
+                        bool(
+                            inactivity_feature.value
+                            < self.config.intervention.focus_break_inactivity_pause_seconds
+                        )
+                        if inactivity_feature is not None
                         and inactivity_feature.valid
                         and inactivity_feature.value is not None
-                        and inactivity_feature.value
-                        < self.config.intervention.focus_break_inactivity_pause_seconds
+                        else None
                     )
                     self._focus_break_policy.update_preferences(
                         enabled=(self.config.intervention.enable_focus_break_reminders),
