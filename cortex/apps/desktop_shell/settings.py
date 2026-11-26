@@ -648,6 +648,9 @@ class SettingsDialog(QWidget):
             mac_native.system_font(FS_CAPTION, "regular"),
         )
         self._distraction_custom_domains.setMaximumHeight(90)
+        # A tab is never part of a domain; let Tab move on instead of
+        # trapping keyboard users in the box.
+        self._distraction_custom_domains.setTabChangesFocus(True)
         self._distraction_custom_domains.setStyleSheet(
             "QPlainTextEdit {"
             f"  background: {CX_SURFACE};"
@@ -1139,9 +1142,15 @@ class SettingsDialog(QWidget):
 
         # Phase-3 / Audit-1.2 F5: include the new P0 §3.10 / §3.12
         # controls in the tab order so keyboard users can reach them.
+        # Every focusable control belongs here in visual order: one left out
+        # is pushed behind the whole chain, so the permission links,
+        # Recalibrate and Test connection used to come only after Apply.
         chain_tab_order(
             self._webcam_enabled,
+            self._camera_perm_row["label"],
             self._input_telemetry_enabled,
+            self._accessibility_perm_row["label"],
+            self._recalibrate_btn,
             self._interventions_enabled,
             self._sensitivity_slider,
             self._cooldown_spin,
@@ -1152,6 +1161,7 @@ class SettingsDialog(QWidget):
             self._distraction_custom_domains,
             self._os_notifications,
             self._llm_backend,
+            self._test_provider_btn,
             self._llm_privacy_mode,
             self._external_context_ack,
             self._review_context_btn,
