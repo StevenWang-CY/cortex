@@ -1393,7 +1393,8 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
                 self._interventions_layout.removeWidget(w)
                 w.deleteLater()
         if not rows:
-            placeholder = QLabel("No HYPER spikes recorded.")
+            # Plain language: the shell never prints engine state names.
+            placeholder = QLabel("No interventions recorded in this session.")
             placeholder.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
             placeholder.setStyleSheet(
                 f"color: {CX_TEXT_TERTIARY}; background: transparent;"
