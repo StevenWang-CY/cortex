@@ -11,7 +11,11 @@ import { randomUUID } from "crypto";
 import { CortexWSClient } from "./ws-client";
 import { ContextProvider } from "./context-provider";
 import { FoldController } from "./fold-controller";
-import { CortexPanelProvider } from "./panel-provider";
+import {
+    CortexPanelProvider,
+    STALE_STATE_LABEL,
+    STATE_FRESHNESS_MS,
+} from "./panel-provider";
 import { PANEL_STATE_LABELS } from "./design-tokens";
 import { EditorTransactionAdapter } from "./editor-transaction-adapter";
 
@@ -38,6 +42,21 @@ let quietModeEndsAtSeconds: number | undefined;
 
 /** Paint the quiet-mode label. Returns false when quiet mode is off. */
 function renderQuietModeStatus(): boolean {
+    if (
+        quietModeKind !== "off"
+        && typeof quietModeEndsAtSeconds === "number"
+        && Date.now() >= quietModeEndsAtSeconds * 1000
+    ) {
+        // A timed mode whose end has passed is over, exactly as the daemon's
+        // own get_quiet_mode_state() re-normalises it. Waiting for an "off"
+        // frame instead kept "Snoozed" over the live estimate indefinitely
+        // whenever that frame never came: the daemon lapses a timed mode on
+        // restart without broadcasting, and a decay frame sent while this
+        // window was disconnected is not replayed.
+        quietModeKind = "off";
+        quietModeLabel = "Cortex";
+        quietModeEndsAtSeconds = undefined;
+    }
     if (!statusBarItem || quietModeKind === "off") return false;
     statusBarItem.text = `$(circle-slash) ${quietModeLabel}`;
     if (typeof quietModeEndsAtSeconds === "number") {
@@ -150,6 +169,36 @@ function workspaceMutationAllowed(): boolean {
 // deactivate so the closure doesn't outlive the disposed status bar.
 let osNotifPulseTimeout: ReturnType<typeof setTimeout> | undefined;
 
+// Rule 42: the status-bar estimate expires STATE_FRESHNESS_MS after the last
+// STATE_UPDATE, like the panel and the browser surfaces. Re-armed by every
+// update, cancelled on disconnect and deactivate.
+let stateFreshnessTimeout: ReturnType<typeof setTimeout> | undefined;
+
+function clearStatusBarFreshness(): void {
+    if (stateFreshnessTimeout) {
+        clearTimeout(stateFreshnessTimeout);
+        stateFreshnessTimeout = undefined;
+    }
+}
+
+function armStatusBarFreshness(): void {
+    clearStatusBarFreshness();
+    stateFreshnessTimeout = setTimeout(() => {
+        stateFreshnessTimeout = undefined;
+        if (!statusBarItem || !statusBarConnected) return;
+        // Quiet mode outranks the estimate, and so outranks its expiry.
+        if (renderQuietModeStatus()) return;
+        if (osNotifPulseTimeout !== undefined) return;
+        statusBarItem.text = `$(ellipsis) Cortex: ${STALE_STATE_LABEL}`;
+        statusBarItem.tooltip =
+            `Cortex — no update from the daemon for ${STATE_FRESHNESS_MS / 1000} s. `
+            + "No actionable estimate.";
+        statusBarItem.backgroundColor = undefined;
+    }, STATE_FRESHNESS_MS);
+    // Presentation only: never keep the extension host alive for it.
+    (stateFreshnessTimeout as { unref?: () => void }).unref?.();
+}
+
 // F9 (Phase-4 audit): single OutputChannel shared by every debug-gated
 // diagnostic line in the extension. Replaces console.log so messages
 // flow into VS Code's Output panel under "Cortex" rather than the
@@ -210,6 +259,7 @@ function ensureStatusBar(context: vscode.ExtensionContext): void {
             100,
         );
         applyStatusBarConnection(statusBarConnected, !statusBarConnected);
+        if (statusBarConnected) renderQuietModeStatus();
         statusBarItem.show();
         context.subscriptions.push(statusBarItem);
     } else if (!show && statusBarItem) {
@@ -226,6 +276,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     lastOverlayToastInterventionId = null;
     lastOsNotifInterventionId = null;
     statusBarConnected = false;
+    quietModeKind = "off";
+    quietModeLabel = "Cortex";
+    quietModeEndsAtSeconds = undefined;
     const config = vscode.workspace.getConfiguration("cortex");
     const daemonUrl = config.get<string>("daemonUrl", DEFAULT_DAEMON_URL);
 
@@ -276,6 +329,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     client.onStateUpdate((payload) => {
         updateStatusBar(payload);
+        armStatusBarFreshness();
     });
 
     client.onInterventionTrigger((payload) => {
@@ -286,6 +340,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (connected) {
             void editorTransactionAdapter?.flushPendingReceipts();
         }
+        clearStatusBarFreshness();
         applyStatusBarConnection(connected);
     });
 
@@ -333,7 +388,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     client.onMessage((msg) => {
         if (msg.type !== 'QUIET_MODE_STATE') return;
         const payload = msg.payload as Record<string, unknown> | undefined;
-        if (!statusBarItem || !payload) return;
+        // Record the mode even while the status bar is hidden, so turning
+        // it back on shows the truth rather than a normal bar.
+        if (!payload) return;
         const kind = (payload.kind as string | undefined) || "off";
         const labels: Record<string, string> = {
             off: "Cortex",
@@ -365,29 +422,37 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     osNotifPulseTimeout = undefined;
     let lastOsNotifShownHeadline = "";
     let lastOsNotifShownAt = 0;
-    client.onMessage((msg) => {
-        if (msg.type !== 'INTERVENTION_TRIGGER') return;
-        const payload = msg.payload as Record<string, unknown> | undefined;
+    // Registered on the trigger stream itself. This used to be a generic
+    // ``onMessage`` listener, but the client dispatches INTERVENTION_TRIGGER
+    // only to ``onInterventionTrigger`` handlers, so neither the pulse nor
+    // the Snooze toast ever ran.
+    client.onInterventionTrigger((payload) => {
         if (!payload || payload.desktop_not_focused !== true) return;
-        if (!statusBarItem) return;
         const headline = String(payload.headline || 'Cortex');
-        statusBarItem.text = `$(pulse) Cortex — ${headline}`.slice(0, 64);
-        statusBarItem.backgroundColor = new vscode.ThemeColor(
-            "statusBarItem.warningBackground",
-        );
-        if (osNotifPulseTimeout) clearTimeout(osNotifPulseTimeout);
-        osNotifPulseTimeout = setTimeout(() => {
-            if (statusBarItem) {
-                statusBarItem.backgroundColor = undefined;
-                // Restore whatever the bar should actually say, rather than
-                // hardcoding the connected label over a disconnected or
-                // quiet-mode state.
-                if (!renderQuietModeStatus()) {
-                    applyStatusBarConnection(statusBarConnected);
+        if (statusBarItem) {
+            statusBarItem.text = `$(pulse) Cortex — ${headline}`.slice(0, 64);
+            statusBarItem.backgroundColor = new vscode.ThemeColor(
+                "statusBarItem.warningBackground",
+            );
+            if (osNotifPulseTimeout) clearTimeout(osNotifPulseTimeout);
+            // updateStatusBar() yields to the pulse while this is armed;
+            // otherwise the next 500 ms STATE_UPDATE painted over it.
+            osNotifPulseTimeout = setTimeout(() => {
+                osNotifPulseTimeout = undefined;
+                if (statusBarItem) {
+                    statusBarItem.backgroundColor = undefined;
+                    // Restore whatever the bar should actually say, rather than
+                    // hardcoding the connected label over a disconnected or
+                    // quiet-mode state.
+                    if (!renderQuietModeStatus()) {
+                        applyStatusBarConnection(statusBarConnected);
+                    }
                 }
-            }
-            osNotifPulseTimeout = undefined;
-        }, 5000);
+            }, 5000);
+        }
+        // handleIntervention() already toasts an overlay_only proposal; one
+        // toast per intervention, not two.
+        if (payload.level === "overlay_only" && payload.headline) return;
         const interventionId = String(payload.intervention_id || '');
         // A6: de-dup by intervention_id (the daemon echoes the same
         // trigger after every micro-step toggle). Payloads without an id
@@ -406,12 +471,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         lastOsNotifInterventionId = interventionId || null;
         lastOsNotifShownHeadline = headline;
         lastOsNotifShownAt = now;
+        // "View Details", not "Open Dashboard": the action reveals this
+        // window's Cortex panel; it never raised the desktop dashboard.
         void Promise.resolve(vscode.window.showInformationMessage(
             `Cortex · ${headline}`,
-            'Open Dashboard',
+            'View Details',
             'Snooze',
         )).then((choice) => {
-            if (choice === 'Open Dashboard') {
+            if (choice === 'View Details') {
                 panelProvider?.showPanel();
             } else if (choice === 'Snooze') {
                 // Phase-3 / Audit-1.2 F11: surface a warning instead
@@ -443,6 +510,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 panelProvider.applyWhyDetail(payload);
             }
         }
+    });
+
+    // --- P0 §3.21: DISMISS_OVERLAY — the cross-surface dismiss cue ---
+    // Cmd+Shift+D (desktop or browser) dismisses the active intervention on
+    // every surface. The daemon broadcasts only this cue — no
+    // INTERVENTION_RESTORE follows — so ignoring it left the dismissed card
+    // in the VS Code panel. Presentation only; restore receipts are owned by
+    // the transaction adapter and are untouched. A cue naming another
+    // intervention must not wipe a newer one; one without an id clears
+    // whatever is shown.
+    client.onMessage((msg) => {
+        if (msg.type !== "DISMISS_OVERLAY") return;
+        const dismissedId = typeof msg.payload.intervention_id === "string"
+            && msg.payload.intervention_id.length > 0
+            ? msg.payload.intervention_id
+            : undefined;
+        panelProvider?.clearIntervention(dismissedId);
     });
 
     // Compatibility-only: reject unsupported HRV/stress-derived claims.
@@ -576,6 +660,7 @@ export function deactivate(): void {
         clearTimeout(osNotifPulseTimeout);
         osNotifPulseTimeout = undefined;
     }
+    clearStatusBarFreshness();
     wsClient?.disconnect();
     wsClient = undefined;
     // A10: release the subscriptions the providers own. They are also in
@@ -606,6 +691,10 @@ function updateStatusBar(payload: Record<string, unknown>): void {
     // than a second and the user saw a normal bar while interventions were
     // suppressed.
     if (renderQuietModeStatus()) {
+        return;
+    }
+    // The five-second desktop-not-focused pulse owns the bar until it ends.
+    if (osNotifPulseTimeout !== undefined) {
         return;
     }
 

@@ -688,6 +688,13 @@ class OnboardingWindow(QWidget):
             )
         except Exception:
             pass
+        # A token already in the Keychain (it outlives a reinstall) is the
+        # same real completion as saving one here; the card already says
+        # "Token found", so the strip and the finish note must agree.
+        if self._llm_key_present and (
+            "llm_backend" not in self._onboarding_state.completed_steps
+        ):
+            self.mark_step_complete("llm_backend")
         self._refresh_progress()
 
         # Permissions are granted in System Settings out-of-process — there's
@@ -1155,17 +1162,34 @@ class OnboardingWindow(QWidget):
         # we walk the BYOK card → Connect Extensions → Get Started
         # explicitly so the keyboard user lands on the primary actions
         # without bouncing through every non-interactive label.
+        # Each step's "Why?" disclosure and Grant button belong in the chain
+        # too: Qt moves chained widgets ahead of unchained ones, so leaving
+        # them out put the step 4-6 explanations after Get Started.
+        def _why(step: QWidget | None) -> QWidget | None:
+            return getattr(step, "_cortex_why_btn", None)
+
+        def _action(step: QWidget | None) -> QWidget | None:
+            return getattr(step, "_cortex_action_btn", None)
+
         chain_targets = [
             w
             for w in (
+                _why(self._camera_step),
+                _action(self._camera_step),
+                _why(self._accessibility_step),
+                _action(self._accessibility_step),
+                _why(self._llm_step),
                 getattr(self, "_region_combo", None),
                 getattr(self, "_key_input", None),
                 getattr(self, "_save_key_btn", None),
                 getattr(self, "_skip_llm_btn", None),
+                _why(self._calibration_step),
                 getattr(self, "_begin_calibration_btn", None),
                 getattr(self, "_skip_calibration_btn", None),
+                _why(ext_frame),
                 connect_btn,
                 skip_ext_btn,
+                _why(notif_frame),
                 notif_btn,
                 finish_btn,
             )
@@ -1614,6 +1638,7 @@ class OnboardingWindow(QWidget):
         # Stash the refresh closure on the frame so the polling timer can
         # call it without re-resolving widgets by index.
         frame._cortex_set_state = _set_state  # type: ignore[attr-defined]
+        frame._cortex_action_btn = btn  # type: ignore[attr-defined]
         return frame
 
     # ------------------------------------------------------------------
@@ -1746,6 +1771,8 @@ class OnboardingWindow(QWidget):
         controller can spin up a ``CalibrationRunner``."""
         try:
             self._begin_calibration_btn.setEnabled(False)
+            # A new attempt must not sit under the last run's verdict.
+            self._cal_success_label.setVisible(False)
             self._cal_progress_bar.setValue(1)
             self._cal_numerics.setText(
                 "Experimental camera pulse: — bpm  ·  Quality: starting…  ·  Valid: 0s"
@@ -1831,6 +1858,9 @@ class OnboardingWindow(QWidget):
                 self._cal_progress_bar.setValue(100)
                 self._begin_calibration_btn.setVisible(False)
                 self._skip_calibration_btn.setVisible(False)
+                # "review_required" and "applying" rewrote this line; restate
+                # the outcome or it stays on "Saving and applying…".
+                self._cal_success_label.setText("✓ Measured profile saved and applied")
                 self._cal_success_label.setVisible(True)
             except AttributeError:
                 pass

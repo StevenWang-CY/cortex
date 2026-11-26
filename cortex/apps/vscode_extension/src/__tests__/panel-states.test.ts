@@ -92,6 +92,10 @@ describe("CortexPanelProvider – P2-6 distinct empty states", () => {
         expect(html).toContain('data-testid="cx-state-awaiting"');
         expect(html).not.toContain('data-testid="cx-state-offline"');
         expect(html).not.toContain('data-testid="cx-state-active"');
+        // The socket is authenticated here and the status bar already says
+        // "Connected"; the panel must not claim it is still connecting.
+        expect(html).not.toContain("Connecting");
+        expect(html).toContain("Waiting for the first reading");
     });
 
     it("(c) connected + state received → data-testid=cx-state-active", () => {

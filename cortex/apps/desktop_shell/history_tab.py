@@ -190,18 +190,40 @@ def _format_duration(seconds: float) -> str:
     return f"{s}s"
 
 
+def _parse_utc(iso: str) -> Any:
+    """Parse an ISO timestamp as an aware UTC ``datetime``.
+
+    Naive values are read as UTC, as the rest of this tab does
+    (``_format_relative_age``, ``_TodayPanel._parse_iso``): the daemon stamps
+    with ``datetime.now(UTC)``.
+    """
+    from datetime import UTC, datetime
+
+    # Tolerate Z suffix.
+    normalised = iso.replace("Z", "+00:00") if iso.endswith("Z") else iso
+    dt = datetime.fromisoformat(normalised)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
+def _parse_local(iso: str) -> Any:
+    """Parse an ISO timestamp and express it on the user's wall clock.
+
+    The report generator stamps times with ``datetime.now(UTC)``, so the
+    wire carries UTC. Formatting the parsed value in its own offset showed
+    every time in UTC.
+    """
+    return _parse_utc(iso).astimezone()
+
+
 def _format_date_time(iso: str) -> str:
-    """ISO timestamp → ``Mon 5/22 · 3:14 PM`` (best-effort)."""
+    """ISO timestamp → ``Mon 5/22 · 3:14 PM`` in local time (best-effort)."""
     if not iso:
         return ""
     try:
         # The wire format from ``model_dump(mode='json')`` is ISO 8601.
-        from datetime import datetime
-
-        # Tolerate Z suffix.
-        normalised = iso.replace("Z", "+00:00") if iso.endswith("Z") else iso
-        dt = datetime.fromisoformat(normalised)
-        return dt.strftime("%a %-m/%-d · %-I:%M %p")
+        return str(_parse_local(iso).strftime("%a %-m/%-d · %-I:%M %p"))
     except Exception:
         return iso[:16].replace("T", " ")
 
@@ -211,11 +233,10 @@ def _short_date(iso: str) -> str:
     if not iso:
         return ""
     try:
-        from datetime import date, datetime
+        from datetime import date
 
         if "T" in iso:
-            normalised = iso.replace("Z", "+00:00") if iso.endswith("Z") else iso
-            d = datetime.fromisoformat(normalised).date()
+            d = _parse_local(iso).date()
         else:
             d = date.fromisoformat(iso)
         return d.strftime("%-m/%-d")
@@ -228,11 +249,10 @@ def _weekday(iso: str) -> str:
     if not iso:
         return ""
     try:
-        from datetime import date, datetime
+        from datetime import date
 
         if "T" in iso:
-            normalised = iso.replace("Z", "+00:00") if iso.endswith("Z") else iso
-            d = datetime.fromisoformat(normalised).date()
+            d = _parse_local(iso).date()
         else:
             d = date.fromisoformat(iso)
         return d.strftime("%a")
@@ -1123,6 +1143,10 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
         try:
             self._loading_label.setVisible(self._loading)
             if self._loading:
+                # Loading blanks what is on screen, so the next payload must
+                # render even if it equals the last one (two rows timing out
+                # give identical error payloads).
+                self._current_payload_hash = ""
                 self._error_label.setVisible(False)
                 if self._scroll_widget is not None:
                     self._scroll_widget.setVisible(False)
@@ -1165,6 +1189,10 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
             self._set_text_if_changed(self._subhead, "")
             self._error_label.setText(msg)
             self._error_label.setVisible(True)
+            # No report was loaded: the body's empty states ("No
+            # interventions…") would describe a session nobody has seen.
+            if self._scroll_widget is not None:
+                self._scroll_widget.setVisible(False)
             self._render_segments([])
             self._heatmap.set_hourly_flow([0.0] * 24)
             self._populate_distractions([])
@@ -1172,6 +1200,8 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
             self._populate_comparison(None)
             return
         self._error_label.setVisible(False)
+        if self._scroll_widget is not None:
+            self._scroll_widget.setVisible(True)
 
         # Headline.
         start = str(report.get("start_time") or "")
@@ -1194,12 +1224,6 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
         # Hourly heatmap derived from state_transitions.
         self._render_heatmap_from_transitions(report)
 
-        # Distractions.
-        domains = report.get("top_distraction_domains") or []
-        if not isinstance(domains, list):
-            domains = []
-        self._populate_distractions([str(d) for d in domains[:3]])
-
         # Interventions: state_transitions with to_state=="HYPER".
         transitions = report.get("state_transitions") or []
         if not isinstance(transitions, list):
@@ -1209,7 +1233,23 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
             for t in transitions
             if isinstance(t, dict) and str(t.get("to_state", "")).upper() == "HYPER"
         ]
-        self._populate_interventions(intervention_rows)
+        # The report's real counter. HYPER changes are only a proxy, and the
+        # schema keeps the two apart: neither empty state may deny
+        # interventions the counter recorded.
+        try:
+            triggered = max(0, int(report.get("interventions_triggered") or 0))
+        except (TypeError, ValueError):
+            triggered = 0
+
+        # Distractions.
+        domains = report.get("top_distraction_domains") or []
+        if not isinstance(domains, list):
+            domains = []
+        self._populate_distractions(
+            [str(d) for d in domains[:3]],
+            any_interventions=bool(intervention_rows) or triggered > 0,
+        )
+        self._populate_interventions(intervention_rows, triggered=triggered)
 
         # Comparison.
         self._populate_comparison(report.get("comparison_to_7day"))
@@ -1273,13 +1313,10 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
         end_iso = str(report.get("end_time") or "")
         buckets = [0.0] * 24
         try:
-            from datetime import datetime, timedelta
+            from datetime import timedelta
 
             def _parse(value: str) -> Any:
-                if not value:
-                    return None
-                norm = value.replace("Z", "+00:00") if value.endswith("Z") else value
-                return datetime.fromisoformat(norm)
+                return _parse_utc(value) if value else None
 
             end_dt = _parse(end_iso)
             for i, t in enumerate(transitions):
@@ -1301,17 +1338,21 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
                     next_dt = end_dt
                 if next_dt is None or next_dt <= ts_dt:
                     continue
-                # Walk the FLOW interval one minute at a time so cross-hour
-                # spans bucket correctly.
+                # Walk the FLOW interval in UTC, one local hour at a time,
+                # bucketing each slice by the hour the user lived. Each
+                # slice takes its own local offset, so a span crossing a DST
+                # change lands in the right hours on both sides (as the
+                # daemon's longitudinal roll-up does).
                 cursor = ts_dt
                 while cursor < next_dt:
-                    step_end = min(
-                        next_dt,
-                        cursor.replace(minute=0, second=0, microsecond=0)
-                        + timedelta(hours=1),
-                    )
+                    local = cursor.astimezone()
+                    hour_top = (
+                        local.replace(minute=0, second=0, microsecond=0)
+                        + timedelta(hours=1)
+                    ).astimezone(cursor.tzinfo)
+                    step_end = min(next_dt, hour_top)
                     seconds = (step_end - cursor).total_seconds()
-                    hour = cursor.hour
+                    hour = local.hour
                     if 0 <= hour < 24:
                         buckets[hour] += max(0.0, seconds)
                     cursor = step_end
@@ -1333,7 +1374,9 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
                     buckets = [total / 24.0] * 24
         self._heatmap.set_hourly_flow(buckets)
 
-    def _populate_distractions(self, domains: list[str]) -> None:
+    def _populate_distractions(
+        self, domains: list[str], *, any_interventions: bool = False,
+    ) -> None:
         # Tear down and rebuild — these are at most 3 rows; rebuilding
         # avoids cache key churn.
         for i in reversed(range(self._distractions_layout.count())):
@@ -1346,9 +1389,13 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
                 w.deleteLater()
         if not domains:
             # P2-8: per-session detail empty state — sessions exist but this
-            # one had no distraction domains detected.
+            # one had no distraction domains detected. The calm copy also
+            # says there were no interventions, which is only true when the
+            # Interventions section below is empty too.
             placeholder = QLabel(
-                "No interventions in this session — focus held steady."
+                "No distracting sites recorded in this session."
+                if any_interventions
+                else "No interventions in this session — focus held steady."
             )
             placeholder.setObjectName("CortexDetailDistractionsEmpty")
             placeholder.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
@@ -1365,7 +1412,7 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
             )
             self._distractions_layout.addWidget(row)
 
-    def _populate_interventions(self, rows: list[dict]) -> None:
+    def _populate_interventions(self, rows: list[dict], *, triggered: int = 0) -> None:
         for i in reversed(range(self._interventions_layout.count())):
             item = self._interventions_layout.itemAt(i)
             if item is None:
@@ -1375,7 +1422,12 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
                 self._interventions_layout.removeWidget(w)
                 w.deleteLater()
         if not rows:
-            placeholder = QLabel("No HYPER spikes recorded.")
+            # Plain language: the shell never prints engine state names.
+            placeholder = QLabel(
+                f"{triggered} intervention{'s' if triggered != 1 else ''} in this session."
+                if triggered > 0
+                else "No interventions recorded in this session."
+            )
             placeholder.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
             placeholder.setStyleSheet(
                 f"color: {CX_TEXT_TERTIARY}; background: transparent;"
@@ -2167,7 +2219,7 @@ class HistoryTab(QWidget):
         except Exception:
             pass
         if isinstance(report, dict) and report.get("session_id"):
-            self.apply_session_detail({"report": dict(report)})
+            self._render_session_detail({"report": dict(report)})
             return
         self._on_row_clicked(session_id)
 
@@ -2272,6 +2324,25 @@ class HistoryTab(QWidget):
         self._today_panel.apply_payload(payload)
 
     def apply_session_detail(self, payload: dict) -> None:
+        # A reply nobody is waiting for -- the user went Back or switched
+        # segment, or opened another session since -- must not pop the
+        # overlay back up or replace the session being loaded.
+        pending = self._pending_detail_id
+        if pending is None:
+            logger.debug("ignoring unrequested SESSION_DETAIL")
+            return
+        report = payload.get("report") if isinstance(payload, dict) else None
+        if isinstance(report, dict):
+            replied_id = str(report.get("session_id") or "")
+            if replied_id and replied_id != pending:
+                logger.debug(
+                    "ignoring SESSION_DETAIL for %s while %s is pending",
+                    replied_id, pending,
+                )
+                return
+        self._render_session_detail(payload)
+
+    def _render_session_detail(self, payload: dict) -> None:
         # Phase 4.B fix (#13): cancel the detail-request timeout now
         # that the response (or an error envelope) has arrived. The
         # panel's apply_payload clears the loading flag itself.

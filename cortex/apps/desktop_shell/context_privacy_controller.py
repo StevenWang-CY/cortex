@@ -26,6 +26,13 @@ logger = logging.getLogger(__name__)
 
 _MAX_RESPONSE_BYTES = 256_000
 
+# Every request here targets the local daemon. ``urlopen`` would build its
+# ``ProxyHandler`` from ``getproxies()`` -- the ``HTTP_PROXY`` environment or
+# the macOS System Settings proxy, whose default bypass list does not cover
+# ``127.0.0.1`` -- and send the bearer token and the redacted preview to that
+# proxy. An empty ``ProxyHandler`` pins these requests to a direct connection.
+_LOOPBACK_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 
 class ContextPrivacyController(QObject):
     """Small view-controller adapter; all loopback I/O stays off the UI thread."""
@@ -139,7 +146,7 @@ class ContextPrivacyController(QObject):
                     "X-Cortex-Request-ID": str(uuid4()),
                 },
             )
-            with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+            with _LOOPBACK_OPENER.open(request, timeout=timeout) as response:  # noqa: S310
                 raw = response.read(_MAX_RESPONSE_BYTES + 1)
             if len(raw) > _MAX_RESPONSE_BYTES:
                 raise ValueError("local privacy response exceeded its size bound")

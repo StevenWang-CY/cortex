@@ -412,6 +412,15 @@ class BreakOverlayWindow(QWidget):
         total = sum(seconds for _, seconds in cycle) or 1.0
         cycle_t = float(elapsed) % total
         cursor = 0.0
+        # A hold keeps the circle where the previous breath left it: full
+        # after an inhale, empty after an exhale (box breathing holds both).
+        # Seed from the cycle's last breath so a leading hold wraps correctly.
+        settled = 0.32
+        for label, _seconds in cycle:
+            if label == "Inhale":
+                settled = 0.62
+            elif label == "Exhale":
+                settled = 0.32
         for label, seconds in cycle:
             if cycle_t < cursor + seconds:
                 local = (cycle_t - cursor) / max(seconds, 1e-3)
@@ -419,7 +428,11 @@ class BreakOverlayWindow(QWidget):
                     return label, 0.32 + 0.30 * local
                 if label == "Exhale":
                     return label, 0.62 - 0.30 * local
-                return label, 0.62
+                return label, settled
+            if label == "Inhale":
+                settled = 0.62
+            elif label == "Exhale":
+                settled = 0.32
             cursor += seconds
         return cycle[-1][0], 0.32
 

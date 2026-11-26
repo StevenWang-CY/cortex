@@ -18,6 +18,7 @@ class DesktopMessageRouter:
     def __init__(self, handlers: Mapping[str, DesktopMessageHandler]) -> None:
         self._handlers = dict(handlers)
         self._last_sequence_by_type: dict[str, int] = {}
+        self._current_correlation_id: str | None = None
 
     def reset(self) -> None:
         self._last_sequence_by_type.clear()
@@ -27,6 +28,17 @@ class DesktopMessageRouter:
         """Mutable compatibility view for the legacy bridge test seam."""
 
         return self._last_sequence_by_type
+
+    @property
+    def current_correlation_id(self) -> str | None:
+        """The envelope's ``correlation_id`` while its handler runs.
+
+        A handler that must echo the daemon's cid later (USER_ACTION is
+        dropped unless it carries the trigger's cid) reads it here; it is
+        ``None`` outside a dispatch and for envelopes without one.
+        """
+
+        return self._current_correlation_id
 
     def dispatch_json(self, raw: str) -> bool:
         try:
@@ -40,6 +52,7 @@ class DesktopMessageRouter:
             envelope.get("payload"),
             sequence=envelope.get("sequence", 0),
             target_client_types=envelope.get("target_client_types"),
+            correlation_id=envelope.get("correlation_id"),
         )
 
     def dispatch(
@@ -49,6 +62,7 @@ class DesktopMessageRouter:
         *,
         sequence: object = 0,
         target_client_types: object = None,
+        correlation_id: object = None,
     ) -> bool:
         if not message_type:
             return False
@@ -68,7 +82,13 @@ class DesktopMessageRouter:
         handler = self._handlers.get(message_type)
         if handler is None:
             return False
-        handler(dict(payload) if isinstance(payload, Mapping) else {})
+        self._current_correlation_id = (
+            correlation_id if isinstance(correlation_id, str) and correlation_id else None
+        )
+        try:
+            handler(dict(payload) if isinstance(payload, Mapping) else {})
+        finally:
+            self._current_correlation_id = None
         return True
 
     @staticmethod
