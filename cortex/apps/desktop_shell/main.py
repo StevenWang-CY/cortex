@@ -35,7 +35,7 @@ from cortex.apps.desktop_shell.dashboard import DashboardWindow
 from cortex.apps.desktop_shell.font_assets import install_application_fonts
 from cortex.apps.desktop_shell.message_router import DesktopMessageRouter
 from cortex.apps.desktop_shell.onboarding import OnboardingWindow, onboarding_marker_path
-from cortex.apps.desktop_shell.overlay import OverlayWindow
+from cortex.apps.desktop_shell.overlay import OverlayWindow, overlay_close_action
 from cortex.apps.desktop_shell.settings import SettingsDialog
 from cortex.apps.desktop_shell.tokens import FS_FOOTNOTE
 from cortex.apps.desktop_shell.tray import CortexTrayIcon
@@ -1073,9 +1073,11 @@ class CortexApp:
 
     @Slot(str)
     def _on_overlay_dismissed(self, intervention_id: str) -> None:
-        """Handle overlay dismiss by user."""
+        """Report the card's close; only a user's close is a dismissal."""
         if self._bridge is not None:
-            self._bridge.send_user_action("dismissed", intervention_id)
+            self._bridge.send_user_action(
+                overlay_close_action(self._overlay), intervention_id,
+            )
 
     def _on_settings_save_failed(self, reason: str) -> None:
         """Audit-prod fix (P1-2): surface failed save in the dashboard."""
