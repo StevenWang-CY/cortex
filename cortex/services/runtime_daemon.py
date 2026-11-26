@@ -2126,6 +2126,7 @@ class CortexDaemon:
         # native extension call it can lead to a segfault on resume.
         self._install_loop_signal_handlers()
         self._register_services()
+        self._bind_os_notification_actions()
         self._restore_quiet_mode_from_policy()
         ws_started = await self._ws_server.start()
         if not ws_started:
@@ -2337,6 +2338,8 @@ class CortexDaemon:
             from cortex.libs.utils import macos_notifications as _mn
 
             _mn.mark_shutting_down()
+            # Drop this daemon's receiver; a successor binds its own.
+            _mn.set_user_action_handler(None)
         except Exception:
             logger.debug(
                 "macos_notifications.mark_shutting_down failed",
@@ -6573,6 +6576,69 @@ class CortexDaemon:
         except Exception:
             logger.debug("desktop focus probe raised", exc_info=True)
             return True
+
+    def _bind_os_notification_actions(self) -> None:
+        """Route macOS banner buttons into this daemon (P0 §3.12).
+
+        Banners carry "Open" and "Snooze 15" buttons; the delegate forwards a
+        click to whatever handler is registered, and nothing registered one,
+        so both buttons did nothing. Called from :meth:`start` with the
+        daemon loop running. Clicks arrive on the AppKit main thread and are
+        marshalled onto that loop. Also re-arms the process-wide shutdown
+        latch a previous in-process daemon's :meth:`stop` left set.
+        """
+        try:
+            from cortex.libs.utils import macos_notifications as _mn
+        except ImportError:
+            return
+        loop = asyncio.get_running_loop()
+
+        def _on_click(intervention_id: str, action_id: str) -> None:
+            try:
+                loop.call_soon_threadsafe(
+                    self._schedule_os_notification_action,
+                    intervention_id,
+                    action_id,
+                )
+            except RuntimeError:
+                # The loop already closed; the click has no daemon to reach.
+                logger.debug("notification click after loop close ignored")
+
+        _mn.clear_shutting_down()
+        _mn.set_user_action_handler(_on_click)
+
+    def _schedule_os_notification_action(
+        self, intervention_id: str, action_id: str,
+    ) -> None:
+        """Loop-thread half of a banner click; never runs during stop."""
+        if self._stop_started:
+            return
+        self._spawn_background_task(
+            self._handle_os_notification_action(intervention_id, action_id),
+            name="cortex-notification-action",
+        )
+
+    async def _handle_os_notification_action(
+        self, intervention_id: str, action_id: str,
+    ) -> None:
+        """Apply one banner click: "snooze" snoozes, a tap or "open" raises."""
+        if action_id == "snooze":
+            await self.set_quiet_mode(
+                "snooze_15", duration_minutes=15, source="os_notification",
+            )
+            return
+        try:
+            await self._ws_server.send_message(
+                MessageType.RAISE_DASHBOARD.value,
+                {"target": None},
+                target_client_types=["desktop"],
+            )
+        except Exception:
+            logger.debug(
+                "RAISE_DASHBOARD for notification %s failed",
+                intervention_id,
+                exc_info=True,
+            )
 
     async def _dispatch_os_notification(self, plan: InterventionPlan) -> None:
         """P0 §3.12: fire a macOS UNUserNotification for an intervention.
