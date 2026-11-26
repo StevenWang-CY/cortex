@@ -46,17 +46,27 @@ artifact metadata records the resolved architecture-specific graph. The lock
 uses `opencv-contrib-python<5` as the sole `cv2` provider on both architectures;
 the repository gate rejects co-installing the overlapping base OpenCV wheel.
 
-MediaPipe 0.10.21 also caps Intel Protobuf below 5. The resulting
-`PYSEC-2026-1805` finding concerns `google.protobuf.json_format.ParseDict` on
-attacker-controlled nested `Any` dictionaries. Neither Cortex nor the installed
-MediaPipe Python sources import that boundary, and the product accepts no
-Protobuf/JSON model graphs from clients. The reviewed Intel-only exception was
-re-reviewed on 2026-09-04 (no patched Intel wheel exists), expires on
-2026-10-15, is revalidated on every architecture build, and is included in
-release evidence alongside the raw audit. Each renewal must record the review
-date and the upstream check in the exception itself; a compatible patched
-backend or retirement of the Intel artifact to CI-only status is the decision
-due before that date. Silently extending the exception is not permitted.
+MediaPipe 0.10.21 declares `protobuf<5`, and every Protobuf 4.x release is
+affected by `PYSEC-2026-1805`, which concerns
+`google.protobuf.json_format.ParseDict` on attacker-controlled nested `Any`
+dictionaries and is fixed only in 5.29.6 and 6.33.5. Until 0.6.0 an Intel-only
+audit exception covered it; that exception expired on 2026-10-15 without the
+decision it called for, and the Intel audit step failed from then on. Since
+0.6.0 `cortex/pyproject.toml` restates that one MediaPipe release's
+requirements (`[[tool.uv.dependency-metadata]]`) with the Protobuf line moved
+to `>=5.29.6,<6`, so Intel resolves the patched series and the Intel graph
+audits clean. `cortex/security/python-intel-audit-exceptions.json` is empty
+and must stay empty unless a new exception records its review date and
+upstream check; a "high" exception may run 45 days at most, and silently
+extending one is not permitted.
+
+The combination is outside what MediaPipe declares, so it rests on a test:
+`cortex/tests/integration/test_mediapipe_runtime_boundary.py` asserts the
+Protobuf range on Intel, checks that MediaPipe's Python sources do not import
+the Protobuf JSON parser, loads the bundled FaceLandmarker model and runs a
+frame through it. The repository contract still keeps that parser out of
+Cortex. The test runs in the Intel CI job; no Intel Mac has run the packaged
+app with this combination.
 
 The locks make resolution repeatable. Apple signing/notarization timestamps and
 DMG metadata mean the final archive is not promised to be byte-for-byte
