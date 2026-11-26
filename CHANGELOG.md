@@ -46,8 +46,10 @@ client audit round, each fix with a regression test.
   of otherwise-ready windows.
 - Compute SDNN over the trailing three minutes. Breathing rate comes from
   three channels (pulse-amplitude envelope, vertical head movement,
-  beat-interval modulation) and is published only when two agree; the
-  envelope channel abstains without a cardiac line. A requirement of the full
+  beat-interval modulation) and is published only when head movement and a
+  pulse-derived channel agree: the two pulse-derived channels alone agreed on
+  a rate 5 /min too low on simulated recordings. The envelope channel abstains
+  without a cardiac line. A requirement of the full
   45.0 s, which a 30 fps buffer (44.97 s) never met, had prevented any
   breathing rate from being published; it is now a share of the window.
 - Face-skin extraction returns no region for a partial landmark set instead of
@@ -180,6 +182,38 @@ client audit round, each fix with a regression test.
   ignore frames from a released socket; stop saying "connecting" when
   connected; announce the selected rating; open the view when asked before it
   was ever shown; wire the desktop-not-focused pulse and Snooze toast.
+
+### Found by running the installed build
+
+- Ending a session and starting another no longer crashes the app. pynput's
+  keyboard listener thread read the keyboard layout through HIToolbox, which
+  traps off the main thread on current macOS (`SIGTRAP` in
+  `dispatch_assert_queue`). The listening path never uses that layout, so the
+  listener skips the read.
+- The camera permission prompt says what the camera is used for and that
+  frames are analysed in memory and not saved or sent.
+- Camera-offline guidance on the dashboard, in Settings and in the browser
+  popup points at Cortex's own Settings, which asks macOS for first-use access.
+  An app that was never asked has no row under System Settings → Camera.
+- Pause is disabled once a session has ended.
+
+### Dependencies
+
+The dependency audit policy failed on all three ecosystems when this release
+was prepared: advisories published after the 0.5.1 lock, and browser
+exceptions that expired on 2026-11-22.
+
+- Python: pillow 13.0.0, pyasn1 0.6.5, certifi 2026.11.20, setuptools 84.2.1,
+  filelock 4.3.1, msgpack 1.2.4 and virtualenv 21.15.13 close 77 advisories.
+  The declared security floors rise with them.
+- Browser extension: vite 6.4.6 and vitest 4.1.12 close seven advisories. The
+  eight exceptions for Svelte and the Parcel dev-server reporter, both pinned
+  by Plasmo 0.90.5 (still its latest release) and absent from the shipped
+  bundle, are renewed to 2026-12-22. Two exceptions whose advisories are no
+  longer reported are removed.
+- Editor extension: overrides move glob to 14.0.6, minimatch to 11.0.9 and qs
+  to 6.17.1, and `@azure/msal-node` resolves to 7.2.3. All four are build and
+  test tooling.
 
 ### Documentation
 
