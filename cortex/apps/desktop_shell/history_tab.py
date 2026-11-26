@@ -190,22 +190,31 @@ def _format_duration(seconds: float) -> str:
     return f"{s}s"
 
 
+def _parse_utc(iso: str) -> Any:
+    """Parse an ISO timestamp as an aware UTC ``datetime``.
+
+    Naive values are read as UTC, as the rest of this tab does
+    (``_format_relative_age``, ``_TodayPanel._parse_iso``): the daemon stamps
+    with ``datetime.now(UTC)``.
+    """
+    from datetime import UTC, datetime
+
+    # Tolerate Z suffix.
+    normalised = iso.replace("Z", "+00:00") if iso.endswith("Z") else iso
+    dt = datetime.fromisoformat(normalised)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
 def _parse_local(iso: str) -> Any:
     """Parse an ISO timestamp and express it on the user's wall clock.
 
     The report generator stamps times with ``datetime.now(UTC)``, so the
     wire carries UTC. Formatting the parsed value in its own offset showed
-    every time in UTC. Naive values carry no zone to convert from and are
-    returned unchanged.
+    every time in UTC.
     """
-    from datetime import datetime
-
-    # Tolerate Z suffix.
-    normalised = iso.replace("Z", "+00:00") if iso.endswith("Z") else iso
-    dt = datetime.fromisoformat(normalised)
-    if dt.tzinfo is not None:
-        dt = dt.astimezone()
-    return dt
+    return _parse_utc(iso).astimezone()
 
 
 def _format_date_time(iso: str) -> str:
@@ -1290,8 +1299,7 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
             from datetime import timedelta
 
             def _parse(value: str) -> Any:
-                # Bucket by the hour the user lived, not the UTC hour.
-                return _parse_local(value) if value else None
+                return _parse_utc(value) if value else None
 
             end_dt = _parse(end_iso)
             for i, t in enumerate(transitions):
@@ -1313,17 +1321,21 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
                     next_dt = end_dt
                 if next_dt is None or next_dt <= ts_dt:
                     continue
-                # Walk the FLOW interval one minute at a time so cross-hour
-                # spans bucket correctly.
+                # Walk the FLOW interval in UTC, one local hour at a time,
+                # bucketing each slice by the hour the user lived. Each
+                # slice takes its own local offset, so a span crossing a DST
+                # change lands in the right hours on both sides (as the
+                # daemon's longitudinal roll-up does).
                 cursor = ts_dt
                 while cursor < next_dt:
-                    step_end = min(
-                        next_dt,
-                        cursor.replace(minute=0, second=0, microsecond=0)
-                        + timedelta(hours=1),
-                    )
+                    local = cursor.astimezone()
+                    hour_top = (
+                        local.replace(minute=0, second=0, microsecond=0)
+                        + timedelta(hours=1)
+                    ).astimezone(cursor.tzinfo)
+                    step_end = min(next_dt, hour_top)
                     seconds = (step_end - cursor).total_seconds()
-                    hour = cursor.hour
+                    hour = local.hour
                     if 0 <= hour < 24:
                         buckets[hour] += max(0.0, seconds)
                     cursor = step_end
