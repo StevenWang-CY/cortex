@@ -85,6 +85,17 @@ DEFAULT_ACTION_LEVELS: dict[str, int] = {
     "collapse_before_error": PREVIEW,
     "fold_except_current": PREVIEW,
     "dim_background": SUGGEST,
+
+    # LeetCode coach cues (``intervention_engine/leetcode_interventions``).
+    # The pattern ladder is a hint panel requested at SUGGEST; unregistered,
+    # its minimum fell back to PREVIEW and every request was denied, so the
+    # productive-struggle hint ladder could never appear. The other cues
+    # request PREVIEW and keep that minimum explicitly.
+    "show_pattern_ladder": SUGGEST,
+    "show_scratchpad": PREVIEW,
+    "show_lockout": PREVIEW,
+    "show_submission_gate": PREVIEW,
+    "show_solution_friction": PREVIEW,
 }
 
 
