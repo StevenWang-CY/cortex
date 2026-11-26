@@ -38,7 +38,7 @@ from cortex.apps.desktop_shell.dashboard import DashboardWindow
 from cortex.apps.desktop_shell.font_assets import install_application_fonts
 from cortex.apps.desktop_shell.message_router import DesktopMessageRouter
 from cortex.apps.desktop_shell.onboarding import OnboardingWindow, onboarding_marker_path
-from cortex.apps.desktop_shell.overlay import OverlayWindow
+from cortex.apps.desktop_shell.overlay import OverlayWindow, overlay_close_action
 from cortex.apps.desktop_shell.settings import SettingsDialog
 from cortex.apps.desktop_shell.tokens import FS_FOOTNOTE
 from cortex.apps.desktop_shell.tray import CortexTrayIcon
@@ -1486,11 +1486,13 @@ class CortexAppController:
 
     @Slot(str)
     def _on_overlay_dismissed(self, intervention_id: str) -> None:
-        # In-process: directly call the handler on the daemon's loop
+        # In-process: directly call the handler on the daemon's loop. Only a
+        # user's close is a dismissal (the daemon books it as a rejection);
+        # the untouched timeout and the close after a rating are "expired".
         if self._daemon is not None and self._daemon_loop is not None:
             asyncio.run_coroutine_threadsafe(
                 self._daemon._handle_user_action({
-                    "action": "dismissed",
+                    "action": overlay_close_action(self._overlay),
                     "intervention_id": intervention_id,
                 }),
                 self._daemon_loop,

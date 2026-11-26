@@ -361,6 +361,20 @@ class _SparklineWidget(QWidget):
             painter.end()
 
 
+def overlay_close_action(overlay: object | None) -> str:
+    """The USER_ACTION a host reports for the card's last close.
+
+    Only a user's close (×, Escape, Cmd+D) is ``"dismissed"``: the daemon
+    records it as a dismissal, trains the dismissal model on it and books
+    a consent rejection. The untouched timeout and the close after a 👍 or
+    a 👎 comment are ``"expired"``, a neutral close, as the browser panel
+    already reports its own timeout.
+    """
+
+    reason = getattr(overlay, "last_dismiss_reason", "user")
+    return "dismissed" if reason == "user" else "expired"
+
+
 class OverlayWindow(QWidget):
     """Frameless always-on-top intervention overlay with native HUD styling."""
 
@@ -412,6 +426,13 @@ class OverlayWindow(QWidget):
         # Idempotency guard: once dismissed (auto or user), subsequent dismiss
         # calls are no-ops. First emitter wins. See F06.
         self._dismissed: bool = False
+        # Why the card last closed: "user" (×, Escape, Cmd+D), "timeout"
+        # (five minutes untouched) or "rated" (the close after 👍 or a 👎
+        # comment). Set before ``dismissed`` is emitted; hosts report only
+        # "user" to the daemon as a dismissal, which it books as a
+        # rejection. The others are a neutral close.
+        self.last_dismiss_reason: str = "user"
+        self._rated_close_id: str = ""
         # P0 §3.8 audit fix: per-intervention rating-row gate. ``True``
         # for guided_mode + simplified_workspace; ``False`` for
         # overlay_only minimal-tone interventions. Set in
@@ -2206,7 +2227,7 @@ class OverlayWindow(QWidget):
             logger.debug("rating_invoked(thumbs_up) failed", exc_info=True)
         # Once rated, collapse the overlay — the rating completes the
         # interaction (consent: implicit "I'm done").
-        QTimer.singleShot(180, self._auto_dismiss)
+        self._schedule_rated_close(180)
 
     def _on_thumbs_down(self) -> None:
         if not self._intervention_id:
@@ -2242,7 +2263,7 @@ class OverlayWindow(QWidget):
                 )
         self._feedback_text.clear()
         self._feedback_text.hide()
-        QTimer.singleShot(120, self._auto_dismiss)
+        self._schedule_rated_close(120)
 
     # ─────────────────────────────────────────────────────────────────
     # P0 §3.9: structured "Why?" drilldown
@@ -2328,6 +2349,18 @@ class OverlayWindow(QWidget):
     def _auto_dismiss(self) -> None:
         self._dismiss(reason="timeout")
 
+    def _schedule_rated_close(self, delay_ms: int) -> None:
+        self._rated_close_id = self._intervention_id
+        QTimer.singleShot(delay_ms, self._close_after_rating)
+
+    def _close_after_rating(self) -> None:
+        # Only the card that was rated: a newer suggestion shown within the
+        # delay must stay open.
+        rated = self._rated_close_id
+        self._rated_close_id = ""
+        if rated and rated == self._intervention_id:
+            self._dismiss(reason="rated")
+
     def _dismiss(self, *, reason: str) -> None:
         """The one dismiss path (user, timeout, rating completion).
 
@@ -2348,6 +2381,7 @@ class OverlayWindow(QWidget):
             logger.debug("clear inline widgets failed", exc_info=True)
         self.hide()
         dismissed_id = self._intervention_id
+        self.last_dismiss_reason = reason
         self.dismissed.emit(dismissed_id)
         # Audit-prod fix (P2): clear ``_intervention_id`` so a stale
         # button click after dismiss (Qt repaint tail, animation queue)
