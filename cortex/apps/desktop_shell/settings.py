@@ -1955,16 +1955,22 @@ class SettingsDialog(QWidget):
             # the extension; this dialog holds only a persisted preference.
             self._quiet_mode_baseline = self._quiet_mode.isChecked()
             self._quiet_duration.setValue(_get_int("quiet_duration_minutes", 30))
+            # Every control is set on every load, falling back to its
+            # default: this also runs on Close to discard unapplied edits, so
+            # a control left untouched here keeps whatever was abandoned.
             llm_mode = str(self._qs.value("llm_mode", "bedrock"))
             llm_modes = ["bedrock", "vertex", "direct", "rule_based"]
-            if llm_mode in llm_modes:
-                self._llm_backend.setCurrentIndex(llm_modes.index(llm_mode))
+            self._llm_backend.setCurrentIndex(
+                llm_modes.index(llm_mode) if llm_mode in llm_modes else 0
+            )
             planner_mode = str(self._qs.value("llm_planner_mode", "no_llm"))
             planner_modes = ["no_llm", "no_content", "external_redacted"]
-            if planner_mode in planner_modes and llm_mode != "rule_based":
-                self._llm_privacy_mode.setCurrentIndex(
-                    planner_modes.index(planner_mode)
-                )
+            # The offline backend runs the local planner (index 0).
+            self._llm_privacy_mode.setCurrentIndex(
+                planner_modes.index(planner_mode)
+                if planner_mode in planner_modes and llm_mode != "rule_based"
+                else 0
+            )
             self._external_context_ack.setChecked(
                 _get_bool("external_context_enabled", False)
                 and str(
@@ -2001,8 +2007,7 @@ class SettingsDialog(QWidget):
             _preset_index = {
                 "developer": 0, "student": 1, "writer": 2, "custom": 3,
             }
-            if preset in _preset_index:
-                self._distraction_preset.setCurrentIndex(_preset_index[preset])
+            self._distraction_preset.setCurrentIndex(_preset_index.get(preset, 0))
             raw_domains = self._qs.value(
                 "auto_distraction_block_custom_domains", [],
             )
@@ -2046,21 +2051,24 @@ class SettingsDialog(QWidget):
                     schedule_dict = {}
                 for day, combos in self._schedule_combos.items():
                     saved = schedule_dict.get(day, []) if isinstance(schedule_dict, dict) else []
+                    if not isinstance(saved, list):
+                        saved = []
                     for idx, cb in enumerate(combos):
-                        if idx < len(saved):
-                            val = str(saved[idx])
-                            cb_idx = cb.findText(val) if hasattr(cb, "findText") else -1
-                            if cb_idx >= 0:
-                                cb.setCurrentIndex(cb_idx)
+                        # Unsaved slots return to the default ("on", index 0).
+                        val = str(saved[idx]) if idx < len(saved) else "on"
+                        cb_idx = cb.findText(val) if hasattr(cb, "findText") else -1
+                        cb.setCurrentIndex(cb_idx if cb_idx >= 0 else 0)
             except Exception:
                 logger.debug("weekly schedule restore failed", exc_info=True)
             # P0 §3.25 — palette variant.
             try:
                 palette_value = str(self._qs.value("palette_variant", "default"))
+                palette_index = 0
                 for i in range(self._palette_combo.count()):
                     if self._palette_combo.itemData(i) == palette_value:
-                        self._palette_combo.setCurrentIndex(i)
+                        palette_index = i
                         break
+                self._palette_combo.setCurrentIndex(palette_index)
                 # Apply at startup so the runtime helper returns the
                 # right palette from the very first state lookup.
                 from cortex.apps.desktop_shell.palette_runtime import (
@@ -2147,4 +2155,11 @@ class SettingsDialog(QWidget):
             self._show_apply_error(
                 "Some settings could not be applied. Your changes may not have taken effect.",
             )
-        self._persist_settings(self.get_settings())
+        # Save only what the daemon just stated. A snapshot of every control
+        # would also save edits the user has not applied, and Close would
+        # then "restore" them instead of discarding them.
+        current = self.get_settings()
+        synced = {key for key in payload if key in current}
+        if "sensitivity" in synced:
+            synced.add("entry_threshold")
+        self._persist_settings({key: current[key] for key in synced})
