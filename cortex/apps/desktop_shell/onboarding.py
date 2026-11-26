@@ -688,6 +688,13 @@ class OnboardingWindow(QWidget):
             )
         except Exception:
             pass
+        # A token already in the Keychain (it outlives a reinstall) is the
+        # same real completion as saving one here; the card already says
+        # "Token found", so the strip and the finish note must agree.
+        if self._llm_key_present and (
+            "llm_backend" not in self._onboarding_state.completed_steps
+        ):
+            self.mark_step_complete("llm_backend")
         self._refresh_progress()
 
         # Permissions are granted in System Settings out-of-process — there's
