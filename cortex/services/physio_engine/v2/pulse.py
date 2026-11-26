@@ -112,6 +112,13 @@ PRIOR_MAX_AGE_SECONDS = 30.0
 # extend a rate that a confirmed window established; see the track constants.
 HARMONIC_SNR_HALF_WIDTH_HZ = 0.12
 HARMONIC_SNR_CONFIRMED_DB = 3.0
+# The second harmonic may add at most this share of the fundamental's power to
+# the signal; the excess counts as noise.  A camera pulse wave is dominated by
+# its fundamental.  Without the cap a candidate at *half* the true rate is
+# confirmed by the true pulse sitting on its "harmonic": on the 4TU recording
+# P2LC3 a weak 51 BPM line plus the real 101 BPM pulse cleared the confirmed
+# level and three windows published 51 BPM.
+HARMONIC_POWER_CAP = 0.5
 # A published rate forms a track. A weak window continues it only while the
 # track is fresh, the rate has not jumped, and a strong window confirmed the
 # track recently enough.
@@ -283,8 +290,9 @@ def harmonic_snr_db(
 ) -> float:
     """Power at the candidate rate and its second harmonic over the rest (dB).
 
-    ``filtered`` is the band-passed waveform.  Returns ``-99.0`` when the
-    window is too short to analyse or carries no power.
+    ``filtered`` is the band-passed waveform.  The harmonic counts only up to
+    ``HARMONIC_POWER_CAP`` of the fundamental (see the constant).  Returns
+    ``-99.0`` when the window is too short to analyse or carries no power.
     """
 
     count = len(filtered)
@@ -296,12 +304,21 @@ def harmonic_snr_db(
         nfft=nfft, detrend="constant",
     )
     band = (frequencies >= low_hz) & (frequencies <= high_hz)
-    cardiac = band & (
-        (np.abs(frequencies - cardiac_hz) <= HARMONIC_SNR_HALF_WIDTH_HZ)
-        | (np.abs(frequencies - 2.0 * cardiac_hz) <= HARMONIC_SNR_HALF_WIDTH_HZ)
+    at_fundamental = band & (
+        np.abs(frequencies - cardiac_hz) <= HARMONIC_SNR_HALF_WIDTH_HZ
     )
-    signal = float(np.sum(power[cardiac]))
-    noise = float(np.sum(power[band & ~cardiac]))
+    at_harmonic = (
+        band
+        & ~at_fundamental
+        & (np.abs(frequencies - 2.0 * cardiac_hz) <= HARMONIC_SNR_HALF_WIDTH_HZ)
+    )
+    fundamental = float(np.sum(power[at_fundamental]))
+    harmonic = float(np.sum(power[at_harmonic]))
+    counted_harmonic = min(harmonic, HARMONIC_POWER_CAP * fundamental)
+    signal = fundamental + counted_harmonic
+    noise = float(np.sum(power[band & ~at_fundamental & ~at_harmonic])) + (
+        harmonic - counted_harmonic
+    )
     if signal <= 1e-18 or noise <= 1e-18:
         return -99.0 if signal <= 1e-18 else 99.0
     return float(10.0 * np.log10(signal / noise))
@@ -489,6 +506,7 @@ class PulsePipelineV2:
             "min_cardiac_snr_db": self._min_cardiac_snr_db,
             "harmonic_snr_half_width_hz": HARMONIC_SNR_HALF_WIDTH_HZ,
             "harmonic_snr_confirmed_db": HARMONIC_SNR_CONFIRMED_DB,
+            "harmonic_power_cap": HARMONIC_POWER_CAP,
             "track_tolerance_bpm": TRACK_TOLERANCE_BPM,
             "track_continuity_seconds": TRACK_CONTINUITY_SECONDS,
             "track_confirmation_max_age_seconds": TRACK_CONFIRMATION_MAX_AGE_SECONDS,

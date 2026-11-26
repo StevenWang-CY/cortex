@@ -217,12 +217,18 @@ def test_concepts_glossary_has_core_terms() -> None:
     from cortex.apps.desktop_shell import dashboard
 
     glossary = dashboard._CONCEPTS_GLOSSARY
-    for required in ("state", "hr", "perclos", "sqi"):
+    for required in ("state", "hr", "hrv", "resp", "strain", "perclos", "sqi"):
         assert required in glossary, f"glossary missing {required!r}"
         # Every entry is a non-empty string so the tooltip is not blank.
         assert isinstance(glossary[required], str)
         assert len(glossary[required]) > 10
-    assert "hrv" not in glossary
+    # Variability is shown since 0.6.0 (SDNN qualified against ECG); its
+    # entry must say what the number is and must not present it as a stress
+    # or health reading.
+    hrv = glossary["hrv"].lower()
+    assert "sdnn" in hrv or "variation between heartbeats" in hrv
+    for claim in ("stress level", "diagnos", "medical"):
+        assert claim not in hrv or "not" in hrv
 
 
 # ---------------------------------------------------------------------------

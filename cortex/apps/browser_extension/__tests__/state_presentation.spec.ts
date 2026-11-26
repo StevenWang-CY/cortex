@@ -38,6 +38,41 @@ describe("live presentation continuity", () => {
         expect(currentSignalView(valid, false, 0, labels).heartRate).toBeNull();
         expect(currentSignalView(null, true, 0, labels).heartRate).toBeNull();
     });
+    it("shows variability, breathing and body load only while the camera evidence is live", () => {
+        const biometrics = statePresentationFields({ biometrics: {
+            heart_rate: 72, blink_rate: 12, hrv_sdnn: 41.6, respiration_rate: 14.4, strain_load_ratio: 0.426,
+        } }).biometrics!;
+        const live = currentSignalView(state({ biometrics }), true, 0, labels);
+        expect(live.hrvSdnn).toBe(42);
+        expect(live.breathRate).toBe(14);
+        expect(live.bodyLoadPercent).toBe(43);
+        for (const capture of [{ stale: true }, { frames_flowing: false }, { face_detected: false }]) {
+            const paused = currentSignalView(state({ biometrics, capture }), true, 0, labels);
+            expect(paused.hrvSdnn).toBeNull();
+            expect(paused.breathRate).toBeNull();
+            expect(paused.bodyLoadPercent).toBeNull();
+        }
+        const expired = currentSignalView(state({ biometrics }), true, STATE_FRESHNESS_MS, labels);
+        expect([expired.hrvSdnn, expired.breathRate, expired.bodyLoadPercent]).toEqual([null, null, null]);
+        expect(currentSignalView(state({ biometrics }), false, 0, labels).hrvSdnn).toBeNull();
+    });
+    it("drops implausible or malformed slow measurements instead of drawing them", () => {
+        for (const bad of [0, -5, 301, NaN, Infinity, "40", null]) {
+            const biometrics = statePresentationFields({ biometrics: { heart_rate: 72, hrv_sdnn: bad } }).biometrics!;
+            expect(currentSignalView(state({ biometrics }), true, 0, labels).hrvSdnn).toBeNull();
+        }
+        for (const bad of [0, 2.9, 45.1, NaN, "14", null]) {
+            const biometrics = statePresentationFields({ biometrics: { heart_rate: 72, respiration_rate: bad } }).biometrics!;
+            expect(currentSignalView(state({ biometrics }), true, 0, labels).breathRate).toBeNull();
+        }
+        for (const bad of [-0.1, NaN, "0.5", null]) {
+            const biometrics = statePresentationFields({ biometrics: { heart_rate: 72, strain_load_ratio: bad } }).biometrics!;
+            expect(currentSignalView(state({ biometrics }), true, 0, labels).bodyLoadPercent).toBeNull();
+        }
+        // An older daemon sends none of the three; the popup shows dashes, not zeros.
+        const legacy = currentSignalView(state(), true, 0, labels);
+        expect([legacy.hrvSdnn, legacy.breathRate, legacy.bodyLoadPercent]).toEqual([null, null, null]);
+    });
     it("keeps support readiness separate from the optional camera estimate", () => {
         const warming = currentSignalView(state({ status: "warming_up" }), true, 0, labels);
         expect(warming.stateKey).toBe("UNKNOWN");

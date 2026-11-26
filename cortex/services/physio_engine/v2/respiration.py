@@ -290,7 +290,17 @@ class RespirationFusionV2:
         boot_id: UUID,
         head_vertical_face_units: NDArray[np.float64] | None,
         beat_intervals: tuple[InterBeatInterval, ...] | None = None,
+        cardiac_signal_present: bool = True,
     ) -> RespirationProcessingResult:
+        """Estimate the breathing rate of one window.
+
+        ``cardiac_signal_present`` says whether the pulse pipeline currently
+        sees a cardiac line.  The colour-envelope channel reads breathing off
+        the amplitude of the pulse wave; with no pulse wave there it is
+        reading noise, and noise agrees with the head-motion channel often
+        enough (about one window in a hundred on signal-free input) to
+        publish a rate.  Without a cardiac signal that channel abstains.
+        """
         rgb = np.asarray(rgb_window, dtype=np.float64)
         times = np.asarray(sample_times_mono_ns, dtype=np.int64)
         if rgb.ndim != 2 or rgb.shape[1] != 3 or len(rgb) != len(times):
@@ -310,13 +320,15 @@ class RespirationFusionV2:
                 fused=self._unavailable("fusion", reason, boot_id, start_ns, end_ns),
             )
 
-        waveform = self._backend.extract(rgb, fs=sample_rate_hz)
-        color_signal = _color_envelope(
-            waveform,
-            fs=sample_rate_hz,
-            cardiac_low_hz=0.7,
-            cardiac_high_hz=3.5,
-        )
+        color_signal: NDArray[np.float64] | None = None
+        if cardiac_signal_present:
+            waveform = self._backend.extract(rgb, fs=sample_rate_hz)
+            color_signal = _color_envelope(
+                waveform,
+                fs=sample_rate_hz,
+                cardiac_low_hz=0.7,
+                cardiac_high_hz=3.5,
+            )
         raw_channels = {
             "color_envelope": _spectral_channel(
                 color_signal,

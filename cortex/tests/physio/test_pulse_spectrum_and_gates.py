@@ -812,3 +812,75 @@ def test_signal_presence_thresholds_reach_the_pipeline_from_config() -> None:
     parameters = engine.pulse.algorithm_identity.parameters
     assert parameters["nsqi_threshold"] == pytest.approx(0.51)
     assert parameters["min_cardiac_snr_db"] == pytest.approx(7.5)
+
+
+def _harmonic_mix(
+    fundamental_hz: float,
+    *,
+    fundamental_amplitude: float,
+    harmonic_amplitude: float,
+    noise_sigma: float,
+    seed: int,
+) -> np.ndarray:
+    times = _times(20.0)
+    rng = np.random.default_rng(seed)
+    return (
+        fundamental_amplitude * np.sin(2.0 * np.pi * fundamental_hz * times)
+        + harmonic_amplitude * np.sin(2.0 * np.pi * 2.0 * fundamental_hz * times + 0.4)
+        + noise_sigma * rng.standard_normal(len(times))
+    )
+
+
+def test_a_pulse_on_the_harmonic_cannot_confirm_a_candidate_at_half_its_rate() -> None:
+    """The real pulse must not be counted as the harmonic of a weak half-rate line.
+
+    Measured on the 4TU recording P2LC3 (ECG 101 BPM): the selector preferred
+    a weak 0.85 Hz line, the harmonic SNR added the real 1.7 Hz pulse to it as
+    "second harmonic", the sum cleared the confirmed level and three windows
+    published 51 BPM. With the harmonic capped at a share of the fundamental
+    the excess is noise, and the half-rate candidate stays below the level.
+    """
+    from cortex.services.physio_engine.v2.pulse import (
+        HARMONIC_SNR_CONFIRMED_DB,
+        harmonic_snr_db,
+    )
+
+    true_hz = 101.0 / 60.0
+    for seed in range(20):
+        # A half-rate line at 0.55-0.80 of the pulse amplitude: weaker than
+        # the pulse, yet strong enough for the selector's sub-harmonic
+        # preference to pick it (the preference needs 0.54 or more).
+        relative = 0.55 + 0.25 * seed / 19.0
+        mix = _harmonic_mix(
+            true_hz / 2.0,
+            fundamental_amplitude=relative,
+            harmonic_amplitude=1.0,
+            noise_sigma=1.2,
+            seed=seed,
+        )
+        at_half = harmonic_snr_db(
+            mix, fs=FS, cardiac_hz=true_hz / 2.0, low_hz=0.7, high_hz=3.5
+        )
+        assert at_half < HARMONIC_SNR_CONFIRMED_DB, (seed, relative, at_half)
+
+
+def test_harmonic_cap_leaves_a_genuine_pulse_shape_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fundamental-dominant pulse scores the same with and without the cap."""
+    from cortex.services.physio_engine.v2 import pulse as pulse_module
+
+    # Second harmonic at 60% of the fundamental's amplitude (36% of its
+    # power) is already a sharper upstroke than a camera pulse shows.
+    mix = _harmonic_mix(
+        1.2, fundamental_amplitude=1.0, harmonic_amplitude=0.6, noise_sigma=0.8, seed=3
+    )
+    capped = pulse_module.harmonic_snr_db(
+        mix, fs=FS, cardiac_hz=1.2, low_hz=0.7, high_hz=3.5
+    )
+    monkeypatch.setattr(pulse_module, "HARMONIC_POWER_CAP", 1e9)
+    uncapped = pulse_module.harmonic_snr_db(
+        mix, fs=FS, cardiac_hz=1.2, low_hz=0.7, high_hz=3.5
+    )
+    assert capped == pytest.approx(uncapped)
+    assert capped >= pulse_module.HARMONIC_SNR_CONFIRMED_DB

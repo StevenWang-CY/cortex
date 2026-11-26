@@ -234,6 +234,8 @@ from cortex.apps.desktop_shell.palette_runtime import active_state_color
 from cortex.apps.desktop_shell.tokens import (
     BIO_BLINK,
     BIO_HR,
+    BIO_HRV,
+    BIO_RESP,
     BRAND_ACCENT,
     BRAND_ACCENT_DARK,
     BRAND_ACCENT_TEXT,
@@ -322,6 +324,21 @@ _CONCEPTS_GLOSSARY: dict[str, str] = {
         "BPM: an experimental camera-derived pulse estimate. Accuracy varies "
         "with lighting, motion, camera, and individual conditions; it is not "
         "medical-grade."
+    ),
+    "hrv": (
+        "HRV (SDNN, ms): how much the interval between pulses varies over the "
+        "last few minutes, estimated from the camera. Read it against your own "
+        "usual level, not as an absolute; it is not medical-grade."
+    ),
+    "resp": (
+        "Breaths per minute: an estimate shown only when two independent "
+        "camera signals agree. Experimental and not medical-grade."
+    ),
+    "strain": (
+        "Body load: time recently spent with pulse up, variability down or "
+        "breathing fast compared with your own reference. Calm time brings it "
+        "back down. It paces break suggestions; it is not a measure of stress "
+        "or health."
     ),
     "perclos": (
         "PERCLOS: estimated eyelid-closure exposure over a recent window. "
@@ -1082,13 +1099,17 @@ class _ConsumerTab(QWidget):
         bio_row.setContentsMargins(0, 0, 0, 0)
 
         self._bpm_label = QLabel("--")
+        self._hrv_label = QLabel("--")
+        self._resp_label = QLabel("--")
         self._blk_label = QLabel("--")
 
         # Channel tints stay as 6 px dots (data identity); the caption itself
         # uses the secondary text token so it clears AA at 11 px.
         bio_specs = [
             (self._bpm_label, "Pulse · bpm", BIO_HR, "hr"),
-            (self._blk_label, "Blinks / min", BIO_BLINK, "blink"),
+            (self._hrv_label, "HRV · ms", BIO_HRV, "hrv"),
+            (self._resp_label, "Breath/min", BIO_RESP, "resp"),
+            (self._blk_label, "Blink/min", BIO_BLINK, "blink"),
         ]
         for val_widget, title, color, glossary_key in bio_specs:
             col = QVBoxLayout()
@@ -1156,6 +1177,21 @@ class _ConsumerTab(QWidget):
         self._bio_status_label.setVisible(False)
         _set_accessible_name(self._bio_status_label, "Biometrics status")
         bio_inner.addWidget(self._bio_status_label)
+
+        # Cumulative strain load: hidden until camera physiology has been
+        # read against a personal reference.
+        self._strain_label = QLabel("")
+        self._strain_label.setObjectName("CortexStrainLoad")
+        self._strain_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._strain_label.setFont(mac_native.system_font(FS_CAPTION, "regular"))
+        self._strain_label.setStyleSheet(
+            f"font-size: {FS_CAPTION}px; color: {CX_TEXT_SECONDARY}; "
+            "background: transparent; border: none;"
+        )
+        self._strain_label.setToolTip(_CONCEPTS_GLOSSARY["strain"])
+        self._strain_label.setVisible(False)
+        _set_accessible_name(self._strain_label, "Body load")
+        bio_inner.addWidget(self._strain_label)
         root.addWidget(bio_card)
         root.addSpacing(SP4)
 
@@ -1680,20 +1716,37 @@ class _ConsumerTab(QWidget):
             logger.debug("focus protection pill update failed", exc_info=True)
 
     def apply_break_recommendation(self, payload: dict) -> None:
-        """Render only the opt-in elapsed-focus reminder contract."""
+        """Offer a break: the pill says why, and a click starts the session."""
 
-        if payload.get("basis") != "elapsed_focus":
+        basis = payload.get("basis")
+        if basis not in ("elapsed_focus", "physiological_strain"):
             self._clear_break_pill()
             return
         self._break_recommendation_payload = dict(payload)
         try:
-            elapsed = float(payload.get("elapsed_focus_seconds", 0.0))
-            minutes = max(1, round(elapsed / 60.0))
-            self._break_pill.setText(f"Take a break? · {minutes} min")
-            self._break_pill.setToolTip(
-                "Your preferred active-work interval was reached. "
-                "This reminder does not use camera or biometric estimates."
-            )
+            try:
+                breathe = max(1, round(float(payload.get("duration_seconds", 180)) / 60.0))
+            except (TypeError, ValueError):
+                breathe = 3
+            if basis == "physiological_strain":
+                self._break_pill.setText(f"Take a breather? · {breathe} min")
+                self._break_pill.setToolTip(
+                    "Your pulse, its variability or your breathing have been "
+                    "away from your usual level for a while. A few minutes of "
+                    "paced breathing may help; this is a suggestion, not a "
+                    "health reading."
+                )
+            else:
+                try:
+                    elapsed = float(payload.get("focus_elapsed_seconds") or 0.0)
+                except (TypeError, ValueError):
+                    elapsed = 0.0
+                minutes = max(1, round(elapsed / 60.0))
+                self._break_pill.setText(f"Take a break? · {minutes} min in")
+                self._break_pill.setToolTip(
+                    "Your preferred active-work interval was reached. "
+                    "This reminder does not use camera estimates."
+                )
             self._break_pill.setVisible(True)
         except Exception:
             logger.debug("break pill update failed", exc_info=True)
@@ -2041,8 +2094,19 @@ class _ConsumerTab(QWidget):
                 pass
             self._set_text_if_changed(self._bpm_label, f"{hr:.0f}")
             self._set_text_if_changed(
-                self._blk_label, f"{blink:.1f}" if blink is not None else "--"
+                self._hrv_label,
+                f"{view.hrv_sdnn:.0f}" if view.hrv_sdnn is not None else "--",
             )
+            self._set_text_if_changed(
+                self._resp_label,
+                f"{view.respiration_rate:.0f}"
+                if view.respiration_rate is not None
+                else "--",
+            )
+            self._set_text_if_changed(
+                self._blk_label, f"{blink:.0f}" if blink is not None else "--"
+            )
+        self._render_strain_load(view.strain_load_ratio if hr is not None else None)
 
         # "This session" stats accumulate steady-activity seconds, the
         # longest contiguous steady run, and nudges shown. The section is
@@ -2076,12 +2140,34 @@ class _ConsumerTab(QWidget):
         except Exception:
             pass
 
+    def _render_strain_load(self, ratio: float | None) -> None:
+        """Show the cumulative strain load, or hide the line when unknown."""
+
+        label = getattr(self, "_strain_label", None)
+        if label is None:
+            return
+        if ratio is None:
+            label.setVisible(False)
+            return
+        percent = int(round(min(ratio, 9.99) * 100))
+        if ratio >= 1.0:
+            text = f"Body load {percent}% · a short break would help"
+        elif ratio >= 0.8:
+            text = f"Body load {percent}% · nearing a break"
+        else:
+            text = f"Body load {percent}% of your break level"
+        self._set_text_if_changed(label, text)
+        label.setVisible(True)
+
     def expire_state(self) -> None:
         """Clear live presentation without changing transport/session authority."""
         self._last_state = "UNKNOWN"
         self._render_state_badge("UNKNOWN", "Waiting for fresh signals")
         self._set_text_if_changed(self._bpm_label, "--")
         self._set_text_if_changed(self._blk_label, "--")
+        self._set_text_if_changed(self._hrv_label, "--")
+        self._set_text_if_changed(self._resp_label, "--")
+        self._render_strain_load(None)
         self._set_text_if_changed(self._bio_status_label, "Waiting for fresh signals…")
         self._bio_numerics.hide()
         self._bio_empty_state.hide()
@@ -2361,6 +2447,9 @@ class _ConsumerTab(QWidget):
             message = messages.get(phase, "Live readings unavailable")
             self._set_text_if_changed(self._bpm_label, "--")
             self._set_text_if_changed(self._blk_label, "--")
+            self._set_text_if_changed(self._hrv_label, "--")
+            self._set_text_if_changed(self._resp_label, "--")
+            self._render_strain_load(None)
             self._set_text_if_changed(self._bio_status_label, message)
             self._bio_numerics.setVisible(False)
             self._bio_status_label.setVisible(self._has_received_state)

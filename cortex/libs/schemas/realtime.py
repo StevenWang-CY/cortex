@@ -616,7 +616,7 @@ class BiometricsSummary(BaseModel):
         ),
     )
     hrv_sdnn: float | None = Field(
-        None, description="SDNN of camera pulse intervals (ms, trailing five minutes)"
+        None, description="SDNN of camera pulse intervals (ms, trailing three minutes)"
     )
     pulse_quality: float | None = Field(
         None, ge=0.0, le=1.0, description="Quality of the current pulse window"

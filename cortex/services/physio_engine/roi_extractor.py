@@ -50,6 +50,12 @@ _NON_SKIN_FEATURES: tuple[tuple[int, ...], ...] = (
     # lips
     (61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185),
 )
+# Highest landmark index the face-skin region reads. The outline alone stops
+# at 454 while the eye and lip contours reach further, so the completeness
+# check must cover every index set.
+_MAX_FACE_SKIN_LANDMARK = max(
+    max(FACE_OVAL), *(max(feature) for feature in _NON_SKIN_FEATURES)
+)
 # The outline is pulled this far towards the face centre so the hairline, jaw
 # edge and background never enter the mean when a landmark is a pixel off.
 FACE_OVAL_SHRINK = 0.92
@@ -233,7 +239,7 @@ class RoiExtractor:
         """
 
         landmarks = np.asarray(landmarks_px, dtype=np.float64)
-        if landmarks.ndim != 2 or landmarks.shape[0] <= max(FACE_OVAL):
+        if landmarks.ndim != 2 or landmarks.shape[0] <= _MAX_FACE_SKIN_LANDMARK:
             return None
         if not bool(np.isfinite(landmarks[:, :2]).all()):
             return None

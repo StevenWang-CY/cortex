@@ -1872,13 +1872,18 @@ async function handleMessage(raw: string): Promise<void> {
         }
 
         case "BREAK_RECOMMENDATION": {
-            // Only explicit elapsed-focus reminders are product-eligible.
-            // Legacy stress-integral messages remain a silent decode sink.
-            if (msg.payload.basis !== "elapsed_focus") break;
+            // Elapsed-focus reminders and qualified strain-load suggestions
+            // are product-eligible. A message with no basis, or with the
+            // legacy stress-integral basis, remains a silent decode sink.
+            const basis: unknown = msg.payload.basis;
+            if (basis !== "elapsed_focus" && basis !== "physiological_strain") break;
+            const strain = basis === "physiological_strain";
             const reason = typeof msg.payload.reason === "string"
                 ? msg.payload.reason
-                : "You've reached your preferred focus interval.";
-            injectToast("Break reminder", reason);
+                : strain
+                    ? "Your heart and breathing have run above your usual level for a while."
+                    : "You've reached your preferred focus interval.";
+            injectToast(strain ? "Breathing break?" : "Break reminder", reason);
             broadcastToPopup({ type: "BREAK_SUGGESTED", reason });
             break;
         }

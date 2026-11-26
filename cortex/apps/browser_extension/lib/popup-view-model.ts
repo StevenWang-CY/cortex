@@ -5,6 +5,12 @@ import type { PulseReadinessReason } from "../types/generated/cortex_schemas";
 export interface Biometrics {
     heart_rate: number | null;
     hrv_rmssd: number | null;
+    /** SDNN of camera pulse intervals (ms). Optional: older daemons omit it. */
+    hrv_sdnn?: number | null;
+    /** Breathing rate (breaths/min) when two camera channels agree. */
+    respiration_rate?: number | null;
+    /** Cumulative strain load as a fraction of the user's break level. */
+    strain_load_ratio?: number | null;
     blink_rate: number | null;
     head_neck_flexion_score: number | null;
     head_neck_flexion_angle: number | null;

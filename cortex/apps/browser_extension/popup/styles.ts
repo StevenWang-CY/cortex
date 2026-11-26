@@ -402,6 +402,7 @@ export const S: Record<string, React.CSSProperties> = {
     // available) does not reflow the popup card.
     bioRow: {
         display: "flex",
+        flexWrap: "wrap" as const,
         justifyContent: "space-between",
         alignItems: "center" as const,
         padding: "16px 8px",
@@ -424,6 +425,15 @@ export const S: Record<string, React.CSSProperties> = {
         fontWeight: 400,
         fontFamily: CX.fontSerif,
         color: CX.text,
+        fontVariantNumeric: "tabular-nums",
+    },
+    // Second line of the biometrics row, shown once a strain load exists.
+    bioLoad: {
+        flexBasis: "100%",
+        marginTop: 10,
+        fontSize: 11,
+        color: CX.textSecondary,
+        fontFamily: CX.font,
         fontVariantNumeric: "tabular-nums",
     },
     bioStatusBox: {

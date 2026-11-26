@@ -41,7 +41,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-from cortex._version import __version__
+from cortex._version import VERSION
 from cortex.libs.config.settings import CortexConfig
 from cortex.services.eval.physio_qualification import (
     METRIC_HEART_RATE,
@@ -381,7 +381,7 @@ def main(argv: list[str] | None = None) -> int:
     config = CortexConfig()
     result: dict[str, Any] = {
         "generated_at_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "cortex_version": __version__,
+        "cortex_version": VERSION,
         "mode": args.mode,
         "rppg_config": config.signal.rppg.model_dump(mode="json"),
     }

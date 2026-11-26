@@ -48,6 +48,13 @@ class ConsumerStateViewModel:
     blink_rate: float | None
     biometrics_status: str | None
     connected_surfaces: frozenset[str]
+    # Dispersion of pulse intervals (SDNN, ms): the variability measure that
+    # qualified against ECG and that the support rules use.
+    hrv_sdnn: float | None = None
+    respiration_rate: float | None = None
+    # Cumulative strain load as a fraction of the break threshold; None until
+    # camera physiology has been observed against a personal reference.
+    strain_load_ratio: float | None = None
 
 
 _PULSE_MISSING_REASON_COPY: dict[str, str] = {
@@ -125,11 +132,19 @@ def consumer_state_view(payload: Mapping[str, Any]) -> ConsumerStateViewModel:
     hrv = _measurement(raw_hrv)
     raw_blink = biometrics.get("blink_rate")
     blink = _measurement(raw_blink)
+    sdnn = _measurement(biometrics.get("hrv_sdnn"), positive=True)
+    respiration = _measurement(biometrics.get("respiration_rate"), positive=True)
+    if respiration is not None and not 3.0 <= respiration <= 45.0:
+        respiration = None
+    strain_load = _measurement(biometrics.get("strain_load_ratio"))
     if (
         capture.get("stale") or capture.get("frames_flowing") is False
         or capture.get("face_detected") is False
     ):
         heart_rate, hrv, blink = None, None, None
+        # Variability and breathing describe the last minutes, but without a
+        # face in view they are history rather than readings.
+        sdnn, respiration = None, None
     if capture.get("pulse_unavailable"):
         heart_rate, hrv = None, None
     if heart_rate is None:
@@ -162,6 +177,9 @@ def consumer_state_view(payload: Mapping[str, Any]) -> ConsumerStateViewModel:
         blink_rate=blink,
         biometrics_status=bio_status,
         connected_surfaces=connected,
+        hrv_sdnn=sdnn,
+        respiration_rate=respiration,
+        strain_load_ratio=strain_load,
     )
 
 

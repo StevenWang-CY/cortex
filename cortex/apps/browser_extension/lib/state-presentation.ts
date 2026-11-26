@@ -25,6 +25,9 @@ export function statePresentationFields(raw: unknown): Pick<CortexState, "biomet
         result.biometrics = {
             heart_rate: numberOrNull(bio.heart_rate),
             hrv_rmssd: numberOrNull(bio.hrv_rmssd),
+            hrv_sdnn: numberOrNull(bio.hrv_sdnn),
+            respiration_rate: numberOrNull(bio.respiration_rate),
+            strain_load_ratio: numberOrNull(bio.strain_load_ratio),
             blink_rate: numberOrNull(bio.blink_rate),
             head_neck_flexion_score: numberOrNull(bio.head_neck_flexion_score),
             head_neck_flexion_angle: numberOrNull(bio.head_neck_flexion_angle),
@@ -78,6 +81,13 @@ export function currentSignalView(
     const heartRate = captureReady && !current?.capture?.pulse_unavailable
         && pulse !== null && pulse >= 30 && pulse <= 220 ? Math.round(pulse) : null;
     const blink = numberOrNull(current?.biometrics?.blink_rate);
+    // The slower camera measurements share the capture lifetime of the pulse:
+    // a paused camera or an absent face clears them with it. The bounds are
+    // the daemon's own plausibility ranges, repeated so a malformed frame
+    // cannot draw an impossible number.
+    const sdnn = numberOrNull(current?.biometrics?.hrv_sdnn);
+    const breath = numberOrNull(current?.biometrics?.respiration_rate);
+    const load = numberOrNull(current?.biometrics?.strain_load_ratio);
     return {
         ...view,
         stale,
@@ -85,6 +95,11 @@ export function currentSignalView(
         label: stale ? "Waiting for fresh signals" : view.label,
         heartRate,
         blinkRate: captureReady && blink !== null && blink >= 0 ? Math.round(blink) : null,
+        hrvSdnn: captureReady && sdnn !== null && sdnn >= 1 && sdnn <= 300 ? Math.round(sdnn) : null,
+        breathRate: captureReady && breath !== null && breath >= 3 && breath <= 45
+            ? Math.round(breath) : null,
+        bodyLoadPercent: captureReady && load !== null && load >= 0
+            ? Math.min(999, Math.round(load * 100)) : null,
         bioStatusMessage: !connected ? "Cortex is resting"
             : stale ? "Waiting for fresh signals…"
             : view.captureStale ? "Camera signal paused — waiting for fresh frames"

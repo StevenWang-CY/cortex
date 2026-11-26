@@ -18,8 +18,10 @@ Three consequences follow directly and are tested:
   enables the camera;
 * physiology moves the score only inside
   ``[(1 - L) * behaviour, (1 - L) * behaviour + L]``;
-* with behaviour at zero the fused score is at most ``L``, which the
-  registry keeps below the smoother's entry threshold.
+* the scorer fuses a state only where that state's own behaviour rule
+  produced a positive eligible score; an abstaining or gated rule leaves the
+  state at zero whatever the camera reads.  ``L`` is additionally capped
+  below the smoother's entry threshold.
 
 Every transform standardises against the person's own reference
 (:mod:`physiology_baseline`), so a constant instrument bias does not read as
@@ -193,8 +195,21 @@ def _standard_scores(
             float(blink.quality),
         )
 
+    # Eye-closure share is an absolute fraction and needs no reference of its
+    # own, but it joins the block only once some personal reference exists:
+    # until then the camera has not watched this person long enough for any
+    # of its readings to weigh on a support score.
     perclos = _value(FeatureName.PERCLOS)
-    if perclos is not None and perclos.value is not None:
+    any_reference_ready = any(
+        item.ready
+        for item in (
+            reference.heart_rate,
+            reference.sdnn,
+            reference.respiration,
+            reference.blink_rate,
+        )
+    )
+    if perclos is not None and perclos.value is not None and any_reference_ready:
         usable[FeatureName.PERCLOS] = (float(perclos.value), float(perclos.quality))
     return usable
 

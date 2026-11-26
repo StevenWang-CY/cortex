@@ -1,7 +1,7 @@
 {
   "name": "cortex-browser-extension",
   "displayName": "Cortex — Workspace Support",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "packageManager": "pnpm@9.15.9",
   "description": "Local workspace context and user-controlled support, with optional experimental camera estimates.",
   "scripts": {

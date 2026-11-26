@@ -273,9 +273,11 @@ class RuleScorer:
             SupportState.FLOW_LIKE: flow_coverage,
         }
 
-        # Physiology corroborates or tempers the behavioural reading; it is
-        # fused only once behaviour has made some hypothesis eligible, so a
-        # camera can never be the sole basis of an estimate.
+        # Physiology corroborates or tempers a behavioural reading; it is
+        # fused into a state only where that state's own behaviour rule
+        # produced a positive eligible score. Where the rule abstained or was
+        # gated to zero the state stays at zero, so a camera can never be the
+        # sole basis of an estimate -- not even of the runner-up.
         weight = self.physiology_weight
         observed_physiology = (
             evaluate_physiology(features, self._physiology_reference)
@@ -285,18 +287,30 @@ class RuleScorer:
         # Kept for consumers that read physiology in its own right (the
         # strain load, the live display), whatever behaviour is doing.
         self.last_physiology = observed_physiology
-        physiology: PhysiologyEvidence = NO_PHYSIOLOGY
-        if any(eligible.values()):
-            physiology = observed_physiology
-            contributions.extend(physiology.contributions)
+        fusable = {state: eligible[state] > 0.0 for state in eligible}
+        contributions.extend(
+            item
+            for item in observed_physiology.contributions
+            if fusable.get(item.support_state, False)
+        )
         fused = {
-            state: fuse(eligible[state], physiology.block(state), weight)
+            state: (
+                fuse(eligible[state], observed_physiology.block(state), weight)
+                if fusable[state]
+                else 0.0
+            )
             for state in eligible
         }
         coverage_by_state = {
             **{
-                state: fuse_coverage(
-                    behaviour_coverage[state], physiology.block(state), weight
+                state: (
+                    fuse_coverage(
+                        behaviour_coverage[state],
+                        observed_physiology.block(state),
+                        weight,
+                    )
+                    if fusable[state]
+                    else behaviour_coverage[state]
                 )
                 for state in behaviour_coverage
             },

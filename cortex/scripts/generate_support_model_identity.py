@@ -42,6 +42,8 @@ IMPLEMENTATION_COMPONENTS: tuple[str, ...] = (
     "services/state_engine/physiology_evidence.py",
     "services/state_engine/physiology_baseline.py",
     "services/physio_engine/camera_physiology.py",
+    "services/physio_engine/roi_extractor.py",
+    "services/physio_engine/v2/engine.py",
     "services/physio_engine/v2/pulse.py",
     "services/physio_engine/v2/beat_timing.py",
     "services/physio_engine/v2/beats.py",

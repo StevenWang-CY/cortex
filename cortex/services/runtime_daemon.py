@@ -3008,6 +3008,14 @@ class CortexDaemon:
             self._causal_attributor = prepared.causal_attributor
             self._active_calibration_profile = profile
             self._baseline_snapshot = prepared.baselines
+            # A new calibration's measured levels replace the corresponding
+            # personal physiology references; metrics it did not measure keep
+            # what the session has learned.
+            physiology_baseline: PhysiologyBaselineTracker | None = getattr(
+                self, "_physiology_baseline", None
+            )
+            if physiology_baseline is not None:
+                physiology_baseline.seed_from_calibration(prepared.baselines)
             self._camera_calibration_valid = prepared.camera_calibration_valid
             self._latest_respiration_evidence = None
             self._latest_estimate = None
@@ -3229,6 +3237,14 @@ class CortexDaemon:
         if invalidate_calibration:
             self._posture.reset_calibration()
             self._camera_calibration_valid = False
+            # The personal physiology reference describes one person through
+            # one camera. A different physical camera carries a different
+            # bias, so the reference is relearned from its own measurements;
+            # levels calibrated through the previous camera do not seed it.
+            self._physiology_baseline = PhysiologyBaselineTracker(None)
+            self._scorer.set_physiology_reference(
+                self._physiology_baseline.reference()
+            )
         else:
             self._posture.reset()
         self._feature_fusion.invalidate_camera_channels()
@@ -3942,7 +3958,10 @@ class CortexDaemon:
         ):
             pattern = "coherent"
         recommendation = BreakRecommendation(
-            reason="Your body has been working hard for a while.",
+            reason=(
+                "Your heart and breathing have run above your usual level "
+                "for a while. A short break may help."
+            ),
             urgency="medium",
             basis="physiological_strain",
             stress_load=tracker.current_load,
@@ -6254,6 +6273,12 @@ class CortexDaemon:
             return None
         if record.completed:
             self._focus_break_policy.record_break_taken()
+            # A completed breathing session pays back strain load in
+            # proportion to its length, so the next suggestion is earned by
+            # new strain rather than by the old total.
+            self._strain_load_tracker().apply_recovery_credit(
+                2.0 * float(record.duration_seconds)
+            )
         # Phase-4b TASK G: structured BIOLOGY_BREAK_COMPLETED event.
         try:
             logger.info(

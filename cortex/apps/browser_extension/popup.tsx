@@ -1153,8 +1153,9 @@ function CortexPopup(): React.ReactElement {
                 break;
             }
             case "BREAK_RECOMMENDATION": {
-                // Compatibility-only message. Never render an unsupported
-                // HRV/stress claim, even if an older daemon emits one.
+                // The worker decides eligibility and forwards an eligible
+                // suggestion as BREAK_SUGGESTED; the raw message is never
+                // rendered here, so a legacy stress claim cannot surface.
                 break;
             }
             case "WHY_DETAIL": {
@@ -1445,6 +1446,9 @@ function CortexPopup(): React.ReactElement {
     const stateLabel = supportView.label;
     const hr = supportView.heartRate;
     const blink = supportView.blinkRate;
+    const hrvSdnn = supportView.hrvSdnn;
+    const breathRate = supportView.breathRate;
+    const bodyLoadPercent = supportView.bodyLoadPercent;
     const captureStale = supportView.captureStale;
     const storeDegraded = supportView.storeDegraded;
     const bioStatusMessage = supportView.bioStatusMessage;
@@ -1937,9 +1941,25 @@ function CortexPopup(): React.ReactElement {
                         <span style={S.bioVal} aria-label={`${Math.round(hr)} beats per minute`}>{Math.round(hr)}</span>
                     </div>
                     <div style={S.bioCol}>
+                        <span style={S.bioLabel} title="Variation between heartbeats (SDNN, milliseconds) over the last three minutes">HRV</span>
+                        <span style={S.bioVal} aria-label={hrvSdnn !== null ? `heart rate variability ${hrvSdnn} milliseconds` : "no heart rate variability yet"}>{hrvSdnn !== null ? `${hrvSdnn}ms` : "—"}</span>
+                    </div>
+                    <div style={S.bioCol}>
+                        <span style={S.bioLabel}>Breath</span>
+                        <span style={S.bioVal} aria-label={breathRate !== null ? `${breathRate} breaths per minute` : "no breathing rate yet"}>{breathRate !== null ? `${breathRate}/m` : "—"}</span>
+                    </div>
+                    <div style={S.bioCol}>
                         <span style={S.bioLabel}>Blinks</span>
                         <span style={S.bioVal} aria-label={blink ? `${Math.round(blink)} blinks per minute` : "no blink rate data"}>{blink ? `${Math.round(blink)}/m` : "—"}</span>
                     </div>
+                    {bodyLoadPercent !== null && bodyLoadPercent >= 1 ? (
+                        <div
+                            style={S.bioLoad}
+                            title="Time with heart rate up and variability down against your own level, less the calm time since. A pacing aid, not a health measure."
+                        >
+                            Body load {bodyLoadPercent}% of your break level
+                        </div>
+                    ) : null}
                 </div>
             ) : connected ? (
                 <div
