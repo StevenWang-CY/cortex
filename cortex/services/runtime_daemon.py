@@ -12,6 +12,7 @@ import asyncio
 import copy
 import json
 import logging
+import math
 import os
 import queue
 import threading
@@ -8748,6 +8749,24 @@ class CortexDaemon:
             self.config.intervention.enable_os_notifications = bool(
                 settings["enable_os_notifications"]
             )
+        # P0 §3.15: the Settings "Daily LLM cap" (USD; 0 = unlimited). The
+        # dialog sends it in every Apply and nothing read it, so spend ran to
+        # the built-in default whatever cap the user chose. A non-finite or
+        # unparsable value is ignored rather than read as "unlimited".
+        if "daily_llm_budget_usd" in settings:
+            try:
+                requested_budget = float(settings["daily_llm_budget_usd"])
+            except (TypeError, ValueError):
+                requested_budget = float("nan")
+            if math.isfinite(requested_budget):
+                budget = max(0.0, requested_budget)
+                self.config.llm.daily_cost_budget_usd = budget
+                tracker = getattr(self._llm_client, "_cost_tracker", None)
+                set_kill_usd = getattr(tracker, "set_kill_usd", None)
+                if callable(set_kill_usd):
+                    set_kill_usd(budget)
+            else:
+                logger.warning("Ignoring non-finite daily_llm_budget_usd setting")
         # External model transport is a separate, revision-bound privacy
         # choice from provider selection.  Every update rebuilds the planner
         # once and burns pending previews from the prior configuration.
