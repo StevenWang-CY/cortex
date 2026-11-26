@@ -18,8 +18,10 @@ default and logs once.
 from __future__ import annotations
 
 import logging
+import struct
 import sys
 from functools import lru_cache
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -33,16 +35,45 @@ def _log_unsupported_once(reason: str) -> None:
     logger.info("Receptivity probe unsupported: %s", reason)
 
 
+def _read_uint32_property(
+    core_audio: Any,
+    null_qualifier: Any,
+    audio_object: int,
+    selector: int,
+) -> int | None:
+    """Read one global ``UInt32`` property, or ``None`` when it fails.
+
+    pyobjc maps ``AudioObjectGetPropertyData(object, address, qualifierSize,
+    qualifier, ioDataSize, outData)`` to a call returning ``(status, size,
+    bytes)``; the qualifier must be ``objc.NULL`` (``None`` fails argument
+    conversion).
+    """
+
+    address = core_audio.AudioObjectPropertyAddress(
+        selector,
+        core_audio.kAudioObjectPropertyScopeGlobal,
+        getattr(core_audio, "kAudioObjectPropertyElementMain", 0),
+    )
+    status, size, data = core_audio.AudioObjectGetPropertyData(
+        audio_object, address, 0, null_qualifier, 4, None,
+    )
+    if status != 0 or data is None or int(size) < 4:
+        return None
+    return int(struct.unpack("=I", bytes(data)[:4])[0])
+
+
 def is_microphone_in_use() -> bool | None:
     """Best-effort detection of an active microphone capture session.
 
-    Implementation strategy on macOS:
+    Reads ``kAudioDevicePropertyDeviceIsRunningSomewhere`` on the default
+    input device: true while any process does I/O on it (a call, a
+    recording). The previous probe read
+    ``kAudioHardwarePropertyProcessIsRunning``, which the pyobjc binding does
+    not export (and which describes only the calling process); the lookup
+    raised on every call, so this always answered ``None`` and the
+    mic-active receptivity gate never engaged.
 
-    * Prefer ``CoreAudio`` ``kAudioHardwarePropertyProcessIsRunning``
-      (any process with an input stream open).
-    * Fall back to scanning ``AVCaptureDevice``s for an active session.
-
-    Returns ``True`` / ``False`` on success; ``None`` if neither API is
+    Returns ``True`` / ``False`` on success; ``None`` if the API is not
     available (so the caller can degrade gracefully).
     """
     if not _is_macos():
@@ -50,26 +81,33 @@ def is_microphone_in_use() -> bool | None:
         return None
     try:
         import CoreAudio
+        import objc
     except ImportError:
         _log_unsupported_once("CoreAudio framework missing")
         return None
     try:
-        prop = CoreAudio.AudioObjectPropertyAddress(
-            CoreAudio.kAudioHardwarePropertyProcessIsRunning,
-            CoreAudio.kAudioObjectPropertyScopeGlobal,
-            CoreAudio.kAudioObjectPropertyElementMain,
-        )
-        _, running = CoreAudio.AudioObjectGetPropertyData(
+        default_input = _read_uint32_property(
+            CoreAudio,
+            objc.NULL,
             CoreAudio.kAudioObjectSystemObject,
-            prop,
-            0,
-            None,
-            CoreAudio.UInt32(0),
+            CoreAudio.kAudioHardwarePropertyDefaultInputDevice,
         )
-        return bool(running)
+        if default_input is None:
+            return None
+        if default_input == 0:
+            # ``kAudioObjectUnknown``: no input device, so nothing records.
+            return False
+        running = _read_uint32_property(
+            CoreAudio,
+            objc.NULL,
+            default_input,
+            CoreAudio.kAudioDevicePropertyDeviceIsRunningSomewhere,
+        )
+        return None if running is None else bool(running)
     except Exception:  # noqa: BLE001
         # Property not available on this macOS revision — return None so
         # the daemon doesn't false-positive.
+        logger.debug("microphone receptivity probe failed", exc_info=True)
         return None
 
 
