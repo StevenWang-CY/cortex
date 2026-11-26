@@ -560,10 +560,12 @@ export class CortexPanelProvider
         }
         const hasState = Object.keys(this._currentState).length > 0;
         if (!hasState) {
-            // (b) Connected, awaiting first STATE_UPDATE.
+            // (b) Connected, awaiting first STATE_UPDATE. The socket is
+            // already authenticated, so "Connecting…" contradicted the
+            // status bar's "Connected".
             return '<div class="cx-awaiting-state" data-testid="cx-state-awaiting">'
                 + '<span class="cx-spinner" aria-hidden="true"></span>'
-                + ' Connecting…'
+                + ' Connected. Waiting for the first reading…'
                 + '</div>';
         }
         // (c) Active — connected and state received, no intervention right now.
