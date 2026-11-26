@@ -759,8 +759,8 @@ export class CortexPanelProvider
                     </div>
                     <!-- P0 §3.8: 👍 / 👎 row + optional text input. -->
                     <div class="rating-row">
-                        <button id="thumbs-up" type="button" class="rating-btn" aria-label="Mark helpful">👍</button>
-                        <button id="thumbs-down" type="button" class="rating-btn" aria-label="Mark unhelpful">👎</button>
+                        <button id="thumbs-up" type="button" class="rating-btn" aria-label="Mark helpful" aria-pressed="false">👍</button>
+                        <button id="thumbs-down" type="button" class="rating-btn" aria-label="Mark unhelpful" aria-pressed="false">👎</button>
                     </div>
                     <input id="rating-text" type="text" maxlength="200" placeholder="What would have helped? (Enter to send, Esc to skip)" aria-label="What would have helped?" class="rating-text" hidden />
                     <button class="dismiss-btn" id="dismiss-btn" type="button">Dismiss</button>
@@ -1412,7 +1412,12 @@ export class CortexPanelProvider
             thumbsUpBtn.addEventListener('click', () => {
                 if (thumbsUpBtn.classList.contains('selected')) return;
                 thumbsUpBtn.classList.add('selected');
-                if (thumbsDownBtn) thumbsDownBtn.classList.remove('selected');
+                // The selection is announced, not only drawn.
+                thumbsUpBtn.setAttribute('aria-pressed', 'true');
+                if (thumbsDownBtn) {
+                    thumbsDownBtn.classList.remove('selected');
+                    thumbsDownBtn.setAttribute('aria-pressed', 'false');
+                }
                 downPending = false;
                 hideRatingText();
                 sendRating('thumbs_up');
@@ -1422,7 +1427,11 @@ export class CortexPanelProvider
             thumbsDownBtn.addEventListener('click', () => {
                 if (thumbsDownBtn.classList.contains('selected')) return;
                 thumbsDownBtn.classList.add('selected');
-                if (thumbsUpBtn) thumbsUpBtn.classList.remove('selected');
+                thumbsDownBtn.setAttribute('aria-pressed', 'true');
+                if (thumbsUpBtn) {
+                    thumbsUpBtn.classList.remove('selected');
+                    thumbsUpBtn.setAttribute('aria-pressed', 'false');
+                }
                 downPending = true;
                 if (ratingTextEl) {
                     ratingTextEl.hidden = false;
