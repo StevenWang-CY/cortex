@@ -1371,8 +1371,28 @@ class SettingsDialog(QWidget):
             logger.debug("open System Settings failed", exc_info=True)
 
     def _on_back(self) -> None:
+        self._discard_unapplied_edits()
         self.hide()
         self.back_requested.emit()
+
+    def closeEvent(self, event: object) -> None:  # noqa: D401 - Qt override
+        # The title-bar close button bypasses ``_on_back``; it must not keep
+        # abandoned edits either.
+        self._discard_unapplied_edits()
+        super().closeEvent(event)
+
+    def _discard_unapplied_edits(self) -> None:
+        """Return every control to the saved value when Settings closes.
+
+        The dialog is built once and only hidden, so edits abandoned without
+        Apply stayed in the widgets: reopening showed values the daemon was
+        not running, and the next Apply of anything sent them too. Sources
+        chosen in the review sheet are a remembered selection, not a Settings
+        edit, and are kept.
+        """
+        context_sources = dict(self._saved_context_sources)
+        self._load_persisted_settings()
+        self._saved_context_sources = context_sources
 
     def _show_apply_error(
         self,
