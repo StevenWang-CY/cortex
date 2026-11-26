@@ -476,6 +476,10 @@ _AUTO_FOCUS_DEBOUNCE_S: float = 30.0
 # nightly tick. Daily baselines older than this are pruned from
 # ``storage/chronotype/daily/*.json``.
 _CHRONOTYPE_WINDOW_DAYS: int = 90
+# The neutral value of the desktop sensitivity slider's ``entry_threshold``
+# (``0.85 + (3 - sensitivity) * 0.05``); only its offset from this anchor is
+# meaningful to the trigger gate.
+_SENSITIVITY_SCALE_ANCHOR: float = 0.85
 
 _EXECUTION_MODES = frozenset(
     {
@@ -750,6 +754,9 @@ class CortexDaemon:
     ) -> None:
         self.config = config or get_config()
         self._clock = clock or SYSTEM_CLOCK
+        # The Settings sensitivity slider moves the trigger gate around the
+        # configured base; captured once so repeated Applies cannot drift.
+        self._default_overlay_threshold = float(self.config.intervention.overlay_threshold)
         storage_root = Path(self.config.storage.path).expanduser()
         self._database = SQLiteDatabase(
             storage_root / self.config.storage.sqlite_filename,
@@ -8529,7 +8536,16 @@ class CortexDaemon:
         if "entry_threshold" in settings:
             threshold = float(settings["entry_threshold"])
             self.config.state.entry_threshold = threshold
-            self.config.intervention.overlay_threshold = threshold
+            # The dialog sends ``0.85 + (3 - sensitivity) * 0.05``, a scale
+            # anchored at the retired 0.85 state default. Copying it into
+            # the trigger gate (default 0.70) raised the threshold to 0.85
+            # on every Apply with the slider untouched, and even the most
+            # sensitive position (0.75) was stricter than the default. Apply
+            # the slider's offset to the configured base instead.
+            offset = threshold - _SENSITIVITY_SCALE_ANCHOR
+            self.config.intervention.overlay_threshold = min(
+                1.0, max(0.0, self._default_overlay_threshold + offset),
+            )
             # Audit-2 fix: preserve cooldown / dwell state across a
             # live settings change. Re-creating ``TriggerPolicy`` reset
             # every counter and let interventions fire immediately even
