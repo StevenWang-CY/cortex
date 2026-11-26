@@ -166,8 +166,11 @@ def test_trigger_cooldown_decision_is_independent_of_wall_clock(
 
 
 def test_cost_ledger_rolls_at_local_midnight_with_fake_clock(tmp_path: Path) -> None:
-    local_zone = datetime.now().astimezone().tzinfo
-    before_local = datetime(2026, 8, 24, 23, 59, 59, tzinfo=local_zone)
+    # A naive wall time resolved by ``astimezone()`` takes the local offset in
+    # force on *that* date. Borrowing today's offset instead (``datetime.now()
+    # .astimezone().tzinfo``) put "23:59:59 local" an hour past August's
+    # midnight whenever the suite ran in standard time.
+    before_local = datetime(2026, 8, 24, 23, 59, 59).astimezone()
     clock = FakeClock(
         wall_unix_ms=_unix_ms(before_local.astimezone(UTC)),
         mono_ns=0,
