@@ -605,6 +605,9 @@ class CortexApp:
         self._onboarding: OnboardingWindow | None = None
         self._bridge: WebSocketBridge | None = None
         self._paused = False
+        # "Turn off suggestions this session" pauses the desktop without a
+        # daemon quiet kind; see ``_on_quiet_mode_state``.
+        self._suggestions_off_for_session = False
         self._quitting = False
         self._quit_filter: QObject | None = None
         self._active_intervention_id: str | None = None
@@ -736,6 +739,7 @@ class CortexApp:
         )
         self._bridge.quiet_mode_state_received.connect(self._suggestion_review.quiet_updated)
         self._bridge.quiet_mode_state_received.connect(self._dashboard.apply_quiet_mode_state)
+        self._bridge.quiet_mode_state_received.connect(self._on_quiet_mode_state)
         self._dashboard.quiet_mode_requested.connect(self._bridge.send_quiet_mode_toggle)
         self._bridge.intervention_restored.connect(self._on_restore)
         if self._dashboard is not None and hasattr(
@@ -1842,13 +1846,42 @@ class CortexApp:
                 logger.debug("mark_extensions_connected failed", exc_info=True)
 
     def _toggle_pause(self) -> None:
-        """Toggle pause/resume state."""
+        """Toggle pause/resume state.
+
+        Routed through QUIET_MODE_TOGGLE like the in-process controller, so
+        the daemon actually stops sensing and the QUIET_MODE_STATE
+        broadcast updates every surface; a local flag alone left the
+        browser and editor receiving interventions the desktop dropped.
+        """
         self._paused = not self._paused
+        if not self._paused:
+            self._suggestions_off_for_session = False
         if self._tray is not None:
             self._tray.set_paused(self._paused)
         if self._paused:
             self._dismiss_overlay()
+        if self._bridge is not None:
+            self._bridge.send_quiet_mode_toggle(
+                "pause" if self._paused else "off", source="tray",
+            )
         logger.info(f"Cortex {'paused' if self._paused else 'resumed'}")
+
+    @Slot(dict)
+    def _on_quiet_mode_state(self, payload: dict) -> None:
+        """The daemon's quiet kind is the source of truth for ``_paused``
+        and the tray, whichever surface paused or resumed."""
+        if not isinstance(payload, dict):
+            return
+        kind = str(payload.get("kind", "off"))
+        self._paused = kind == "pause" or self._suggestions_off_for_session
+        if self._tray is None:
+            return
+        try:
+            self._tray.set_quiet_mode_kind(kind)
+            if self._suggestions_off_for_session:
+                self._tray.set_paused(True)
+        except Exception:
+            logger.debug("tray quiet-state mirror failed", exc_info=True)
 
     def _restore_workspace(self) -> None:
         """Restore the current intervention if one is active."""
@@ -1870,6 +1903,7 @@ class CortexApp:
                 "interventions_enabled": False,
             })
         self._paused = True
+        self._suggestions_off_for_session = True
         if self._tray is not None:
             self._tray.set_paused(True)
         self._dismiss_overlay()
