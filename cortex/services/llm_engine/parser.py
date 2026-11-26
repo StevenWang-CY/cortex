@@ -306,6 +306,7 @@ def enrich_plan_with_context(
                         )
 
     # --- Enforce tab-type safety rules via classifier ---
+    forced_keep: set[int] = set()
     if plan.tab_recommendations and tabs:
         # Determine if the user is likely debugging/coding
         is_debugging = (
@@ -322,11 +323,26 @@ def enrich_plan_with_context(
                 if tab_type == "ai_assistant":
                     rec.action = "keep"
                     rec.relevance_score = max(rec.relevance_score, 0.9)
+                    forced_keep.add(rec.tab_index)
 
                 # Documentation tabs kept when user is debugging/coding
                 if tab_type == "documentation" and is_debugging:
                     rec.action = "keep"
                     rec.relevance_score = max(rec.relevance_score, 0.8)
+                    forced_keep.add(rec.tab_index)
+
+    # A tab the rules above keep must not keep its one-click close: the
+    # proposal said "keep" while offering "Close <tab>" for the same tab,
+    # and the manifest lowered from it carried the close as authorizable.
+    if forced_keep and plan.suggested_actions:
+        plan.suggested_actions = [
+            action
+            for action in plan.suggested_actions
+            if not (
+                action.action_type in ("close_tab", "bookmark_and_close")
+                and action.tab_index in forced_keep
+            )
+        ]
 
     # --- ALWAYS replace suggested_action labels with real tab titles ---
     if plan.suggested_actions and tabs:
