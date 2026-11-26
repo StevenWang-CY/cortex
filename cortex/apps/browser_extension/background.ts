@@ -5859,7 +5859,11 @@ chrome.runtime.onMessage.addListener(
             case "USER_RATING":
                 // P0 §3.8: relay 👍/👎 ratings. ``context`` is an
                 // optional one-line free-text comment from a 👎 — stays
-                // local on the daemon side; never reaches the LLM.
+                // local on the daemon side; never reaches the LLM. The
+                // daemon checks ratings against the trigger cid exactly
+                // like USER_ACTION, and the comment box outlives Dismiss,
+                // so the cid comes from the rated intervention's own
+                // trigger rather than the active slot.
                 send({
                     type: "USER_RATING",
                     payload: {
@@ -5871,6 +5875,9 @@ chrome.runtime.onMessage.addListener(
                     },
                     timestamp: Date.now() / 1000,
                     sequence: ++sequence,
+                    correlation_id: interventionPresentation.correlationIdFor(
+                        message.intervention_id,
+                    ),
                 });
                 sendResponse({ ok: true });
                 break;
@@ -6749,6 +6756,9 @@ try {
                             },
                             timestamp: Date.now() / 1000,
                             sequence: ++sequence,
+                            correlation_id: interventionPresentation.correlationIdFor(
+                                interventionId,
+                            ),
                         });
                     }
                     void runLaunchCortex().catch((e) => {
@@ -6798,6 +6808,9 @@ try {
                     },
                     timestamp: Date.now() / 1000,
                     sequence: ++sequence,
+                    correlation_id: interventionPresentation.correlationIdFor(
+                        interventionId,
+                    ),
                 });
             }
             void runLaunchCortex().catch((e) => {
