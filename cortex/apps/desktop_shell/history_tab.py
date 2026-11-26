@@ -190,18 +190,31 @@ def _format_duration(seconds: float) -> str:
     return f"{s}s"
 
 
+def _parse_local(iso: str) -> Any:
+    """Parse an ISO timestamp and express it on the user's wall clock.
+
+    The report generator stamps times with ``datetime.now(UTC)``, so the
+    wire carries UTC. Formatting the parsed value in its own offset showed
+    every time in UTC. Naive values carry no zone to convert from and are
+    returned unchanged.
+    """
+    from datetime import datetime
+
+    # Tolerate Z suffix.
+    normalised = iso.replace("Z", "+00:00") if iso.endswith("Z") else iso
+    dt = datetime.fromisoformat(normalised)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone()
+    return dt
+
+
 def _format_date_time(iso: str) -> str:
-    """ISO timestamp → ``Mon 5/22 · 3:14 PM`` (best-effort)."""
+    """ISO timestamp → ``Mon 5/22 · 3:14 PM`` in local time (best-effort)."""
     if not iso:
         return ""
     try:
         # The wire format from ``model_dump(mode='json')`` is ISO 8601.
-        from datetime import datetime
-
-        # Tolerate Z suffix.
-        normalised = iso.replace("Z", "+00:00") if iso.endswith("Z") else iso
-        dt = datetime.fromisoformat(normalised)
-        return dt.strftime("%a %-m/%-d · %-I:%M %p")
+        return str(_parse_local(iso).strftime("%a %-m/%-d · %-I:%M %p"))
     except Exception:
         return iso[:16].replace("T", " ")
 
@@ -211,11 +224,10 @@ def _short_date(iso: str) -> str:
     if not iso:
         return ""
     try:
-        from datetime import date, datetime
+        from datetime import date
 
         if "T" in iso:
-            normalised = iso.replace("Z", "+00:00") if iso.endswith("Z") else iso
-            d = datetime.fromisoformat(normalised).date()
+            d = _parse_local(iso).date()
         else:
             d = date.fromisoformat(iso)
         return d.strftime("%-m/%-d")
@@ -228,11 +240,10 @@ def _weekday(iso: str) -> str:
     if not iso:
         return ""
     try:
-        from datetime import date, datetime
+        from datetime import date
 
         if "T" in iso:
-            normalised = iso.replace("Z", "+00:00") if iso.endswith("Z") else iso
-            d = datetime.fromisoformat(normalised).date()
+            d = _parse_local(iso).date()
         else:
             d = date.fromisoformat(iso)
         return d.strftime("%a")
@@ -1273,13 +1284,11 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
         end_iso = str(report.get("end_time") or "")
         buckets = [0.0] * 24
         try:
-            from datetime import datetime, timedelta
+            from datetime import timedelta
 
             def _parse(value: str) -> Any:
-                if not value:
-                    return None
-                norm = value.replace("Z", "+00:00") if value.endswith("Z") else value
-                return datetime.fromisoformat(norm)
+                # Bucket by the hour the user lived, not the UTC hour.
+                return _parse_local(value) if value else None
 
             end_dt = _parse(end_iso)
             for i, t in enumerate(transitions):
