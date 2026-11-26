@@ -396,6 +396,67 @@ describe("CortexPanelProvider – view disposal (A8)", () => {
     });
 });
 
+// ── Rule 42: the state bar shares the evidence lifetime ────────────────────
+
+describe("CortexPanelProvider – state freshness (rule 42)", () => {
+    beforeEach(() => {
+        jest.useFakeTimers({ doNotFake: ["nextTick", "queueMicrotask", "setImmediate"] });
+    });
+    afterEach(() => {
+        jest.clearAllTimers();
+        jest.useRealTimers();
+    });
+
+    const flow = { state: "FLOW", status: "estimated", confidence: 0.84 };
+
+    function lastState(posted: Record<string, unknown>[]): Record<string, unknown> | undefined {
+        return posted.filter((m) => m.type === "state").pop();
+    }
+
+    it("expires the label and evidence ten seconds after the last update", () => {
+        const client = new FakeWSClient();
+        client.setConnected(true);
+        const provider = makeProvider(client);
+        const v = makeView();
+        provider.resolveWebviewView(v.view as never, {} as never, {} as never);
+
+        client.fireState(flow);
+        expect(lastState(v.posted)).toMatchObject({ label: "Steady activity", status: "estimated" });
+
+        jest.advanceTimersByTime(9_999);
+        expect(lastState(v.posted)).toMatchObject({ label: "Steady activity" });
+
+        jest.advanceTimersByTime(1);
+        const stale = lastState(v.posted);
+        expect(stale).toMatchObject({ state: "UNKNOWN", label: "Waiting for fresh signals" });
+        expect(stale?.status).not.toBe("estimated");
+
+        // A full rebuild while stale must not resurrect the old reading.
+        provider.showIntervention({ intervention_id: "iv-stale", headline: "h" });
+        expect(v.html).toContain("Waiting for fresh signals");
+        expect(v.html).toContain("No estimate");
+        expect(v.html).not.toContain("Evidence 84%");
+
+        client.fireState(flow);
+        expect(lastState(v.posted)).toMatchObject({ label: "Steady activity", status: "estimated" });
+    });
+
+    it("a disconnect cancels the pending expiry", () => {
+        const client = new FakeWSClient();
+        client.setConnected(true);
+        const provider = makeProvider(client);
+        const v = makeView();
+        provider.resolveWebviewView(v.view as never, {} as never, {} as never);
+        client.fireState(flow);
+        client.setConnected(false);
+        client.fireConnection(false);
+        const posts = v.posted.length;
+        jest.advanceTimersByTime(10_000);
+        expect(v.posted.length).toBe(posts);
+        expect(v.html).toContain('data-testid="cx-state-offline"');
+    });
+});
+
 // ── Reveal before the view was ever resolved ───────────────────────────────
 
 describe("CortexPanelProvider – reveal before the view is resolved", () => {

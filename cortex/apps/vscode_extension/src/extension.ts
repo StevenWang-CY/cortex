@@ -11,7 +11,11 @@ import { randomUUID } from "crypto";
 import { CortexWSClient } from "./ws-client";
 import { ContextProvider } from "./context-provider";
 import { FoldController } from "./fold-controller";
-import { CortexPanelProvider } from "./panel-provider";
+import {
+    CortexPanelProvider,
+    STALE_STATE_LABEL,
+    STATE_FRESHNESS_MS,
+} from "./panel-provider";
 import { PANEL_STATE_LABELS } from "./design-tokens";
 import { EditorTransactionAdapter } from "./editor-transaction-adapter";
 
@@ -165,6 +169,35 @@ function workspaceMutationAllowed(): boolean {
 // deactivate so the closure doesn't outlive the disposed status bar.
 let osNotifPulseTimeout: ReturnType<typeof setTimeout> | undefined;
 
+// Rule 42: the status-bar estimate expires STATE_FRESHNESS_MS after the last
+// STATE_UPDATE, like the panel and the browser surfaces. Re-armed by every
+// update, cancelled on disconnect and deactivate.
+let stateFreshnessTimeout: ReturnType<typeof setTimeout> | undefined;
+
+function clearStatusBarFreshness(): void {
+    if (stateFreshnessTimeout) {
+        clearTimeout(stateFreshnessTimeout);
+        stateFreshnessTimeout = undefined;
+    }
+}
+
+function armStatusBarFreshness(): void {
+    clearStatusBarFreshness();
+    stateFreshnessTimeout = setTimeout(() => {
+        stateFreshnessTimeout = undefined;
+        if (!statusBarItem || !statusBarConnected) return;
+        // Quiet mode outranks the estimate, and so outranks its expiry.
+        if (renderQuietModeStatus()) return;
+        statusBarItem.text = `$(ellipsis) Cortex: ${STALE_STATE_LABEL}`;
+        statusBarItem.tooltip =
+            `Cortex — no update from the daemon for ${STATE_FRESHNESS_MS / 1000} s. `
+            + "No actionable estimate.";
+        statusBarItem.backgroundColor = undefined;
+    }, STATE_FRESHNESS_MS);
+    // Presentation only: never keep the extension host alive for it.
+    (stateFreshnessTimeout as { unref?: () => void }).unref?.();
+}
+
 // F9 (Phase-4 audit): single OutputChannel shared by every debug-gated
 // diagnostic line in the extension. Replaces console.log so messages
 // flow into VS Code's Output panel under "Cortex" rather than the
@@ -295,6 +328,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     client.onStateUpdate((payload) => {
         updateStatusBar(payload);
+        armStatusBarFreshness();
     });
 
     client.onInterventionTrigger((payload) => {
@@ -305,6 +339,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (connected) {
             void editorTransactionAdapter?.flushPendingReceipts();
         }
+        clearStatusBarFreshness();
         applyStatusBarConnection(connected);
     });
 
@@ -614,6 +649,7 @@ export function deactivate(): void {
         clearTimeout(osNotifPulseTimeout);
         osNotifPulseTimeout = undefined;
     }
+    clearStatusBarFreshness();
     wsClient?.disconnect();
     wsClient = undefined;
     // A10: release the subscriptions the providers own. They are also in

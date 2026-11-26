@@ -207,6 +207,38 @@ describe("status bar quiet mode lifetime", () => {
     });
 });
 
+describe("status bar estimate freshness (rule 42)", () => {
+    it("stops presenting the estimate after ten seconds without an update", async () => {
+        const h = await activateHarness();
+        connect(h);
+        h.deliver("STATE_UPDATE", FLOW_ESTIMATE);
+        expect(h.statusBar().text).toContain("Steady activity 84%");
+
+        jest.advanceTimersByTime(9_999);
+        expect(h.statusBar().text).toContain("Steady activity 84%");
+
+        // The heartbeat only notices a dead transport, ~45-75 s later; a
+        // daemon that stops publishing while its socket stays up never trips
+        // it. The browser surfaces expire at 10 s.
+        jest.advanceTimersByTime(1);
+        expect(h.statusBar().text).toContain("Waiting for fresh signals");
+        expect(h.statusBar().text).not.toContain("84%");
+        expect(String(h.statusBar().tooltip)).toContain("No actionable estimate");
+
+        h.deliver("STATE_UPDATE", FLOW_ESTIMATE);
+        expect(h.statusBar().text).toContain("Steady activity 84%");
+    });
+
+    it("quiet mode still outranks the stale notice", async () => {
+        const h = await activateHarness();
+        connect(h);
+        h.deliver("QUIET_MODE_STATE", { kind: "pause", source: "dashboard" });
+        h.deliver("STATE_UPDATE", FLOW_ESTIMATE);
+        jest.advanceTimersByTime(10_000);
+        expect(h.statusBar().text).toContain("Paused");
+    });
+});
+
 describe("DISMISS_OVERLAY (P0 §3.21 cross-surface dismiss)", () => {
     it("clears the intervention the daemon dismissed from the panel", async () => {
         const h = await activateHarness();
