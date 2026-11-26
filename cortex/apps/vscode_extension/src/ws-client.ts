@@ -210,6 +210,17 @@ export class CortexWSClient {
     private readonly _readToken: () => CapabilityTokenLookup;
 
     /**
+     * F16 parity: the correlation id the daemon stamped on the latest
+     * INTERVENTION_TRIGGER for each intervention. The daemon drops any
+     * USER_ACTION / USER_RATING whose id differs from that stamp, and it
+     * mints a fresh id for a frame that carries none — so omitting it meant
+     * every Dismiss, engage and rating from VS Code was discarded. Bounded
+     * and insertion-ordered so the oldest entry is evicted first.
+     */
+    private readonly _interventionCorrelationIds = new Map<string, string>();
+    private static readonly _MAX_TRACKED_INTERVENTIONS = 64;
+
+    /**
      * A4: the daemon must answer ``AUTH`` with ``AUTH_OK`` before the
      * client counts as connected. If nothing arrives within this window
      * the socket is torn down so the backoff cycle can retry instead of
@@ -764,7 +775,33 @@ export class CortexWSClient {
             },
             timestamp: Date.now() / 1000,
             sequence: ++this._sequence,
+            correlation_id: this._interventionCorrelationIds.get(interventionId),
         });
+    }
+
+    /** Remember the daemon's stamp for an intervention (newest wins). */
+    private _rememberInterventionCorrelation(msg: WSMessage): void {
+        const interventionId = msg.payload.intervention_id;
+        const correlationId = msg.correlation_id;
+        if (
+            typeof interventionId !== "string"
+            || interventionId.length === 0
+            || typeof correlationId !== "string"
+            || correlationId.length === 0
+        ) {
+            return;
+        }
+        this._interventionCorrelationIds.delete(interventionId);
+        this._interventionCorrelationIds.set(interventionId, correlationId);
+        if (
+            this._interventionCorrelationIds.size
+            > CortexWSClient._MAX_TRACKED_INTERVENTIONS
+        ) {
+            const oldest = this._interventionCorrelationIds.keys().next().value;
+            if (oldest !== undefined) {
+                this._interventionCorrelationIds.delete(oldest);
+            }
+        }
     }
 
     /** Send typed per-action apply/compensation/restore receipts. */
@@ -825,6 +862,8 @@ export class CortexWSClient {
             payload,
             timestamp: Date.now() / 1000,
             sequence: ++this._sequence,
+            // The daemon routes ratings through the same stale-ACK check.
+            correlation_id: this._interventionCorrelationIds.get(interventionId),
         });
     }
 
@@ -1022,6 +1061,7 @@ export class CortexWSClient {
                 break;
 
             case "INTERVENTION_TRIGGER":
+                this._rememberInterventionCorrelation(msg);
                 for (const handler of this._interventionHandlers) {
                     try {
                         handler(msg.payload);

@@ -391,6 +391,64 @@ describe("CortexWSClient – PROTOCOL_ERROR (A5)", () => {
     });
 });
 
+describe("CortexWSClient – user feedback echoes the trigger correlation id (F16)", () => {
+    // The daemon stamps every INTERVENTION_TRIGGER with a correlation id and
+    // drops a USER_ACTION / USER_RATING whose id differs from the latest one
+    // it stamped. It mints a fresh id for any frame that arrives without one,
+    // so a frame that omits it is always "different" and is dropped: every
+    // Dismiss and every rating from this extension was discarded.
+    function connectedClient(): CortexWSClient {
+        const client = makeClient();
+        client.connect();
+        latest().emit("open");
+        latest().emit(
+            "message",
+            Buffer.from(daemonFrame("AUTH_OK", { selected_protocol_version: "2.0" })),
+        );
+        return client;
+    }
+
+    function trigger(interventionId: string, correlationId: string): void {
+        latest().emit(
+            "message",
+            Buffer.from(daemonFrame(
+                "INTERVENTION_TRIGGER",
+                { intervention_id: interventionId, headline: "Breathe" },
+                { correlation_id: correlationId },
+            )),
+        );
+    }
+
+    function lastFrame(): { type: string; correlation_id?: string } {
+        return JSON.parse(latest().sent[latest().sent.length - 1]);
+    }
+
+    it("sends the latest trigger correlation id with USER_ACTION and USER_RATING", () => {
+        const client = connectedClient();
+        trigger("iv-9", "iv_iv-9_12");
+
+        client.sendUserAction("dismissed", "iv-9");
+        expect(lastFrame()).toMatchObject({ type: "USER_ACTION", correlation_id: "iv_iv-9_12" });
+
+        client.sendUserRating("iv-9", "thumbs_up");
+        expect(lastFrame()).toMatchObject({ type: "USER_RATING", correlation_id: "iv_iv-9_12" });
+
+        // The daemon re-stamps the same intervention after a micro-step
+        // toggle; only the newest id is accepted.
+        trigger("iv-9", "iv_iv-9_13");
+        client.sendUserAction("engaged", "iv-9");
+        expect(lastFrame()).toMatchObject({ type: "USER_ACTION", correlation_id: "iv_iv-9_13" });
+    });
+
+    it("leaves the id off for an intervention this client never saw", () => {
+        const client = connectedClient();
+        trigger("iv-9", "iv_iv-9_12");
+        client.sendUserAction("dismissed", "iv-other");
+        expect(lastFrame().type).toBe("USER_ACTION");
+        expect(lastFrame().correlation_id).toBeUndefined();
+    });
+});
+
 describe("CortexWSClient – WHY_DETAIL correlation (A7)", () => {
     function connectedClient(): CortexWSClient {
         const client = makeClient();
