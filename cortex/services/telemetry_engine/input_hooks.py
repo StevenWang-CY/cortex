@@ -17,6 +17,7 @@ Design:
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 from collections import deque
 from dataclasses import dataclass, field
@@ -28,6 +29,40 @@ from cortex.libs.config.settings import TelemetryConfig
 from cortex.libs.utils.platform import check_accessibility_permission
 
 logger = logging.getLogger(__name__)
+
+
+def keyboard_listener_class() -> type[Any]:
+    """pynput's keyboard listener, without its off-main-thread HIToolbox call.
+
+    On macOS pynput's listener thread begins by reading the keyboard layout
+    (``keycode_context``: ``TISCopyCurrentKeyboardInputSource`` and
+    ``TISGetInputSourceProperty``). HIToolbox asserts the main dispatch queue
+    when it has to rebuild its input-source list, so the call traps
+    (``dispatch_assert_queue`` -> SIGTRAP) on any thread but the main one.
+    The packaged 0.6.0 build crashed this way when a session was ended and
+    started again: the first start found the list already built, the second
+    did not.
+
+    The listening path never uses that layout -- ``_event_to_key`` reads the
+    character from the event itself -- so the listener goes straight to the
+    event-tap loop. ``test_input_hooks_main_thread_safety`` fails if a pynput
+    upgrade starts using the layout while listening.
+    """
+
+    from pynput import keyboard
+
+    base: type[Any] = keyboard.Listener
+    # Only the real macOS listener class has the layout read to skip.
+    if sys.platform != "darwin" or not isinstance(base, type):
+        return base
+
+    class MainThreadSafeKeyboardListener(base):  # type: ignore[misc]
+        def _run(self) -> None:
+            # Skip ``keyboard._darwin.Listener._run`` (the layout read) and
+            # run the event-tap loop of the class after it.
+            super(base, self)._run()
+
+    return MainThreadSafeKeyboardListener
 
 
 class MouseButton(StrEnum):
@@ -233,14 +268,14 @@ class InputHooks:
             self.stop()
 
         try:
-            from pynput import keyboard, mouse
+            from pynput import mouse
 
             self._mouse_listener = mouse.Listener(
                 on_move=self._on_mouse_move,
                 on_click=self._on_mouse_click,
                 on_scroll=self._on_mouse_scroll,
             )
-            self._keyboard_listener = keyboard.Listener(
+            self._keyboard_listener = keyboard_listener_class()(
                 on_press=self._on_key_press,
                 on_release=self._on_key_release,
             )

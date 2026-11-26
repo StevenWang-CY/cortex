@@ -21,8 +21,8 @@ class TestDestructiveStruggleDetector:
             stage_dwell_s=400.0,
             allostatic_load=0.8,
             allostatic_load_prev=0.5,
-            hrv_rmssd=60.0,
-            hrv_baseline=60.0,
+            hrv_ms=60.0,
+            hrv_baseline_ms=60.0,
             wa_timestamps=[],
             current_time=base_t,
         )
@@ -40,8 +40,8 @@ class TestDestructiveStruggleDetector:
             stage_dwell_s=400.0,
             allostatic_load=0.8,
             allostatic_load_prev=0.5,
-            hrv_rmssd=60.0,
-            hrv_baseline=60.0,
+            hrv_ms=60.0,
+            hrv_baseline_ms=60.0,
             wa_timestamps=[],
             current_time=base_t,
         )
@@ -59,8 +59,8 @@ class TestDestructiveStruggleDetector:
             stage_dwell_s=0.0,
             allostatic_load=0.5,
             allostatic_load_prev=0.5,
-            hrv_rmssd=40.0,      # below 80% of baseline (48.0)
-            hrv_baseline=60.0,
+            hrv_ms=40.0,      # below 80% of baseline (48.0)
+            hrv_baseline_ms=60.0,
             wa_timestamps=wa_times,
             current_time=base_t,
         )
@@ -79,8 +79,8 @@ class TestDestructiveStruggleDetector:
             stage_dwell_s=0.0,
             allostatic_load=0.5,
             allostatic_load_prev=0.5,
-            hrv_rmssd=40.0,
-            hrv_baseline=60.0,
+            hrv_ms=40.0,
+            hrv_baseline_ms=60.0,
             wa_timestamps=wa_times,
             current_time=base_t,
         )
@@ -96,8 +96,8 @@ class TestDestructiveStruggleDetector:
             stage_dwell_s=10.0,
             allostatic_load=0.3,
             allostatic_load_prev=0.3,
-            hrv_rmssd=60.0,
-            hrv_baseline=60.0,
+            hrv_ms=60.0,
+            hrv_baseline_ms=60.0,
             wa_timestamps=[],
             current_time=base_t,
         )
@@ -115,8 +115,8 @@ class TestDestructiveStruggleDetector:
             stage_dwell_s=400.0,
             allostatic_load=0.8,
             allostatic_load_prev=0.5,
-            hrv_rmssd=60.0,
-            hrv_baseline=60.0,
+            hrv_ms=60.0,
+            hrv_baseline_ms=60.0,
             wa_timestamps=[],
             current_time=base_t,
         )
@@ -127,3 +127,39 @@ class TestDestructiveStruggleDetector:
         assert detector._latest.is_destructive is False
         assert detector._latest.pathway == ""
         assert detector._latest.confidence == 0.0
+
+
+def test_no_physiology_means_neither_pathway_fires() -> None:
+    """Without a camera reading or a ready reference the caller passes zeros
+    and a flat load; strong behaviour alone must not trigger either pathway."""
+
+    detector = DestructiveStruggleDetector()
+    now = 1_000.0
+    estimate = detector.update(
+        reread_count=9,
+        wrong_answer_count=6,
+        code_delete_ratio=0.95,
+        stage_dwell_s=1_800.0,
+        allostatic_load=0.0,
+        allostatic_load_prev=0.0,
+        hrv_ms=0.0,
+        hrv_baseline_ms=0.0,
+        wa_timestamps=[now - 30.0] * 6,
+        current_time=now,
+    )
+    assert estimate.is_destructive is False
+
+    # A measurement without a personal reference is not a drop either.
+    estimate = detector.update(
+        reread_count=0,
+        wrong_answer_count=6,
+        code_delete_ratio=0.95,
+        stage_dwell_s=10.0,
+        allostatic_load=0.0,
+        allostatic_load_prev=0.0,
+        hrv_ms=20.0,
+        hrv_baseline_ms=0.0,
+        wa_timestamps=[now - 30.0] * 6,
+        current_time=now,
+    )
+    assert estimate.is_destructive is False

@@ -211,7 +211,16 @@ it is centered. Anchored popovers originate from their trigger.
   Stop/disconnect clears live Advanced diagnostics, and queued updates cannot
   revive an ending/ended session. The camera section says **Camera estimates**,
   with an experimental caption, not a clinical
-  measurement. Verify the dashboard at 380 × 500 logical pixels, Settings at
+  measurement. It shows four readings, **Pulse · bpm**, **HRV · ms** (SDNN),
+  **Breath/min** and **Blink/min**, each with a glossary tooltip; HRV and
+  breathing clear with the pulse when the face or capture is lost. A
+  "Body load N% of your break level" caption appears only once camera
+  physiology has been read against a personal reference, and its tooltip says
+  it is a pacing aid, not a measure of stress or health. A strain-load
+  suggestion uses the break pill ("Take a breather? · N min") with copy that
+  names the user's own usual level and calls itself a suggestion, not a health
+  reading; the elapsed-focus pill says it does not use camera estimates.
+  RMSSD is never displayed. Verify the dashboard at 380 × 500 logical pixels, Settings at
   440 px wide with schedule/privacy controls expanded, and onboarding at
   600 × 520: no horizontal scrolling, clipped controls, or inaccessible
   session/completion footer.
@@ -227,7 +236,11 @@ it is centered. Anchored popovers originate from their trigger.
   remains pending until the native helper or launcher confirms completion;
   durable stop intent only disables automatic reconnect. Errors remain inline
   and retryable. Quiet-mode radio controls implement roving focus and arrow,
-  Home and End navigation.
+  Home and End navigation. The signal row shows BPM, HRV (SDNN, ms), Breath
+  and Blinks, each with an accessible name that also covers the missing
+  value; HRV, breathing and the "Body load N% of your break level" line share
+  the pulse's capture lifetime and are bounded to plausible ranges. A
+  strain-load suggestion arrives as a "Breathing break?" toast.
 - **Injected overlays:** one coherent 200 ms entrance, in-place content update,
   quick symmetric exit, no replay on a replacement proposal. Blocking
   surfaces use labelled modal semantics, initial focus, Tab containment,
@@ -250,7 +263,9 @@ it is centered. Anchored popovers originate from their trigger.
 - **VS Code:** use theme variables, never assume light/dark colors, keep action
   authority and errors visible, and mirror reduced-motion semantics. The pacer
   owns one requestAnimationFrame loop, cancels it while hidden, and renders a
-  static countdown-free guide under Reduce Motion.
+  static countdown-free guide under Reduce Motion. A strain-load suggestion is
+  an information message with the daemon's own wording and an **Open Cortex**
+  action.
 
 ## Review gate
 

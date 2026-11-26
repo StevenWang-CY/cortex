@@ -5,7 +5,9 @@ Cortex exposes a REST API on `http://127.0.0.1:9472` and a WebSocket server on `
 Pydantic schemas in `cortex/libs/schemas/` are authoritative. Examples below are
 selected payloads, not substitutes for generated schemas. See the
 [current validation record](../../docs/release/0.5.1-validation.md) for the
-model, source-availability and lifecycle changes.
+model, source-availability and lifecycle changes, and the
+[model card](../../docs/model-cards/deterministic-support-v3.md) for the 0.6.0
+camera physiology fields.
 
 ## REST API
 
@@ -121,9 +123,13 @@ Submit physiology features from the physio engine.
 }
 ```
 
-Pulse is experimental; HRV/respiration compatibility fields remain unavailable
-in product publication. Camera measurements do not contribute to production
-support scores.
+Pulse, SDNN (`hrv_sdnn`) and breathing rate (`respiration_rate`) are
+experimental; each is published only when its own gate passes. Since 0.6.0
+they, together with blink rate and eye-closure share, can corroborate a support
+score whose behavioral rule is eligible, read against the personal reference
+and with bounded weight. `pulse_variability_proxy` (RMSSD) and the other
+beat-to-beat fields are research-only and never enter the rules. See the
+[model card](../../docs/model-cards/deterministic-support-v3.md).
 
 #### `POST /features/kinematics`
 
@@ -201,7 +207,10 @@ Compute an evidence-aware deterministic support estimate. Named
 `FeatureValue` entries are canonical; flat fields are decode-only. Every named
 entry carries validity, quality, age, source-window exposure, algorithm
 version, and a missing reason when invalid. The current registered model is
-`deterministic-support@2.6.0`, using `support-features-v2.2.0`.
+`deterministic-support@3.0.0`, using `support-features-v3.0.0`. Its camera
+features (`heart_rate_bpm`, `hrv_sdnn_ms`, `respiration_rate_bpm`,
+`blink_rate_per_min`, `perclos_60s`) are optional; without them, or without a
+ready personal reference, the estimate equals the behavior-only estimate.
 The smoother ignores duplicate/regressed observation times and resets scores,
 pending confirmation and the committed label after gaps above 3 seconds.
 Supply the complete v2 time tuple for explicit observation timing; without it,
@@ -504,8 +513,9 @@ Valid `user_action` values: `dismissed`, `engaged`, `snoozed`, `timed_out`, `nat
 
 #### `GET /api/stress-integral`
 
-Compatibility endpoint for the removed physiology-triggered break feature.
-It is side-effect free and always reports unavailable.
+Compatibility endpoint for the removed stress-integral break feature.
+It is side-effect free and always reports unavailable. The 0.6.0 strain load is
+not served here; it travels in `STATE_UPDATE` biometrics.
 
 **Response:**
 ```json
@@ -592,10 +602,14 @@ Launch a project profile (opens VS Code workspace, Chrome URLs, terminal command
 ```json
 {
   "launched": true,
-  "project": "research",
+  "project_name": "research",
+  "errors": [],
   "timestamp": 1000.5
 }
 ```
+
+An unknown project answers `launched: false` with
+`errors: ["project_not_found"]`.
 
 ---
 
@@ -655,9 +669,14 @@ rejects any literal outside it. Counts: 29 inbound, 33 outbound,
 **Outbound (daemon → client):**
 `AUTH_OK`, `PROTOCOL_ERROR`, `STATE_UPDATE`, `CALIBRATION_UPDATED`, `CALIBRATION_UPDATE_FAILED`, `INTERVENTION_TRIGGER`, `INTERVENTION_APPLY`, `INTERVENTION_AUTHORIZATION_DENIED`, `INTERVENTION_TRANSACTION_STATE`, `INTERVENTION_RESTORE`, `CONTEXT_REQUEST`, `ACTIVE_RECALL`, `BREATHING_OVERLAY`, `PRE_BREAK_WARNING`, `MORNING_BRIEFING`, `COPILOT_THROTTLE`, `AMBIENT_STATE_UPDATE`, `ACTION_DISPATCH`, `SESSION_LIST`, `SESSION_DETAIL`, `TRENDS_PAYLOAD`, `SESSION_RECAP`, `WHY_DETAIL`, `BREAK_RECOMMENDATION`, `QUIET_MODE_STATE`, `START_FOCUS_AUTO`, `STOP_FOCUS_AUTO`, `INTERVENTION_FAILED`, `INTERVENTION_PROMPT`, `COST_RESPONSE`, `TEST_PROVIDER_RESULT`, `RAISE_DASHBOARD`, `ERROR`.
 
-`BREAK_RECOMMENDATION`, `BREATHING_OVERLAY`, `PRE_BREAK_WARNING` are decode-only compatibility entries: the daemon can
+`BREATHING_OVERLAY` and `PRE_BREAK_WARNING` are decode-only compatibility entries: the daemon can
 still emit the legacy break/respiration frames for one migration window, but
 product clients ignore them and they cannot trigger an action.
+`BREAK_RECOMMENDATION` is presented only when its `basis` is `elapsed_focus`
+(the opt-in focus-interval reminder) or `physiological_strain` (the 0.6.0
+strain-load suggestion); a frame with no basis or with
+`legacy_stress_integral` is ignored. Either presentation is a suggestion and
+cannot change the workspace.
 
 **LeetCode cues (daemon → chrome, `target_client_types=["chrome"]`):**
 `LEETCODE_SHOW_SCRATCHPAD`, `LEETCODE_SHOW_PATTERN_LADDER`, `LEETCODE_SHOW_LOCKOUT`, `LEETCODE_SHOW_CONSOLIDATION`, `LEETCODE_SHOW_SUBMISSION_GATE`, `LEETCODE_SHOW_SOLUTION_FRICTION`.
@@ -724,6 +743,43 @@ instead of comparing monotonic clocks from different contexts. This UI bound
 is separate from the 3-second inference-continuity bound. Neither timing rule
 establishes physiological validity. Clients must inspect capture status and
 pulse-unavailability reasons as well as numeric values.
+
+The optional `biometrics` object carries the camera estimates: `heart_rate`,
+`pulse_quality`, `hrv_sdnn`, `respiration_rate`, `blink_rate`, `perclos` and
+the head/neck proxy fields. Since 0.6.0 it also carries `strain` (the share of
+the observed physiology currently pointing to strain against the personal
+reference), `strain_load_ratio` (the cumulative strain load as a fraction of
+the break threshold), `stress_integral` (that load in strain-seconds) and
+`physiology_reference_ready`. The strain fields are `null` until camera
+physiology has been read against a reference. `hrv_rmssd` is research-only;
+product surfaces display `hrv_sdnn`.
+
+#### `BREAK_RECOMMENDATION` (server → client)
+
+A break suggestion. It passes the same interruption gate as every other
+suggestion (quiet mode, pause, receptivity, cooldown, hourly cap) and
+changes nothing in the workspace. With `basis: "physiological_strain"`,
+`stress_load` and `threshold` carry the strain load in strain-seconds:
+
+```json
+{
+  "type": "BREAK_RECOMMENDATION",
+  "payload": {
+    "reason": "Your heart and breathing have run above your usual level for a while. A short break may help.",
+    "urgency": "medium",
+    "basis": "physiological_strain",
+    "stress_load": 612.0,
+    "threshold": 600.0,
+    "duration_seconds": 180,
+    "breathing_pattern": "box"
+  },
+  "timestamp": 12500.0,
+  "sequence": 51
+}
+```
+
+An `elapsed_focus` reminder instead carries `focus_elapsed_seconds` and
+`preferred_interval_seconds`, with `stress_load` and `threshold` `null`.
 
 #### `INTERVENTION_TRIGGER` (server → client)
 

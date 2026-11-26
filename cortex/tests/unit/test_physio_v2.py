@@ -520,19 +520,11 @@ def test_respiration_window_the_acquisition_gate_accepts_is_long_enough() -> Non
     assert not any("requires at least" in reason for reason in reasons)
 
 
-def test_two_agreeing_breathing_channels_outvote_a_third() -> None:
-    fs = 30.0
-    t = np.arange(int(45 * fs), dtype=np.float64) / fs
-    times = 1_000_000_000 + np.rint(t * 1e9).astype(np.int64)
-    backend = RPPGBackendRegistry.with_packaged_backends().resolve("pos")
-    fusion = RespirationFusionV2(
-        backend,
-        minimum_channel_quality=0.20,
-        experimental_publication_enabled=True,
-    )
-    # Beat intervals carrying respiratory sinus arrhythmia at 0.25 Hz.
+def _rsa_intervals(times: np.ndarray, respiration_hz: float) -> tuple[object, ...]:
+    """Beat intervals carrying respiratory sinus arrhythmia at ``respiration_hz``."""
+
     beat_times = np.arange(1.2, 45.0, 0.85)
-    beat_times = beat_times + 0.03 * np.sin(2 * np.pi * 0.25 * beat_times)
+    beat_times = beat_times + 0.03 * np.sin(2 * np.pi * respiration_hz * beat_times)
     beats_ns = 1_000_000_000 + np.rint(beat_times * 1e9).astype(np.int64)
     ledger = BeatLedger()
     _, intervals = ledger.ingest(
@@ -542,6 +534,51 @@ def test_two_agreeing_breathing_channels_outvote_a_third() -> None:
         window_end_mono_ns=int(times[-1]) + 1_000_000_000,
         boundary_margin_ns=0,
     )
+    return tuple(intervals)
+
+
+def test_head_movement_and_one_pulse_channel_outvote_the_other_pulse_channel() -> None:
+    fs = 30.0
+    t = np.arange(int(45 * fs), dtype=np.float64) / fs
+    times = 1_000_000_000 + np.rint(t * 1e9).astype(np.int64)
+    backend = RPPGBackendRegistry.with_packaged_backends().resolve("pos")
+    fusion = RespirationFusionV2(
+        backend,
+        minimum_channel_quality=0.20,
+        experimental_publication_enabled=True,
+    )
+    result = fusion.process_window(
+        # The pulse amplitude is modulated at an unrelated 7 /min ...
+        _rgb_trace(t, respiration_hz=0.12),
+        times,
+        sample_rate_hz=fs,
+        boot_id=_BOOT,
+        # ... while the head and the beat intervals both carry 15 /min.
+        head_vertical_face_units=np.sin(2 * np.pi * 0.25 * t),
+        beat_intervals=_rsa_intervals(times, 0.25),
+    )
+    assert result.channels["beat_interval"].value == pytest.approx(15.0, abs=1.5)
+    assert result.fused.status == "experimental"
+    assert result.fused.value == pytest.approx(15.0, abs=1.5)
+
+
+def test_two_pulse_derived_channels_alone_do_not_publish_a_breathing_rate() -> None:
+    """The envelope and beat-interval channels are one mechanism, not two.
+
+    On simulated recordings they agreed with each other on a rate 5 /min too
+    low while head movement read the true one, and the wrong rate was
+    published. Agreement has to include the motion channel.
+    """
+
+    fs = 30.0
+    t = np.arange(int(45 * fs), dtype=np.float64) / fs
+    times = 1_000_000_000 + np.rint(t * 1e9).astype(np.int64)
+    backend = RPPGBackendRegistry.with_packaged_backends().resolve("pos")
+    fusion = RespirationFusionV2(
+        backend,
+        minimum_channel_quality=0.20,
+        experimental_publication_enabled=True,
+    )
     result = fusion.process_window(
         _rgb_trace(t, respiration_hz=0.25),
         times,
@@ -549,11 +586,26 @@ def test_two_agreeing_breathing_channels_outvote_a_third() -> None:
         boot_id=_BOOT,
         # The head moves at an unrelated rate (fidgeting, not breathing).
         head_vertical_face_units=np.sin(2 * np.pi * 0.12 * t),
-        beat_intervals=intervals,
+        beat_intervals=_rsa_intervals(times, 0.25),
     )
+    # Both pulse-derived channels read 15 /min and agree with each other ...
     assert result.channels["beat_interval"].value == pytest.approx(15.0, abs=1.5)
-    assert result.fused.status == "experimental"
-    assert result.fused.value == pytest.approx(15.0, abs=1.5)
+    assert result.channels["color_envelope"].value == pytest.approx(15.0, abs=1.5)
+    # ... and that is still not a published rate.
+    assert result.fused.status == "unavailable"
+    assert result.fused.value is None
+    assert "disagree" in (result.fused.unavailable_reason or "")
+
+    # Without any head-movement channel there is nothing to agree with either.
+    no_motion = fusion.process_window(
+        _rgb_trace(t, respiration_hz=0.25),
+        times,
+        sample_rate_hz=fs,
+        boot_id=_BOOT,
+        head_vertical_face_units=None,
+        beat_intervals=_rsa_intervals(times, 0.25),
+    )
+    assert no_motion.fused.value is None
 
 
 def test_respiration_opt_in_fuses_agreement_and_abstains_on_disagreement() -> None:

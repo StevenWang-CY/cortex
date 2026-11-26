@@ -125,11 +125,12 @@ same-window refreshes), so a window holding *n* events reports *n* switches.
 | eye-closure share (PERCLOS) | fraction | 60 s | none | under-engaged |
 
 Each is published only when its own gate passes (a confirmed cardiac line for
-heart rate, enough accepted beats for SDNN, two agreeing channels for
-breathing). The figures, the conditions under which nothing is published and
-the limits of the evidence — in particular that every reference comparison
-comes from one participant and that the estimator abstained on the two
-participants with intermediate and dark skin tone — are in the
+heart rate, enough accepted beats for SDNN, head movement agreeing with a
+pulse-derived channel for breathing). The figures, the conditions under which
+nothing is published and the limits of the evidence — in particular that every
+reference comparison comes from one participant and that the estimator
+abstained on the two participants with intermediate and dark skin tone — are
+in the
 [qualification report](../research/physiology-qualification.md).
 
 Camera inputs are optional. Removing the camera, losing the face, or lacking a
@@ -335,14 +336,33 @@ suggestion.
   owed; a completed break pays back twice its duration. The load is a pacing
   aid, not a measure of stress, fatigue or health.
 
-Reading check-ins are behaviour-only proposals. Blink values, missing camera
-input and blink baselines cannot change their timing or eligibility. The default
+Reading check-ins read no camera value directly: blink values and blink
+baselines cannot change their timing. They do require an `under_engaged`
+estimate, and since 3.0.0 that estimate may be corroborated by blink rate and
+eye-closure share where its behaviour rule is eligible. The default
 is 120 s of observed mouse velocity at or below 30 px/s in a browser while the
 support estimate is `under_engaged`. Quiet interaction does not establish
 comprehension or attention. Goal check-ins use only the foreground
 editor file or active browser title; missing foreground metadata resets the pending check-in
 rather than counting as a mismatch. Both remain subject to the shared interruption
 and authorization gates.
+
+### Other consumers of camera physiology
+
+- **Session report and multi-day trend.** The session's mean heart rate and
+  mean SDNN (`avg_hrv_sdnn`) are recorded. `avg_hrv_rmssd` is kept in the
+  schema so older session files load; it is no longer written.
+- **Coding-practice coach (struggle detection).** Both pathways are
+  behaviour-led — re-reading with a long dwell on one stage, or repeated wrong
+  answers with heavy deletion — and each needs a physiological condition to
+  corroborate it: a rising strain load, or SDNN below 80 % of the person's own
+  reference level. With no camera reading or no ready reference neither
+  condition can hold and the detector is silent. Its actions change the page
+  and therefore run only in an authorized execution mode.
+- **Contained.** Two coach modes would be established by physiology rather
+  than corroborated by it — an immediate heart-rate reaction to a submission,
+  which a 20 s pulse window cannot resolve, and a post-success recovery
+  window. Their physiological inputs remain zero, as in 2.6.0.
 
 ## Change log
 

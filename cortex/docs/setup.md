@@ -1,10 +1,12 @@
 # Setup and development
 
 This page describes the supported, locked setup path. Cortex is an alpha
-macOS research prototype, not a medical device. Camera pulse is experimental;
-HRV, respiration, stress-integral, and physiology-triggered actions are
-unavailable. See [limitations](../../docs/limitations.md) before interpreting
-any signal or support label.
+macOS research prototype, not a medical device. Camera pulse, heart-rate
+variability (SDNN) and breathing rate are experimental estimates that can
+corroborate, never establish, a support label; heart rate and SDNN were checked
+against ECG on one participant only. See [limitations](../../docs/limitations.md)
+and the [qualification report](../../docs/research/physiology-qualification.md)
+before interpreting any signal or support label.
 
 ## Install a published application
 
@@ -113,7 +115,14 @@ CORTEX_LLM__PRIVACY__PLANNER_MODE=no_llm
 CORTEX_LLM__PRIVACY__EXTERNAL_CONTEXT_ENABLED=false
 CORTEX_EVAL__POLICY=deterministic
 CORTEX_INTERVENTION__ENABLE_FOCUS_BREAK_REMINDERS=false
+CORTEX_STATE__PHYSIOLOGY_WEIGHT=0.35
+CORTEX_INTERVENTION__ENABLE_STRAIN_BREAK_SUGGESTIONS=true
 ```
+
+Set `CORTEX_STATE__PHYSIOLOGY_WEIGHT=0` to keep the support rules
+behavior-only, and `CORTEX_INTERVENTION__ENABLE_STRAIN_BREAK_SUGGESTIONS=false`
+to turn off the strain-load breathing-break suggestion. Neither switch stops the
+camera; pause sensing for that.
 
 Leave `CORTEX_CAPTURE__DEVICE_ID` unset for automatic camera preference and
 candidate ordering. A configured index overrides that preference, but still
@@ -131,7 +140,8 @@ one-time confirmation, and provider-retention disclosure. See
 
 ## macOS permissions and launch lineage
 
-- **Camera:** optional experimental acquisition and pulse estimate.
+- **Camera:** optional experimental acquisition and pulse, variability and
+  breathing estimates that can corroborate the behavioral rules.
 - **Input Monitoring / Accessibility:** aggregate input/window context and
   explicitly authorized OS capabilities.
 - **Automation:** only for a capability the user authorizes.
@@ -205,6 +215,20 @@ personal application profile. Dataset replay requires a manifest with licensing,
 provenance, condition, checksum, and reference-timing metadata; participant
 data is never committed. See
 [`tests/physio/DATASETS.md`](../tests/physio/DATASETS.md).
+
+After changing a pulse, HRV or respiration estimator, gate or window, run the
+physiology qualification and update its report and the model card in the same
+change:
+
+```bash
+uv run --project cortex --locked --extra dev python -m cortex.scripts.qualify_physiology \
+    synthetic --markdown
+```
+
+The `dataset-4tu` mode replays the ECG-referenced videos described in the
+[qualification report](../../docs/research/physiology-qualification.md#reproduce);
+download them separately and keep the videos and their trace cache out of the
+repository.
 
 ## Build and release
 

@@ -9,10 +9,10 @@ measurements; it does not validate support labels or make scores probabilistic,
 diagnostic or accurate against an independent sensor.
 
 The current protocol is `calibration/2.0.0`, with profile schema `2.0` and
-calibration feature schema `features/2.0`. These are separate from behavioral
-inference's `support-features-v2.2.0` and model `2.6.0`. The
+calibration feature schema `features/2.0`. These are separate from support
+inference's `support-features-v3.0.0` and model `3.0.0`. The
 [current implementation record](../../docs/implementation-2026-10.md) and
-[behavioral model card](../../docs/model-cards/deterministic-support-v2.md)
+[support model card](../../docs/model-cards/deterministic-support-v3.md)
 describe that boundary.
 
 ## Capture, review and application
@@ -85,10 +85,20 @@ with no movement can contribute an observed zero. A low mouse-variance baseline
 can still be unsuitable for normalization: the support scorer abstains on that
 feature below its documented 1,000 px²/s² readiness floor.
 
-Heart-rate and respiration summaries remain experimental and are not applied to
-production scoring. Blink and head/neck references can calibrate their diagnostic
-proxies, but cannot establish attention, comprehension or support need. A profile
-cannot enable camera HRV, respiration or physiology-triggered production actions.
+Since 0.6.0 the measured resting heart rate, resting breathing rate and working
+blink rate seed the personal reference that the support rules read camera
+physiology against. Only measured levels seed it; population placeholders never
+do. A new calibration replaces the corresponding references, and metrics it did
+not measure keep what the session has learned. Calibration does not measure
+SDNN, so the variability reference is always learned in the session (sixty
+valid values over at least two minutes); without calibration the other metrics
+are learned the same way. A different physical camera discards the reference,
+including calibrated levels, because a different camera carries a different
+bias. These summaries remain experimental: a reference makes a deviation
+interpretable for one person through one camera, not accurate against an
+independent sensor. Head/neck references calibrate a diagnostic proxy only.
+None of these references can establish attention, comprehension or support
+need, and a profile cannot turn camera evidence into an estimate on its own.
 
 ## Persistence and validation
 
@@ -102,8 +112,11 @@ normal migration and compatibility checks reconcile it with the daemon.
 Automated tests cover live failure, demo isolation, explicit approval, immutable
 profiles, checksum/identity rejection, staged-versus-active state, failed
 application and estimator replacement. Those checks do not establish sensor or
-product validity. Physiological measurements still need a consented synchronized
-reference-sensor study; support inference needs participant-held-out evaluation
-and intervention benefit needs randomized evidence. See the
+product validity. Camera heart rate and SDNN have been checked against ECG on
+one participant ([qualification report](../../docs/research/physiology-qualification.md));
+physiological measurements still need a consented synchronized reference-sensor
+study across people, skin tones and cameras, support inference needs
+participant-held-out evaluation and intervention benefit needs randomized
+evidence. See the
 [study protocol](../../docs/research/support-inference-study-protocol.md) and
 [limitations](../../docs/limitations.md).

@@ -9,8 +9,8 @@ from __future__ import annotations
 
 SUPPORT_MODEL_MANIFEST_SCHEMA_VERSION = "1.0"
 SUPPORT_MODEL_COMPONENT_SHA256: tuple[tuple[str, str], ...] = (
-    ("libs/schemas/features.py", "50bac5f6974dde5727d04013ee3e11501669d8213ecc9ba77ef241c9c19bb497"),
-    ("services/telemetry_engine/input_hooks.py", "bc910d386a9ba4facf6022e17c8cf9670fc8954fb2748ef21e0b97a3558ebc7e"),
+    ("libs/schemas/features.py", "06a81ff4fa26eed77246fbd4b73b659b9d0035caf9e5355cccb89ef71d99d053"),
+    ("services/telemetry_engine/input_hooks.py", "e8b25eab347568a90a750b637edc157c7cbd78211e67ba2c550d85b72188a28c"),
     ("services/telemetry_engine/window_tracker.py", "da69f332964ba5858b5395e7f1f437fb7f313ae964f1ca9bc2d916bfe851ada1"),
     ("services/telemetry_engine/feature_aggregator.py", "6cd0529a7a13ffa5922381b19b1383e17cf13c3828f83352b773ceda7de9eb6f"),
     ("services/telemetry_engine/focus_graph.py", "48554223aa7dc7cb297b59faf7024a79c1e8321b2c78269488c6763157181796"),
@@ -29,6 +29,6 @@ SUPPORT_MODEL_COMPONENT_SHA256: tuple[tuple[str, str], ...] = (
     ("services/physio_engine/v2/beat_timing.py", "a158614efa5a9350c22c27fc4989e52ee7b519b11a422be3a9a6551618ff376c"),
     ("services/physio_engine/v2/beats.py", "c980dde70b7814d9c02bed90b51e99027f88fe9a5327dcc945147ac91f7eb0de"),
     ("services/physio_engine/v2/hrv.py", "5f8953c2a8d5ea70ca1d52cf22af2e3ea5e494699f522adae14a2ea57d7a1757"),
-    ("services/physio_engine/v2/respiration.py", "58cf3af9b346d284c4369de986efe6106f65b9c0fe050a171b62b6bbdb83008c"),
+    ("services/physio_engine/v2/respiration.py", "68a9826355cdb0e2468bc74ad108f3def118256edc205edfd0ff347dfcb8d2a3"),
 )
-DETERMINISTIC_SUPPORT_IMPLEMENTATION_SHA256 = "01e444e1e7f724fc0d2c5760fb9f2b304b43ba70e44d5129e9fc229556ab487e"
+DETERMINISTIC_SUPPORT_IMPLEMENTATION_SHA256 = "a6696fda3114d8c6ea7588037a1c9b7db40bf8f553c522f7a5177b9d2c6e7564"

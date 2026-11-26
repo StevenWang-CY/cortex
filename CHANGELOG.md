@@ -4,6 +4,197 @@ All notable changes to Cortex. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.6.0] — 2026-11-25
+
+Camera physiology becomes optional corroborating evidence for the support
+rules: `deterministic-support` 3.0.0, feature schema `support-features-v3.0.0`,
+[ADR 0008](docs/adr/0008-qualified-camera-physiology.md). Until 0.5.1 every
+camera value was diagnostic-only. The release also carries a backend and a
+client audit round, each fix with a regression test.
+
+### Camera physiology — evidence limits
+
+- Heart rate and SDNN were checked against ECG on 21 public recordings
+  (4TU.ResearchData, Hoffman & Lakens 2020): heart rate MAE 1.8 BPM on the
+  33 % of windows it published, SDNN MAE 8.3 ms on 22 %. Every published value
+  came from **one participant**.
+- For the two participants with intermediate and dark skin tone the estimator
+  published nothing. For such users the rules stay behavior-only.
+- The publication gate was designed with the same recordings in view; there is
+  no held-out data. Breathing rate has only simulated truth behind it, and
+  blink rate and eye closure were not checked against a reference.
+- RMSSD (MAE 22.8 ms, 9 % within 15 ms) and the other beat-to-beat measures
+  did not qualify and are not inputs.
+- Agreement with a reference sensor does not show a need for support. Cortex
+  is not a medical device; its outputs are not diagnoses or measurements of
+  stress.
+
+### Camera physiology — measurement
+
+- Rebuild the pulse estimator (`pulse-v2/3.0.0`, `hrv-v2/3.1.0`) around the
+  whole facial skin (face outline minus eyes, brows and lips), a 20 s POS
+  window (10 s while it fills) and narrow-band Hilbert-phase beat timing on
+  which overlapping windows vote.
+- Publish a rate only when the harmonic signal-to-noise ratio reaches 3 dB; a
+  weaker window may only continue a rate a 3 dB window established within the
+  last 60 s. The in-band ratio it replaces had the same median for right and
+  wrong rates. The second harmonic counts only up to half the fundamental:
+  uncapped, a weak line at half the true rate was confirmed by the real pulse
+  and published 51 BPM for a 101 BPM heart.
+- Window quality is cardiac-line strength times acquisition quality.
+  Multiplying in per-frame scores that rarely exceed 0.6 rejected about half
+  of otherwise-ready windows.
+- Compute SDNN over the trailing three minutes. Breathing rate comes from
+  three channels (pulse-amplitude envelope, vertical head movement,
+  beat-interval modulation) and is published only when two agree; the
+  envelope channel abstains without a cardiac line. A requirement of the full
+  45.0 s, which a 30 fps buffer (44.97 s) never met, had prevented any
+  breathing rate from being published; it is now a share of the window.
+- Face-skin extraction returns no region for a partial landmark set instead of
+  raising `IndexError`.
+- Add `python -m cortex.scripts.qualify_physiology`, which replays simulated
+  truth and the ECG-referenced videos through the production capture and
+  physiology path against per-metric acceptance criteria. No pulse, SDNN or
+  breathing rate was published on the eighteen signal-free simulated
+  recordings.
+- `signal.rppg.experimental_hrv_enabled` and
+  `signal.rppg.experimental_respiration_enabled` now default to true.
+
+### Camera physiology — inference and suggestions
+
+- Heart rate, SDNN, breathing rate, blink rate and eye-closure share are
+  production features, each read against a personal reference: seeded by a
+  calibration's measured level or learned over two minutes and sixty valid
+  values, adapting with a one-hour half-life. A different physical camera
+  discards the reference.
+- Mix the physiology block into a state only where that state's own behavior
+  rule is eligible, with weight `state.physiology_weight` (default 0.35,
+  capped below the smoother's entry threshold). Camera evidence alone cannot
+  make any hypothesis the estimate. With no camera, no face, no reference or
+  `state.physiology_weight: 0` every score equals the behavior-only 2.6.0
+  score; behavior weights, transforms, gates and temporal behavior are
+  unchanged.
+- Model identity grows from eleven to twenty-one components (physiology
+  evidence, personal reference and camera estimators).
+- A strain load integrates the support-likely physiology block and drains
+  during calm. Crossing its threshold (600 strain-seconds by default) suggests
+  one three-minute paced-breathing break through the shared interruption gate;
+  a refused crossing stays owed, and a completed break pays the load back.
+  `intervention.enable_strain_break_suggestions` (on by default) turns it off.
+  The load is a pacing aid, not a measure of stress.
+- Everything that used to be handed RMSSD now receives SDNN or nothing.
+  Session reports and multi-day trends record mean SDNN (`avg_hrv_sdnn`);
+  `avg_hrv_rmssd` still decodes in older files but is no longer written. The
+  coding-practice struggle detector stays behavior-led and needs a rising
+  strain load, or SDNN below 80 % of the personal reference, to corroborate
+  it. The two coach modes that physiology alone would establish stay
+  contained.
+
+### Camera physiology — interface
+
+- The desktop dashboard and the browser popup show Pulse, HRV (SDNN),
+  breathing rate and blink rate, and "Body load N% of your break level" once
+  physiology has been read against a reference. The values clear with the face
+  or capture. History shows a session's peak load against the default break
+  level, only when camera physiology produced one.
+- A strain-load suggestion appears as the dashboard pill "Take a breather?",
+  the browser toast "Breathing break?" and an editor notification.
+  `BREAK_RECOMMENDATION` carries `basis: physiological_strain`; a message with
+  the legacy stress-integral basis is still ignored, and
+  `GET /api/stress-integral` still reports unavailable.
+- `STATE_UPDATE` biometrics add `hrv_sdnn`, `pulse_quality`, `strain`,
+  `strain_load_ratio` and `physiology_reference_ready`; `respiration_rate` and
+  `stress_integral` (the strain load in strain-seconds) are populated.
+  TypeScript schemas are regenerated.
+
+### Backend audit fixes
+
+- Consent: register the LeetCode coach cues in the consent policy, so the
+  pattern-ladder hint is no longer denied on every call; start each earned tier
+  with a clean rejection count; never de-escalate an action below its own
+  policy minimum.
+- Proposals: release the intervention slot when a proposal closes unapplied
+  (in `suggest_only`, every proposal after the first had been refused for the
+  rest of the session); stop dropping ratings and dismissals without a
+  correlation id as stale acknowledgements; drop the close action of a tab the
+  safety rules keep; keep editor-error guidance in the rule-based plan when
+  browser tabs are open; answer **Why?** with the trigger-time rationale even
+  when it was empty.
+- Context: stop classifying Xcode as VS Code; classify only `x.com` itself as
+  social (dropbox.com and fedex.com had been); feed the telemetry
+  window-switch rate into workspace complexity; collect browser context and
+  send LeetCode cues to Edge as well as Chrome.
+- Time and quiet state: do not credit a machine sleep to the session's last
+  state; re-arm the focus-break reminder after an observed break; persist
+  **Pause all sensing** when it is set and when it is lifted; keep an explicit
+  pause and report the real quiet state when settings are applied; make the
+  microphone receptivity probe answer on macOS, so the active-call receptivity
+  block and the guided break's audio mute can engage.
+- Settings and spend: apply the Settings daily LLM cap to the spend
+  kill-switch; move the trigger threshold around its default for the
+  sensitivity slider instead of raising it on every Apply.
+- Routes and integration: `/api/launch` reports an unknown project as not
+  launched; pass `launcher.user_command_allowlist` to the project launcher;
+  `/api/feedback` answers 503 when a bug report failed to save; wire the
+  macOS banner **Open** and **Snooze** buttons to the daemon and re-arm them
+  after an in-process restart. Make the cost-ledger midnight test independent
+  of the season.
+
+### Client audit fixes
+
+- Desktop correlation and quiet state: WebSocket-mode dismissals carry the
+  trigger correlation id, overlay ratings and tray **Pause** reach the daemon,
+  and the pause flag and tray item follow quiet changes made elsewhere; a
+  paused tray shows Paused rather than a reading frozen at the pause, and
+  pausing keeps the menu-bar tooltip's withheld status. Only a user's
+  dismissal of the suggestion card counts as a rejection. The desktop
+  WebSocket bridge and the privacy controller's loopback requests bypass any
+  configured proxy, and the auth-first bridge test fake accepts the proxy
+  keyword.
+- Desktop accessibility: Tab order follows the suggestion card, Settings and
+  the setup wizard; tabbing through the recap sheet holds it open; VoiceOver
+  names the Settings controls and context-review text areas and reads the
+  status pill, health banner, spend chip, Pause capsule and "This session"
+  numbers.
+- Desktop History: times use the user's clock; the hourly heatmap keeps the
+  local hour across a DST change; empty states and "No interventions" respect
+  the report's intervention count, and the empty Interventions copy no longer
+  prints the engine state; a failed or late session detail no longer shows or
+  reopens a report.
+- Desktop Settings, onboarding and dashboard: closing Settings without Apply
+  discards unapplied edits and restores every control; a sync saves only its
+  keys; a daemon-synced quiet state becomes the Apply baseline; "Test
+  connection" stops saying Testing... when nothing answers; a Keychain token
+  completes the Claude step; the calibration card reports a saved profile as
+  saved; a successful external request no longer shows the last failure's
+  heading; Connections re-probe updates the card's verdict; elided labels keep
+  their text on resize; "This session" numbers restart with a new session; the
+  breathing circle stays empty through the post-exhale hold.
+- Browser extension: ratings and notification opens carry the trigger
+  correlation id; a timed quiet mode ends at its end time; the popup's daily
+  totals follow the local day; a popup opened after the trigger shows the full
+  intervention card.
+- VS Code: echo the trigger correlation id so dismissals and ratings land;
+  expire the estimate ten seconds after the last update; clear the panel on
+  `DISMISS_OVERLAY`; let a lapsed quiet mode stop masking the status bar;
+  ignore frames from a released socket; stop saying "connecting" when
+  connected; announce the selected rating; open the view when asked before it
+  was ever shown; wire the desktop-not-focused pulse and Snooze toast.
+
+### Documentation
+
+- Add the [physiology qualification report](docs/research/physiology-qualification.md),
+  ADR 0008, which supersedes ADR 0001's camera exclusion, and
+  [model card v3](docs/model-cards/deterministic-support-v3.md); the v2.6.0 card
+  is kept as the superseded behavior-only record.
+- Align both READMEs, the contributor guide, documentation index,
+  limitations, data flow, architecture, calibration, API, privacy, UI and setup
+  guides, research protocols and local wiki with the 0.6.0 boundary. AGENTS.md
+  rules 43–50 record the physiology lessons.
+
+The camera physiology evidence and its limits are recorded in
+[the qualification report](docs/research/physiology-qualification.md).
+
 ## [v0.5.1] — 2026-10-11
 
 ### Correctness and numerical integrity

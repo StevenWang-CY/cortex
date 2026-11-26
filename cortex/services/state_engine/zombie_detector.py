@@ -1,8 +1,10 @@
-"""Conservative behavior-only reading check-in eligibility.
+"""Conservative reading check-in eligibility.
 
 The legacy class/argument names are retained for compatibility. A quiet input
 pattern does not establish whether somebody understands or absorbs a text.
-Camera measurements never change the eligibility or timing of this reminder.
+This detector reads no camera measurement. It is gated on an under-engaged
+support estimate, which since rules 3.0.0 may itself be corroborated by blink
+rate and eye-closure share.
 """
 
 from __future__ import annotations
@@ -30,7 +32,8 @@ class ZombieReadingDetector:
     """Offer a reading check-in after sustained quiet input in a browser.
 
     ``blink_baseline`` and ``blink_rate`` are accepted for older callers but
-    intentionally have no effect. They remain diagnostic-only measurements.
+    intentionally have no effect here; blink reaches the check-in only through
+    the support estimate it is gated on.
     """
 
     def __init__(

@@ -15,8 +15,8 @@ covers the completed evidence-continuity, runtime and interface refinement.
 [Earlier implementation history](../IMPLEMENTATION.md) remains available.
 This README describes the current package and product boundary.
 
-Application version is `0.5.1`; behavioral model `2.6.0` uses
-`support-features-v2.2.0`. See the [current validation record](../docs/release/0.5.1-validation.md)
+Application version is `0.6.0`; support model `3.0.0` uses
+`support-features-v3.0.0`. See the [current validation record](../docs/release/0.5.1-validation.md)
 for source checks, packaging and publication status. Run `make verify` from
 the repository root for the full local release checks. A local ad-hoc build
 does not establish notarization or a public release.
@@ -35,10 +35,22 @@ or validated estimator of a person's cognitive state.
 - Webcam pulse is an experimental wellness estimate and is published only
   after signal-quality checks. Accuracy varies with lighting, motion, camera,
   occlusion, and individual characteristics.
-- Camera-derived HRV, LF/HF, pNN50, nonlinear HRV, respiration, breath-pause
-  detection, the former stress integral, and physiology-triggered breaks are
-  unavailable in product mode pending metric-specific reference-sensor
-  validation.
+- Camera heart rate, SDNN, breathing rate, blink rate and eye-closure share
+  are optional corroborating inputs to the support rules
+  ([ADR 0008](../docs/adr/0008-qualified-camera-physiology.md)). Each is read
+  against a personal reference and mixed only into a state whose behavioral
+  rule is eligible, with weight `state.physiology_weight` (default 0.35).
+  Heart rate and SDNN were checked against ECG on one participant; the
+  estimator published nothing for the two participants with intermediate and
+  dark skin tone; there is no held-out data; breathing rate has no reference
+  sensor. See the [qualification report](../docs/research/physiology-qualification.md).
+- RMSSD, pNN50, SD1/SD2, LF/HF and sample entropy did not qualify. They are
+  computed for research only and are not inputs. Breath-pause (“screen
+  apnea”) detection and the former stress integral are not provided.
+- A strain load integrates the physiology evidence and can suggest one short
+  breathing break through the shared interruption gate
+  (`intervention.enable_strain_break_suggestions`, on by default). It is a
+  pacing aid, not a measure of stress or health.
 - FLOW/HYPER/HYPO/RECOVERY are legacy heuristic support labels. Their scores
   are not calibrated probabilities and must not be interpreted as diagnoses.
 - Production policy selection is deterministic and does not learn online.
@@ -57,7 +69,10 @@ observed input/window activity → availability + exposure + aggregation
                                              |
                                              v
                              behavioral scoring + continuous dwell
-                                             |
+                                             |  <── optional camera → signal-quality
+                                             |      gates → personal reference
+                                             |      (corroborates eligible rules
+                                             |      only; bounded weight)
                                              v
                                 deterministic eligibility gates
                                              |
@@ -66,8 +81,6 @@ current workspace context ────────────────→ lo
                                              |
                                              v
                                   suggestion for user review
-
-optional camera → signal-quality gates → experimental diagnostic display
 ```
 
 The daemon runs FastAPI on `127.0.0.1:9472` and WebSocket on
@@ -76,19 +89,21 @@ packaged PySide6 desktop shell hosts the daemon in-process and receives queued
 UI callbacks. The development shell can also connect as a WebSocket client.
 Chrome/Edge and VS Code connect over authenticated local transports. Internal
 services use the application kernel and ports; they do not require a network
-hop between every layer. Camera observations are excluded from production
-behavioral inference and cannot drive reading-reminder eligibility.
+hop between every layer. Camera physiology can corroborate an eligible
+behavioral reading but cannot establish one. Reading reminders read no camera
+value directly; the `under_engaged` estimate they require may itself be
+corroborated by blink rate and eye-closure share.
 
 ### Main components
 
 | Component | Responsibility |
 |---|---|
 | `services/capture_service` | camera selection, timestamped frames, face/ROI and quality observations |
-| `services/physio_engine` | experimental rPPG pulse estimation; unsupported derived physiology is contained |
+| `services/physio_engine` | experimental rPPG pulse, SDNN and breathing-rate estimation with per-metric publication gates; unqualified variability measures are research-only |
 | `services/kinematics_engine` | blink and head/neck proxy features |
 | `services/telemetry_engine` | per-source availability, input exposure/intervals, current foreground window and focus transitions |
 | `application` | typed kernel/ports, deadline-bounded cancellation, live task ownership and bounded value-only diagnostic history |
-| `services/state_engine` | deterministic evidence-aware scoring, smoothing, eligibility, and compatibility decoders |
+| `services/state_engine` | deterministic evidence-aware scoring, personal physiology reference and bounded fusion, strain load, smoothing, eligibility, and compatibility decoders |
 | `services/context_engine` | browser/editor/terminal context assembly |
 | `services/llm_engine` | default local planner, privacy broker, preview-gated Anthropic transport, validation and deterministic fallback |
 | `services/intervention_engine` | manifest validation, exact authorization, receipts, verification, compensation, and restore |
@@ -112,18 +127,24 @@ requires an exact checksummed study epoch.
 
 | Surface | Product status |
 |---|---|
-| camera pulse/BPM | experimental, quality-gated wellness estimate |
-| blink rate and PERCLOS | local diagnostics only; not support-inference inputs or externally validated |
+| camera pulse/BPM | experimental, quality-gated wellness estimate; corroborating support input; checked against ECG on one participant |
+| HRV as SDNN | experimental wellness estimate; corroborating support input; checked against ECG on one participant |
+| breathing rate | published only when two camera channels agree; low-weight corroborating input; simulated truth only |
+| blink rate and PERCLOS | low-weight corroborating inputs against a personal reference; not externally validated |
 | head/neck pose proxy | local diagnostics only; not support-inference inputs or a posture diagnosis |
 | input/window telemetry | observed local behavioral evidence; unavailable channels abstain |
-| HRV/RMSSD/SDNN/pNN50/LF-HF/entropy | unavailable in product mode |
-| respiration or “screen apnea” | unavailable in product mode |
-| stress integral / biology-driven break | unavailable and cannot trigger an action |
+| RMSSD/pNN50/SD1/SD2/LF-HF/entropy | did not qualify; research-only, never read by rules, suggestions or screens |
+| “screen apnea” / breath-pause | not provided |
+| strain load / breathing-break suggestion | pacing aid from the physiology evidence; one suggestion through the shared interruption gate; not a stress measure |
 | state “confidence” | legacy score only; not a calibrated probability |
 
 Compatibility fields and messages may remain decodable for one migration
 window. They are emitted as unavailable or ignored, never silently
-reinterpreted as evidence.
+reinterpreted as evidence. The one deliberate reuse is documented in the
+[API reference](docs/apis.md): `stress_integral` and a
+`BREAK_RECOMMENDATION`'s `stress_load` now carry the strain load, while a
+break message without a basis or with the legacy stress-integral basis is
+still ignored.
 
 Input silence is evidence only while the corresponding listener is available.
 Typing variance requires at least two positive regular-key intervals;
@@ -131,9 +152,10 @@ backspaces do not satisfy that count. Nonincreasing timestamps are ignored by
 smoothing and fusion; gaps above three seconds reset scores, dwell and source
 warm-up. Smoothing scales by elapsed time, numeric evidence must be finite,
 and clock-domain changes restart confirmation. The model identity
-includes eleven telemetry/schema/fusion/smoothing/scoring components; it does
-not hash the entire runtime, configuration or intervention policy. See the
-[model card](../docs/model-cards/deterministic-support-v2.md) for precise scope.
+includes twenty-one telemetry/schema/fusion/smoothing/scoring, physiology
+evidence/reference and camera-estimator components; it does not hash the
+entire runtime, configuration or intervention policy. See the
+[model card](../docs/model-cards/deterministic-support-v3.md) for precise scope.
 
 ## Interface behavior
 
@@ -142,6 +164,9 @@ not hash the entire runtime, configuration or intervention policy. See the
 - A pending suggestion offers **Review suggestion** from the dashboard. It
   activates the exact current card only after the gesture, expires within its
   original bounded lifetime, and clears on terminal lifecycle events.
+- The dashboard and popup show pulse, HRV (SDNN), breathing rate and blink
+  rate, and a "Body load N% of your break level" line once physiology has been
+  read against a personal reference. A lost face or stale capture clears them.
 - Popup and Pulse Room share normalized fields and sample age; invalid values,
   disconnects and ten seconds without updates clear current signal display.
   This is a UI continuity bound, not physiological validation.
@@ -272,7 +297,7 @@ Important endpoints:
 |---|---|---|
 | GET | `/health` | readiness/degradation summary; token is optional |
 | GET | `/status/current` | current legacy support estimate |
-| GET | `/api/stress-integral` | compatibility response: unavailable, never a break trigger |
+| GET | `/api/stress-integral` | compatibility response: unavailable, never a break trigger; the 0.6.0 strain load travels in `STATE_UPDATE` biometrics |
 | GET | `/api/helpfulness/summary` | legacy diagnostic summary |
 | POST | `/consent/reset` | reset consent records |
 | POST | `/shutdown` | graceful daemon shutdown |

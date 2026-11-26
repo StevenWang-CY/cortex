@@ -89,18 +89,29 @@ port-based kills terminate them too.
 
 ### "Reading your pulse…" never resolves
 
-Webcam pulse is experimental and does not affect support estimates. The
-dashboard states why a pulse is unavailable rather than showing a permanent
-warm-up: the window is still filling, coverage is below the gate, the light
-is too low, there is too much motion, or the face was lost. Sit facing the
-camera at arm's length with even light and no strong backlight. A steady
-low-frame-rate camera may need a longer window, and pulse still remains
-unavailable if the quality/coverage gates cannot be met.
+Webcam pulse is experimental. It can corroborate a support estimate the
+behavioral rules already make, but a missing pulse only means the estimate
+rests on behavior alone. The dashboard states why a pulse is unavailable
+rather than showing a permanent warm-up: the window is still filling, coverage
+is below the gate, the light is too low, there is too much motion, or the face
+was lost. Sit facing the camera at arm's length with even light and no strong
+backlight. A steady low-frame-rate camera may need a longer window, and pulse
+still remains unavailable if the quality/coverage gates cannot be met. On the
+public reference recordings the estimator published a rate for none of the
+windows of the two participants with intermediate and dark skin tone; for some
+people it may never publish one on a given camera, and Cortex then behaves as
+if no camera were present.
+
+HRV (SDNN) appears only after enough accepted beats have accumulated in its
+three-minute window, and breathing rate only when two independent camera
+signals agree, so both can show "--" while a pulse is visible. "Body load"
+appears only once a personal reference exists: from calibration, or after
+about two minutes of valid readings in the session.
 
 ### Status stays "Still gathering" or "Not enough evidence"
 
 Support estimates come from input and window telemetry (mouse, keyboard,
-focus transitions), not from the camera. They require:
+focus transitions); camera physiology can only corroborate them. They require:
 
 - **Observable input sources**: inspect Input Monitoring/Accessibility and
   the acquisition status. A stopped or denied keyboard/mouse/window source is
@@ -113,9 +124,11 @@ focus transitions), not from the camera. They require:
   or regressed times and resets accumulated evidence/dwell after gaps above
   three seconds; time spent disconnected does not satisfy a waiting period.
 
-There is no camera-only mode and the camera cannot raise or lower a support
-score. The scorer uses the personal mouse-variance baseline; calibration can
-also record camera/acquisition diagnostics, which do not validate support labels.
+There is no camera-only mode. Camera physiology can strengthen or temper a
+score only where the behavioral rule is already eligible, so it cannot turn
+"Not enough evidence" into an estimate. The scorer uses the personal
+mouse-variance baseline; calibration also records the camera levels the
+physiology is read against, which do not validate support labels.
 
 ### Too many or too few suggestions
 

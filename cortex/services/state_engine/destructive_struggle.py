@@ -13,8 +13,13 @@ during a LeetCode session.  Two independent pathways are monitored:
 **Implementation thrash**
     The user has received > 2 Wrong Answers within 10 minutes AND their
     code-delete ratio over the last 60 seconds exceeds 0.5 (more deleting
-    than writing) AND their HRV RMSSD has dropped below 80% of baseline
-    (sympathetic dominance).  This signals they are rewriting blindly.
+    than writing) AND their heart-rate variability (SDNN) has dropped below
+    80% of their own reference level.  This signals they are rewriting blindly.
+
+Both pathways are behaviour-led; the physiological condition corroborates.
+The caller passes only qualified physiology read against the personal
+reference (the strain load and SDNN).  When none is available the
+corroborating condition cannot hold and neither pathway fires.
 
 The detector outputs a ``DestructiveStruggleEstimate`` pydantic model.
 """
@@ -53,8 +58,8 @@ class DestructiveStruggleDetector:
             stage_dwell_s=320.0,
             allostatic_load=0.7,
             allostatic_load_prev=0.5,
-            hrv_rmssd=45.0,
-            hrv_baseline=60.0,
+            hrv_ms=45.0,
+            hrv_baseline_ms=60.0,
             wa_timestamps=[t1, t2, t3],
         )
         if estimate.is_destructive:
@@ -76,8 +81,8 @@ class DestructiveStruggleDetector:
         stage_dwell_s: float,
         allostatic_load: float,
         allostatic_load_prev: float,
-        hrv_rmssd: float,
-        hrv_baseline: float,
+        hrv_ms: float,
+        hrv_baseline_ms: float,
         wa_timestamps: list[float],
         current_time: float | None = None,
     ) -> DestructiveStruggleEstimate:
@@ -92,10 +97,12 @@ class DestructiveStruggleDetector:
                                typed over the last 60 seconds.  1.0 = pure
                                deletion.
             stage_dwell_s: Seconds spent on the current cognitive stage.
-            allostatic_load: Current allostatic-load score.
-            allostatic_load_prev: Previous allostatic-load score (for trend).
-            hrv_rmssd: Current HRV RMSSD in milliseconds.
-            hrv_baseline: Baseline HRV RMSSD in milliseconds.
+            allostatic_load: Current strain load as a share of the break
+                             threshold.
+            allostatic_load_prev: Its value at the previous call (for trend).
+            hrv_ms: Current SDNN in milliseconds; 0 when unavailable.
+            hrv_baseline_ms: The person's own SDNN reference level in
+                             milliseconds; 0 when no reference is ready.
             wa_timestamps: Monotonic timestamps of all Wrong Answer
                            submissions in the session.
             current_time: Override for the current monotonic clock.  Defaults
@@ -119,8 +126,8 @@ class DestructiveStruggleDetector:
         impl = self._check_implementation(
             wrong_answer_count=wrong_answer_count,
             code_delete_ratio=code_delete_ratio,
-            hrv_rmssd=hrv_rmssd,
-            hrv_baseline=hrv_baseline,
+            hrv_ms=hrv_ms,
+            hrv_baseline_ms=hrv_baseline_ms,
             wa_timestamps=wa_timestamps,
             current_time=current_time,
         )
@@ -189,8 +196,8 @@ class DestructiveStruggleDetector:
     def _check_implementation(
         wrong_answer_count: int,
         code_delete_ratio: float,
-        hrv_rmssd: float,
-        hrv_baseline: float,
+        hrv_ms: float,
+        hrv_baseline_ms: float,
         wa_timestamps: list[float],
         current_time: float,
     ) -> float:
@@ -207,9 +214,11 @@ class DestructiveStruggleDetector:
             return 0.0
         if code_delete_ratio <= _CODE_DELETE_RATIO_THRESHOLD:
             return 0.0
-        if hrv_baseline <= 0 or hrv_rmssd < 0:
+        # No reference or no measurement: the corroborating condition
+        # cannot hold.
+        if hrv_baseline_ms <= 0 or hrv_ms <= 0:
             return 0.0
-        if hrv_rmssd >= hrv_baseline * _HRV_DROP_RATIO:
+        if hrv_ms >= hrv_baseline_ms * _HRV_DROP_RATIO:
             return 0.0
 
         # All conditions met — compute confidence
@@ -217,7 +226,7 @@ class DestructiveStruggleDetector:
         delete_factor = min(
             (code_delete_ratio - _CODE_DELETE_RATIO_THRESHOLD) / 0.5, 1.0
         )
-        hrv_ratio = hrv_rmssd / hrv_baseline
+        hrv_ratio = hrv_ms / hrv_baseline_ms
         hrv_factor = min((_HRV_DROP_RATIO - hrv_ratio) / 0.3, 1.0)
 
         return 0.4 * wa_factor + 0.3 * delete_factor + 0.3 * hrv_factor

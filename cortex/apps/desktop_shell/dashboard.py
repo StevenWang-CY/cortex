@@ -331,8 +331,8 @@ _CONCEPTS_GLOSSARY: dict[str, str] = {
         "usual level, not as an absolute; it is not medical-grade."
     ),
     "resp": (
-        "Breaths per minute: an estimate shown only when two independent "
-        "camera signals agree. Experimental and not medical-grade."
+        "Breaths per minute: an estimate shown only when head movement and "
+        "the pulse agree on the rate. Experimental and not medical-grade."
     ),
     "strain": (
         "Body load: time recently spent with pulse up, variability down or "
@@ -2457,6 +2457,12 @@ class _ConsumerTab(QWidget):
                 self._bio_empty_state.setText(message)
             if phase != _PHASE_LIVE:
                 self._health_banner.hide()
+        # Pause/quiet act on a running session. With sensing already off the
+        # control has nothing to pause, so it is disabled, not left looking
+        # live beside "Session ended".
+        capsule = getattr(self, "_quiet_capsule", None)
+        if capsule is not None:
+            capsule.setEnabled(phase in (_PHASE_LIVE, _PHASE_STARTING))
         if quit_btn is not None:
             try:
                 quit_btn.setVisible(show_quit)

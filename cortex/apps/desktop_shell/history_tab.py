@@ -152,6 +152,7 @@ from cortex.apps.desktop_shell.tokens import (
     SP4,
     STATE_LABELS,
 )
+from cortex.services.state_engine.strain_load import DEFAULT_THRESHOLD_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -445,8 +446,16 @@ class _SessionRow(_RenderCacheMixin, QFrame):
             f"color: {flow_color}; background: transparent;"
         )
 
+        # ``peak_stress_integral`` holds the session's highest strain load in
+        # strain-seconds; show it against the default break level and only
+        # when camera physiology produced one.
         peak = float(summary.get("peak_stress_integral") or 0.0)
-        self._peak_label = QLabel(f"peak {peak:.0f}")
+        peak_share = peak / DEFAULT_THRESHOLD_SECONDS
+        self._peak_label = QLabel(f"peak load {peak_share:.0%}" if peak > 0.0 else "")
+        self._peak_label.setVisible(peak > 0.0)
+        self._peak_label.setToolTip(
+            "Highest body load in this session, against the default break level."
+        )
         self._peak_label.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         self._peak_label.setStyleSheet(
             f"color: {CX_TEXT_TERTIARY}; background: transparent;"

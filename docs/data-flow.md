@@ -1,6 +1,6 @@
 # Data flow and deletion map
 
-This document names the implemented flows in Cortex 0.5.1. The canonical
+This document names the implemented flows in Cortex 0.6.0. The canonical
 external-context disclosure is [cortex/docs/privacy.md](../cortex/docs/privacy.md);
 security controls are in [cortex/docs/security.md](../cortex/docs/security.md).
 The [current implementation record](implementation-2026-10.md) documents the
@@ -9,11 +9,16 @@ reviewed evidence-continuity and interaction changes.
 ```mermaid
 flowchart LR
   Camera["Camera frames\nprocess memory only"] --> CameraObs["Camera observations\nquality + missingness"]
-  CameraObs --> Diagnostics["Experimental pulse and\ndiagnostic blink/pose"]
+  CameraObs --> Physio["Gated pulse, SDNN, breathing,\nblink, eye closure"]
+  CameraObs --> Diagnostics["Diagnostic head/neck pose"]
+  Physio --> Reference["Personal reference\n(in memory)"]
   Input["Mouse/keyboard/window\naggregate events"] --> Obs["Behavioral windows\navailability + missingness"]
   Browser["Browser metadata\noptional origin content"] --> Context["Local task context"]
   Editor["Editor metadata\noptional selected content"] --> Context
   Obs --> Estimate["Heuristic support estimate\nor unknown"]
+  Reference -->|"corroborates eligible rules only"| Estimate
+  Reference --> Strain["Strain load"]
+  Strain --> Policy
   Estimate --> Policy["Deterministic eligibility"]
   Policy --> Local
   Policy --> Broker
@@ -29,26 +34,32 @@ flowchart LR
   Effect --> SQLite
 ```
 
-Camera diagnostics have no edge into production support scoring or automatic
-state-driven eligibility. The behavioral model is `deterministic-support@2.6.0`
-with `support-features-v2.2.0`. Missing input sources contribute no evidence;
+Camera physiology enters support scoring only as corroboration: each value is
+read against a personal reference held in memory, and the physiology block is
+mixed only into a state whose behavioral rule is eligible, with bounded weight.
+Camera evidence alone cannot produce an estimate. The strain load built from
+the same block can request one breathing-break suggestion, which passes the
+same interruption gate as every other suggestion. Head/neck pose stays
+diagnostic. The support model is `deterministic-support@3.0.0` with
+`support-features-v3.0.0`. Missing input sources contribute no evidence;
 healthy observed zero rates remain usable. Source loss or an acquisition gap
 above 3 seconds restarts inactivity exposure. Duplicate/regressed inference
 timestamps are ignored; a gap above 3 seconds clears prior scores and dwell.
-See the [model card](model-cards/deterministic-support-v2.md) for the distinct
+See the [model card](model-cards/deterministic-support-v3.md) for the distinct
 measurement, smoothing and intervention gates.
 
 Local goal check-ins consume the foreground editor file or active browser title;
 they do not interpret absent metadata as a mismatch. A stationary foreground app
-remains current while tracking is live. Reading check-ins use behavioral evidence
-only. These local checks do not themselves authorize external disclosure or
-workspace changes.
+remains current while tracking is live. Reading check-ins read no camera value
+directly; the `under_engaged` estimate they require may be corroborated by
+blink rate and eye-closure share. These local checks do not themselves
+authorize external disclosure or workspace changes.
 
 ## Source-by-source handling
 
 | Source | Collected form | Ordinary persistence | External egress |
 | --- | --- | --- | --- |
-| Camera | Frames, landmarks, ROI color traces and quality in process memory | No raw frames, landmarks or waveforms; bounded derived status/events only | Never in planner contract |
+| Camera | Frames, landmarks, ROI color traces, quality and the personal physiology reference in process memory | No raw frames, landmarks or waveforms; bounded derived status/events, session-report summaries (average pulse and variability, peak strain load) and calibration-profile levels | Never in planner contract |
 | Mouse/keyboard | Timing/rate/variance aggregates; no key text | Bounded features/status where enabled | Only named support status, never raw input events |
 | Window/app | Active app and transition aggregates | Bounded events | Optional aggregate category after preview |
 | Browser activity | Sanitized title/origin/path, tab type, dwell/resume metadata | Browser local storage capped at 200 records | Metadata only when selected and previewed |

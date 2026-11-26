@@ -103,7 +103,8 @@ commit a populated `.env`.
 
 ## Permissions and TCC
 
-- Camera: experimental pulse/acquisition; optional for telemetry-only use.
+- Camera: experimental pulse, variability and breathing estimates that can
+  corroborate the behavioral rules; optional for telemetry-only use.
 - Input Monitoring/Accessibility: aggregate input/window support and optional
   authorized effects.
 - Automation: only for an explicitly authorized OS capability.

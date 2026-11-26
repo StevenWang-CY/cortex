@@ -151,6 +151,10 @@ class SessionReport(BaseModel):
     golden_hour_start: int | None = None  # hour of day with highest flow ratio
     golden_hour_end: int | None = None
     avg_hr_bpm: float | None = None
+    # Mean SDNN (ms) of the session's camera pulse intervals: the variability
+    # measure that agreed with ECG. ``avg_hrv_rmssd`` is kept so older session
+    # files still load; RMSSD did not qualify and is no longer recorded.
+    avg_hrv_sdnn: float | None = None
     avg_hrv_rmssd: float | None = None
     comparison_to_7day: ComparisonStats | None = None
 

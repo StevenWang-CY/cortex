@@ -280,7 +280,7 @@ export function supportStateViewModel(
         bioStatusMessage: !state
             ? "Connecting to Cortex…"
             : !framesFlowing
-                ? "Camera offline — open System Settings → Privacy & Security → Camera"
+                ? "Camera offline — open Cortex Settings to allow camera access"
                 : !faceDetected
                     ? "Looking for your face…"
                     : pulseUnavailableCopy(state.capture?.pulse_unavailable),

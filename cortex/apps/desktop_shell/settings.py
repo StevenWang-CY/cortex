@@ -431,7 +431,11 @@ class SettingsDialog(QWidget):
         # onboarding wizard; users who flipped the toggle from System
         # Settings mid-session had no in-app feedback until relaunch.
         self._camera_perm_row = self._make_permission_row(
-            label_not_granted="Camera access not granted — open System Settings",
+            # The link asks macOS for first-use access and only falls back to
+            # System Settings for a denied grant, where Cortex is listed. An
+            # app that was never asked has no row there, so the label must
+            # not send the user looking for one.
+            label_not_granted="Camera access not granted — allow camera access",
             label_granted="Camera access granted",
             target="camera",
         )

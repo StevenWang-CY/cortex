@@ -56,10 +56,10 @@ not separately deployed network services:
 | Package | Responsibility |
 | --- | --- |
 | `capture_service` | Webcam ownership and raw-frame acquisition |
-| `physio_engine` | Experimental camera-derived physiology and signal quality |
+| `physio_engine` | Experimental camera pulse, variability and breathing estimates with per-metric publication gates |
 | `kinematics_engine` | Face and motion observations |
 | `telemetry_engine` | Aggregate input/window telemetry features |
-| `state_engine` | Evidence-aware state estimation and trigger policy |
+| `state_engine` | Evidence-aware state estimation, personal physiology reference, strain load and trigger policy |
 | `context_engine` | Privacy-filtered application context |
 | `eval` | Offline replay, regression, and research evaluation |
 | `llm_engine` | Optional untrusted planning providers |
@@ -126,15 +126,18 @@ Production support inference is a deterministic telemetry model with
 abstention and no learned classifier. Retired AMIP/contextual-bandit
 implementations were deleted; only read-only legacy diagnostics remain.
 Research MRT/OPE is separately consented and fixed by a checksummed study
-specification. Camera physiology cannot influence production support scores.
+specification. Camera physiology can only corroborate a state whose behavioral
+rule is eligible, with bounded weight and against a personal reference; camera
+evidence alone never produces an estimate.
 Optional planning transports are AWS Bedrock, GCP Vertex, and the direct
 Anthropic API; all are BYOK, network-off by default, and remain outside the
 authority boundary.
 
-The current model is `2.6.0` and its feature schema is
-`support-features-v2.2.0`. Its generated eleven-component identity covers
+The current model is `3.0.0` and its feature schema is
+`support-features-v3.0.0`. Its generated twenty-one-component identity covers
 telemetry schema/acquisition/aggregation, focus graph, feature fusion, smoothing,
-feature catalog, registry, scorer and inference wrapper. It is not a whole-app
+feature catalog, registry, scorer and inference wrapper, the physiology
+evidence and personal reference, and the camera physiology estimators. It is not a whole-app
 hash: reproducing proposals also needs the application revision, configuration,
 personal calibration and policy context. `safety_null` disables inference as a
 fail-closed rollback.
