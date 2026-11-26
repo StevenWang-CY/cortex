@@ -1746,6 +1746,8 @@ class OnboardingWindow(QWidget):
         controller can spin up a ``CalibrationRunner``."""
         try:
             self._begin_calibration_btn.setEnabled(False)
+            # A new attempt must not sit under the last run's verdict.
+            self._cal_success_label.setVisible(False)
             self._cal_progress_bar.setValue(1)
             self._cal_numerics.setText(
                 "Experimental camera pulse: — bpm  ·  Quality: starting…  ·  Valid: 0s"
@@ -1831,6 +1833,9 @@ class OnboardingWindow(QWidget):
                 self._cal_progress_bar.setValue(100)
                 self._begin_calibration_btn.setVisible(False)
                 self._skip_calibration_btn.setVisible(False)
+                # "review_required" and "applying" rewrote this line; restate
+                # the outcome or it stays on "Saving and applying…".
+                self._cal_success_label.setText("✓ Measured profile saved and applied")
                 self._cal_success_label.setVisible(True)
             except AttributeError:
                 pass
