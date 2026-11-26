@@ -105,7 +105,7 @@ function handleLegacyBreakRecommendation(payload: unknown): void {
     const reason = typeof p.reason === "string"
         ? p.reason
         : p.basis === "physiological_strain"
-            ? "Your heart and breathing have run above your usual level for a while."
+            ? "Your camera readings have stayed away from your usual level for a while."
             : "You've reached your preferred focus interval.";
     void Promise.resolve(vscode.window.showInformationMessage(
         `Cortex · ${reason}`,
@@ -532,7 +532,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         panelProvider?.clearIntervention(dismissedId);
     });
 
-    // Compatibility-only: reject unsupported HRV/stress-derived claims.
+    // Elapsed-focus reminders and strain-load suggestions are shown; a
+    // message with no basis or the legacy stress-integral basis is dropped.
     client.onMessage((msg) => {
         if (msg.type === 'BREAK_RECOMMENDATION') {
             handleLegacyBreakRecommendation(msg.payload);

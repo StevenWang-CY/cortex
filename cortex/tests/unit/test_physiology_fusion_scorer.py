@@ -360,3 +360,101 @@ def test_fused_coverage_never_falls_below_the_behaviour_share() -> None:
         after = fused.state_coverage[state]
         assert after >= (1.0 - weight) * before - 1e-9
         assert after >= before - 1e-9  # a fully observed block only adds coverage
+
+
+# ---------------------------------------------------------------------------
+# Physiology cannot turn a weak or ambiguous behavioural reading into an
+# estimate (found in review: a committed support-likely label "explained" by
+# heart rate, from behaviour that read flow 0.47 / support 0.23).
+# ---------------------------------------------------------------------------
+
+# Behaviour that reads flow-like, with support below the 0.25 ambiguity gate.
+AMBIGUOUS_FLOW_WEAK_SUPPORT: dict[FeatureName, float] = {
+    FeatureName.MOUSE_VELOCITY_MEAN: 2.0,
+    FeatureName.MOUSE_VELOCITY_VARIANCE: 4_400.0,
+    FeatureName.CLICK_FREQUENCY: 0.02,
+    FeatureName.KEYPRESS_RATE_PER_MIN: 0.6,
+    FeatureName.KEYSTROKE_INTERVAL_VARIANCE: 7_500.0,
+    FeatureName.CORRECTION_RATE_PER_100_KEYS: 13.0,
+    FeatureName.INACTIVITY_SECONDS: 16.0,
+    FeatureName.TAB_SWITCH_RATE_PER_MIN: 11.0,
+    FeatureName.SCROLL_BACK_RATE_PER_MIN: 21.0,
+    FeatureName.THRASHING_SCORE: 0.25,
+}
+
+
+def test_strained_camera_cannot_lift_a_sub_threshold_support_score() -> None:
+    entry = StateConfig().estimate_entry_threshold
+    behaviour = _behaviour_only(AMBIGUOUS_FLOW_WEAK_SUPPORT)
+    b_support = behaviour.scores.support_likely
+    b_flow = behaviour.scores.flow_like
+    assert 0.0 < b_support < 0.25 < entry <= b_flow, (b_support, b_flow)
+
+    fused = _scorer().evaluate(_vector({**AMBIGUOUS_FLOW_WEAK_SUPPORT, **STRAINED_CAMERA}))
+    # Support stays where behaviour left it (or lower); it is not the estimate.
+    assert fused.scores.support_likely <= b_support + 1e-12
+    assert fused.scores.dominant()[0] != SupportState.SUPPORT_LIKELY
+    # The strained camera does temper the flow reading it contradicts.
+    assert fused.scores.flow_like < b_flow
+
+
+def test_no_score_crosses_the_entry_threshold_on_camera_evidence() -> None:
+    """Property: over many behaviour vectors, a state whose behaviour score is
+    below the entry threshold never ends above its behaviour score, whatever
+    the camera reads."""
+
+    import numpy as np
+
+    rng = np.random.default_rng(20261125)
+    entry = StateConfig().estimate_entry_threshold
+    ranges = {
+        FeatureName.MOUSE_VELOCITY_MEAN: (0.0, 600.0),
+        FeatureName.MOUSE_VELOCITY_VARIANCE: (0.0, 40_000.0),
+        FeatureName.CLICK_FREQUENCY: (0.0, 2.5),
+        FeatureName.KEYPRESS_RATE_PER_MIN: (0.0, 240.0),
+        FeatureName.KEYSTROKE_INTERVAL_VARIANCE: (0.0, 9_000.0),
+        FeatureName.CORRECTION_RATE_PER_100_KEYS: (0.0, 25.0),
+        FeatureName.INACTIVITY_SECONDS: (0.0, 90.0),
+        FeatureName.TAB_SWITCH_RATE_PER_MIN: (0.0, 40.0),
+        FeatureName.SCROLL_BACK_RATE_PER_MIN: (0.0, 30.0),
+        FeatureName.THRASHING_SCORE: (0.0, 1.0),
+    }
+    scorer = _scorer()
+    lifted_above_entry = 0
+    for _ in range(400):
+        behaviour_values = {
+            name: float(rng.uniform(low, high)) for name, (low, high) in ranges.items()
+        }
+        behaviour = _behaviour_only(behaviour_values).scores
+        for camera in (STRAINED_CAMERA, CALM_CAMERA):
+            fused = scorer.evaluate(_vector({**behaviour_values, **camera})).scores
+            for attr in ("support_likely", "flow_like", "under_engaged"):
+                before, after = getattr(behaviour, attr), getattr(fused, attr)
+                if before < entry:
+                    assert after <= before + 1e-12, (attr, before, after, behaviour_values)
+                elif after > before:
+                    lifted_above_entry += 1
+    # The bound is not vacuous: physiology still strengthens readings that
+    # behaviour has carried past the threshold.
+    assert lifted_above_entry > 0
+
+
+def test_ambiguous_behaviour_plus_strained_camera_never_commits_a_support_label() -> None:
+    """Through the real smoother: two minutes of the ambiguous reading with a
+    strained camera must not produce a support-likely label."""
+
+    from cortex.libs.schemas.state import SignalQuality
+    from cortex.services.state_engine.smoother import ScoreSmoother
+
+    config = StateConfig()
+    scorer = _scorer(config)
+    smoother = ScoreSmoother(config)
+    quality = SignalQuality(physio=1.0, kinematics=1.0, telemetry=1.0, overall=1.0)
+    vector = _vector({**AMBIGUOUS_FLOW_WEAK_SUPPORT, **STRAINED_CAMERA})
+    labels: set[str] = set()
+    for tick in range(240):
+        evaluation = scorer.evaluate(vector)
+        estimate = smoother.update(evaluation, quality, timestamp=10.0 + 0.5 * tick)
+        labels.add(str(estimate.state))
+    assert "HYPER" not in labels, labels
+    assert len(labels) >= 1

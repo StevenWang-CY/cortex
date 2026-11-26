@@ -218,7 +218,10 @@ class PhysioFeatures(BaseModel):
         None,
         ge=0.0,
         le=60.0,
-        description="Breathing rate in breaths/min when two channels agree",
+        description=(
+            "Breathing rate in breaths/min, published when head movement and a "
+            "pulse-derived channel agree"
+        ),
     )
     pulse_evidence: SignalEstimate | None = Field(
         None,

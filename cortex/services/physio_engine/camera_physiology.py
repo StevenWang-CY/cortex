@@ -309,10 +309,13 @@ class CameraPhysiologyProcessor:
         end_ns = pulse.summary.window_end_mono_ns
         hrv = pulse.hrv_estimates
         rmssd = _published(hrv.get(PhysiologyMetric.RMSSD))
+        sdnn = _published(hrv.get(PhysiologyMetric.SDNN))
         respiration_rate = _published(self._latest_respiration)
         # One published measurement is enough for the channel to be live;
-        # each field still stands or falls on its own evidence.
-        valid = any(value is not None for value in (hr, rmssd, respiration_rate))
+        # each field still stands or falls on its own evidence. Only the
+        # measurements the rules may read count: RMSSD did not qualify, so a
+        # published RMSSD must not be what marks the channel live.
+        valid = any(value is not None for value in (hr, sdnn, respiration_rate))
 
         def _hrv(metric: PhysiologyMetric) -> float | None:
             return _published(hrv.get(metric)) if valid else None
@@ -320,7 +323,8 @@ class CameraPhysiologyProcessor:
         features = PhysioFeatures(
             pulse_bpm=hr,
             pulse_quality=pulse.summary.quality,
-            pulse_variability_proxy=rmssd,
+            # RMSSD travels only with a live channel; alone it is not one.
+            pulse_variability_proxy=rmssd if valid else None,
             hrv_sdnn=_hrv(PhysiologyMetric.SDNN),
             hrv_pnn50=_hrv(PhysiologyMetric.PNN50),
             hrv_sd1=_hrv(PhysiologyMetric.SD1),

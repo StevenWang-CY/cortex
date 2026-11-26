@@ -3,7 +3,7 @@
 //
 // Source of truth: cortex/libs/schemas/*.py (Pydantic v2 models).
 // Schema package: cortex-wire/2.0
-// Source SHA-256: 8c1e5fff0169741e6d6643af85632d301d2395f291f8b1107b01d88569c0332c
+// Source SHA-256: 74fd021ad64ece53dfedc5d945a3e039c5384c7c466175343d85c9512fa2fa71
 // Drift-gate: a pre-commit hook and the GitHub Actions CI run
 //   `python -m cortex.scripts.generate_ts_schemas --check`
 // and fail if this file is out of sync with the Python models.
@@ -3064,7 +3064,7 @@ export interface PhysioFeatures {
    */
   hr_delta_5s?: number | null;
   /**
-   * Breathing rate in breaths/min when two channels agree
+   * Breathing rate in breaths/min, published when head movement and a pulse-derived channel agree
    */
   respiration_rate_bpm?: number | null;
   /**
@@ -4423,7 +4423,7 @@ export interface BiometricsSummary {
    */
   heart_rate?: number | null;
   /**
-   * RMSSD of camera pulse intervals (ms, trailing two minutes); interpret as a change against the personal reference
+   * Not populated. RMSSD of camera pulse intervals did not agree with ECG and is not sent; the field is kept so older clients still decode. Use hrv_sdnn.
    */
   hrv_rmssd?: number | null;
   /**
@@ -4485,7 +4485,7 @@ export interface BiometricsSummary {
    */
   forward_lean_angle?: number | null;
   /**
-   * Breathing rate in breaths/min when two channels agree
+   * Breathing rate in breaths/min, published when head movement and a pulse-derived channel agree
    */
   respiration_rate?: number | null;
   /**

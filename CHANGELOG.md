@@ -16,13 +16,16 @@ client audit round, each fix with a regression test.
 
 - Heart rate and SDNN were checked against ECG on 21 public recordings
   (4TU.ResearchData, Hoffman & Lakens 2020): heart rate MAE 1.8 BPM on the
-  33 % of windows it published, SDNN MAE 8.3 ms on 22 %. Every published value
+  33 % of windows it published, SDNN MAE 8.2 ms on 21 %. Every published value
   came from **one participant**.
 - For the two participants with intermediate and dark skin tone the estimator
-  published nothing. For such users the rules stay behavior-only.
-- The publication gate was designed with the same recordings in view; there is
-  no held-out data. Breathing rate has only simulated truth behind it, and
-  blink rate and eye closure were not checked against a reference.
+  published nothing. For such users the rules stay behavior-only. For one of
+  them, in bright light, the strongest spectral peak matched the ECG in more
+  than four windows of five and the gate still rejected it.
+- The publication gate and the acceptance criteria were set with the same
+  recordings in view; there is no held-out data. Breathing rate has only
+  simulated truth behind it, and blink rate and eye closure were not checked
+  against anything. "Qualified" applies to heart rate and SDNN only.
 - RMSSD (MAE 22.8 ms, 9 % within 15 ms) and the other beat-to-beat measures
   did not qualify and are not inputs.
 - Agreement with a reference sensor does not show a need for support. Cortex
@@ -31,7 +34,7 @@ client audit round, each fix with a regression test.
 
 ### Camera physiology — measurement
 
-- Rebuild the pulse estimator (`pulse-v2/3.0.0`, `hrv-v2/3.1.0`) around the
+- Rebuild the pulse estimator (`pulse-v2/3.0.0`, `hrv-v2/3.2.0`) around the
   whole facial skin (face outline minus eyes, brows and lips), a 20 s POS
   window (10 s while it fills) and narrow-band Hilbert-phase beat timing on
   which overlapping windows vote.
@@ -44,7 +47,11 @@ client audit round, each fix with a regression test.
 - Window quality is cardiac-line strength times acquisition quality.
   Multiplying in per-frame scores that rarely exceed 0.6 rejected about half
   of otherwise-ready windows.
-- Compute SDNN over the trailing three minutes. Breathing rate comes from
+- Compute SDNN over the trailing three minutes, from at least 80 accepted
+  intervals. The window ends at the current pulse window, and no variability
+  value is published once the newest accepted beat is more than 10 s old:
+  the last SDNN had been re-published unchanged after the person left the
+  camera. Breathing rate comes from
   three channels (pulse-amplitude envelope, vertical head movement,
   beat-interval modulation) and is published only when head movement and a
   pulse-derived channel agree: the two pulse-derived channels alone agreed on
@@ -58,30 +65,44 @@ client audit round, each fix with a regression test.
   truth and the ECG-referenced videos through the production capture and
   physiology path against per-metric acceptance criteria. No pulse, SDNN or
   breathing rate was published on the eighteen signal-free simulated
-  recordings.
+  recordings. `make qualify-physiology` runs the simulated half with
+  `--check`, which fails when heart rate, SDNN or breathing rate misses its
+  criterion or anything is published without a pulse; `make verify` includes
+  it.
 - `signal.rppg.experimental_hrv_enabled` and
   `signal.rppg.experimental_respiration_enabled` now default to true.
 
 ### Camera physiology — inference and suggestions
 
 - Heart rate, SDNN, breathing rate, blink rate and eye-closure share are
-  production features, each read against a personal reference: seeded by a
-  calibration's measured level or learned over two minutes and sixty valid
-  values, adapting with a one-hour half-life. A different physical camera
-  discards the reference.
+  production features. The first four are read against a personal reference
+  learned over two minutes and sixty valid values, adapting with a one-hour
+  half-life; calibration seeds the blink reference only, for the camera it
+  was taken with. Eye-closure share is read as an absolute fraction. A
+  different physical camera discards the reference.
+- Blink rate and eye-closure share, which no reference sensor checked, are
+  read only while heart rate or SDNN is usable in the same evaluation. With
+  no pulse the physiology block is empty.
 - Mix the physiology block into a state only where that state's own behavior
   rule is eligible, with weight `state.physiology_weight` (default 0.35,
-  capped below the smoother's entry threshold). Camera evidence alone cannot
-  make any hypothesis the estimate. With no camera, no face, no reference or
-  `state.physiology_weight: 0` every score equals the behavior-only 2.6.0
-  score; behavior weights, transforms, gates and temporal behavior are
-  unchanged.
+  capped below the smoother's entry threshold). Physiology may lower any
+  eligible score and may raise one only when the behavior score alone already
+  reaches the entry threshold, so a weak or ambiguous behavioral reading
+  cannot become an estimate because of the camera. Camera evidence alone
+  cannot make any hypothesis the estimate. With no camera, no face, no pulse,
+  no reference or `state.physiology_weight: 0` every score equals the
+  behavior-only 2.6.0 score; behavior weights, transforms, gates and temporal
+  behavior are unchanged.
 - Model identity grows from eleven to twenty-one components (physiology
   evidence, personal reference and camera estimators).
 - A strain load integrates the support-likely physiology block and drains
   during calm. Crossing its threshold (600 strain-seconds by default) suggests
   one three-minute paced-breathing break through the shared interruption gate;
-  a refused crossing stays owed, and a completed break pays the load back.
+  a refused crossing stays owed and is retried at most every 30 s, and a
+  completed break pays the load back. The suggestion needs a camera reading
+  from the last 30 s, goes to the desktop app and the client in front, and
+  says that camera readings have stayed away from the person's usual level
+  without naming stress.
   `intervention.enable_strain_break_suggestions` (on by default) turns it off.
   The load is a pacing aid, not a measure of stress.
 - Everything that used to be handed RMSSD now receives SDNN or nothing.
@@ -91,7 +112,7 @@ client audit round, each fix with a regression test.
   coding-practice struggle detector stays behavior-led and needs a rising
   strain load, or SDNN below 80 % of the personal reference, to corroborate
   it. The two coach modes that physiology alone would establish stay
-  contained.
+  contained, and the coach's mode resolver is given no strain load.
 
 ### Camera physiology — interface
 
@@ -101,14 +122,15 @@ client audit round, each fix with a regression test.
   or capture. History shows a session's peak load against the default break
   level, only when camera physiology produced one.
 - A strain-load suggestion appears as the dashboard pill "Take a breather?",
-  the browser toast "Breathing break?" and an editor notification.
+  the browser toast "Breathing break?" and an editor notification. The pill
+  is shown only during a live session and is cleared when the session ends.
   `BREAK_RECOMMENDATION` carries `basis: physiological_strain`; a message with
   the legacy stress-integral basis is still ignored, and
   `GET /api/stress-integral` still reports unavailable.
 - `STATE_UPDATE` biometrics add `hrv_sdnn`, `pulse_quality`, `strain`,
   `strain_load_ratio` and `physiology_reference_ready`; `respiration_rate` and
   `stress_integral` (the strain load in strain-seconds) are populated.
-  TypeScript schemas are regenerated.
+  `hrv_rmssd` is always null. TypeScript schemas are regenerated.
 
 ### Backend audit fixes
 
@@ -210,6 +232,36 @@ client audit round, each fix with a regression test.
   An app that was never asked has no row under System Settings → Camera.
 - Pause is disabled once a session has ended.
 
+### Found by an independent review
+
+One review round read the change cold. Each defect below was found by it or
+while fixing its findings, and is fixed with a regression test; the sections
+above describe the corrected behavior. They are listed here because every one
+of them contradicted a statement the release made about itself.
+
+- Camera evidence could lift a behavior score below the entry threshold past
+  it, so a weak or ambiguous behavioral reading became the estimate.
+- Blink rate and eye-closure share moved scores when the camera yielded no
+  pulse at all.
+- The last SDNN was re-published unchanged after the pulse was lost, for as
+  long as beats stayed in the buffer.
+- A strain-load break could be offered after the person had left the camera,
+  went to every connected client, and was worded as a statement about strain.
+- The dashboard's break pill could appear outside a live session and outlive
+  the session it belonged to.
+- Calibration levels measured through one camera could seed the personal
+  reference for another.
+- A window whose only variability value was RMSSD produced an invalid feature
+  record; RMSSD was still sent to clients in `STATE_UPDATE`.
+- The coding-practice coach's mode resolver could still be driven by the
+  strain load.
+- `qualify_physiology` exited 0 whatever it measured.
+- The documents called breathing rate, blink rate and eye-closure share
+  "qualified", described a fusion property the code did not have, said
+  calibration seeds the heart-rate and breathing references, and described
+  the abstention on two participants as a signal below the noise floor when,
+  for one of them in bright light, the pulse was mostly readable.
+
 ### Dependencies
 
 The dependency audit policy failed on all three ecosystems when this release
@@ -237,7 +289,7 @@ exceptions that expired on 2026-11-22.
 - Align both READMEs, the contributor guide, documentation index,
   limitations, data flow, architecture, calibration, API, privacy, UI and setup
   guides, research protocols and local wiki with the 0.6.0 boundary. AGENTS.md
-  rules 43–50 record the physiology lessons.
+  rules 43–58 record the physiology, live-run and review lessons.
 
 The camera physiology evidence and its limits are recorded in
 [the qualification report](docs/research/physiology-qualification.md).

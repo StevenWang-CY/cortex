@@ -751,8 +751,9 @@ the observed physiology currently pointing to strain against the personal
 reference), `strain_load_ratio` (the cumulative strain load as a fraction of
 the break threshold), `stress_integral` (that load in strain-seconds) and
 `physiology_reference_ready`. The strain fields are `null` until camera
-physiology has been read against a reference. `hrv_rmssd` is research-only;
-product surfaces display `hrv_sdnn`.
+physiology has been read against a reference. `hrv_rmssd` is kept in the
+schema for older clients and is always `null`: RMSSD did not qualify and is
+not sent. Product surfaces display `hrv_sdnn`.
 
 #### `BREAK_RECOMMENDATION` (server → client)
 
@@ -765,7 +766,7 @@ changes nothing in the workspace. With `basis: "physiological_strain"`,
 {
   "type": "BREAK_RECOMMENDATION",
   "payload": {
-    "reason": "Your heart and breathing have run above your usual level for a while. A short break may help.",
+    "reason": "Your camera readings have stayed away from your usual level for a while. A short break may help.",
     "urgency": "medium",
     "basis": "physiological_strain",
     "stress_load": 612.0,

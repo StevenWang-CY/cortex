@@ -270,15 +270,26 @@ def test_drowsy_physiology_scores_under_engaged() -> None:
 def test_each_strain_marker_pushes_support_and_its_absence_pushes_flow(
     name: FeatureName, pushed: float, neutral: float
 ) -> None:
-    """Alone, each strain marker saturates support; at reference it reads as flow."""
+    """Each strain marker saturates its share of support; at reference it reads as flow.
 
-    strained = evaluate_physiology({name: _value(name, pushed)}, READY)
+    Blink rate only joins the block beside a live cardiac measurement, so it
+    is tested with a heart rate sitting exactly at its reference (which adds
+    coverage and flow, and no support).
+    """
+
+    companion = _eye_companion(name)
+    companion_support = sum(SUPPORT_WEIGHTS[item] for item in companion)
+    companion_flow = sum(FLOW_WEIGHTS[item] for item in companion)
+
+    strained = evaluate_physiology({**companion, name: _value(name, pushed)}, READY)
     assert strained.support_likely.score == pytest.approx(SUPPORT_WEIGHTS[name])
-    assert strained.support_likely.score == pytest.approx(strained.support_likely.coverage)
+    assert strained.support_likely.coverage == pytest.approx(
+        SUPPORT_WEIGHTS[name] + companion_support
+    )
 
-    calm = evaluate_physiology({name: _value(name, neutral)}, READY)
+    calm = evaluate_physiology({**companion, name: _value(name, neutral)}, READY)
     assert calm.support_likely.score == pytest.approx(0.0)
-    assert calm.flow_like.score == pytest.approx(FLOW_WEIGHTS[name])
+    assert calm.flow_like.score == pytest.approx(FLOW_WEIGHTS[name] + companion_flow)
 
 
 @pytest.mark.parametrize(
@@ -293,11 +304,72 @@ def test_each_strain_marker_pushes_support_and_its_absence_pushes_flow(
 def test_each_drowsiness_marker_pushes_under_engaged(
     name: FeatureName, pushed: float, neutral: float
 ) -> None:
-    pushed_block = evaluate_physiology({name: _value(name, pushed)}, READY).under_engaged
-    neutral_block = evaluate_physiology({name: _value(name, neutral)}, READY).under_engaged
+    # The eye inputs are tested beside a heart rate at its reference, which
+    # adds coverage and no under-engaged score.
+    companion = _eye_companion(name)
+    pushed_block = evaluate_physiology(
+        {**companion, name: _value(name, pushed)}, READY
+    ).under_engaged
+    neutral_block = evaluate_physiology(
+        {**companion, name: _value(name, neutral)}, READY
+    ).under_engaged
     assert pushed_block.score == pytest.approx(UNDER_ENGAGED_WEIGHTS[name])
     assert neutral_block.score == pytest.approx(0.0)
     assert neutral_block.coverage == pytest.approx(pushed_block.coverage)
+
+
+def _eye_companion(name: FeatureName) -> dict[FeatureName, FeatureValue]:
+    """A heart rate at its reference, for the inputs that need a live cardiac one."""
+
+    if name in (FeatureName.BLINK_RATE_PER_MIN, FeatureName.PERCLOS):
+        return {FeatureName.HEART_RATE_BPM: _value(FeatureName.HEART_RATE_BPM, HR_CENTER)}
+    return {}
+
+
+@pytest.mark.parametrize(
+    "eye_only",
+    [
+        {FeatureName.BLINK_RATE_PER_MIN: 0.30 * BLINK_CENTER},
+        {FeatureName.BLINK_RATE_PER_MIN: 2.2 * BLINK_CENTER},
+        {FeatureName.PERCLOS: 0.40},
+        {FeatureName.BLINK_RATE_PER_MIN: 2.2 * BLINK_CENTER, FeatureName.PERCLOS: 0.40},
+        # Breathing is not a cardiac measurement for this purpose either.
+        {
+            FeatureName.PERCLOS: 0.40,
+            FeatureName.BLINK_RATE_PER_MIN: 2.2 * BLINK_CENTER,
+        },
+    ],
+)
+def test_eye_inputs_without_a_live_pulse_contribute_nothing(
+    eye_only: dict[FeatureName, float],
+) -> None:
+    """No pulse, no physiology block: a user for whom the camera yields no
+    heart rate or SDNN gets behaviour-only rules, even with every personal
+    reference ready and the eye inputs at their extremes."""
+
+    evidence = evaluate_physiology(_features(eye_only), READY)
+    assert evidence.available is False
+    for block in (evidence.support_likely, evidence.flow_like, evidence.under_engaged):
+        assert block.score == 0.0 and block.coverage == 0.0 and block.observed_count == 0
+
+
+def test_eye_inputs_join_once_heart_rate_or_sdnn_is_live() -> None:
+    eyes = {FeatureName.BLINK_RATE_PER_MIN: 2.2 * BLINK_CENTER, FeatureName.PERCLOS: 0.40}
+    for cardiac in (
+        {FeatureName.HEART_RATE_BPM: HR_CENTER},
+        {FeatureName.HRV_SDNN_MS: SDNN_CENTER},
+    ):
+        evidence = evaluate_physiology(_features({**eyes, **cardiac}), READY)
+        expected = UNDER_ENGAGED_WEIGHTS[FeatureName.PERCLOS] + UNDER_ENGAGED_WEIGHTS[
+            FeatureName.BLINK_RATE_PER_MIN
+        ]
+        assert evidence.under_engaged.score == pytest.approx(expected)
+    # A heart-rate value whose own reference is not ready does not count.
+    no_heart_reference = PhysiologyReference(blink_rate=READY.blink_rate)
+    evidence = evaluate_physiology(
+        _features({**eyes, FeatureName.HEART_RATE_BPM: HR_CENTER}), no_heart_reference
+    )
+    assert evidence.available is False
 
 
 def test_constant_offset_in_the_reference_frame_cancels() -> None:

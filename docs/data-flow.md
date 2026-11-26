@@ -34,10 +34,12 @@ flowchart LR
   Effect --> SQLite
 ```
 
-Camera physiology enters support scoring only as corroboration: each value is
-read against a personal reference held in memory, and the physiology block is
-mixed only into a state whose behavioral rule is eligible, with bounded weight.
-Camera evidence alone cannot produce an estimate. The strain load built from
+Camera physiology enters support scoring only as corroboration: values are
+read against a personal reference held in memory (eye-closure share as an
+absolute fraction), and the physiology block is mixed only into a state whose
+behavioral rule is eligible, with bounded weight. It can raise a score only
+when the behavioral score alone already reaches the entry threshold. Camera
+evidence alone cannot produce an estimate. The strain load built from
 the same block can request one breathing-break suggestion, which passes the
 same interruption gate as every other suggestion. Head/neck pose stays
 diagnostic. The support model is `deterministic-support@3.0.0` with

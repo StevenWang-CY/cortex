@@ -82,10 +82,12 @@ Read the [current validation record](docs/release/0.6.0-validation.md),
   `cortex.scripts.generate_support_model_identity` using the locked interpreter;
   review whether the model version, feature schema and model card must change.
 - After changing a pulse, HRV or respiration estimator, gate or window, re-run
-  `python -m cortex.scripts.qualify_physiology synthetic` (and `dataset-4tu`
-  when the dataset is available) and update the qualification report and model
-  card in the same change. Never commit the dataset videos or traces derived
-  from them; its license forbids redistribution.
+  `make qualify-physiology` (the simulated run, also a step of `make verify`;
+  it fails when an admitted metric misses its criterion) and
+  `python -m cortex.scripts.qualify_physiology dataset-4tu` when the dataset
+  is available, and update the qualification report and model card in the
+  same change. Never commit the dataset videos or traces derived from them;
+  its license forbids redistribution.
 - Design tokens come from `cortex/libs/design/tokens.yaml`; regenerate with
   `cortex.scripts.sync_design_tokens`. Generated configuration references come
   from `make config-sync`. Do not hand-edit generated output.

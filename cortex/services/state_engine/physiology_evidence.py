@@ -11,7 +11,7 @@ state by itself:
 ``P[s]`` is this block's score for state ``s``, ``C[s]`` its quality-weighted
 coverage (``P[s] <= C[s]``) and ``L`` the configured physiology weight.
 
-Three consequences follow directly and are tested:
+These consequences follow and are tested:
 
 * with no camera, or no ready personal reference, ``C[s] == 0`` and the fused
   score *is* the behaviour score — nothing changes for a user who never
@@ -20,8 +20,11 @@ Three consequences follow directly and are tested:
   ``[(1 - L) * behaviour, (1 - L) * behaviour + L]``;
 * the scorer fuses a state only where that state's own behaviour rule
   produced a positive eligible score; an abstaining or gated rule leaves the
-  state at zero whatever the camera reads.  ``L`` is additionally capped
-  below the smoother's entry threshold.
+  state at zero whatever the camera reads;
+* the scorer lets physiology raise a score only where behaviour alone is
+  already past the smoother's entry threshold; below it physiology can only
+  lower the score.  A weak or ambiguous behavioural reading therefore cannot
+  be turned into an estimate by the camera.
 
 Every transform standardises against the person's own reference
 (:mod:`physiology_baseline`), so a constant instrument bias does not read as
@@ -51,10 +54,13 @@ PHYSIOLOGY_FEATURES: tuple[FeatureName, ...] = (
     FeatureName.PERCLOS,
 )
 
-# Heart rate and dispersion (SDNN) qualified against ECG and carry the block.
-# Breathing rate is agreement-gated but has no reference-sensor check behind
-# it, and blinking is an attention proxy rather than a strain measure, so both
-# weigh less.
+# Heart rate and dispersion (SDNN) agreed with ECG and carry the support and
+# flow blocks. Breathing rate is agreement-gated but has no reference-sensor
+# check behind it, and blinking is an attention proxy rather than a strain
+# measure, so both weigh less there. The under-engaged block is different:
+# eye-closure share is its largest single weight (0.40) because prolonged
+# eye closure is what that hypothesis is about -- and it, like blink rate,
+# only joins while a cardiac measurement is live (see ``_standard_scores``).
 SUPPORT_WEIGHTS: dict[FeatureName, float] = {
     FeatureName.HEART_RATE_BPM: 0.35,
     FeatureName.HRV_SDNN_MS: 0.35,
@@ -163,7 +169,9 @@ def _standard_scores(
     Heart rate, variability and breathing are z-scores against the personal
     reference; blink rate is the ratio to its reference (blinking is a count
     process, and "a third of normal" means the same at any baseline);
-    eye-closure share is already an absolute fraction.
+    eye-closure share is already an absolute fraction, read on a fixed scale.
+    The two eye inputs are returned only alongside a usable heart rate or
+    SDNN.
     """
 
     usable: dict[FeatureName, tuple[float, float]] = {}
@@ -183,6 +191,18 @@ def _standard_scores(
         if item is not None and item.value is not None and metric_reference.ready:
             usable[name] = (metric_reference.z(float(item.value)), float(item.quality))
 
+    # Blink rate and eye-closure share were not checked against any reference
+    # sensor. They ride along with the measurements that were: neither joins
+    # the block unless heart rate or SDNN is usable in this same evaluation.
+    # Where the camera yields no pulse -- the two darker-skinned participants
+    # of the qualification, poor light, frequent movement -- the block is
+    # therefore empty and the rules are behaviour-only, as documented.
+    cardiac_live = (
+        FeatureName.HEART_RATE_BPM in usable or FeatureName.HRV_SDNN_MS in usable
+    )
+    if not cardiac_live:
+        return usable
+
     blink = _value(FeatureName.BLINK_RATE_PER_MIN)
     if (
         blink is not None
@@ -196,20 +216,9 @@ def _standard_scores(
         )
 
     # Eye-closure share is an absolute fraction and needs no reference of its
-    # own, but it joins the block only once some personal reference exists:
-    # until then the camera has not watched this person long enough for any
-    # of its readings to weigh on a support score.
+    # own.
     perclos = _value(FeatureName.PERCLOS)
-    any_reference_ready = any(
-        item.ready
-        for item in (
-            reference.heart_rate,
-            reference.sdnn,
-            reference.respiration,
-            reference.blink_rate,
-        )
-    )
-    if perclos is not None and perclos.value is not None and any_reference_ready:
+    if perclos is not None and perclos.value is not None:
         usable[FeatureName.PERCLOS] = (float(perclos.value), float(perclos.quality))
     return usable
 

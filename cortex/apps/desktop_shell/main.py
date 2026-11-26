@@ -1606,8 +1606,9 @@ class CortexApp:
         box.setText("Apply this measured calibration profile?")
         box.setInformativeText(
             f"Source: {provenance} · Camera: {camera_name}. "
-            "Observed work and head/neck baselines can be applied. Webcam "
-            "heart and breathing estimates remain experimental and will not affect scoring."
+            "Observed work and head/neck baselines can be applied. The "
+            "profile's webcam heart and breathing levels are not used: Cortex "
+            "learns your usual level for those during each session."
         )
         box.setDetailedText("\n".join(lines) or "No metrics were available.")
         box.setStandardButtons(

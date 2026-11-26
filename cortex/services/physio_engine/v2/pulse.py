@@ -868,6 +868,7 @@ class PulsePipelineV2:
             rmssd_min_seconds=self._hrv_min_window_seconds,
             sdnn_min_seconds=max(90.0, 1.5 * self._hrv_min_window_seconds),
             min_valid_ibi=self._hrv_min_valid_ibi,
+            as_of_mono_ns=end_ns,
         )
         window_events = [item for item in events if window_id in item.source_window_ids]
         summary = PulseWindowSummary(

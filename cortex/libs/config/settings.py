@@ -441,10 +441,11 @@ class StateConfig(BaseModel):
         ge=0.0,
         le=0.5,
         description=(
-            "Share of a support score that qualified camera physiology may "
-            "move when fully observed; 0 makes the rules behaviour-only. The "
-            "scorer caps the effective value below estimate_entry_threshold "
-            "so physiology alone cannot establish a state."
+            "Share of a support score that camera physiology may move when "
+            "fully observed; 0 makes the rules behaviour-only. Physiology "
+            "can lower any eligible score but can raise one only if "
+            "behaviour alone is already past estimate_entry_threshold, so "
+            "it cannot establish a state."
         ),
     )
     hyper_dwell_seconds: int = Field(30, ge=0)
@@ -768,7 +769,7 @@ class RPPGSignalConfig(BaseModel):
     respiration_max_channel_disagreement_bpm: float = Field(3.0, gt=0.0)
     experimental_respiration_enabled: bool = Field(
         True,
-        description="Publish the camera breathing-rate estimate when its channels agree",
+        description="Publish the camera breathing-rate estimate when head movement and a pulse-derived channel agree",
     )
 
     @field_validator("respiration_high_hz")

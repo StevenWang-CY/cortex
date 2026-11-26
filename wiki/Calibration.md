@@ -12,11 +12,13 @@ validate camera-derived heart rate, variability or breathing.
 - local blink and camera-relative head/neck proxy baselines;
 - user interaction baselines used by deterministic telemetry rules.
 
-The measured pulse, breathing and blink levels seed the personal reference the
-support rules read camera physiology against; without calibration the
-reference is learned during the session. Calibration does not measure
-heart-rate variability, so its reference is always learned in the session. A
-different physical camera discards the reference. Camera physiology only
+The measured blink level seeds the personal reference the support rules read
+camera physiology against, for the camera the profile was taken with. The
+pulse and breathing levels are kept in the profile for review and are not
+used, and calibration does not measure heart-rate variability: Cortex learns
+the usual level for those three during each session, over about two minutes of
+valid readings. A different physical camera discards the reference. Camera
+physiology only
 corroborates a behavioral reading that is already eligible; calibration cannot
 make it establish one. RMSSD, LF/HF and breath-pause detection are not product
 inputs regardless of calibration.
@@ -38,9 +40,9 @@ the previous profile. Reload verifies the exact committed profile ID.
 Acquisition/profile versions and the production behavioral model version are
 separate. Model `3.0.0` uses feature schema `support-features-v3.0.0`; calibrating
 does not train that model or validate its labels. The production scorer uses
-the calibrated mouse-variance baseline where applicable; measured camera levels
-serve only as the personal physiology reference, and blink baselines cannot
-change reading-check-in timing.
+the calibrated mouse-variance baseline where applicable; the measured blink
+level serves only as part of the personal physiology reference, and blink
+baselines cannot change reading-check-in timing.
 
 Camera opening follows macOS-specific safeguards: automatic selection unless a
 device override is explicit, live re-enumeration after open to reject a

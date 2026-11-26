@@ -119,18 +119,20 @@ same-window refreshes), so a window holding *n* events reports *n* switches.
 | Feature | Unit | Source window | Reference check | Support use |
 | --- | --- | ---: | --- | --- |
 | heart rate | BPM | 20 s (10 s while filling) | ECG: MAE 1.8 BPM on published windows | all three |
-| heart-rate variability, SDNN | ms | trailing 3 min | ECG: MAE 8.3 ms on published windows | support-likely, flow-like |
+| heart-rate variability, SDNN | ms | trailing 3 min | ECG: MAE 8.2 ms on published windows | support-likely, flow-like |
 | breathing rate | breaths/min | 45 s | simulated truth only | all three |
 | blink rate | blinks/min | 60 s | none | all three |
 | eye-closure share (PERCLOS) | fraction | 60 s | none | under-engaged |
 
-Each is published only when its own gate passes (a confirmed cardiac line for
-heart rate, enough accepted beats for SDNN, head movement agreeing with a
-pulse-derived channel for breathing). The figures, the conditions under which
-nothing is published and the limits of the evidence — in particular that every
-reference comparison comes from one participant and that the estimator
-abstained on the two participants with intermediate and dark skin tone — are
-in the
+Each is published only when its own gate passes: a confirmed cardiac line for
+heart rate; at least 80 accepted beat intervals, the newest no more than 10 s
+old, for SDNN; head movement agreeing with a pulse-derived channel for
+breathing. Blink rate and eye-closure share have no reference check; they are
+read only while heart rate or SDNN is usable in the same evaluation. The
+figures, the conditions under which nothing is published and the limits of the
+evidence — in particular that every reference comparison comes from one
+participant and that the estimator abstained on the two participants with
+intermediate and dark skin tone — are in the
 [qualification report](../research/physiology-qualification.md).
 
 Camera inputs are optional. Removing the camera, losing the face, or lacking a
@@ -197,18 +199,26 @@ Important compound gates are:
 
 Camera physiology is interpreted only against the same person measured through
 the same camera. `PhysiologyBaselineTracker` keeps a centre and spread per
-metric. A reference becomes ready when a calibration profile holds a measured
-level for the metric, or when the session has supplied sixty valid values over
-at least two minutes (median and scaled median absolute deviation). It then
-adapts with a one-hour half-life, with each update clipped to three spreads, so
-a long demanding stretch reads as a deviation instead of becoming the new
-normal. Spreads have absolute and relative floors (heart rate 3 BPM or 5 %,
-SDNN 6 ms or 20 %, breathing 1.5 /min or 12 %, blink 3 /min or 25 %). A
-different physical camera discards the reference.
+metric. A reference becomes ready when the session has supplied sixty valid
+values over at least two minutes (median and scaled median absolute
+deviation), or when a calibration profile taken through the camera in use
+holds a measured level for the metric. In practice calibration seeds blink
+rate only: it records heart rate and breathing at a maturity the profile does
+not yet promote, and never records SDNN, so those three are learned in each
+session. The reference then adapts with a one-hour half-life, with each update
+clipped to three spreads, so a long demanding stretch reads as a deviation
+instead of becoming the new normal. Spreads have absolute and relative floors
+(heart rate 3 BPM or 5 %, SDNN 6 ms or 20 %, breathing 1.5 /min or 12 %, blink
+3 /min or 25 %). A different physical camera discards the reference.
 
 Heart rate, SDNN and breathing enter as standard scores `z` against the
-reference; blink rate as the ratio to its reference; eye-closure share as an
-absolute fraction, admitted only once some personal reference is ready.
+reference, and blink rate as the ratio to its reference. Eye-closure share is
+the one input read on a fixed scale, as an absolute fraction.
+
+Blink rate and eye-closure share were not checked against any reference
+sensor. They enter the block only while heart rate or SDNN is usable in the
+same evaluation. When the camera yields no pulse the block is empty, whatever
+the eyes are doing.
 
 ### Physiology block
 
@@ -251,21 +261,28 @@ score[s]    = (1 − L · Cp[s]) · B[s]  + L · P[s]     where rule s is eligib
 coverage[s] = (1 − L · Cp[s]) · Cb[s] + L · Cp[s]
 ```
 
-`L` is `state.physiology_weight` (default 0.35), capped at 0.9 of the
-smoother's entry threshold. Physiology is mixed into a state only where that
-state's own behaviour rule produced a positive eligible score; where the rule
-abstained or was gated to zero, the state stays at zero and keeps its
-behaviour coverage. Consequences, each covered by a test:
+`L` is `state.physiology_weight`, 0.35 by default and capped at 0.9 of the
+smoother's entry threshold. Two bounds apply to every state:
 
-- with no camera, no face or no ready reference, `Cp[s] = 0` and every score
-  equals the behaviour score;
+1. Physiology is mixed into a state only where that state's own behaviour rule
+   produced a positive eligible score. Where the rule abstained or was gated to
+   zero, the state stays at zero and keeps its behaviour coverage.
+2. Physiology may lower any eligible score. It may raise one only if the
+   behaviour score alone is already at or past the smoother's entry threshold
+   (0.40 by default); below that, `score[s] = min(score[s], B[s])`.
+
+Consequences, each covered by a test:
+
+- with no camera, no face, no pulse or no ready reference, `Cp[s] = 0` and
+  every score equals the behaviour score;
 - physiology moves an eligible score only within
-  `[(1 − L) · B[s], (1 − L) · B[s] + L]`: it can strengthen a reading it agrees
-  with and temper one it contradicts;
-- camera evidence alone cannot make any hypothesis the estimate, nor the
-  runner-up;
-- lowering a physiology input's quality moves the score toward the behaviour
-  score.
+  `[(1 − L) · B[s], (1 − L) · B[s] + L]`;
+- a weak or ambiguous behavioural reading cannot be turned into an estimate:
+  no state whose behaviour score is below the entry threshold ends above its
+  behaviour score, whatever the camera reads;
+- between two hypotheses that behaviour has each carried past the entry
+  threshold, physiology can decide which is dominant, and it can temper a
+  dominant reading until it no longer clears the threshold.
 
 ## Temporal model and action boundary
 
@@ -332,9 +349,15 @@ suggestion.
   where `a` is the reading above a 0.15 floor, rescaled to 0–1. The default
   threshold is 600 strain-seconds and the recovery half-life 600 s. Gaps longer
   than 30 s earn neither load nor recovery. Crossing the threshold suggests a
-  three-minute paced-breathing break once; a crossing the gate refuses stays
-  owed; a completed break pays back twice its duration. The load is a pacing
-  aid, not a measure of stress, fatigue or health.
+  three-minute paced-breathing break once, and only while a camera reading
+  from the last 30 s exists: a load built earlier is not acted on after the
+  person has left the camera. The offer goes to the desktop app and to the
+  client in front (browser or editor), not to every connected client. A
+  crossing the interruption gate refuses stays owed and is retried no more
+  often than every 30 s; a completed break pays back twice its duration. The
+  wording names camera readings and the person's usual level and makes no
+  claim about stress. The load is a pacing aid, not a measure of stress,
+  fatigue or health.
 
 Reading check-ins read no camera value directly: blink values and blink
 baselines cannot change their timing. They do require an `under_engaged`
@@ -363,7 +386,11 @@ and authorization gates.
 - **Contained.** Two coach modes would be established by physiology rather
   than corroborated by it — an immediate heart-rate reaction to a submission,
   which a 20 s pulse window cannot resolve, and a post-success recovery
-  window. Their physiological inputs remain zero, as in 2.6.0.
+  window. Their physiological inputs remain zero, as in 2.6.0. The coach's
+  mode resolver is also given no strain load, so its two load-driven modes
+  cannot be selected by camera physiology.
+- **Not sent.** RMSSD is computed for research output only. The realtime
+  state message carries `hrv_rmssd: null`, and no client reads the field.
 
 ## Change log
 
@@ -373,7 +400,7 @@ fusion with the behaviour block, heart rate / SDNN / breathing rate / blink
 rate / eye-closure share as production features, and the strain-load break
 suggestion. The pulse estimator was rebuilt around a harmonic signal-to-noise
 publication gate, a whole-face skin region, a 20 s window and narrow-band beat
-timing (`pulse-v2/3.0.0`, `hrv-v2/3.1.0`); a window bug that prevented any
+timing (`pulse-v2/3.0.0`, `hrv-v2/3.2.0`); a window bug that prevented any
 breathing rate from being published was fixed. Behaviour weights, transforms,
 gates and temporal behaviour are unchanged, and with `state.physiology_weight:
 0` or no camera the output is identical to 2.6.0. See the
@@ -487,12 +514,15 @@ are reconciled here.
 
 Required pre-merge tests include feature-catalog completeness, exact dimension,
 missing-value coherence, all channel-presence combinations, camera absence
-equivalence (no camera, no face or no reference reproduces the behaviour-only
-score exactly), bounded physiology influence, ineligible-rule exclusion,
+equivalence (no camera, no face, no pulse or no reference reproduces the
+behaviour-only score exactly), bounded physiology influence (including that no
+state below the entry threshold is raised), ineligible-rule exclusion,
 zero-stream rejection, evidence monotonicity, deterministic replay, dwell and
 recovery semantics, probability-artifact rejection, and safe-null rollback.
-The physiology estimators additionally require the synthetic qualification
-(agreement and zero false publication on signal-free input) to pass.
+The physiology estimators additionally run the synthetic qualification
+(agreement and zero false publication on signal-free input) as a step of
+`make verify`; the ECG comparison needs the separately downloaded dataset and
+is run by hand when an estimator changes.
 
 Operational telemetry must record only aggregate health and model identity:
 status/abstention rate, coverage distribution, feature missingness by reason,

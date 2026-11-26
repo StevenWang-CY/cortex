@@ -60,13 +60,15 @@ Cortex remains **alpha research software**. Its support scores are explainable
 heuristics, not calibrated probabilities or validated measures of stress,
 attention or productivity. Since 0.6.0, camera heart rate, heart-rate
 variability (SDNN), breathing rate, blink rate and eye-closure share are
-optional corroborating inputs: each is read against the person's own
-reference and is mixed into a score only where the behavioral rule is already
-eligible, with a weight of at most 0.35. Heart rate and SDNN were checked
-against ECG on one participant; for the two participants with intermediate and
-dark skin tone the estimator published nothing, there is no held-out data, and
-breathing rate has no reference sensor behind it. RMSSD, LF/HF and the other
-beat-to-beat measures did not qualify and are not inputs. See the
+optional corroborating inputs: they are mixed into a score only where the
+behavioral rule is already eligible, with a default weight of 0.35, and can
+raise a score only when the behavioral score alone already reaches the entry
+threshold. Heart rate and SDNN were checked against ECG on one participant;
+for the two participants with intermediate and dark skin tone the estimator
+published nothing, there is no held-out data, breathing rate has no reference
+sensor behind it, and blink rate and eye closure were not checked. RMSSD,
+LF/HF and the other beat-to-beat measures did not qualify and are not inputs.
+See the
 [qualification report](docs/research/physiology-qualification.md),
 [limitations](docs/limitations.md) and the
 [model card](docs/model-cards/deterministic-support-v3.md).
@@ -104,9 +106,9 @@ interfaces. SQLite stores transactional authority and session records.
 
 Camera physiology never establishes a support state or grants authority. It
 can strengthen or temper a reading the behavioral rules already support; with
-no camera, no face or no personal reference the score is exactly the
-behavior-only score. A strain load built from the same physiology can suggest
-one short breathing break through the usual interruption gate.
+no camera, no face, no pulse or no personal reference the score is exactly
+the behavior-only score. A strain load built from the same physiology can
+suggest one short breathing break through the usual interruption gate.
 The behavior model uses fixed-denominator scores: removing evidence cannot
 increase its contribution. Duplicate observations do not count again, gaps
 above three seconds reset temporal confirmation, and display values expire
@@ -171,7 +173,8 @@ make help
 `make verify` includes strict Python and TypeScript checks, Python branch
 coverage and wheel inspection, schema/config/version/model/token drift, local
 document links, browser/editor tests, both browser builds and size budgets,
-VSIX packaging, recorded-trace replay and dependency-audit policy. Hosted CI
+VSIX packaging, recorded-trace replay, the simulated camera-physiology
+qualification and dependency-audit policy. Hosted CI
 adds external link checks and the two-architecture matrix. Tests use isolated
 profiles; hardware tests need their explicitly supplied fixtures.
 

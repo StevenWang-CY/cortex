@@ -57,13 +57,13 @@ describe("proposal-only editor authority", () => {
 
         _handleLegacyBreakRecommendationForTest({
             basis: "physiological_strain",
-            reason: "Your heart and breathing have run above your usual level for a while.",
+            reason: "Your camera readings have stayed away from your usual level for a while.",
             duration_seconds: 180,
         });
 
         expect(mockWindow.showInformationMessage).toHaveBeenCalledTimes(1);
         expect(mockWindow.showInformationMessage.mock.calls[0][0]).toBe(
-            "Cortex · Your heart and breathing have run above your usual level for a while.",
+            "Cortex · Your camera readings have stayed away from your usual level for a while.",
         );
     });
 });

@@ -103,10 +103,11 @@ people it may never publish one on a given camera, and Cortex then behaves as
 if no camera were present.
 
 HRV (SDNN) appears only after enough accepted beats have accumulated in its
-three-minute window, and breathing rate only when two independent camera
-signals agree, so both can show "--" while a pulse is visible. "Body load"
-appears only once a personal reference exists: from calibration, or after
-about two minutes of valid readings in the session.
+three-minute window (about a minute and a half of steady pulse), and
+disappears within ten seconds of the pulse being lost. Breathing rate appears
+only when head movement and a pulse-derived signal agree. Both can show "--"
+while a pulse is visible. "Body load" appears only once a personal reference
+exists, after about two minutes of valid readings in the session.
 
 ### Status stays "Still gathering" or "Not enough evidence"
 
@@ -124,11 +125,12 @@ focus transitions); camera physiology can only corroborate them. They require:
   or regressed times and resets accumulated evidence/dwell after gaps above
   three seconds; time spent disconnected does not satisfy a waiting period.
 
-There is no camera-only mode. Camera physiology can strengthen or temper a
-score only where the behavioral rule is already eligible, so it cannot turn
-"Not enough evidence" into an estimate. The scorer uses the personal
-mouse-variance baseline; calibration also records the camera levels the
-physiology is read against, which do not validate support labels.
+There is no camera-only mode. Camera physiology can lower a score wherever
+the behavioral rule is eligible and raise one only when the behavioral score
+alone already reaches the entry threshold, so it cannot turn "Not enough
+evidence" into an estimate. The scorer uses the personal mouse-variance
+baseline; calibration also records camera levels for review, which do not
+validate support labels.
 
 ### Too many or too few suggestions
 

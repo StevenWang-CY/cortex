@@ -198,16 +198,33 @@ def replay_trace(
             extra["signal_present"] = float(update.pulse.signal_present)
             for key, value in update.pulse.sqi_components.items():
                 extra[f"sqi_{key}"] = float(value)
+        # Score what the app publishes, not what the engine computed: a
+        # variability or breathing value on a stride whose channel is not
+        # live never reaches a user, and counting it inflated coverage.
+        published = update.features
         records.append(
             StrideRecord(
                 at_s=float(stamp_s),
-                heart_rate=_windowed(
-                    update.pulse.summary.hr if update.pulse is not None else None,
-                    origin_ns,
+                heart_rate=(
+                    _windowed(update.pulse.summary.hr, origin_ns)
+                    if update.pulse is not None and published.pulse_bpm is not None
+                    else None
                 ),
-                rmssd=_windowed(hrv.get(PhysiologyMetric.RMSSD), origin_ns),
-                sdnn=_windowed(hrv.get(PhysiologyMetric.SDNN), origin_ns),
-                respiration=_windowed(processor.latest_respiration, origin_ns),
+                rmssd=(
+                    _windowed(hrv.get(PhysiologyMetric.RMSSD), origin_ns)
+                    if published.pulse_variability_proxy is not None
+                    else None
+                ),
+                sdnn=(
+                    _windowed(hrv.get(PhysiologyMetric.SDNN), origin_ns)
+                    if published.hrv_sdnn is not None
+                    else None
+                ),
+                respiration=(
+                    _windowed(processor.latest_respiration, origin_ns)
+                    if published.respiration_rate_bpm is not None
+                    else None
+                ),
                 extra=extra,
             )
         )

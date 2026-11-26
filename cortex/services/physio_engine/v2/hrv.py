@@ -63,6 +63,9 @@ MEDIAN_DEVIATION_LIMIT = 0.30
 # for more than this share of what was measured, the remainder is a small
 # difference of two large, uncertain numbers and is not published.
 MAX_TIMING_NOISE_SHARE = 0.85
+# Variability describes the present only while beats keep arriving. Once the
+# newest accepted interval is older than this, nothing is published.
+MAX_INTERVAL_STALENESS_SECONDS = 10.0
 # A corrected variance is never reported below this share of the measured
 # one: an over-estimated noise term must not manufacture a collapse.
 MIN_CORRECTED_VARIANCE_SHARE = 0.05
@@ -168,23 +171,37 @@ def select_interval_series(
     intervals: tuple[InterBeatInterval, ...],
     *,
     window_seconds: float,
+    as_of_mono_ns: int | None = None,
 ) -> IntervalSeries:
-    """Return the accepted, median-consistent intervals of the trailing window."""
+    """Return the accepted, median-consistent intervals of the trailing window.
 
+    The window trails ``as_of_mono_ns`` -- the end of the pulse window being
+    published -- so it describes the last ``window_seconds`` up to now. When
+    it is omitted the window trails the newest interval instead, which is
+    only right for a caller that knows its intervals are current.
+    """
+
+    empty = IntervalSeries(
+        durations_ms=np.asarray([], dtype=np.float64),
+        end_times_s=np.asarray([], dtype=np.float64),
+        successive=np.asarray([], dtype=np.bool_),
+        span_seconds=0.0,
+        artifact_fraction=1.0,
+        quality=0.0,
+        start_mono_ns=0,
+        end_mono_ns=0,
+    )
     if not intervals:
-        return IntervalSeries(
-            durations_ms=np.asarray([], dtype=np.float64),
-            end_times_s=np.asarray([], dtype=np.float64),
-            successive=np.asarray([], dtype=np.bool_),
-            span_seconds=0.0,
-            artifact_fraction=1.0,
-            quality=0.0,
-            start_mono_ns=0,
-            end_mono_ns=0,
-        )
-    latest_ns = intervals[-1].end_mono_ns
+        return empty
+    latest_ns = intervals[-1].end_mono_ns if as_of_mono_ns is None else int(as_of_mono_ns)
     cutoff_ns = latest_ns - int(window_seconds * 1_000_000_000)
-    windowed = [item for item in intervals if item.start_mono_ns >= cutoff_ns]
+    windowed = [
+        item
+        for item in intervals
+        if item.start_mono_ns >= cutoff_ns and item.end_mono_ns <= latest_ns
+    ]
+    if not windowed:
+        return empty
     accepted_flags = [item.status == BeatStatus.ACCEPTED.value for item in windowed]
     accepted_durations = np.asarray(
         [item.duration_ms for item, ok in zip(windowed, accepted_flags, strict=True) if ok],
@@ -404,8 +421,17 @@ def build_hrv_estimates(
     sdnn_min_seconds: float = 90.0,
     min_valid_ibi: int = 40,
     max_artifact_fraction: float = 0.25,
+    as_of_mono_ns: int | None = None,
 ) -> dict[PhysiologyMetric, SignalEstimate]:
-    """Return every HRV metric; each is unavailable unless its contract holds."""
+    """Return every HRV metric; each is unavailable unless its contract holds.
+
+    ``as_of_mono_ns`` is the end of the pulse window being published. With it
+    the analysis windows trail the present, and nothing is published once the
+    newest accepted interval is more than ``MAX_INTERVAL_STALENESS_SECONDS``
+    old. Without it the ledger's last beats kept being re-published after the
+    pulse had gone: a replay with the pulse removed went on reporting an SDNN
+    150 s later.
+    """
 
     parameters: dict[str, str | int | float | bool] = {
         "upstream_algorithm": algorithm.name,
@@ -420,13 +446,14 @@ def build_hrv_estimates(
         "median_deviation_limit": MEDIAN_DEVIATION_LIMIT,
         "max_timing_noise_share": MAX_TIMING_NOISE_SHARE,
         "min_corrected_variance_share": MIN_CORRECTED_VARIANCE_SHARE,
+        "max_interval_staleness_seconds": MAX_INTERVAL_STALENESS_SECONDS,
         "publication_enabled": enabled,
     }
     if algorithm.configuration_sha256 is not None:
         parameters["upstream_configuration_sha256"] = algorithm.configuration_sha256
     hrv_algorithm = SignalAlgorithmIdentity(
         name=f"hrv-v2:{algorithm.name}",
-        version="hrv-v2/3.1.0",
+        version="hrv-v2/3.2.0",
         implementation_sha256=code_sha256(
             (
                 build_hrv_estimates,
@@ -485,19 +512,40 @@ def build_hrv_estimates(
         ),
     )
 
+    newest_accepted_ns = next(
+        (
+            item.end_mono_ns
+            for item in reversed(intervals)
+            if item.status == BeatStatus.ACCEPTED.value
+        ),
+        None,
+    )
+    beats_are_stale = as_of_mono_ns is not None and (
+        newest_accepted_ns is None
+        or int(as_of_mono_ns) - newest_accepted_ns
+        > int(MAX_INTERVAL_STALENESS_SECONDS * 1_000_000_000)
+    )
+
     series_by_window: dict[float, IntervalSeries] = {}
     results: dict[PhysiologyMetric, SignalEstimate] = {}
     for contract in contracts:
         series = series_by_window.get(contract.window_seconds)
         if series is None:
             series = select_interval_series(
-                intervals, window_seconds=contract.window_seconds
+                intervals,
+                window_seconds=contract.window_seconds,
+                as_of_mono_ns=as_of_mono_ns,
             )
             series_by_window[contract.window_seconds] = series
 
         reason: str | None = None
         if not enabled:
             reason = "pulse-rate variability is turned off in settings"
+        elif beats_are_stale:
+            reason = (
+                "no accepted heartbeat interval in the last "
+                f"{MAX_INTERVAL_STALENESS_SECONDS:.0f} s"
+            )
         elif series.count < contract.minimum_intervals:
             reason = (
                 f"needs {contract.minimum_intervals} clean beat intervals "

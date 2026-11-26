@@ -42,32 +42,39 @@ camera processing, skin/camera interaction, frame timing, distance, glasses,
 and device differences. Since 0.6.0, camera heart rate, heart-rate variability
 as SDNN, breathing rate, blink rate and eye-closure share are optional
 corroborating inputs to the support rules
-([ADR 0008](adr/0008-qualified-camera-physiology.md)). Each is read as a
-deviation from the same person's reference through the same camera, and is
-mixed only into a state whose behavioral rule is already eligible, with a
-weight of at most `state.physiology_weight` (default 0.35). Camera evidence
-alone cannot produce an estimate. With no camera, no face or no reference the
-scores equal the behavior-only scores; `state.physiology_weight: 0` restores
-behavior-only scoring.
+([ADR 0008](adr/0008-qualified-camera-physiology.md)). Heart rate, SDNN,
+breathing rate and blink rate are read as deviations from the same person's
+reference through the same camera; eye-closure share is read as an absolute
+fraction. They are mixed only into a state whose behavioral rule is already
+eligible, with a weight of `state.physiology_weight` (default 0.35), and can
+raise a score only when the behavioral score alone already reaches the entry
+threshold. Camera evidence alone cannot produce an estimate, and it cannot
+turn a weak behavioral reading into one. With no camera, no face, no pulse or
+no reference the scores equal the behavior-only scores;
+`state.physiology_weight: 0` restores behavior-only scoring.
 
 The evidence behind this is narrow. The
 [qualification report](research/physiology-qualification.md) states it in
 full:
 
 - Heart rate (mean error 1.8 BPM, on the 33 % of windows it published) and
-  SDNN (8.3 ms, on 22 % of windows) were checked against ECG on 21 public
+  SDNN (8.2 ms, on 21 % of windows) were checked against ECG on 21 public
   recordings. Every published value came from **one participant**.
 - For the two participants with intermediate and dark skin tone the estimator
   published nothing. For such users, on comparable footage, the camera adds
-  nothing and the rules are behavior-only. This is an unequal benefit, not a
-  settled state.
-- The publication gate was designed with the same recordings in view. There is
-  no held-out data; agreement on new people, cameras and rooms may be lower.
+  nothing and the rules are behavior-only. For one of them, in bright light,
+  the pulse was mostly readable and the gate still rejected it. This is an
+  unequal benefit, not a settled state.
+- The publication gate and the acceptance criteria were set with the same
+  recordings in view. There is no held-out data; agreement on new people,
+  cameras and rooms may be lower.
 - Breathing rate has only simulated truth behind it. Blink rate and eye
-  closure were not checked against a reference.
-- Head movement and low light cause gaps: with head movement 3 % of windows
-  published a rate, and at 5 lux a third did. Typing and talking at a desk
-  resemble the movement recordings more than the still ones.
+  closure were not checked against anything; the rules read them only while
+  heart rate or SDNN is usable.
+- Head movement and low light cause gaps: for the one participant with
+  published values, 3 % of windows published a rate with head movement and a
+  third did at 5 lux. Typing and talking at a desk resemble the movement
+  recordings more than the still ones.
 - Agreement with a reference sensor shows that a value tracks the body, not
   that it indicates a need for support. Heart rate and variability change with
   posture, caffeine, conversation and exercise as well as with work.
