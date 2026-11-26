@@ -2196,6 +2196,10 @@ class _ConsumerTab(QWidget):
         # extension row too — they can't possibly be alive without the
         # daemon. This keeps the dashboard's connection story coherent.
         if connected:
+            if self._session_phase == _PHASE_ENDED:
+                # The previous session's daemon stopped; whatever connects
+                # now is a new session (the WebSocket host has no Start).
+                self._begin_session_stats()
             self._ended_by_user = False
             self._enter_phase(_PHASE_LIVE)
             return
@@ -2353,9 +2357,20 @@ class _ConsumerTab(QWidget):
         elif self._session_phase in (_PHASE_ENDED, _PHASE_DISCONNECTED):
             self._request_session_start()
 
+    def _begin_session_stats(self) -> None:
+        """Start "This session" over: zero the accumulators and hide the
+        section until the new session's first estimate arrives."""
+        self._reset_today_stats()
+        self._has_estimate = False
+        try:
+            self._session_stats.setVisible(False)
+        except Exception:
+            pass
+
     def _request_session_start(self) -> None:
         if not self._restart_available:
             return
+        self._begin_session_stats()
         self._enter_phase(_PHASE_STARTING)
         try:
             self.session_start_requested.emit()
