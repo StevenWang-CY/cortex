@@ -421,10 +421,16 @@ class ConsentLadder:
             state.setdefault("rejection_timestamps", []).append(state["last_rejection"])
             self._prune_old_timestamps(state)
 
-            # 3 rejections at current level -> de-escalate
-            if state["rejections"] >= 3 and state["level"] > SUGGEST:
+            # 3 rejections at current level -> de-escalate, never below the
+            # action's own minimum. Dropping ``group_tabs`` (minimum PREVIEW)
+            # to SUGGEST after three dismissed proposals made every later
+            # user-confirmed PREVIEW authorization for it ``consent_denied``,
+            # and nothing could raise it again: approvals are recorded only
+            # after a verified receipt, which needs a permitted authorization.
+            floor = max(SUGGEST, self._policy.get_minimum_level(action_type))
+            if state["rejections"] >= 3 and state["level"] > floor:
                 old_level = state["level"]
-                state["level"] = max(state["level"] - 1, SUGGEST)
+                state["level"] = max(state["level"] - 1, floor)
                 state["rejections"] = 0
                 state["approvals"] = 0
                 logger.info(
