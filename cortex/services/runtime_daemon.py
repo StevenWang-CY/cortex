@@ -7519,10 +7519,11 @@ class CortexDaemon:
         payload = message.get("payload")
         if not message_type:
             return
+        # Edge runs the same extension and identifies as ``"edge"``.
         await self._ws_server.send_message(
             message_type,
             payload if isinstance(payload, dict) else {},
-            target_client_types=["chrome"],
+            target_client_types=["chrome", "edge"],
         )
 
     async def _handle_leetcode_context_update(self, payload: dict[str, Any]) -> None:

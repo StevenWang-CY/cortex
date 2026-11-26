@@ -27,6 +27,11 @@ from cortex.services.context_engine.app_classifier import classify_tab_type
 
 logger = logging.getLogger(__name__)
 
+# The same extension build ships to Chrome and Edge and identifies with the
+# host browser's ``client_type`` (``lib/browser.ts::detectBrowser``). Asking
+# only for ``"chrome"`` left an Edge-only user with no browser context at all.
+_BROWSER_CLIENT_TYPES: tuple[str, ...] = ("chrome", "edge")
+
 
 class BrowserAdapter:
     """
@@ -73,7 +78,16 @@ class BrowserAdapter:
         """
         if self._request_context is not None:
             try:
-                payload = await asyncio.wait_for(self._request_context("chrome"), timeout=timeout)
+                payload: Any = {}
+                # ``request_context`` answers ``{}`` at once when no client
+                # of that type is connected, so the fallback costs nothing
+                # for a Chrome user and reaches an Edge-only user.
+                for client_type in _BROWSER_CLIENT_TYPES:
+                    payload = await asyncio.wait_for(
+                        self._request_context(client_type), timeout=timeout,
+                    )
+                    if payload:
+                        break
                 if not isinstance(payload, dict):
                     self._available = False
                     return None
