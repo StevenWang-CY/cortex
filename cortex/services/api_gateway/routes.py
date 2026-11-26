@@ -1834,7 +1834,17 @@ async def launch_project(
             errors=["No project launcher available"],
         )
     try:
-        await _asyncio.wait_for(launcher.launch(project_name), timeout=20.0)
+        result = await _asyncio.wait_for(launcher.launch(project_name), timeout=20.0)
+        # ``ProjectLauncher.launch`` reports an unknown project by returning
+        # ``success: False`` rather than raising, which this route used to
+        # answer with ``launched: true``.
+        if isinstance(result, dict) and result.get("success") is False:
+            return LaunchProjectResponse.from_clock(
+                _get_clock(request),
+                launched=False,
+                project_name=project_name,
+                errors=["project_not_found"],
+            )
         return LaunchProjectResponse.from_clock(
             _get_clock(request),
             launched=True,
