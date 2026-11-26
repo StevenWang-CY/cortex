@@ -413,9 +413,18 @@ export class CortexWSClient {
         this._intentionalDisconnect = false;
 
         try {
-            this._ws = new WebSocket(this._url);
+            const socket = new WebSocket(this._url);
+            this._ws = socket;
+            // disconnect() and setUrl() close a socket gracefully, and the ws
+            // library keeps emitting frames that arrive during the close
+            // handshake. A socket that is no longer ``_ws`` speaks for nobody:
+            // its late STATE_UPDATE repainted a "Disconnected" status bar as a
+            // live reading, and its AUTH_OK marked a freshly dialled,
+            // unauthenticated socket connected and sent IDENTIFY on it.
+            const current = (): boolean => this._ws === socket;
 
-            this._ws.on("open", () => {
+            socket.on("open", () => {
+                if (!current()) return;
                 this._lastInboundSequenceByType.clear();
                 this._seenInboundEventIds.clear();
                 this._seenInboundEventOrder.length = 0;
@@ -423,7 +432,8 @@ export class CortexWSClient {
                 this._onSocketOpen();
             });
 
-            this._ws.on("message", (data: WebSocket.RawData) => {
+            socket.on("message", (data: WebSocket.RawData) => {
+                if (!current()) return;
                 this._handleMessage(data.toString());
             });
 
@@ -431,18 +441,20 @@ export class CortexWSClient {
             // ``websockets`` server auto-pongs every inbound frame-level
             // ping; the timestamp lets ``_checkHeartbeatHealth`` decide
             // whether the connection is alive.
-            this._ws.on("pong", () => {
+            socket.on("pong", () => {
+                if (!current()) return;
                 this._lastPongAt = Date.now();
             });
 
-            this._ws.on("close", (code: number, reason: Buffer | string) => {
+            socket.on("close", (code: number, reason: Buffer | string) => {
+                if (!current()) return;
                 const reasonText = typeof reason === "string"
                     ? reason
                     : (reason ? reason.toString() : "");
                 this._handleDisconnect(code, reasonText);
             });
 
-            this._ws.on("error", () => {
+            socket.on("error", () => {
                 // onclose will follow; no extra handling needed
             });
         } catch {
