@@ -123,9 +123,13 @@ class CortexTrayIcon(QSystemTrayIcon):
         # P0 §3.11: cached quiet-mode kind so the tray menu can mark
         # the active row with a checkmark when rebuilt.
         self._quiet_mode_kind: str = "off"
+        # Tooltip without the " · Paused" suffix, as the last status update
+        # wrote it. Pausing appends to this rather than re-deriving a label
+        # from the raw state, which would name a state the evidence withheld.
+        self._tooltip_base: str = "Cortex — Disconnected"
 
         self.setIcon(_make_heart_icon(DISCONNECTED_COLOR))
-        self.setToolTip("Cortex — Disconnected")
+        self.setToolTip(self._tooltip_base)
 
         self._menu = QMenu()
         self._build_menu()
@@ -366,15 +370,17 @@ class CortexTrayIcon(QSystemTrayIcon):
                 color.name() if color is not DISCONNECTED_COLOR else None
             )
 
-        tooltip = (
+        self._tooltip_base = (
             f"Cortex — {label} · {confidence:.0%} evidence strength · "
             f"{evidence_coverage:.0%} coverage"
         )
-        if self._paused:
-            tooltip += " · Paused"
-        self.setToolTip(tooltip)
+        self._render_tooltip()
 
         self._state_action.setText(f"Status: {label}")
+
+    def _render_tooltip(self) -> None:
+        suffix = " · Paused" if self._paused else ""
+        self.setToolTip(self._tooltip_base + suffix)
 
     def set_connected(self, connected: bool) -> None:
         self._connected = connected
@@ -382,7 +388,8 @@ class CortexTrayIcon(QSystemTrayIcon):
             self.setIcon(_make_heart_icon(DISCONNECTED_COLOR))
             if self._native_status is not None:
                 self._native_status.set_state_tint(None)
-            self.setToolTip("Cortex — Disconnected")
+            self._tooltip_base = "Cortex — Disconnected"
+            self._render_tooltip()
             self._state_action.setText("Status: Disconnected")
         self._refresh_quit_label()
 
@@ -393,7 +400,8 @@ class CortexTrayIcon(QSystemTrayIcon):
         self.setIcon(_make_heart_icon(DISCONNECTED_COLOR))
         if self._native_status is not None:
             self._native_status.set_state_tint(None)
-        self.setToolTip("Cortex — Starting…")
+        self._tooltip_base = "Cortex — Starting…"
+        self._render_tooltip()
         self._state_action.setText("Status: Starting…")
         self._refresh_quit_label()
 
@@ -409,9 +417,7 @@ class CortexTrayIcon(QSystemTrayIcon):
     def set_paused(self, paused: bool) -> None:
         self._paused = paused
         self._pause_action.setText(_NATIVE_RESUME if paused else _NATIVE_PAUSE)
-        if paused:
-            label = STATE_LABELS.get(self._state, "Status unavailable")
-            self.setToolTip(f"Cortex — {label} · Paused")
+        self._render_tooltip()
         # Pause is one of the quiet-mode kinds — keep the menu in sync.
         try:
             self._pause_action.setCheckable(True)
