@@ -4,6 +4,16 @@ All notable changes to Cortex. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+- CI verifies links from the wiki to this repository's own files against the
+  checked-out tree, and the external link check no longer probes them.
+  github.com answered those probes from CI runners with HTTP 503 for hours,
+  which failed `main`; a self-link broken by a commit now fails that commit.
+- The 0.6.0 validation record and the release guide state that the `v0.6.0`
+  release run stopped at Apple's HTTP 403 (agreement missing or expired) and
+  what clears it.
+
 ## [v0.6.0] — 2026-11-26
 
 Camera physiology becomes optional corroborating evidence for the support
