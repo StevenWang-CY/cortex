@@ -6256,10 +6256,14 @@ class CortexDaemon:
         if not intervention_id:
             return None
         cached = self._causal_signals_by_intervention.get(intervention_id)
-        if cached:
+        # An empty cached list is the trigger-time answer "no strong observed
+        # contributor", not a miss. Treating it as a miss answered the Why?
+        # panel (which asks exactly when the plan carried no signals) with
+        # whatever was abnormal at the moment of the click.
+        if cached is not None:
             return list(cached)
         # Fall back to live attribution against the most recent feature
-        # vector + baselines if available.
+        # vector + baselines if available (an unknown or evicted id).
         try:
             latest_features = self._current_feature_vector()
             if latest_features is None:
