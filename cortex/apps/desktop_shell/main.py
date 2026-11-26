@@ -119,9 +119,7 @@ class WebSocketBridge(QObject):
         self._message_router = DesktopMessageRouter(
             {
                 "STATE_UPDATE": lambda payload: self.state_updated.emit(payload),
-                "INTERVENTION_TRIGGER": lambda payload: (
-                    self.intervention_triggered.emit(payload)
-                ),
+                "INTERVENTION_TRIGGER": self._on_trigger_frame,
                 "INTERVENTION_RESTORE": lambda payload: (
                     self.intervention_restored.emit(payload)
                 ),
@@ -156,6 +154,24 @@ class WebSocketBridge(QObject):
         )
         # One-release compatibility facade. New code calls router.reset().
         self._last_seq_by_type = self._message_router.sequence_state
+        # intervention_id -> the cid the daemon stamped on its latest
+        # trigger. The daemon drops a USER_ACTION whose cid differs from
+        # it, and mints a fresh one (which never matches) when none is
+        # sent. Bounded; written on the WS thread before the trigger is
+        # emitted, read on the Qt thread when the user acts.
+        self._trigger_cids: dict[str, str] = {}
+
+    _MAX_TRIGGER_CIDS = 32
+
+    def _on_trigger_frame(self, payload: dict[str, Any]) -> None:
+        intervention_id = payload.get("intervention_id")
+        cid = self._message_router.current_correlation_id
+        if isinstance(intervention_id, str) and intervention_id and cid:
+            self._trigger_cids.pop(intervention_id, None)
+            self._trigger_cids[intervention_id] = cid
+            while len(self._trigger_cids) > self._MAX_TRIGGER_CIDS:
+                self._trigger_cids.pop(next(iter(self._trigger_cids)))
+        self.intervention_triggered.emit(payload)
 
     def start(self) -> None:
         """Start the WebSocket listener in a background thread."""
@@ -201,12 +217,16 @@ class WebSocketBridge(QObject):
         """Send a USER_ACTION message to the daemon."""
         if self._loop is None or self._ws is None:
             return
-        msg = json.dumps({
+        envelope: dict[str, Any] = {
             "type": "USER_ACTION",
             "payload": {"action": action, "intervention_id": intervention_id},
             "timestamp": 0,
             "sequence": 0,
-        })
+        }
+        cid = self._trigger_cids.get(intervention_id) if intervention_id else None
+        if cid:
+            envelope["correlation_id"] = cid
+        msg = json.dumps(envelope)
         asyncio.run_coroutine_threadsafe(self._send(msg), self._loop)
 
     def send_action_execute(
